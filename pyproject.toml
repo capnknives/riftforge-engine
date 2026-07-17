@@ -1,0 +1,30 @@
+[project]
+name = "riftforge"
+version = "0.1.0"
+description = "A from-scratch MUD engine (pure Python, asyncio) powering the SUPERS game."
+requires-python = ">=3.11"
+dependencies = []  # standard library only — keep it that way
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+# Two-repo purity Phase 3 (docs/plans/two_repo_purity.md): riftforge installs
+# the `engine` package -- the half of the codebase that's actually clean of
+# SUPERS content (Phase 2's gate: zero `from supers`/`import supers` under
+# engine/, enforced by smoke_test.py's engine_hooks_purity_tests). The repo
+# root still holds a handful of shared, undecomposed modules (world.py,
+# commands.py, persistence.py, maps.py, server.py -- see AGENTS.md's "Where
+# things live") that a real public/private remote split (Phase 5) will need
+# to relocate; those stay unpackaged for now, and the game keeps running the
+# whole monorepo with the checkout's own directory on `sys.path` (Docker's
+# bind-mount + `watch_and_run`), same as today -- this declaration doesn't
+# change how the live server boots, it only makes `engine` independently
+# `pip install`-able for a future standalone consumer (docs/ENGINE_CONSUMER.md).
+include = ["engine*"]
+
+[tool.ruff]
+# Ruff is optional tooling; the project itself needs no dependencies to run.
+line-length = 100
+target-version = "py311"
