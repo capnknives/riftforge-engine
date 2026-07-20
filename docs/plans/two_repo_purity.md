@@ -77,7 +77,7 @@ training-cancel/work-stop/carried-body/lodging-owner calls,
 `_can_see_spirit`'s Spirit-Magic/Attunement check, `_pull_followers`'
 hunter-safe check) reached into `supers` directly. They were exempt from
 the Phase 2 gate because they lived at the repo root, not `engine/` — see
-AGENTS.md's "Where things live" — but Phase 3's lean, installable engine
+the monorepo layout notes — but Phase 3's lean, installable engine
 package needed them hook-ified the same way `engine/verbs/basic.py`'s old
 lazy imports were in Phase 2:
 
@@ -148,7 +148,7 @@ game content split out to `supers/`:
   editable hacking loop needs regardless. A real install-and-run pass
   is Phase 5 work (the actual remote split).
 - **Not done in this MVP pass:** `server.py`/`commands.py` remain shared,
-  undecomposed root modules (AGENTS.md's "Where things live") — Phase 4/5
+  undecomposed root modules (see the monorepo layout notes) — Phase 4/5
   will need to finish deciding what, if anything, of those moves.
 
 ## Phase 4 notes (done)
