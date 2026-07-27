@@ -5,6 +5,11 @@ style.py -- gothic ANSI color + old-MUD layout helpers
 Preference catalog (phases, gaps, cite prefs #N in PRs):
   docs/plans/mud_formatting_preferences.md
 
+Agent coloring guide (sighted sweeps, role table, layout families):
+  docs/plans/sighted_color_guide.md
+  Always-apply: .cursor/rules/sighted-color.mdc
+  Sibling a11y: .cursor/rules/screenreader-a11y.mdc
+
 Pure presentation. Game logic must never depend on color for meaning
 (docs/SYSTEMS_DESIGN.md section 8): every painted string still carries a
 plain-text label. Session.send strips ANSI when Character.use_color is off.
@@ -14,15 +19,24 @@ Palette (#51 + the plan's named tags):
     templates remap to soft cyan / dark grey so a11y stays intact.
   - No neon spam; soft amber, crimson, silver, muted green, teal.
   - ``render("<tag>text <other>more")`` switches color at each <tag>.
+  - ``paint_layered(role, template)`` / ``paint_layered_for(...)``: like
+    paint(), but a ``<tag>`` inside `template` switches color for that
+    span only -- an unrecognized tag (including the sentinel ``_base``)
+    reverts to `role`'s own color rather than going blank. Lets combat's
+    direction-role base coexist with rare gothic accents inside one line
+    (docs/plans/combat_color_gothic.md).
   - Semantic combat/chat roles (prefs #10 / #19 / #23): ``combat_out``,
     ``combat_in``, ``combat_other``, ``combat_mitigate``, ``ooc``, ``alert``.
+    Combat direction VALUES are gothic parchment/blood/ash/steel (retuned
+    2026-07-19 -- the old bright-cyan/teal pair read as sci-fi HUD).
 
 Layout families from the plan (docs/plans/colorandformattingforgame.R):
-  - Master Room        -- look sheet (O=====O, Paths / Souls / Items)
+  - Master Room        -- framed sheets (score / who / help), not look
   - Wrought Iron & Ash -- who list (x-x-x rules, badge columns)
   - Blood & Velvet     -- help tomes / score / shop sheets (==== rules)
   - Abyss menu         -- numbered option menus (chargen, settings)
   - Dialogue frame     -- NPC prompt boxes (reusable; optional callers)
+  - Connect splash     -- gothic login banner (wrought rules + paint roles)
 """
 
 import re
@@ -43,6 +57,12 @@ COLORS = {
     "dark_red": "\x1b[31m",
     "gold": "\x1b[33m",
     "dark_purple": "\x1b[35m",
+    # sighted_color_guide.md known-gap #1: BADGE_COLORS["witch"] names
+    # "violet" but the role was never defined, so Witch badges silently
+    # rendered uncolored. Alias into the purple family (16-color magenta;
+    # a brighter orchid in 256 below) rather than editing the badge map --
+    # "violet" is a perfectly good gothic name other content may reuse.
+    "violet": "\x1b[35m",
     "teal": "\x1b[36m",
     "dark_cyan": "\x1b[36m",
     "absinthe_green": "\x1b[32m",
@@ -59,12 +79,14 @@ COLORS = {
     "muted": "\x1b[90m",
     "accent": "\x1b[35m",
     # Combat / chat direction roles (prefs #19 / #23 / #29) --------------
-    # Outgoing = bright cyan; incoming = red alert; third-party = muted;
-    # mitigate = soft teal; OOC = unnatural muted grey; alert = gold.
-    "combat_out": "\x1b[96m",
-    "combat_in": "\x1b[91m",
-    "combat_other": "\x1b[90m",
-    "combat_mitigate": "\x1b[36m",
+    # Gothic + keyword-pop + structural accents (2026-07-19 / 21 / 21):
+    # direction roles stay soft tints so every-swing accents (verbs, tags,
+    # reaction outcomes) can read. 16-color: out/other silver, in danger-red,
+    # mitigate ash -- already distinct at this coarse depth.
+    "combat_out": "\x1b[37m",
+    "combat_in": "\x1b[31m",
+    "combat_other": "\x1b[37m",
+    "combat_mitigate": "\x1b[90m",
     "ooc": "\x1b[90m",
     "alert": "\x1b[93m",
     "prose": "\x1b[37m",
@@ -85,6 +107,9 @@ COLORS_XTERM256 = {
     "dark_red": "\x1b[38;5;88m",
     "gold": "\x1b[38;5;178m",
     "dark_purple": "\x1b[38;5;97m",
+    # Witch-badge violet (see COLORS note): soft orchid, distinct from
+    # dark_purple at 256 depth so Witch and Occultist badges don't merge.
+    "violet": "\x1b[38;5;134m",
     "teal": "\x1b[38;5;73m",
     "dark_cyan": "\x1b[38;5;66m",
     "absinthe_green": "\x1b[38;5;107m",
@@ -98,10 +123,15 @@ COLORS_XTERM256 = {
     "error": "\x1b[38;5;167m",
     "muted": "\x1b[38;5;240m",
     "accent": "\x1b[38;5;97m",
-    "combat_out": "\x1b[38;5;123m",
-    "combat_in": "\x1b[38;5;196m",
-    "combat_other": "\x1b[38;5;242m",
-    "combat_mitigate": "\x1b[38;5;73m",
+    # Structural-accents 256 pairing (combat_color_structural_accents.md):
+    # Outgoing body = prose grey (250) so bright_white verbs actually pop
+    # (parchment 187 was white-on-white after keyword-pop); incoming soft
+    # rose; spectators same prose grey; mitigate cooler slate (242) so
+    # miss/dodge lines are not mush next to a landed swing.
+    "combat_out": "\x1b[38;5;250m",
+    "combat_in": "\x1b[38;5;174m",
+    "combat_other": "\x1b[38;5;250m",
+    "combat_mitigate": "\x1b[38;5;242m",
     "ooc": "\x1b[38;5;245m",
     "alert": "\x1b[38;5;220m",
     "prose": "\x1b[38;5;250m",
@@ -221,6 +251,57 @@ def render(template):
     return "".join(parts)
 
 
+def paint_layered(role, template, depth="ansi"):
+    """Like ``paint(role, ...)``, but a ``<tag>`` inside `template` switches
+    color for that span only -- text reverts to `role`'s own color at the
+    next tag (or the sentinel ``<_base>``), never to blank.
+
+    Built for combat lines (docs/plans/combat_color_gothic.md): the
+    direction-role base (parchment/blood/ash/steel) carries the whole line,
+    while a rare high-signal span (a silver blade, a rider callout) gets a
+    named accent without losing the base color for everything after it.
+    An UNKNOWN tag -- including ``_base``, which names no real color -- also
+    reverts to `role`, so callers never need to remember which accent was
+    open; they just emit ``<_base>`` to close one.
+
+    A template with no ``<tag>`` at all behaves byte-identically to
+    ``paint(role, template, depth)`` -- existing callers that never emit
+    tags see no behavior change.
+    """
+    if not template:
+        return template
+    palette = COLORS_XTERM256 if depth in ("256", "xterm", "xterm256") else COLORS
+    base_code = palette.get(role) or COLORS.get(role) or ""
+    if "<" not in template:
+        return f"{base_code}{template}{RESET}" if base_code else template
+    parts = []
+    pos = 0
+    code = base_code
+    for match in _TAG_RE.finditer(template):
+        if match.start() > pos:
+            chunk = template[pos:match.start()]
+            parts.append(f"{code}{chunk}{RESET}" if code else chunk)
+        tag = match.group(1)
+        found = palette.get(tag) or COLORS.get(tag)
+        code = found if found else base_code
+        pos = match.end()
+    if pos < len(template):
+        chunk = template[pos:]
+        parts.append(f"{code}{chunk}{RESET}" if code else chunk)
+    return "".join(parts)
+
+
+def paint_layered_for(character, role, template, depth=None):
+    """paint_layered() using the player's color_depth preference when omitted."""
+    if depth is None:
+        try:
+            from engine import display_prefs
+            depth = display_prefs.color_depth(character)
+        except Exception:
+            depth = "ansi"
+    return paint_layered(role, template, depth=depth)
+
+
 # --- Rules -----------------------------------------------------------------
 
 def hrule(width=DEFAULT_WIDTH, char="-"):
@@ -294,19 +375,111 @@ def box(lines, width=None):
     return out
 
 
+# --- Connect splash (login) ------------------------------------------------
+# Gothic wrought chrome via paint() (16-color default -- no Character yet,
+# so paint_for / config color 16|256 cannot apply). Labels carry meaning;
+# color is decoration. No SUPERS package name on the wire -- listings already
+# expose CODEBASE=Riftforge via MSSP.
+
+LOGIN_GAME_TITLE = "Mortals and Monsters"
+LOGIN_CREATOR = "CapnKnives"
+LOGIN_ENGINE = "Riftforge"
+LOGIN_STATUS = "Pre-alpha"
+# Spaced title kept for the sighted who-list banner (brand continuity).
+# Login splash uses LOGIN_GAME_TITLE (unspaced) for TTS -- see format_login_banner.
+LOGIN_SPACED_TITLE = "M O R T A L S   &   M O N S T E R S"
+
+
+def format_login_banner(width=WHO_WIDTH):
+    """Build the connect splash: title, setting blurb, creator + engine.
+
+    Returns painted lines (wrought rules / silver title / muted blurb /
+    gold creator / muted engine / soft-crimson status). Callers send each
+    line before the name prompt. Width matches the who-list chrome.
+
+    Pre-login has no ``config screenreader`` yet, so the title stays
+    **unspaced** (``Mortals and Monsters``, not letter-spaced) and credits
+    use ``Label: value.`` lines -- TTS-friendly without a Character pref.
+    Color is decoration only; wrought rules are sighted chrome.
+    """
+    w = max(40, int(width))
+    rule = paint("dark_grey", wrought_rule(w))
+    # Unspaced brand -- spaced caps force letter-by-letter TTS.
+    title = paint("silver", pad(LOGIN_GAME_TITLE, w, "center"))
+    # Canon frame (docs/LORE.md): Earth towns under Heaven / Hell /
+    # Purgatory; hunters and vessel Celestials -- not Wastes-as-mind.
+    blurb = (
+        "Hunters work the cases. Monsters wear human faces.",
+        "Earth towns sit thin under Heaven, Hell, and older prisons.",
+    )
+    lines = ["", rule, title, rule, ""]
+    for line in blurb:
+        lines.append(paint("muted", pad(line, w, "center")))
+    lines.append("")
+    # Label: value. so screenreaders pause cleanly (a11y rule 7).
+    lines.append(
+        paint("gold", pad(f"Created by: {LOGIN_CREATOR}.", w, "center"))
+    )
+    lines.append(
+        paint(
+            "muted",
+            pad(f"Engine: {LOGIN_ENGINE}.", w, "center"),
+        )
+    )
+    lines.append(
+        paint("dark_red", pad(f"Status: {LOGIN_STATUS}.", w, "center"))
+    )
+    lines.extend(["", rule, ""])
+    return lines
+
+
 # --- Wrought Iron & Ash: who list ------------------------------------------
 
-def format_moral_meter(balance, *, lean="", eclipse=False, width=WHO_WIDTH):
-    """Aesthetic Good/Evil world-tide bar (who-list footer).
+def moral_tide_caption(balance, lean=""):
+    """Plain World Tide lean line with signed balance (never color alone).
+
+    Shared by the sighted meter caption, screenreader meter flatten, and
+    the who-list SR Tide footer so wording stays one source of truth.
+    """
+    bal = max(-100, min(100, int(balance)))
+    if lean:
+        return f"{lean} ({bal:+d})"
+    if bal == 0:
+        return f"The town hangs in balance ({bal:+d})"
+    if bal > 0:
+        return f"The town leans toward the light ({bal:+d})"
+    return f"The town leans toward darkness ({bal:+d})"
+
+
+def format_moral_meter(balance, *, lean="", eclipse=False, width=WHO_WIDTH,
+                       screenreader=False):
+    """Aesthetic Good/Evil world-tide bar (who-list footer / world sheets).
 
     Scale is -100..+100 (positive = good). Fill grows from the center `|`
     toward EVIL (left) or GOOD (right) -- empty track stays at the outer
     edges. Labels carry meaning -- EVIL / GOOD ends, lean phrase, and
     signed number -- so color-off clients still read the meter (section 8
     a11y). Color is decoration only.
+
+    ``screenreader=True`` drops the ASCII bar and spaced ``W O R L D``
+    title; emits semantic Tide lines for TTS (same policy as needs meters).
     """
     w = max(40, int(width))
     bal = max(-100, min(100, int(balance)))
+    caption = moral_tide_caption(bal, lean)
+
+    if screenreader:
+        # No [#-|] glyphs / letter-spaced banner -- phrase + signed balance.
+        # _tts_period lives below in this module; fine at call time.
+        out = [
+            _tts_period("World Tide"),
+            _tts_period(f"Balance: {bal:+d}"),
+            _tts_period(caption),
+        ]
+        if eclipse:
+            out.append(_tts_period("Sky: unnatural eclipse"))
+        return out
+
     # Odd inner width so the center `|` sits cleanly between halves.
     inner = 25
     half = inner // 2  # 12 cells each side of the pivot
@@ -344,15 +517,6 @@ def format_moral_meter(balance, *, lean="", eclipse=False, width=WHO_WIDTH):
     pad_left = max(0, (w - visible_len(meter)) // 2)
     meter_line = (" " * pad_left) + meter
 
-    # Caption: lean phrase (or "even") + signed number -- never color alone.
-    if lean:
-        caption = f"{lean} ({bal:+d})"
-    elif bal == 0:
-        caption = f"The town hangs in balance ({bal:+d})"
-    elif bal > 0:
-        caption = f"The town leans toward the light ({bal:+d})"
-    else:
-        caption = f"The town leans toward darkness ({bal:+d})"
     cap_line = paint("muted", pad(caption, w, "center"))
 
     out = [
@@ -367,13 +531,44 @@ def format_moral_meter(balance, *, lean="", eclipse=False, width=WHO_WIDTH):
     return out
 
 
+# Pressure bands for need meters -- mirror supers.needs SEEK_THRESHOLD /
+# CRITICAL_THRESHOLD. Kept here (not imported) so engine/style stays free
+# of SUPERS. If those lifestyle thresholds move, update these too.
+NEED_METER_SEEK_BAND = 0.60
+NEED_METER_CRITICAL_BAND = 0.95
+
+
+def need_meter_fill_role(level, *, critical=False):
+    """Gothic vitals fill role for a 0→1 need / fuel-pressure bar.
+
+    Bands match Cadence seek / critical so the tint tracks the same
+    pressure the phrases already name (a11y: color is decoration only)::
+
+        calm   (< seek)      absinthe_green  -- soft "ok" vitals
+        seek   (>= seek)     gold            -- rising warn
+        crit   (>= critical) dark_red        -- dried-blood crisis
+
+    ``critical=True`` forces the crisis role even when ``level`` is a
+    derived pressure (fuel row) that already flipped the bang glyphs.
+    """
+    if critical or float(level) >= NEED_METER_CRITICAL_BAND:
+        return "dark_red"
+    if float(level) >= NEED_METER_SEEK_BAND:
+        return "gold"
+    return "absinthe_green"
+
+
 def format_need_meter(level, *, critical=False, width=16):
-    """Unipolar 0→1 need bar (left fill), World Tide–adjacent glyphs.
+    """Unipolar 0→1 need bar (left fill), gothic vitals / Tide glyphs.
 
     Fill grows left→right as the need rises (0 = empty track, 1 = full).
     Critical meters use `=` fill and a trailing `!` inside the brackets so
     color-off clients still read severity (section 8 a11y). Color is
     decoration only -- callers should pair this with a plain-language phrase.
+
+    Sighted paint (prompt / World Tide kinship): dark_grey chrome brackets,
+    absinthe→gold→crimson fill by pressure band (see
+    ``need_meter_fill_role``), empty track stays dark_grey ash.
 
     Returns the painted bar string only, e.g. `[########--------]` or
     `[============---!]`.
@@ -389,8 +584,12 @@ def format_need_meter(level, *, critical=False, width=16):
     body = (fill_ch * filled) + ("-" * empty)
     if critical:
         body = body + "!"
-    # Paint: critical fill dark_red, normal fill silver; empty dark_grey.
-    fill_role = "dark_red" if critical else "silver"
+    # Gothic vitals gradient (not flat silver) -- still paired with phrases.
+    fill_role = need_meter_fill_role(lvl, critical=critical)
+    # Fill first; leftover track (dashes and optional bang) stays ash chrome.
+    # The bang sits in the empty slice when critical so it stays readable
+    # even if fill_role and alert gold would fight -- dark_grey `!` next to
+    # crimson `=` is enough; the plain `!!` phrase carries severity.
     painted_body = (
         paint(fill_role, body[:filled])
         + paint("dark_grey", body[filled:])
@@ -426,7 +625,8 @@ def _format_who_entry_row(entry, width):
 
 def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
                moral_balance=None, lean="", eclipse=False,
-               echo_entries=None, gm_names=None, screenreader=False):
+               echo_entries=None, gm_names=None, unknown_count=0,
+               screenreader=False):
     """Build the plan's Mortals & Monsters who list.
 
     `entries` is an iterable of dicts::
@@ -447,10 +647,14 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
     top listing online, non-immersion-cast staff as `[GM] Name`. The count
     matches that list (online only; cast members with gm_rank are omitted).
 
+    ``unknown_count`` is the player-facing hole: veiled + unintroduced
+    souls that would otherwise appear on this viewer's list.
+
     ``screenreader=True`` (prefs #30 / #32) flattens wrought rules into
     semantic headers and vertical lists.
     """
     w = max(40, int(width))
+    unknown = max(0, int(unknown_count or 0))
     if screenreader:
         lines = ["", "Who list.", ""]
         gm_list = list(gm_names) if gm_names else []
@@ -481,8 +685,15 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
                     lines.append(f"  {badge}: {name}. {status}".rstrip() + ".")
         lines.append("")
         lines.append(f"Visible souls: {souls}. Time: {time_label or 'unknown'}.")
+        lines.append(f"Unknown count: {unknown}.")
         if moral_balance is not None:
-            lines.append(f"World Tide balance: {moral_balance}.")
+            bal = int(moral_balance)
+            # Same Tide prose as format_moral_meter(screenreader=True).
+            lines.append(_tts_period("World Tide"))
+            lines.append(_tts_period(f"Balance: {bal:+d}"))
+            lines.append(_tts_period(moral_tide_caption(bal, lean)))
+            if eclipse:
+                lines.append(_tts_period("Sky: unnatural eclipse"))
         return lines
 
     rule = paint("dark_grey", wrought_rule(w))
@@ -534,6 +745,10 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
     # Two-column footer; pad middle with spaces.
     gap = max(2, w - visible_len(souls_bit) - visible_len(time_bit))
     lines.append(souls_bit + (" " * gap) + time_bit)
+    unknown_bit = render(
+        f"<dark_purple> Unknown Count: <silver>{unknown}"
+    )
+    lines.append(unknown_bit)
     # World Good/Evil meter sits under souls/time, still inside wrought rules.
     if moral_balance is not None:
         lines.append(rule)
@@ -551,14 +766,46 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
 
 # --- Blood & Velvet: help tomes / sheets -----------------------------------
 
+def _tts_period(text):
+    """Ensure a plain line ends with sentence punctuation for TTS pauses."""
+    text = str(text).rstrip()
+    if not text:
+        return text
+    if text[-1] not in ".!?:":
+        return text + "."
+    return text
+
+
 def format_tome(title, body_lines, *, related=None, syntax=None,
-                width=TOME_WIDTH):
+                width=TOME_WIDTH, screenreader=False):
     """Blood & Velvet help / sheet frame (plan section 2).
 
     `body_lines` is an iterable of plain or already-painted lines.
     Optional `syntax` (string) and `related` (string or list) get labeled
     sections under the header / above the footer.
+
+    ``screenreader=True`` drops equals borders and hard-wrap; emits
+    ``Title.`` then body lines with TTS-friendly periods (prefs #30–#32).
     """
+    if screenreader:
+        lines = ["", _tts_period(f"Help: {title}"), ""]
+        if syntax:
+            lines.append(_tts_period(f"Syntax: {syntax}"))
+            lines.append("")
+        for raw in body_lines:
+            text = strip_ansi(str(raw)).strip()
+            if not text:
+                lines.append("")
+                continue
+            lines.append(_tts_period(text))
+        if related:
+            if isinstance(related, (list, tuple)):
+                related = ", ".join(related)
+            lines.append("")
+            lines.append(_tts_period(f"Related: {related}"))
+        lines.append("")
+        return lines
+
     w = max(40, int(width))
     heavy = paint("dark_red", rule_equals(w))
     light = paint("dark_red", hrule(w))
@@ -592,11 +839,27 @@ def format_tome(title, body_lines, *, related=None, syntax=None,
     return lines
 
 
-def format_help_index(categories, *, width=TOME_WIDTH):
+def format_help_index(categories, *, width=TOME_WIDTH, screenreader=False):
     """Bare `help` grimoire index: category tomes with topic blurbs.
 
     `categories` is HELP_CATEGORIES shape: [(category, [(name, blurb), ...])].
+
+    ``screenreader=True`` skips equals rules; vertical ``name -- blurb`` lists.
     """
+    if screenreader:
+        lines = [
+            "",
+            "Help Index.",
+            "Type help followed by a name for a page. Type commands for verbs.",
+            "",
+        ]
+        for category, topics in categories:
+            lines.append(_tts_period(str(category)))
+            for name, blurb in topics:
+                lines.append(f"  {name} -- {blurb}.")
+            lines.append("")
+        return lines
+
     w = max(40, int(width))
     heavy = paint("dark_red", rule_equals(w))
     lines = [
@@ -780,12 +1043,26 @@ def format_commands_list(entries, *, gm_entries=None, width=TOME_WIDTH,
     return lines
 
 
-def format_sheet(title, body_lines, *, width=48):
+def format_sheet(title, body_lines, *, width=48, screenreader=False):
     """Compact Blood & Velvet frame for score / shop / reports.
 
     Body lines that exceed ``width`` are word-wrapped (plain text) so they
-    never run past the equals border.
+    never run past the equals border on the sighted path.
+
+    ``screenreader=True`` drops borders and hard-wrap; one semantic line
+    per body row with TTS punctuation (prefs #30–#32).
     """
+    if screenreader:
+        lines = ["", _tts_period(str(title)), ""]
+        for raw in body_lines:
+            text = strip_ansi(str(raw)).strip()
+            if not text:
+                lines.append("")
+                continue
+            lines.append(_tts_period(text))
+        lines.append("")
+        return lines
+
     w = max(32, int(width))
     heavy = paint("dark_red", rule_equals(w))
     light = paint("dark_red", hrule(w))
@@ -826,30 +1103,81 @@ def format_sheet(title, body_lines, *, width=48):
 
 
 def _wrap_plain(text, width, color="light_grey"):
-    """Word-wrap a plain string to `width`, painting each line."""
-    words = text.split()
+    """Word-wrap a plain string to `width`, painting each line.
+
+    Leading spaces on the source line are kept on every wrapped row so
+    indented help command tables (score / needs style) do not flush left
+    when a long gloss soft-wraps inside ``format_tome``.
+
+    Pipe-separated lists (Background menus, See-also glue) never leave a
+    trailing ``|`` on a wrapped row -- the last item before the break is
+    pulled onto the next line with the following word (so
+    ``… hunter |`` / ``occultist`` becomes ``… procurer`` /
+    ``hunter | occultist``).
+    """
+    # Help topics indent with spaces only; tabs are not used there.
+    lead_len = len(text) - len(text.lstrip(" "))
+    lead = text[:lead_len]
+    words = text[lead_len:].split()
     if not words:
-        return [""]
+        return [paint(color, lead) if lead else ""]
+    # Room left for words after the indent column.
+    inner_w = max(8, int(width) - lead_len)
     rows = []
     current = words[0]
     for word in words[1:]:
         trial = current + " " + word
-        if len(trial) <= width:
+        if len(trial) <= inner_w:
             current = trial
-        else:
-            rows.append(paint(color, current))
-            current = word
-    rows.append(paint(color, current))
+            continue
+        # Overflow: avoid dumping a bare trailing pipe / em-dash glue.
+        stripped = current.rstrip()
+        if stripped.endswith("|"):
+            # Split on pipe so the last real item moves onto the next row
+            # with the new word (never leave "… procurer |" as a finished row).
+            parts = [p for p in re.split(r"\s*\|\s*", stripped) if p]
+            if len(parts) >= 2:
+                left = " | ".join(parts[:-1])
+                right = parts[-1]
+                rows.append(paint(color, lead + left))
+                current = f"{right} | {word}"
+                continue
+        if stripped.endswith("--"):
+            without = stripped[:-2].rstrip()
+            if without:
+                rows.append(paint(color, lead + without))
+                current = f"-- {word}"
+                continue
+        rows.append(paint(color, lead + current))
+        current = word
+    rows.append(paint(color, lead + current))
     return rows
 
 
 # --- Abyss menu / dialogue -------------------------------------------------
 
-def format_menu(title, options, *, prompt="What is your will?", width=67):
+def format_menu(title, options, *, prompt="What is your will?", width=67,
+                screenreader=False):
     """Numbered menu (plan section 3). `options` is [(label, hint), ...].
 
     Hints are the grey parenthetical descriptions. Numbers are absinthe.
+
+    ``screenreader=True`` skips the box and spaced-cap banner; numbered
+    plain lines for TTS (prefs #30 / #32).
     """
+    if screenreader:
+        lines = ["", _tts_period(str(title)), ""]
+        for i, (label, hint) in enumerate(options, start=1):
+            if hint:
+                lines.append(_tts_period(f"{i}. {label} ({hint})"))
+            else:
+                lines.append(_tts_period(f"{i}. {label}"))
+        lines.append("")
+        lines.append(
+            _tts_period(f"{prompt} Enter a number from 1 to {len(options)}")
+        )
+        return lines
+
     w = max(40, int(width))
     border = paint("midnight_blue", "+" + ("=" * (w - 2)) + "+")
     mid = (
@@ -872,8 +1200,29 @@ def format_menu(title, options, *, prompt="What is your will?", width=67):
     return lines
 
 
-def format_dialogue(speaker_line, quote, choices, *, width=65):
-    """NPC dialogue box (plan section 4). `choices` is [reply_str, ...]."""
+def format_dialogue(speaker_line, quote, choices, *, width=65,
+                    screenreader=False):
+    """NPC dialogue box (plan section 4). `choices` is [reply_str, ...].
+
+    ``screenreader=True`` drops the ASCII box; speaker, quote, then
+    numbered replies as plain lines. Empty ``choices`` is allowed (talk
+    v1 has no menu replies) -- omit the ``Reply with a number.`` prompt.
+    """
+    if screenreader:
+        lines = [
+            "",
+            _tts_period(str(speaker_line)),
+            _tts_period(f'Quote: "{quote}"'),
+            "",
+        ]
+        choice_list = list(choices) if choices else []
+        for i, choice in enumerate(choice_list, start=1):
+            lines.append(_tts_period(f'{i}. "{choice}"'))
+        if choice_list:
+            lines.append("")
+            lines.append("Reply with a number.")
+        return lines
+
     w = max(40, int(width))
     top = paint("slate_grey", "." + ("-" * (w - 2)) + ".")
     bot = paint("slate_grey", "'" + ("-" * (w - 2)) + "'")
@@ -885,13 +1234,15 @@ def format_dialogue(speaker_line, quote, choices, *, width=65):
         paint("white", '  "' + quote + '"'),
         "",
     ]
-    for i, choice in enumerate(choices, start=1):
+    choice_list = list(choices) if choices else []
+    for i, choice in enumerate(choice_list, start=1):
         lines.append(render(
             f"<slate_grey>  [ <pale_blue>{i} <slate_grey>] "
             f"<light_grey>\"{choice}\""
         ))
     lines.append(bot)
-    lines.append(render("<pale_blue> > <dark_grey>Reply:"))
+    if choice_list:
+        lines.append(render("<pale_blue> > <dark_grey>Reply:"))
     return lines
 
 
@@ -937,8 +1288,9 @@ def _section_header(label, width=ROOM_WIDTH):
 def _exit_columns(exits, width=ROOM_WIDTH, cols=2):
     """Format ``(direction, dest)`` pairs into balanced columns.
 
-    Each cell looks like ``North: The Dining Hall``. Direction is white,
-    destination light_grey -- labels carry meaning; color is decoration.
+    Legacy helper kept for tests / callers that still want the old
+    ``North: Dest`` column layout. Sighted ``format_room`` uses the
+    compass + legend instead.
     """
     if not exits:
         return []
@@ -972,42 +1324,247 @@ def _exit_columns(exits, width=ROOM_WIDTH, cols=2):
     return rows
 
 
+# Compass slot abbrevs for sighted Paths (labels carry meaning).
+_COMPASS_CARDINALS = {
+    "north": "N", "south": "S", "east": "E", "west": "W",
+    "northeast": "NE", "northwest": "NW",
+    "southeast": "SE", "southwest": "SW",
+    "up": "U", "down": "D",
+}
+_COMPASS_LEGEND_ORDER = (
+    "north", "northeast", "east", "southeast",
+    "south", "southwest", "west", "northwest",
+    "up", "down",
+)
+
+
+def _exit_dir_set(exits):
+    """Lowercased direction -> destination title from exit pairs."""
+    out = {}
+    for direction, dest in exits:
+        key = str(direction).strip().lower()
+        if key:
+            out[key] = str(dest)
+    return out
+
+
+def _center_visible(text, width, *, color=None):
+    """Center a line in the room frame by visible (ANSI-stripped) width.
+
+    ``text`` may already include ANSI. When ``color`` is set, ``text`` is
+    treated as plain and painted after centering. Leading/trailing spaces
+    on the content are stripped before padding so the glyph block sits
+    mid-frame instead of hugging the left.
+    """
+    w = max(8, int(width))
+    if color is not None:
+        content = str(text).strip()
+        vis = len(content)
+        pad = max(0, (w - vis) // 2)
+        return (" " * pad) + paint(color, content)
+    raw = str(text).rstrip("\r\n")
+    # Preserve internal ANSI; measure without escapes.
+    plain = strip_ansi(raw).strip()
+    # Re-find the colored body: strip leading/trailing plain spaces from
+    # the raw string by trimming the same count from each end of plain.
+    # Simpler path: if no ANSI, center the stripped plain; if ANSI, strip
+    # only outer whitespace from the raw string then pad.
+    body = raw.strip()
+    vis = visible_len(body)
+    pad = max(0, (w - vis) // 2)
+    return (" " * pad) + body
+
+
+def _compass_lines(exits, width=ROOM_WIDTH):
+    """Compact centered exit compass + Also: line for non-compass exits.
+
+    Three rows (north-up) instead of a tall five-row rose::
+
+        NW N NE
+         W @ E
+        SW S SE
+
+    Open directions show their letter abbrev; missing slots are spaces.
+    U/D tuck onto the middle row when present. Direction letters are the
+    primary signal (a11y -- not color alone). Centered in the room width.
+    """
+    by_dir = _exit_dir_set(exits)
+    if not by_dir:
+        return []
+
+    def cell(name, size):
+        """Fixed-width slot: abbrev centered, or blank spaces."""
+        if name in by_dir:
+            abbrev = _COMPASS_CARDINALS.get(name, name[:size].upper())
+            return abbrev.center(size)
+        return " " * size
+
+    # Compact 3-row rose (much shorter than the classic 5-row layout).
+    row_n = f"{cell('northwest', 2)} {cell('north', 1)} {cell('northeast', 2)}"
+    # Always show @ in the center (you are here) -- not an exit slot.
+    mid = f" {cell('west', 1)} @ {cell('east', 1)}"
+    if "up" in by_dir or "down" in by_dir:
+        u = cell("up", 1).strip() or " "
+        d = cell("down", 1).strip() or " "
+        mid = f"{mid}  {u} {d}"
+    row_s = f"{cell('southwest', 2)} {cell('south', 1)} {cell('southeast', 2)}"
+
+    lines = []
+    for plain in (row_n, mid, row_s):
+        # Skip empty N/S bands when those exits are absent -- shorter look.
+        if not plain.strip():
+            continue
+        lines.append(_center_visible(plain, width, color="light_grey"))
+
+    # Non-compass exits: in/out, apartment doors, street numbers, …
+    also = []
+    for direction, dest in exits:
+        key = str(direction).strip().lower()
+        if key in _COMPASS_CARDINALS:
+            continue
+        also.append(f"{direction} ({dest})")
+    if also:
+        also_text = "Also: " + ", ".join(also)
+        lines.append(_center_visible(also_text, width, color="silver"))
+
+    return lines
+
+
+def _exit_legend_lines(exits, width=ROOM_WIDTH):
+    """Compact centered ``N Plaza · E Street`` legend under the compass."""
+    by_dir = _exit_dir_set(exits)
+    if not by_dir:
+        return []
+    parts = []
+    # Compass dirs first (stable order), then any leftovers.
+    seen = set()
+    for name in _COMPASS_LEGEND_ORDER:
+        if name not in by_dir:
+            continue
+        abbrev = _COMPASS_CARDINALS[name]
+        parts.append(f"{abbrev} {by_dir[name]}")
+        seen.add(name)
+    for direction, dest in exits:
+        key = str(direction).strip().lower()
+        if key in seen or key in _COMPASS_CARDINALS:
+            continue
+        parts.append(f"{direction} {dest}")
+        seen.add(key)
+    if not parts:
+        return []
+    # Soft-wrap the joined legend, then center each chunk.
+    joined = " · ".join(parts)
+    max_w = max(20, int(width) - 4)
+    out = []
+    while joined:
+        if len(joined) <= max_w:
+            out.append(_center_visible(joined, width, color="muted"))
+            break
+        cut = joined.rfind(" · ", 0, max_w)
+        if cut < 10:
+            cut = max_w
+            chunk, joined = joined[:cut], joined[cut:].lstrip()
+        else:
+            chunk, joined = joined[:cut], joined[cut + 3:].lstrip()
+        out.append(_center_visible(chunk, width, color="muted"))
+    return out
+
+
+def _exit_abbrev(direction):
+    """Short token for an exit direction (n, ne, in, …)."""
+    key = str(direction).strip().lower()
+    if key in _COMPASS_CARDINALS:
+        return _COMPASS_CARDINALS[key].lower()
+    return key
+
+
+# Compact Exits: line order (cardinals, vertical, diagonals).
+_EXIT_LINE_ORDER = (
+    "north", "east", "south", "west", "up", "down",
+    "northeast", "northwest", "southeast", "southwest",
+)
+
+
+def _exit_display_name(direction):
+    """Title-case a direction for the verbose Exits list (``North``)."""
+    return str(direction).strip().title()
+
+
+def _sparse_exits_line(exits, *, verbose=True):
+    """Build LOTJ-style verbose exits or compact ``Exits: n, e, s``.
+
+    Verbose (default): header ``Exits:`` then one ``North - Dest`` line
+    each. Compact: a single abbrev line. Empty exits -> []. Direction
+    words / letters are the primary signal (a11y -- not color alone).
+    """
+    if not exits:
+        return []
+    if verbose:
+        # LOTJ / FK: header + one line per exit with destination name.
+        lines = [paint("silver", "Exits:")]
+        by_dir = _exit_dir_set(exits)
+        ordered = []
+        seen = set()
+        for name in _EXIT_LINE_ORDER:
+            if name in by_dir:
+                ordered.append((name, by_dir[name]))
+                seen.add(name)
+        for direction, dest in exits:
+            key = str(direction).strip().lower()
+            if key in seen:
+                continue
+            ordered.append((direction, dest))
+            seen.add(key)
+        for direction, dest in ordered:
+            label = _exit_display_name(direction)
+            # Gold direction + soft dest -- labels carry meaning, not color.
+            lines.append(
+                render(f"<gold>{label}<silver> - <absinthe_green>{dest}")
+            )
+        return lines
+
+    tokens = []
+    seen = set()
+    by_dir = _exit_dir_set(exits)
+    for name in _EXIT_LINE_ORDER:
+        if name in by_dir:
+            tokens.append(_exit_abbrev(name))
+            seen.add(name)
+    for direction, _dest in exits:
+        key = str(direction).strip().lower()
+        if key in seen:
+            continue
+        tokens.append(_exit_abbrev(direction))
+        seen.add(key)
+    if not tokens:
+        return []
+    joined = ", ".join(tokens)
+    return [render(f"<silver>Exits: <white>{joined}")]
+
+
 def format_room(title, description, *, area_tag="Indoors", exits=None,
                 souls=None, items=None, extras=None, width=ROOM_WIDTH,
-                screenreader=False):
-    """Master Room Layout (colorandformattingforgame.R section 1).
+                screenreader=False, local_map_lines=None,
+                exits_verbose=True):
+    """Room look: classic sparse (sighted) or SR flatten.
 
-    Parameters
-    ----------
-    title : str
-        Room key / name (plain text; painted dark_red in the header).
-    description : str
-        Room prose; soft-wrapped and indented two spaces.
-    area_tag : str
-        Right-side header badge, e.g. ``Ruins`` / ``City``.
-    exits : list[tuple[str, str]] | None
-        ``(direction, destination_name)`` pairs. Omitted or empty -> no
-        Paths section (plan instruction 3: hide empty sections).
-    souls : list[str] | None
-        People present (display names / short lines). Empty -> hidden.
-    items : list[str] | None
-        Floor items (plan draft called this "Relics"; we use Items so it
-        isn't confused with Divine/Path relics). Empty -> hidden.
-    extras : list[str] | None
-        Optional lines after the description (gravity, overland, ambient
-        sky) before the dash divider. Plain text; muted paint applied.
-    width : int
-        Outer frame width (default ROOM_WIDTH=67).
-    screenreader : bool
-        Prefs #30 / #32: skip ASCII frames and columns; semantic headers
-        and vertical lists for TTS.
+    Sighted path follows DIKU / LOTJ anatomy (no Master Room
+    ``O=====O`` on look -- frames stay on score/who/help)::
 
-    Returns a list of lines ready to ``\"\\r\\n\".join``.
+        title + area badge
+        prose
+        Exits:
+        North - Dest
+        people / items as plain long-desc lines (no list bullets)
+
+    Compact ``Exits: n, e, s`` is opt-in via ``exits_verbose=False``.
+    Screenreader keeps vertical Paths / Souls / Items lists.
     """
     w = max(40, int(width))
     exits = list(exits or [])
     souls = list(souls or [])
     items = list(items or [])
+    local_map_lines = list(local_map_lines or [])
 
     # ---- Screen-reader flatten (prefs #30 / #32) ------------------------
     if screenreader:
@@ -1017,7 +1574,6 @@ def format_room(title, description, *, area_tag="Indoors", exits=None,
             for para in desc.split("\n"):
                 para = para.strip()
                 if para:
-                    # End with period for TTS pauses (prefs #31).
                     if para[-1] not in ".!?":
                         para = para + "."
                     lines.append(para)
@@ -1047,29 +1603,32 @@ def format_room(title, description, *, area_tag="Indoors", exits=None,
             lines.append("")
         return lines
 
-    frame = paint("dark_grey", room_frame_rule(w))
-    # Header row: "  Title .... [ Tag ]" -- title left, badge right.
+    # ---- Classic sparse sighted look ------------------------------------
+    # Title may already be ANSI-painted (City - Main - Sub roles). Do not
+    # re-paint; width math uses visible length so escapes do not eat budget.
     tag_plain = f"[ {area_tag} ]"
-    title_plain = str(title).strip()
-    # Inner width after leading two spaces.
-    inner = w - 2
-    title_budget = max(8, inner - len(tag_plain) - 1)
-    if len(title_plain) > title_budget:
-        title_plain = title_plain[: title_budget - 3] + "..."
-    gap = max(1, inner - len(title_plain) - len(tag_plain))
+    title_raw = str(title).strip()
+    title_visible = strip_ansi(title_raw)
+    title_budget = max(8, w - len(tag_plain) - 1)
+    if visible_len(title_visible) > title_budget:
+        # Truncate the plain text, then drop paint (rare oversized titles).
+        title_visible = title_visible[: title_budget - 3] + "..."
+        title_display = paint("dark_red", title_visible)
+    elif "\x1b[" in title_raw:
+        title_display = title_raw
+    else:
+        title_display = paint("dark_red", title_visible)
+    gap = max(1, w - visible_len(title_visible) - len(tag_plain))
     header = (
-        "  "
-        + paint("dark_red", title_plain)
+        title_display
         + (" " * gap)
         + render(f"<dark_grey>[ <slate_grey>{area_tag} <dark_grey>]")
     )
 
-    lines = ["", frame, header, frame, ""]
+    lines = ["", header, ""]
 
-    # Description: preserve indentation (two spaces); wrap at w-2.
     desc = (description or "").strip()
     if desc:
-        # Split on existing newlines first so authored paragraphs survive.
         for para in desc.split("\n"):
             para = para.strip()
             if not para:
@@ -1077,8 +1636,6 @@ def format_room(title, description, *, area_tag="Indoors", exits=None,
                 continue
             wrapped = _wrap_plain(para, w - 2, color="light_grey")
             for row in wrapped:
-                # _wrap_plain already paints; prepend indent spaces outside
-                # the paint so leading spaces aren't colored oddly.
                 plain_row = strip_ansi(row)
                 lines.append("  " + paint("light_grey", plain_row))
         lines.append("")
@@ -1090,34 +1647,29 @@ def format_room(title, description, *, area_tag="Indoors", exits=None,
                 lines.append("  " + paint("muted", text))
         lines.append("")
 
-    # Dash divider only if at least one of Paths/Souls/Items will show
-    # (keeps an empty room from a lonely divider under the description).
-    has_sections = bool(exits or souls or items)
-    if has_sections:
-        lines.append("  " + paint("dark_grey", spaced_dash_rule(w - 2)))
-
     if exits:
-        lines.append(_section_header("Paths", width=w))
-        lines.extend(_exit_columns(exits, width=w, cols=2))
+        lines.extend(_sparse_exits_line(exits, verbose=exits_verbose))
         lines.append("")
 
+    if local_map_lines:
+        for row in local_map_lines:
+            text = str(row).rstrip("\r\n")
+            if text.strip():
+                lines.append(_center_visible(text, w))
+            else:
+                lines.append("")
+        lines.append("")
+
+    # Plain long-desc lines (LOTJ) -- no list-bullet chrome on look.
+    for soul in souls:
+        lines.append(paint("gold", str(soul)))
     if souls:
-        lines.append(_section_header("Souls", width=w))
-        for soul in souls:
-            lines.append(render(
-                f"<dark_grey>    > <white>{soul}"
-            ))
         lines.append("")
-
+    for item in items:
+        lines.append(paint("light_grey", str(item)))
     if items:
-        lines.append(_section_header("Items", width=w))
-        for item in items:
-            lines.append(render(
-                f"<dark_grey>    > <light_grey>{item}"
-            ))
         lines.append("")
 
-    lines.append(frame)
     return lines
 
 
@@ -1169,6 +1721,7 @@ BADGE_COLORS = {
     "animated": "silver",
     # Alien / Creation ------------------------------------------------------
     "stellar": "gold",
+    "umbral": "silver",
     "maker": "white",
 }
 

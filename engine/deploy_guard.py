@@ -45,7 +45,14 @@ def check_integrations():
                 flush=True,
             )
     except Exception:
-        pass
+        # URL probe itself failed -- still log so a broken bug_webhook
+        # import does not look like a clean "URL unset" info line.
+        import traceback
+        print(
+            "[auto_deploy] post-overlay: webhook URL probe failed:",
+            flush=True,
+        )
+        traceback.print_exc()
 
     return warnings
 

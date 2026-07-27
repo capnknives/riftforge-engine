@@ -15,7 +15,7 @@ watching GMs.
 Delivery hooks (so call sites do not need to know about snoop):
   - Session / FakeSession / SilentSession `.send` -> mirror_output
   - Session.play / npc_do command lines -> mirror_input
-  - Room.broadcast / combat._tell_room for sessionless targets that still
+  - Room.broadcast / combat_narrate.tell_room for sessionless targets that still
     have snoopers (offline Echo / NPC standing in a room)
 
 Relay lines are written with emit_raw() so a mirrored line does not
@@ -88,6 +88,8 @@ def mirror_output(target, message):
     snoopers = getattr(target, "snoopers", None)
     if not snoopers:
         return
+    from command_support import _public_label
+    face = _public_label(target)
     # list() so a mid-loop stop() cannot mutate the set under us.
     for gm in list(snoopers):
         sess = getattr(gm, "session", None)
@@ -96,7 +98,7 @@ def mirror_output(target, message):
         # Skip a dead telnet session (FakeSession has no .alive).
         if hasattr(sess, "alive") and not sess.alive:
             continue
-        tagged = f"% {target.key}> {message}"
+        tagged = f"% {face}> {message}"
         emit_raw(sess, _strip_for_viewer(sess, tagged))
 
 
@@ -111,13 +113,15 @@ def mirror_input(target, raw_line):
     snoopers = getattr(target, "snoopers", None)
     if not snoopers:
         return
+    from command_support import _public_label
+    face = _public_label(target)
     for gm in list(snoopers):
         sess = getattr(gm, "session", None)
         if sess is None:
             continue
         if hasattr(sess, "alive") and not sess.alive:
             continue
-        tagged = f"% {target.key}] {raw_line}"
+        tagged = f"% {face}] {raw_line}"
         emit_raw(sess, _strip_for_viewer(sess, tagged))
 
 
@@ -125,7 +129,8 @@ def start(snooper, target):
     """Point `snooper` at `target`. Returns (ok, message_for_snooper)."""
     if snooper is None or target is None:
         return False, "Snoop whom?"
-    if snooper is target:
+    from command_support import is_linked_self
+    if is_linked_self(snooper, target):
         return False, "You can't snoop yourself."
     # Switching targets: drop the old link first.
     if getattr(snooper, "snooping", None) is not None:
@@ -138,12 +143,16 @@ def start(snooper, target):
     where = ""
     loc = getattr(target, "location", None)
     if loc is not None:
-        where = f" ({loc.key})"
+        # Staff see Name[VNUM] -- never bare storage keys like
+        # ``unowned amenity7`` (those stay dig/goto-only).
+        from engine import room_vnum as room_vnum_mod
+        where = f" ({room_vnum_mod.staff_room_label(loc)})"
     kind = "NPC" if getattr(target, "is_npc", False) else (
         "Echo" if getattr(target, "session", None) is None else "player"
     )
+    from command_support import _public_label
     return True, (
-        f"You are now snooping {target.key} [{kind}]{where}. "
+        f"You are now snooping {_public_label(target)} [{kind}]{where}. "
         f"Type 'snoop' or 'snoop off' to stop."
     )
 
@@ -161,7 +170,8 @@ def stop(snooper, quiet=False):
         snoopers.discard(snooper)
     if quiet:
         return True, ""
-    return True, f"You stop snooping {target.key}."
+    from command_support import _public_label
+    return True, f"You stop snooping {_public_label(target)}."
 
 
 def clear_target(target):

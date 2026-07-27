@@ -6,29 +6,50 @@ color-depth helpers. Pure presentation + input rewrite -- no networking,
 no game rules. See docs/plans/mud_formatting_preferences.md.
 """
 
-# Classic gothic bracket prompt (DIKU-adjacent): <[100/100hp] [30/30st]>
-# Color tags use style.render after token expansion. %h/%H are percent.
+# Dense gothic prompt built from *optional segment* tokens (%Hp, %Fu, …).
+# Segments that do not apply (no fuel, no mana, solo) expand to "" so the
+# field never leaves an empty bracket. Color via style.render.
 DEFAULT_PROMPT = (
+    "<dark_grey><"
+    "%Hp%En%St%Mn%Fu%Ex"
+    "<dark_grey>>"
+    "%Gr"
+)
+# Exact old defaults -- migrate to DEFAULT_PROMPT on ensure (custom stays).
+_OLD_DEFAULT_PROMPT = "[%h/%Hhp]"
+_OLD_BRACKET_PROMPT = (
     "<dark_grey><"
     "<dark_red>[%h/%Hhp]"
     "<dark_grey> "
     "<teal>[%s/%Sst]"
     "<dark_grey>>"
 )
-# Exact old default -- migrate to DEFAULT_PROMPT on ensure (custom stays).
-_OLD_DEFAULT_PROMPT = "[%h/%Hhp]"
+_OLD_EXITS_PROMPT = (
+    "<dark_grey><"
+    "<dark_red>[%h/%Hhp]"
+    "<dark_grey> "
+    "<teal>[%s/%Sst]"
+    "<dark_grey> "
+    "<silver>%E"
+    "<dark_grey>>"
+)
 
 # Caps so a malicious / accidental alias cannot explode input.
 _MAX_ALIASES = 40
 _MAX_ALIAS_KEY_LEN = 24
 _MAX_ALIAS_VALUE_LEN = 120
-# Room for color tags in the default template (~40 visible + markup).
-_MAX_PROMPT_LEN = 160
+# Room for color tags + segment tokens in the default template.
+_MAX_PROMPT_LEN = 240
 
 # Allowed sheet widths for framed ASCII (prefs #3). Prose stays unwrapped.
 WIDTH_MIN = 40
 WIDTH_MAX = 120
 WIDTH_DEFAULT = 67
+
+# Two-character optional-field tokens (checked before single-letter codes).
+_SEGMENT_TOKENS = frozenset({
+    "Hp", "En", "St", "Mn", "Fu", "Ex", "Gr",
+})
 
 
 def ensure_display_defaults(character):
@@ -42,7 +63,11 @@ def ensure_display_defaults(character):
         character.command_aliases = {}
     if not hasattr(character, "prompt_format") or character.prompt_format is None:
         character.prompt_format = DEFAULT_PROMPT
-    elif character.prompt_format == _OLD_DEFAULT_PROMPT:
+    elif character.prompt_format in (
+        _OLD_DEFAULT_PROMPT,
+        _OLD_BRACKET_PROMPT,
+        _OLD_EXITS_PROMPT,
+    ):
         character.prompt_format = DEFAULT_PROMPT
     if not hasattr(character, "display_width"):
         character.display_width = WIDTH_DEFAULT
@@ -50,15 +75,113 @@ def ensure_display_defaults(character):
         character.screenreader = False
     if not hasattr(character, "show_minimap"):
         character.show_minimap = True
+    if not hasattr(character, "map_on_move"):
+        # Pref: after each move, also print the local minimap (default off).
+        character.map_on_move = False
+    if not hasattr(character, "map_on_look"):
+        # Pref: embed local ASCII map in look (default off -- short look).
+        character.map_on_look = False
+    if not hasattr(character, "brief"):
+        # Pref: skip room prose on auto-look after a move (default off).
+        # Explicit ``look`` still shows the full description.
+        character.brief = False
+    if not hasattr(character, "drive_map_full"):
+        # Vehicle / overland cruise redraw: full atlas (default) vs local
+        # minimap. Screenreader always gets text bearings instead of ASCII.
+        character.drive_map_full = True
+    if not hasattr(character, "map_view_full"):
+        # Pref: bare `map` shows the local minimap (default) vs the full
+        # atlas grid -- config mapview atlas|minimap.
+        character.map_view_full = False
+    if not hasattr(character, "exits_verbose"):
+        # Pref: LOTJ-style Exits: / North - Dest (default); compact opt-in.
+        character.exits_verbose = True
+    # One-shot migrate: #534's first squash left compact as the saved
+    # default. Locked design is verbose look -- bump once, then honor
+    # an explicit ``config exits compact`` afterward.
+    if int(getattr(character, "look_exits_rev", 0) or 0) < 1:
+        character.exits_verbose = True
+        character.look_exits_rev = 1
+    if not hasattr(character, "group_row"):
+        # Display-only party row (front/back); not combat math yet.
+        character.group_row = "front"
+    if not hasattr(character, "pager_lines"):
+        # Lines per `more` page for long dumps (engine/pager.py).
+        character.pager_lines = 20
     if not hasattr(character, "combat_gag_other"):
         # Prefs #20: hide third-party (room) combat lines for this viewer.
         character.combat_gag_other = False
+    if not hasattr(character, "show_combat_tags"):
+        # Default on (a11y). Sighted players may opt out via config combattags.
+        # Screenreader mode always shows tags regardless of this flag.
+        character.show_combat_tags = True
+    if not hasattr(character, "show_tips"):
+        character.show_tips = True
+    if not hasattr(character, "next_tip_tick"):
+        character.next_tip_tick = None
+    if not hasattr(character, "last_tip_index"):
+        character.last_tip_index = None
     if not hasattr(character, "color_depth"):
         # Prefs #5 / #6: "ansi" (16) or "xterm256".
         character.color_depth = "ansi"
     if not hasattr(character, "channel_colors") or character.channel_colors is None:
         # Prefs #26: channel id -> style role name (e.g. ooc -> muted).
         character.channel_colors = {}
+
+
+def drive_map_render_args(character):
+    """``cmd_map`` args for vehicle cruise redraw, or ``None`` when skipped.
+
+    Sighted players default to the full overland atlas (``map big``).
+    ``config drivemap minimap`` keeps the smaller local window. Screenreader
+    and ``config map off`` callers use text bearings and never invoke this.
+    """
+    ensure_display_defaults(character)
+    if getattr(character, "screenreader", False):
+        return None
+    if not getattr(character, "show_minimap", True):
+        return None
+    if getattr(character, "drive_map_full", True):
+        return "big"
+    return ""
+
+
+def wants_combat_tags(character):
+    """True when this viewer should see [DMG]/[HIT]/… on combat lines.
+
+    Screenreader mode always forces tags on. Sighted players default on
+    and may hide them with ``config combattags off``.
+    """
+    ensure_display_defaults(character)
+    if getattr(character, "screenreader", False):
+        return True
+    return bool(getattr(character, "show_combat_tags", True))
+
+
+def apply_screenreader_mode(character, enabled):
+    """Turn screenreader mode on or off and sync related display prefs.
+
+    When enabling: flatten ASCII UI, keep combat tags on, and turn the
+    ASCII minimap off (directional ``map`` text is used instead). When
+    disabling: only clear the screenreader flag -- leave map / tags /
+    color alone so a later ``config screenreader off`` does not surprise
+    someone who had customized those separately.
+
+    Returns a short confirmation string for the caller to send.
+    """
+    ensure_display_defaults(character)
+    if enabled:
+        character.screenreader = True
+        character.show_combat_tags = True
+        character.show_minimap = False
+        character.map_on_move = False
+        character.map_on_look = False
+        return (
+            "Screenreader mode on -- ASCII frames and minimaps "
+            "flatten to lists; combat stays tagged and brief."
+        )
+    character.screenreader = False
+    return "Screenreader mode off."
 
 
 def sheet_width(character):
@@ -85,7 +208,7 @@ def expand_aliases(character, raw):
 
     Only expands when the verb is NOT already a real COMMANDS key -- so an
     alias can never shadow a built-in. Alias values may include args
-    (e.g. ``ns`` -> ``north``; ``greet`` -> ``say Hello there``).
+    (e.g. ``ns`` -> ``north``).
     Returns the (possibly unchanged) raw line.
     """
     ensure_display_defaults(character)
@@ -127,7 +250,11 @@ def emote_body(character, args):
     text = (args or "").strip()
     if not text:
         return None
-    key = character.key
+    try:
+        from engine.command_support import _display_name
+        key = _display_name(character)
+    except Exception:
+        key = getattr(character, "key", "?")
     if text.startswith("'s ") or text.startswith("'s\t"):
         return f"{key}'s {text[3:].lstrip()}"
     if text.startswith("'s"):
@@ -135,21 +262,225 @@ def emote_body(character, args):
     return f"{key} {text}"
 
 
+def format_exit_abbrevs(character, game=None):
+    """Compact exit string for prompt ``%E`` (e.g. ``n,e,s,w``).
+
+    Honors the same visibility gates as look (hooks + known secret exits).
+    Returns ``-`` when nowhere / no visible exits. Labels are the signal.
+    """
+    _ = game
+    room = getattr(character, "location", None)
+    if room is None:
+        return "-"
+    try:
+        from engine import hooks
+        from engine import vision as vision_mod
+        from engine import style as style_mod
+    except Exception:
+        return "-"
+    if not vision_mod.can_see_room(character, room):
+        return "-"
+    pairs = []
+    for direction, dest in (room.exits or {}).items():
+        if not hooks.look_exit_visible(dest, game):
+            continue
+        if not vision_mod.character_knows_exit(character, room, direction):
+            continue
+        pairs.append((direction, dest.look_title() if hasattr(dest, "look_title") else ""))
+    if not pairs:
+        return "-"
+    # Reuse style's compact token order without paint.
+    tokens = []
+    seen = set()
+    by_dir = {str(d).strip().lower(): d for d, _ in pairs}
+    for name in style_mod._EXIT_LINE_ORDER:
+        if name in by_dir:
+            tokens.append(style_mod._exit_abbrev(name))
+            seen.add(name)
+    for direction, _dest in pairs:
+        key = str(direction).strip().lower()
+        if key in seen:
+            continue
+        tokens.append(style_mod._exit_abbrev(direction))
+        seen.add(key)
+    return ",".join(tokens) if tokens else "-"
+
+
+def format_group_names(character):
+    """Comma-separated faces of other party members, or ``\"\"`` if solo.
+
+    Used by raw ``%g`` and the optional ``%Gr`` segment. Excludes self.
+    """
+    try:
+        from engine import group as group_mod
+    except Exception:
+        return ""
+    if not group_mod.in_group(character):
+        return ""
+    names = []
+    for member in group_mod.group_members(character):
+        if member is character:
+            continue
+        face = (
+            getattr(member, "assumed_face", None)
+            or getattr(member, "husk_display_name", None)
+            or getattr(member, "key", "?")
+        )
+        names.append(str(face))
+    return ", ".join(names)
+
+
+def _prompt_vitals(character, game=None):
+    """Gather meter values for prompt expansion (engine-safe via hooks).
+
+    Optional resources (fuel / mana) only appear when the vitals builder
+    stamped them -- humans never get a phantom fuel field.
+    """
+    _ = game
+    hp = 100
+    max_hp = 100
+    energy = getattr(character, "energy", 0)
+    stamina = int(getattr(character, "stamina", 0) or 0)
+    max_stamina = stamina
+    fuel_str = ""
+    mana_str = ""
+    max_mana_str = ""
+    has_fuel = False
+    has_mana = False
+    try:
+        from engine import hooks
+        vitals = hooks.gmcp_char_vitals(character) or {}
+    except Exception:
+        vitals = {}
+    if vitals:
+        raw_hp = vitals.get("hp_raw", vitals.get("hp"))
+        raw_max = vitals.get("maxhp_raw", vitals.get("maxhp"))
+        try:
+            cur = float(raw_hp)
+            cap = float(raw_max) if raw_max not in (None, "", "0") else 0.0
+            if cap > 0:
+                if cap == 100.0 and "hp_raw" not in vitals:
+                    hp = max(0, min(100, int(round(cur))))
+                    max_hp = 100
+                else:
+                    hp = max(0, min(100, int(round(100.0 * cur / cap))))
+                    max_hp = 100
+        except (TypeError, ValueError):
+            pass
+        if "energy" in vitals:
+            energy = vitals["energy"]
+        if "stamina" in vitals:
+            try:
+                stamina = int(float(vitals["stamina"]))
+            except (TypeError, ValueError):
+                pass
+        if "maxstamina" in vitals:
+            try:
+                max_stamina = int(float(vitals["maxstamina"]))
+            except (TypeError, ValueError):
+                pass
+        if "fuel" in vitals:
+            has_fuel = True
+            fuel_str = str(vitals["fuel"])
+        if "mana" in vitals:
+            has_mana = True
+            mana_str = str(vitals["mana"])
+            max_mana_str = str(vitals.get("maxmana", ""))
+    room = getattr(character, "location", None)
+    room_key = room.key if room is not None else "-"
+    try:
+        from engine.command_support import _display_name
+        name = _display_name(character)
+    except Exception:
+        name = getattr(character, "key", "?")
+    return {
+        "hp": hp,
+        "max_hp": max_hp,
+        "energy": energy,
+        "stamina": stamina,
+        "max_stamina": max_stamina,
+        "has_fuel": has_fuel,
+        "fuel": fuel_str,
+        "has_mana": has_mana,
+        "mana": mana_str,
+        "max_mana": max_mana_str,
+        "room": room_key,
+        "name": name,
+        "exits": format_exit_abbrevs(character, game),
+        "group": format_group_names(character),
+    }
+
+
+def _seg(space_markup, colored_inner):
+    """Prefix a segment with a muted space when the field is present."""
+    if not colored_inner:
+        return ""
+    return f"{space_markup}{colored_inner}"
+
+
+def _expand_segment(code, v):
+    """Map a two-letter segment token to a colored ``[field]`` or ``\"\"``.
+
+    Missing resources (fuel, mana, group) return empty -- never ``[-]``.
+    """
+    if code == "Hp":
+        return f"<dark_red>[{v['hp']}/{v['max_hp']}hp]"
+    if code == "En":
+        return _seg("<dark_grey> ", f"<gold>[{v['energy']}en]")
+    if code == "St":
+        return _seg(
+            "<dark_grey> ",
+            f"<teal>[{v['stamina']}/{v['max_stamina']}st]",
+        )
+    if code == "Mn":
+        if not v["has_mana"]:
+            return ""
+        return _seg(
+            "<dark_grey> ",
+            f"<pale_blue>[{v['mana']}/{v['max_mana']}mn]",
+        )
+    if code == "Fu":
+        if not v["has_fuel"]:
+            return ""
+        return _seg("<dark_grey> ", f"<violet>[{v['fuel']}fuel]")
+    if code == "Ex":
+        return _seg("<dark_grey> ", f"<silver>[{v['exits']}]")
+    if code == "Gr":
+        names = v["group"]
+        if not names:
+            return ""
+        return _seg("<dark_grey> ", f"<white>[{names}]")
+    return ""
+
+
 def format_prompt(character, game=None):
     """Expand prompt_format tokens into a single line (prefs #27 / #28).
 
-    Tokens (case-sensitive after %):
-      %h  lifeforce percent (0-100; matches score default)
-      %H  always 100 when showing percent (pair with %h)
-      %e  energy
-      %s  stamina current
-      %S  stamina max
-      %f  fuel (supernatural) or ``-``
-      %n  character name
-      %r  room key
-      %%  literal %
-    Color tags (``<dark_red>``, ``<teal>``, …) are allowed and expanded
-    via ``style.render`` after tokens. Empty / disabled prompt returns "".
+    Raw tokens (always emit a value -- fine for custom templates)::
+
+      %h %H   lifeforce percent / out of 100
+      %e      energy
+      %E      exit abbrevs (or ``-``)
+      %s %S   stamina current / max
+      %f      fuel number, or ``\"\"`` when you have no fuel resource
+      %m %M   mana / max mana, or ``\"\"`` when you have no mana
+      %n %r   name / room
+      %g      other groupmates ``Name1, Name2``, or ``\"\"`` if solo
+      %%      literal %
+
+    Optional *segment* tokens (two letters) -- each is a full colored
+    ``[field]`` that **omits itself** when the resource does not apply::
+
+      %Hp  [72/100hp]
+      %En  [40en]
+      %St  [28/30st]
+      %Mn  [12/50mn]   (mages only)
+      %Fu  [80fuel]    (fuel Origins only)
+      %Ex  [n,e,s,w]
+      %Gr  [Sam, Dean] (only when grouped)
+
+    Color tags (``<dark_red>``, ``<teal>``, …) expand via ``style.render``
+    after tokens. Empty / disabled prompt returns \"\".
 
     Hard rule: this module lives under ``engine/`` -- never import ``supers``.
     Caps come from ``hooks.gmcp_char_vitals`` when SUPERS is installed.
@@ -158,84 +489,47 @@ def format_prompt(character, game=None):
     template = character.prompt_format
     if template is None or template == "":
         return ""
-    hp = 100
-    max_hp = 100
-    energy = getattr(character, "energy", 0)
-    stamina = int(getattr(character, "stamina", 0) or 0)
-    max_stamina = stamina
-    fuel_str = "-"
-    # Reuse GMCP vitals builder (SUPERS) via hooks -- no supers import here.
-    try:
-        from engine import hooks
-        vitals = hooks.gmcp_char_vitals(character) or {}
-        if vitals:
-            # Always percent-of-max for %h/%H (never raw Tier pools).
-            raw_hp = vitals.get("hp_raw", vitals.get("hp"))
-            raw_max = vitals.get("maxhp_raw", vitals.get("maxhp"))
-            try:
-                cur = float(raw_hp)
-                cap = float(raw_max) if raw_max not in (None, "", "0") else 0.0
-                if cap > 0:
-                    # Percent gauges use maxhp=100; raw pools use huge max.
-                    if cap == 100.0 and "hp_raw" not in vitals:
-                        hp = max(0, min(100, int(round(cur))))
-                        max_hp = 100
-                    else:
-                        hp = max(0, min(100, int(round(100.0 * cur / cap))))
-                        max_hp = 100
-            except (TypeError, ValueError):
-                pass
-            if "energy" in vitals:
-                energy = vitals["energy"]
-            if "stamina" in vitals:
-                try:
-                    stamina = int(float(vitals["stamina"]))
-                except (TypeError, ValueError):
-                    pass
-            if "maxstamina" in vitals:
-                try:
-                    max_stamina = int(float(vitals["maxstamina"]))
-                except (TypeError, ValueError):
-                    pass
-            if "fuel" in vitals:
-                fuel_str = str(vitals["fuel"])
-    except Exception:
-        pass
-    if fuel_str == "-":
-        fuel_val = getattr(character, "fuel", None)
-        if fuel_val is not None:
-            try:
-                fuel_str = f"{float(fuel_val):.0f}"
-            except (TypeError, ValueError):
-                fuel_str = "-"
-    room = getattr(character, "location", None)
-    room_key = room.key if room is not None else "-"
-    name = getattr(character, "key", "?")
+    v = _prompt_vitals(character, game)
 
     out = []
     i = 0
     while i < len(template):
         ch = template[i]
         if ch == "%" and i + 1 < len(template):
+            # Two-letter optional segments first (%Hp, %Fu, %Gr, …).
+            if i + 2 < len(template):
+                two = template[i + 1: i + 3]
+                if two in _SEGMENT_TOKENS:
+                    out.append(_expand_segment(two, v))
+                    i += 3
+                    continue
             code = template[i + 1]
             if code == "%":
                 out.append("%")
             elif code == "h":
-                out.append(str(hp))
+                out.append(str(v["hp"]))
             elif code == "H":
-                out.append(str(max_hp))
+                out.append(str(v["max_hp"]))
             elif code == "e":
-                out.append(str(energy))
+                out.append(str(v["energy"]))
+            elif code == "E":
+                out.append(v["exits"])
             elif code == "s":
-                out.append(str(stamina))
+                out.append(str(v["stamina"]))
             elif code == "S":
-                out.append(str(max_stamina))
+                out.append(str(v["max_stamina"]))
             elif code == "f":
-                out.append(fuel_str)
+                out.append(v["fuel"])
+            elif code == "m":
+                out.append(v["mana"])
+            elif code == "M":
+                out.append(v["max_mana"])
             elif code == "n":
-                out.append(name)
+                out.append(v["name"])
             elif code == "r":
-                out.append(room_key)
+                out.append(v["room"])
+            elif code == "g":
+                out.append(v["group"])
             else:
                 out.append("%")
                 out.append(code)
@@ -277,9 +571,18 @@ def send_prompt(character, game=None):
 
 
 def paint_combat_line(character, role, text):
-    """Paint a combat line for one viewer (prefs #19). Role is combat_*."""
+    """Paint a combat line for one viewer (prefs #19). Role is combat_*.
+
+    Uses style.paint_layered_for (docs/plans/combat_color_gothic.md): the
+    direction role is still the WHOLE line's base color exactly as before,
+    but combat_prose may have embedded a rare ``<tag>...<_base>`` accent
+    span (a silver blade, a rider callout) that switches color for just
+    that span. A line with no such markup renders byte-identical to the
+    old flat style.paint_for call -- this is a superset, not a behavior
+    change, for every caller that never emits tags.
+    """
     from engine import style
-    return style.paint_for(character, role, text)
+    return style.paint_layered_for(character, role, text)
 
 
 def channel_role(character, channel, default="muted"):

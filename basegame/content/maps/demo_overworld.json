@@ -1,0 +1,93 @@
+{
+    "id": "demo_overworld",
+    "plane": "earth",
+    "realm": "prime",
+    "autoload": true,
+    "_comment": "basegame's reference macro map -- open country outside Millbrook, proving the engine's outdoor/wilderness room tags (nests/encounters land here in Stage 7). North exit from Overworld Trailhead continues into demo_town.json (the micro map).",
+    "city_name": "Millbrook Wilds",
+    "city_color": "dark_grey",
+    "sub_color": "slate_grey",
+    "main_colors": {
+        "street": "silver",
+        "default": "silver"
+    },
+    "rooms": [
+        {
+            "key": "Overworld Trailhead",
+            "title": "Millbrook Wilds - Trailhead - Marker Post",
+            "vnum": "MW00001",
+            "description": "The trail widens into a clearing here, a weathered marker post pointing the way back to town. Wagon ruts fan out toward the fields, the pond, and the treeline.",
+            "area_type": "plains",
+            "zone": "demo-wilds",
+            "outdoor": true,
+            "exits": {
+                "north": "Crossroads Trail",
+                "east": "Fallow Fields",
+                "west": "Old Millpond",
+                "south": "Forest Edge"
+            }
+        },
+        {
+            "key": "Fallow Fields",
+            "title": "Millbrook Wilds - Fallow Fields - Furrows",
+            "vnum": "MW00002",
+            "description": "Rows of turned earth run out toward the hills, left to rest for the season. Crows pick at the stubble, scattering whenever the wind gusts.",
+            "area_type": "plains",
+            "zone": "demo-wilds",
+            "outdoor": true,
+            "exits": {
+                "west": "Overworld Trailhead",
+                "north": "Low Hills"
+            }
+        },
+        {
+            "key": "Low Hills",
+            "title": "Millbrook Wilds - Low Hills - Ridge Trail",
+            "vnum": "MW00003",
+            "description": "The ground rises into rocky, sheep-cropped hills, a thin trail switching back along the ridge. From up here the whole valley spreads out below.",
+            "area_type": "mountains",
+            "zone": "demo-wilds",
+            "outdoor": true,
+            "exits": {
+                "south": "Fallow Fields"
+            }
+        },
+        {
+            "key": "Old Millpond",
+            "title": "Millbrook Wilds - Old Millpond - Shore",
+            "vnum": "MW00004",
+            "description": "Still water sits behind a half-collapsed dam, the old mill's wheel long since seized with rust. Reeds crowd the shallows.",
+            "area_type": "lake",
+            "zone": "demo-wilds",
+            "outdoor": true,
+            "exits": {
+                "east": "Overworld Trailhead"
+            }
+        },
+        {
+            "key": "Forest Edge",
+            "title": "Millbrook Wilds - Forest Edge - Tree Line",
+            "vnum": "MW00005",
+            "description": "The plains give way abruptly to close-grown trees, the light dropping to a cool green shade a few steps in. Birdsong replaces the wind.",
+            "area_type": "forest",
+            "zone": "demo-wilds",
+            "outdoor": true,
+            "exits": {
+                "north": "Overworld Trailhead",
+                "south": "Deep Woods"
+            }
+        },
+        {
+            "key": "Deep Woods",
+            "title": "Millbrook Wilds - Deep Woods - Thicket",
+            "vnum": "MW00006",
+            "description": "The trees close in tighter here, undergrowth thick enough to slow a careless step. Little sunlight reaches the forest floor.",
+            "area_type": "forest",
+            "zone": "demo-wilds",
+            "outdoor": true,
+            "exits": {
+                "north": "Forest Edge"
+            }
+        }
+    ]
+}

@@ -20,16 +20,24 @@ from datetime import datetime
 # Kind strings used by callers and as the JSON "kind" field when useful.
 BUG = "bug"
 SUGGEST = "suggest"
+# Player-submitted helpfile drafts (cmd_helpsubmit). Reuses this whole
+# module -- JSONL log, open/resolved/rejected status, gm_notify ping -- so a
+# GM reviews these the exact same way as a bug/suggestion (docs/plans/
+# helpfile_editing_system.md), instead of a bespoke proposal table + queue UI.
+HELP = "help"
 
 # Optional post-append hooks: list of callback(kind, payload). Kept for
 # future side effects; bug_webhook POSTs are GM-on-demand (squashbugs), not
 # registered here anymore.
 _after_record_hooks = []
+# Optional hooks after mark() flips status (e.g. thank bug reporters).
+_after_mark_hooks = []
 
 # Separate files (user choice) -- never committed; see .gitignore.
 _FILENAMES = {
     BUG: "bug_reports.log",
     SUGGEST: "suggestions.log",
+    HELP: "help_proposals.log",
 }
 
 # A report starts "open"; a GM later marks it "resolved" (fixed/built) or
@@ -51,7 +59,12 @@ def register_after_record(callback):
     _after_record_hooks.append(callback)
 
 
-def record(kind, reporter, description, history, directory="."):
+def register_after_mark(callback):
+    """Register callback(kind, payload, *, old_status, directory, game) after mark()."""
+    _after_mark_hooks.append(callback)
+
+
+def record(kind, reporter, description, history, directory=".", context=None):
     """Append one timestamped report as a single JSON line.
 
     history is a list of [line, traceback_or_None] pairs from the session
@@ -59,6 +72,9 @@ def record(kind, reporter, description, history, directory="."):
       - history: plain command lines (most recent last)
       - errors:  only the entries that carried a traceback, as
                  {"line": ..., "traceback": ...}
+
+    context is an optional dict of diagnostic facts (room, vitals, mission,
+    …) from engine.report_context.build().
 
     Returns the payload dict that was written, including a 1-based ``id``
     (the physical line number in the JSONL file -- same numbering
@@ -85,6 +101,8 @@ def record(kind, reporter, description, history, directory="."):
         "errors": errors,
         "status": "open",
     }
+    if context:
+        payload["context"] = context
     path = _path(kind, directory)
     # "a" appends; if the file doesn't exist yet, open creates it.
     with open(path, "a", encoding="utf-8") as f:
@@ -141,7 +159,7 @@ def recent(kind, n, directory="."):
     return entries[-n:]
 
 
-def mark(kind, entry_id, status, directory="."):
+def mark(kind, entry_id, status, directory=".", game=None):
     """Set the status of one report (by its recent()-assigned id) in place.
 
     Rewrites only that one JSON line, preserving every other line and their
@@ -149,6 +167,9 @@ def mark(kind, entry_id, status, directory="."):
     targeted status flip. Raises ValueError for an unknown status and
     IndexError for an id outside the file's current line range, so callers
     (the GM 'resolve' command) can turn either into a friendly message.
+
+    Optional ``game`` is passed through to after-mark hooks (e.g. thanking an
+    online bug reporter when status becomes ``resolved``).
     """
     if status not in STATUSES:
         raise ValueError(f"status must be one of {STATUSES}, got {status!r}")
@@ -162,10 +183,14 @@ def mark(kind, entry_id, status, directory="."):
         raise IndexError(f"no {kind} report #{entry_id}")
 
     payload = json.loads(lines[entry_id - 1])
+    old_status = payload.get("status", "open")
     payload["status"] = status
+    payload["id"] = entry_id
     lines[entry_id - 1] = json.dumps(payload) + "\n"
     with open(path, "w", encoding="utf-8") as f:
         f.writelines(lines)
+    for hook in _after_mark_hooks:
+        hook(kind, payload, old_status=old_status, directory=directory, game=game)
     return payload
 
 

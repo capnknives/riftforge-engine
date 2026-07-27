@@ -9,9 +9,14 @@ Never the only signal -- every line keeps a plain ``[GM]`` prefix so
 Opt-out: Character.gm_notify False (GM verb ``gmnotify off``). Immersion
 cast bodies are skipped -- same staff filter as ``who``'s GM strip
 (``_is_staff_gm``).
+
+Client IPs: ``peer_host`` always returns the real address when known
+(banlist, head-GM tooling). Connect/disconnect ``from …`` clauses and
+``gm users`` / ``gm host`` peer columns are head-GM only -- junior staff
+do not see player IPs on the ops channel.
 """
 
-from engine.command_support import _is_staff_gm
+from engine.command_support import _is_head_gm, _is_staff_gm
 from engine import style
 
 
@@ -19,8 +24,14 @@ def peer_host(session):
     """Best-effort client IP/host from the session writer, or None.
 
     asyncio StreamWriter.get_extra_info('peername') is usually
-    (host, port) for TCP. Mocks and copyover edge cases may lack it --
+    (host, port) for TCP. Behind the connection gateway the game writer
+    is a GatewaySessionWriter that forwards the real public peer from
+    CTRL open/welcome. Mocks and copyover edge cases may lack it --
     callers omit the ``from …`` clause when this returns None.
+
+    This is the raw address (banlist, head-GM inspect). Display helpers
+    must go through ``format_from`` / ``peer_host_for_viewer`` so junior
+    GMs never see it on staff lines.
     """
     writer = getattr(session, "writer", None)
     if writer is None:
@@ -38,8 +49,26 @@ def peer_host(session):
     return None
 
 
-def format_from(session):
-    """Return `` from 1.2.3.4`` or `` `` (empty) when peer is unknown."""
+def peer_host_for_viewer(session, viewer):
+    """Return peer_host only when viewer is head_gm; else None.
+
+    Used by ``gm users`` / ``gm host`` so junior staff see ``-`` instead
+    of a real client IP.
+    """
+    if viewer is None or not _is_head_gm(viewer):
+        return None
+    return peer_host(session)
+
+
+def format_from(session, viewer=None):
+    """Return `` from 1.2.3.4`` for head_gm viewers only; else empty.
+
+    ``viewer`` is the staff Character receiving the ping. Without a
+    head_gm viewer the clause is omitted so junior GMs (and callers that
+    forget to pass a viewer) never leak player IPs into a shared line.
+    """
+    if viewer is None or not _is_head_gm(viewer):
+        return ""
     host = peer_host(session)
     if host:
         return f" from {host}"
@@ -55,15 +84,19 @@ def paint_gm_line(message):
     return style.paint("absinthe_green", f"[GM] {message}")
 
 
-def ping_gms(game, message, *, exclude=None):
+def ping_gms(game, message, *, exclude=None, peer_session=None):
     """Send one dark-green staff line to every opted-in online staff GM.
 
     exclude -- optional Character who should not receive this ping (e.g.
     the player who just disconnected, or a GM who triggered their own
     event). Immersion cast is never pinged.
+
+    peer_session -- optional Session whose client IP is appended via
+    ``{from}`` in *message* (replaced per recipient). Head GM gets
+    `` from 1.2.3.4``; junior staff get an empty string. If *message*
+    has no ``{from}`` placeholder, it is sent unchanged to everyone.
     """
     sessions = getattr(game, "sessions", None) or []
-    line = paint_gm_line(message)
     for session in list(sessions):
         other = getattr(session, "character", None)
         if other is None:
@@ -79,4 +112,48 @@ def ping_gms(game, message, *, exclude=None):
         send = getattr(session, "send", None)
         if send is None:
             continue
+        text = message
+        if peer_session is not None and "{from}" in message:
+            text = message.replace(
+                "{from}", format_from(peer_session, viewer=other)
+            )
+        send(paint_gm_line(text))
+
+
+def paint_wiz_line(message):
+    """Wrap a staff-chat line in absinthe green with a plain ``[WIZ]`` tag.
+
+    Bidirectional Immortal channel (``wiznet``). Same color role as
+    ``[GM]`` ops pings so color-off clients still read the tag.
+    """
+    return style.paint("absinthe_green", f"[WIZ] {message}")
+
+
+def wiznet_broadcast(game, speaker, message, *, exclude=None):
+    """Send one ``[WIZ]`` line to every online staff GM (not immersion cast).
+
+    Unlike ``ping_gms``, this ignores ``gm_notify`` opt-out -- wiznet is
+    deliberate staff chat, not an ops ping you mute. Immersion cast stays
+    out so in-character bodies never see the channel.
+    """
+    sessions = getattr(game, "sessions", None) or []
+    who = getattr(speaker, "key", None) or "?"
+    text = (message or "").strip()
+    if not text:
+        return False
+    line = paint_wiz_line(f"{who}: {text}")
+    sent = 0
+    for session in list(sessions):
+        other = getattr(session, "character", None)
+        if other is None:
+            continue
+        if exclude is not None and other is exclude:
+            continue
+        if not _is_staff_gm(other):
+            continue
+        send = getattr(session, "send", None)
+        if send is None:
+            continue
         send(line)
+        sent += 1
+    return sent > 0

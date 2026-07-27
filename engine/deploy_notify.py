@@ -222,11 +222,11 @@ async def _run_countdown(game, signal):
     summary = signal.get("summary") or "A reported bug has been fixed."
     total = int(signal.get("countdown_seconds", 30))
 
-    bug_ref = f"Bug #{bug_id}" if bug_id else "A bug"
+    bug_ref = f"Bug #{bug_id}" if bug_id else "A tear in the script"
     game.broadcast_all(
-        f"*** {bug_ref} has been fixed: {summary} ***\r\n"
-        f"The world will reset in {total} seconds to apply the update. "
-        "You will stay connected through the reset."
+        f"*** {bug_ref} has been mended: {summary} ***\r\n"
+        f"*** The Veil will reseal in {total} seconds. Stay put -- "
+        f"you will remain. ***"
     )
     print(
         f"[deploy_notify] countdown started for {bug_ref} "
@@ -237,7 +237,7 @@ async def _run_countdown(game, signal):
     # Walk second-by-second so we can hit WARN_AT milestones cleanly.
     for remaining in range(total, 0, -1):
         if remaining in _COUNTDOWN_WARN_AT and remaining < total:
-            game.broadcast_all(f"*** World reset in {remaining}... ***")
+            game.broadcast_all(f"*** The Veil reseals in {remaining}... ***")
         await asyncio.sleep(1)
 
     signal["phase"] = "awaiting_copyover"
@@ -249,8 +249,7 @@ async def _run_countdown(game, signal):
         f.write("\n")
 
     game.broadcast_all(
-        "*** Applying the update now -- reality will reform momentarily. "
-        "Hold on. ***"
+        "*** The rewrite takes hold. The Veil folds -- hold on. ***"
     )
     print("[deploy_notify] deploy_ready written -- host may pull the fix now",
           flush=True)
@@ -265,16 +264,21 @@ async def on_resume(game):
 
     bug_id = signal.get("bug_id")
     summary = signal.get("summary") or "A reported bug has been fixed."
-    bug_ref = f"Bug #{bug_id}" if bug_id else "The bug fix"
 
-    game.broadcast_all(
-        f"*** {bug_ref} is now live: {summary} ***"
-    )
+    if bug_id is not None:
+        game.broadcast_all(
+            f"*** The Veil holds. Bug #{bug_id} fix is live: {summary} ***"
+        )
+    else:
+        game.broadcast_all(
+            f"*** The Veil holds. The mend is live: {summary} ***"
+        )
 
     if bug_id is not None:
         try:
             reports.mark(
                 reports.BUG, int(bug_id), "resolved", directory=directory,
+                game=game,
             )
             print(f"[deploy_notify] marked bug #{bug_id} resolved", flush=True)
         except (ValueError, IndexError) as exc:

@@ -39,6 +39,60 @@ _CLIENT_SESSION_TAG = re.compile(r"^P\d+", re.IGNORECASE)
 LOGIN_NAME_MIN = 2
 LOGIN_NAME_MAX = 16
 
+# Failed-login backoff (pen-test H5): after this many wrong passwords for
+# the same name+IP, delay further attempts. In-memory only -- clears on
+# process restart / copyover (acceptable for a light throttle).
+_LOGIN_FAIL_THRESHOLD = 5
+_LOGIN_BACKOFF_BASE_SEC = 2.0
+_LOGIN_BACKOFF_CAP_SEC = 30.0
+# key -> fail_count (cleared on success)
+_login_fail_counts = {}
+
+
+def history_line_for_storage(line):
+    """Return a history line safe to keep in Session.history / bug reports.
+
+    Redacts setpass / gm setpass / castpass / gm castpass so plaintext
+    passwords never land in bug_reports.log or squashbugs webhooks
+    (pen-test H2).
+    """
+    text = line if isinstance(line, str) else str(line or "")
+    low = text.strip().lower()
+    if (
+        low.startswith("setpass")
+        or low.startswith("gm setpass")
+        or low.startswith("castpass")
+        or low.startswith("gm castpass")
+    ):
+        return "[redacted setpass]"
+    return text
+
+
+def _login_fail_key(name, peer):
+    """Stable tracker key for failed-password backoff."""
+    return f"{(name or '').lower()}|{(peer or '')}"
+
+
+def _login_backoff_seconds(name, peer):
+    """Seconds to wait before the next password try (0 if under threshold)."""
+    count = _login_fail_counts.get(_login_fail_key(name, peer), 0)
+    if count < _LOGIN_FAIL_THRESHOLD:
+        return 0.0
+    # 5 fails -> 2s, 6 -> 4s, … capped.
+    over = count - _LOGIN_FAIL_THRESHOLD + 1
+    return min(_LOGIN_BACKOFF_CAP_SEC, _LOGIN_BACKOFF_BASE_SEC * (2 ** (over - 1)))
+
+
+def _note_login_failure(name, peer):
+    """Increment the fail counter for this name+IP."""
+    key = _login_fail_key(name, peer)
+    _login_fail_counts[key] = _login_fail_counts.get(key, 0) + 1
+
+
+def _clear_login_failures(name, peer):
+    """Forget failures after a successful password."""
+    _login_fail_counts.pop(_login_fail_key(name, peer), None)
+
 
 def strip_client_session_tags(raw: str) -> str:
     """Remove leading multi-window client tags (P1, P4, …) from a line.
@@ -175,6 +229,13 @@ class Session:
         # commands.cmd_bug/cmd_suggest (which starts it) and
         # play()/_finish_report_capture below (which ends it).
         self.report_capture = None
+        # Modal helpfile line editor (GM `hedit` command; docs/plans/
+        # helpfile_editing_system.md). Same shape of gate as report_capture
+        # above -- while set, EVERY line goes to _handle_help_edit_line
+        # instead of dispatch(). None when not editing; otherwise a dict
+        # with the keyword being edited, the body/syntax line buffers, and
+        # the category/gm_only/is_ic/aliases metadata collected so far.
+        self.help_edit = None
         # Telnet / GMCP state (engine/telnet.py + engine/gmcp.py).
         # _recv_buf holds incomplete IAC/SB bytes across reads; _text_buf
         # accumulates application data until a CR/LF completes a line;
@@ -189,18 +250,80 @@ class Session:
         # host-wide NIC stats.
         self.bytes_in = 0
         self.bytes_out = 0
+        # Staff-only login phase for `gm users` (not public `who`):
+        # "login" = name/password prompts; "creating" = mid-chargen;
+        # None = fully in play (on game.sessions) or not yet registered.
+        self.login_stage = None
+
+    def _register_connecting(self, stage="login"):
+        """Track this socket on game.connecting_sessions for GM users.
+
+        Intentionally separate from game.sessions so public `who` and
+        room broadcasts never see half-made characters. Safe to call
+        more than once (idempotent membership).
+        """
+        self.login_stage = stage
+        bucket = getattr(self.game, "connecting_sessions", None)
+        if bucket is None:
+            # Older Game stubs / smoke FakeGames may omit the list.
+            self.game.connecting_sessions = []
+            bucket = self.game.connecting_sessions
+        if self not in bucket:
+            bucket.append(self)
+
+    def _set_creating(self):
+        """Mark mid-chargen (password stuck; prompts still running)."""
+        self.login_stage = "creating"
+        # Ensure the bucket still holds us (password path already registered).
+        self._register_connecting("creating")
+
+    def _leave_connecting(self):
+        """Drop from connecting_sessions (play promote or disconnect)."""
+        bucket = getattr(self.game, "connecting_sessions", None)
+        if bucket is not None and self in bucket:
+            bucket.remove(self)
+
+    def _promote_to_sessions(self):
+        """Leave connecting bucket and join game.sessions for who/play."""
+        self._leave_connecting()
+        self.login_stage = None
+        if self not in self.game.sessions:
+            self.game.sessions.append(self)
 
     def _notify_gateway_bound(self, name: str):
-        """Tell the gateway this sid is logged in (for reattach after restart)."""
+        """Tell the gateway this sid is logged in (for reattach after restart).
+
+        Always bind the **login body** name, never ``gmspirit:`` / ``husk:``.
+        """
+        from engine.command_support import strip_ephemeral_storage_prefix
+        bind = strip_ephemeral_storage_prefix(name)
+        char = getattr(self, "character", None)
+        if char is not None:
+            body_key = getattr(char, "gm_body_key", None)
+            if body_key:
+                bind = strip_ephemeral_storage_prefix(body_key)
+            elif getattr(char, "gm_spirit", False) or getattr(
+                char, "gm_mode", False
+            ):
+                # Spirit storage key is gmspirit:Login -- peel to Login.
+                # Do NOT use the raw spirit key as the bind name.
+                bind = strip_ephemeral_storage_prefix(
+                    getattr(char, "key", None) or bind
+                )
+            else:
+                # Corporeal body (including gm_away Echo after quit intent).
+                bind = strip_ephemeral_storage_prefix(
+                    getattr(char, "key", None) or bind
+                )
         bridge = self.gateway_bridge
         sid = self.gateway_session_id
-        if bridge is None or not sid or not name:
+        if bridge is None or not sid or not bind or bind == "?":
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(bridge.notify_bound(sid, name))
+        loop.create_task(bridge.notify_bound(sid, bind))
 
     def _kick_gateway_client(self):
         """Ask the gateway to drop the public TCP (quit / intentional close)."""
@@ -357,31 +480,64 @@ class Session:
 
     # --- the session lifecycle --------------------------------------------
     async def run(self):
+        # Always drop from connecting_sessions on exit (mid-login hangup,
+        # chargen abort, or play() end). Promote-to-play already removes us;
+        # this is the safety net for early ``return`` paths that skip
+        # disconnect().
+        try:
+            await self._run_inner()
+        finally:
+            self._leave_connecting()
+
+    async def _run_inner(self):
         # Gateway reattach: game restarted while this telnet client stayed
         # held -- skip name/password and resume play() like copyover.
+        # Preserve idle_mode from the SQLite blob (same as classic copyover
+        # resume): Docker/live "copyover" is this path, and clearing the flag
+        # here used to snap AFK Echo-watchers back to present mid-reload.
+        # Fresh password login still clears idle_mode below -- intentional.
         reattach = getattr(self, "_gateway_reattach_name", None)
         if reattach:
-            char = self.game.find_character(reattach)
+            # Prefer exact login body (never husk: / gmspirit:).
+            finder = getattr(self.game, "find_login_character", None)
+            if callable(finder):
+                char = finder(reattach)
+            else:
+                char = self.game.find_character(reattach)
+            # Hard gm fold: body may be vault-only across a game restart.
+            # Unfinished homezone lessons are also vaulted on copyover boot,
+            # but those players must log in again -- not skip the name prompt.
+            if char is None:
+                if not hooks.is_tutorial_incomplete_vault(
+                    self.game, reattach
+                ):
+                    char = hooks.try_restore_folded_login(self.game, reattach)
             if char is not None and not getattr(char, "is_npc", False):
                 self._gateway_reattach_name = None
                 char.session = self
-                char.idle_mode = False
-                char.last_input_tick = getattr(
-                    self.game, "game_time_ticks", 0
-                ) or 0
+                # Do not stamp last_input_tick when already idle -- autoidle
+                # skips idle bodies anyway; leaving the stamp alone avoids
+                # resetting AFK context after a hot reload.
+                if not getattr(char, "idle_mode", False):
+                    char.last_input_tick = getattr(
+                        self.game, "game_time_ticks", 0
+                    ) or 0
                 self.character = char
-                if self not in self.game.sessions:
-                    self.game.sessions.append(self)
+                # Reattach skips the name prompt -- never on connecting_sessions.
+                self._promote_to_sessions()
                 self.reset_gmcp()
                 from engine import gmcp
                 from engine import mssp
                 gmcp.offer_gmcp(self)
                 mssp.offer_mssp(self)
-                self.send(
-                    "*** The world reforms around you. You're still here. ***"
-                )
+                from engine.copyover import MSG_AFTER
+                from engine import char_identity as identity_mod
+                self.send(MSG_AFTER)
                 self._notify_gateway_bound(char.key)
                 hooks.after_session_attach(char, self.game)
+                notice = identity_mod.legacy_surname_login_notice(char)
+                if notice:
+                    self.send(notice)
                 await self.play()
                 return
             # Name gone or NPC — fall through to a fresh login prompt.
@@ -392,10 +548,16 @@ class Session:
         # crawlers can DO early (before any login line).
         from engine import gmcp
         from engine import mssp
+        from engine import style
         gmcp.offer_gmcp(self)
         mssp.offer_mssp(self)
-        self.send("Welcome to Mortals and Monsters (pre-alpha).")
+        # Classic MUD connect card: gothic wrought splash + creator/engine
+        # credits (paint() 16-color -- no Character prefs yet).
+        for line in style.format_login_banner():
+            self.send(line)
         self.send("By what name are you known?")
+        # Staff `gm users` can see this socket as flags=login until promote.
+        self._register_connecting("login")
 
         # Keep asking until we get a usable name + password. Ways around the
         # loop: a blank/invalid name, an NPC name, a wrong password, a live
@@ -423,7 +585,113 @@ class Session:
             if name_stripped:
                 # Tell the player what will actually be stored / looked up.
                 self.send(f"(Client prefix dropped -- logging in as {name}.)")
-            existing = self.game.find_character(name)
+
+            # Staff banlist (engine/banlist.py) -- name and/or client IP.
+            # Checked before password so a banned account never attaches.
+            from engine import banlist as banlist_mod
+            from engine import gm_notify as gm_notify_mod
+            from engine import char_identity as identity_mod
+            peer = gm_notify_mod.peer_host(self)
+            if banlist_mod.is_banned(self.game, name=name, ip=peer):
+                self.send(
+                    "You are banned from this game. "
+                    "Contact staff if you believe this is an error."
+                )
+                self.close()
+                return
+
+            # First name may belong to zero, one, or many player bodies.
+            # Unique first name: next line may be password OR surname
+            # (Dean→pass, or Dean→Winchester→pass). Shared names still get
+            # an explicit surname prompt. Unused non-empty surname → new char.
+            # Immersion cast first names are reserved for NEW bodies only.
+            given_name = name
+            surname = ""
+            existing = identity_mod.find_unique_given_login(
+                self.game, given_name
+            )
+            unique_short_ok = False
+            if existing is not None:
+                # ---- Unique given name: password-or-surname second line ----
+                if getattr(existing, "is_npc", False):
+                    self.send(
+                        "That name belongs to a townsfolk, not a player. "
+                        "Choose another:"
+                    )
+                    continue
+                if not existing.password_hash:
+                    self.send(
+                        "That character has no password set. "
+                        "Ask a head GM to reset it (gm setpass), then log in."
+                    )
+                    continue
+                wait = _login_backoff_seconds(name, peer)
+                if wait > 0:
+                    self.send(
+                        f"Too many failed logins -- wait {int(wait)}s "
+                        f"and try again."
+                    )
+                    await asyncio.sleep(wait)
+                # Prompt says Password so classic name→pass clients are happy;
+                # typing the body's surname here still works (then Password).
+                self.send("Password:")
+                second = await self.read_line()
+                if second is None:
+                    return
+                second = strip_client_session_tags(second or "")
+                kind, cleaned = identity_mod.interpret_unique_given_second_line(
+                    existing,
+                    second,
+                    password_hash=existing.password_hash,
+                    verify_fn=auth.verify_password,
+                )
+                if kind == "ok":
+                    unique_short_ok = True
+                    surname = identity_mod.character_surname(existing)
+                elif kind == "surname_match":
+                    surname = cleaned or ""
+                    # Fall through to the shared Password: prompt below.
+                elif kind == "new_surname":
+                    # Same first name, different family → new character.
+                    surname = cleaned or ""
+                    existing = None
+                else:
+                    _note_login_failure(name, peer)
+                    self.send(
+                        "Incorrect password. By what name are you known?"
+                    )
+                    continue
+            else:
+                # Zero or several bodies share this first name -- ask surname.
+                self.send("What is your surname? (enter for none)")
+                raw_sur = await self.read_line()
+                if raw_sur is None:
+                    return
+                raw_sur = strip_client_session_tags(raw_sur or "").strip()
+                if not raw_sur:
+                    surname = ""
+                else:
+                    surname, sur_err = identity_mod.normalize_surname(raw_sur)
+                    if sur_err:
+                        self.send(sur_err + " Try again from the start:")
+                        self.send("By what name are you known?")
+                        continue
+
+                existing = identity_mod.find_player_by_given_surname(
+                    self.game, given_name, surname
+                )
+                # Exact storage-key login still works for mash keys when the
+                # body's surname matches what they typed (including empty).
+                if existing is None:
+                    finder = getattr(self.game, "find_login_character", None)
+                    if callable(finder):
+                        key_hit = finder(given_name)
+                        if (
+                            key_hit is not None
+                            and identity_mod.character_surname(key_hit).lower()
+                            == surname.lower()
+                        ):
+                            existing = key_hit
             # Town NPCs / hostiles share the character roster but are never
             # player logins -- letter-only keys (Marta, Bobby, …) used to
             # attach passwordless as if they were Echoes.
@@ -433,29 +701,93 @@ class Session:
                     "Choose another:"
                 )
                 continue
-            # Immersion cast keys (Buffy, Constantine, …) are reserved via
-            # a game hook -- engine stays SUPERS-free (two-repo purity).
-            # Use the module-level `hooks` import (do NOT re-import locally
-            # here -- that would make `hooks` a function-local name and
-            # break reconnect's after_session_attach below).
             if not existing:
-                if hooks.is_reserved_login_name(name):
+                # find_login_character / find_player skip NPCs -- still refuse
+                # letter-only town keys (Marta, Nix, …) so they never fall
+                # through to "need a surname" / new-character chargen.
+                npc_hit = None
+                needle = given_name.lower()
+                for obj in list(getattr(self.game, "characters", None) or []):
+                    if not getattr(obj, "is_npc", False):
+                        continue
+                    if (getattr(obj, "key", None) or "").lower() == needle:
+                        npc_hit = obj
+                        break
+                if npc_hit is not None:
+                    body_sur = identity_mod.character_surname(npc_hit)
+                    if body_sur.lower() == surname.lower():
+                        self.send(
+                            "That name belongs to a townsfolk, not a player. "
+                            "Choose another:"
+                        )
+                        continue
+            if not existing:
+                # Hard gm fold: name may live only in character_vault.
+                existing = hooks.try_restore_folded_login(
+                    self.game, given_name
+                )
+                if existing is not None:
+                    # Folded restore is key-based; require surname match
+                    # when the body already has one stamped.
+                    body_sur = identity_mod.character_surname(existing)
+                    if body_sur.lower() != surname.lower():
+                        existing = None
+            if not existing:
+                if hooks.is_reserved_login_name(given_name):
                     self.send(
                         "That name is reserved for the immersion cast. "
                         "Choose another:"
                     )
                     continue
-                break                 # fresh name -- new-character path below
+                if not surname:
+                    self.send(
+                        "New characters need a surname (2-16 letters). "
+                        "By what name are you known?"
+                    )
+                    continue
+                # Fresh given+surname -- new-character path below.
+                break
 
             # ---- Returning character: password, then optional takeover ----
-            # Password is required whenever a hash exists. When another
-            # Session still holds the body (linkdead / forgotten client /
-            # second login), a correct password kicks that session so the
-            # owner can reclaim the character. Passwordless bodies still
-            # reconnect as Echoes, but cannot take over a live session
-            # (no way to prove ownership).
-            live = existing.session is not None
-            if existing.password_hash:
+            # Every returning body needs a password hash. Blank-hash Echoes
+            # are not publicly reclaimable (pen-test H1) -- head GM resets
+            # via gm setpass. A correct password kicks a live Session so
+            # the owner can reclaim (linkdead / second login).
+            if not existing.password_hash:
+                self.send(
+                    "That character has no password set. "
+                    "Ask a head GM to reset it (gm setpass), then log in."
+                )
+                continue
+            # Live seat may be on the body OR on a gmspirit: while `gm on`
+            # (body.session is None in that case).
+            live_holder = existing if existing.session is not None else None
+            if live_holder is None:
+                sk = getattr(existing, "gm_spirit_key", None)
+                if not sk and getattr(existing, "gm_staff_form", False):
+                    from engine.command_support import (
+                        strip_ephemeral_storage_prefix,
+                    )
+                    sk = (
+                        "gmspirit:"
+                        + strip_ephemeral_storage_prefix(existing.key)
+                    )
+                if sk:
+                    spirit = self.game.find_character(sk)
+                    if (
+                        spirit is not None
+                        and getattr(spirit, "session", None) is not None
+                    ):
+                        live_holder = spirit
+            live = live_holder is not None
+            if not unique_short_ok:
+                wait = _login_backoff_seconds(name, peer)
+                if wait > 0:
+                    self.send(
+                        f"Too many failed logins -- wait {int(wait)}s "
+                        f"and try again."
+                    )
+                    await asyncio.sleep(wait)
                 self.send("Password:")
                 password = await self.read_line()
                 if password is None:
@@ -463,102 +795,142 @@ class Session:
                 # Same client may tag password lines; strip Pn only.
                 password = strip_client_session_tags(password or "")
                 if not auth.verify_password(password, existing.password_hash):
-                    self.send("Incorrect password. By what name are you known?")
-                    continue          # back to square one; don't leak WHICH part was wrong
-                if live:
-                    self._take_over_session(existing)
-                    takeover = True
-            elif live:
-                # No password on file -- refuse rather than steal the seat.
-                self.send("That name is already in play. Choose another:")
-                continue
-            break                     # verified reconnect / takeover / passwordless Echo
+                    _note_login_failure(name, peer)
+                    self.send(
+                        "Incorrect password. By what name are you known?"
+                    )
+                    continue  # back to square one; don't leak WHICH part was wrong
+            _clear_login_failures(name, peer)
+            if live:
+                self._take_over_session(live_holder)
+                takeover = True
+            break                     # verified reconnect / takeover
 
         if existing:
             # ---- RECONNECT / TAKEOVER: reattach the wires ----
             # Echo wake (section 4-E) when the body had no Session; takeover
             # when we just kicked a live Session -- character never left play.
             char = existing
-            # Capitalize a forgotten lowercase key (velan -> Velan) so who
-            # / look match every other name. Case-insensitive find already
-            # matched; rewrite the stored key when only casing differs.
-            if apply_login_name_case(char, name, self.game):
+            # Capitalize a forgotten lowercase storage key when the login
+            # face matches the key letters (legacy single-name bodies).
+            if apply_login_name_case(char, given_name, self.game):
                 self.send(f"(Name casing fixed -- you are {char.key}.)")
+            # Keep given_name casing aligned with what they typed.
+            if (
+                getattr(char, "given_name", None)
+                and char.given_name.lower() == given_name.lower()
+                and char.given_name != given_name
+            ):
+                char.given_name = given_name
+            elif not getattr(char, "given_name", None):
+                char.given_name = given_name
             char.session = self
             # Offline regimen: stretch (growth-only) resets on reconnect.
             # Pending Tier break from banked Echo growth is applied in
             # hooks.after_session_attach (game side) so engine/ never
             # imports supers (two-repo purity).
             char.offline_gains_this_stretch = 0
-            # Never wake into idlemode -- a fresh login is always "present".
-            # (Mid-idle copyover can persist the flag; reconnect clears it.)
+            # Never wake into idlemode -- a fresh password login / takeover
+            # is always "present". Gateway reattach and classic copyover
+            # resume keep the persisted flag (see run() reattach above and
+            # engine/copyover.py resume()).
             char.idle_mode = False
             # Fresh login starts the auto-idle AFK clock now.
             char.last_input_tick = getattr(self.game, "game_time_ticks", 0) or 0
             self.character = char
-            self.game.sessions.append(self)
+            self._promote_to_sessions()
+            # Public face for room / welcome / staff ping -- never
+            # gmspirit:Key / husk:Mantle storage keys (roleplay names only).
+            from engine.command_support import (
+                _presence_face,
+                is_staff_stealth_presence,
+            )
+            face = _presence_face(char)
             if takeover:
                 # Still embodied -- no Echo stir broadcast.
-                if char.location is not None:
+                if (
+                    char.location is not None
+                    and not is_staff_stealth_presence(char)
+                ):
                     char.location.broadcast(
-                        f"{char.key}'s attention snaps back into focus.",
+                        f"{face}'s attention snaps back into focus.",
                         exclude=char,
                     )
                 self.send(
-                    f"\r\nWelcome back, {char.key}! "
+                    f"\r\nWelcome back, {face}! "
                     "(Previous connection closed.)"
                 )
             else:
-                char.location.broadcast(
-                    f"{char.key}'s echo stirs and comes back to life.",
-                    exclude=char,
-                )
-                self.send(f"\r\nWelcome back, {char.key}!")
-            if not char.password_hash:
-                self.send(
-                    "(This character has no password set -- "
-                    "'setpass <new password>' to add one.)"
-                )
+                if (
+                    char.location is not None
+                    and not is_staff_stealth_presence(char)
+                ):
+                    char.location.broadcast(
+                        f"{face}'s echo stirs and comes back to life.",
+                        exclude=char,
+                    )
+                self.send(f"\r\nWelcome back, {face}!")
+            notice = identity_mod.legacy_surname_login_notice(char)
+            if notice:
+                self.send(notice)
             # Mail notify + pending offline Tier break -- after Session is
             # wired (D64 / Echo softcap).
             hooks.after_session_attach(char, self.game)
             # Dark-green staff ping: returning player woke their Echo /
-            # reclaimed a live seat.
+            # reclaimed a live seat. ``{from}`` is filled per recipient --
+            # only head_gm sees the real client IP (junior staff omit it).
             from engine import gm_notify
             gm_notify.ping_gms(
                 self.game,
-                f"{char.key} has connected{gm_notify.format_from(self)}.",
+                f"{face} has connected{{from}}.",
                 exclude=char,
+                peer_session=self,
             )
         else:
             # ---- NEW CHARACTER: password, then chargen, then place --------
             # Chargen (appearance + pronoun + Human Background) runs BEFORE
             # move_to / broadcast / save so a disconnect mid-flow leaves no
             # half-made Echo in the world (section 7 character creation).
-            self.send("Choose a password (at least 4 characters):")
+            from engine import char_identity as identity_mod
+            min_len = auth.MIN_PASSWORD_LEN
+            self.send(f"Choose a password (at least {min_len} characters):")
             while True:
                 password = await self.read_line()
                 if password is None:
                     return
                 # Strip Pn tags so a web client does not bake them into the hash.
                 password = strip_client_session_tags(password or "")
-                if len(password) >= 4:
+                # New characters are mortals -- length only (no GM complexity).
+                policy_err = auth.password_policy_error(password, for_gm=False)
+                if policy_err is None:
                     break
-                self.send("Too short -- at least 4 characters. Try again:")
+                self.send(f"{policy_err} Try again:")
 
-            char = Character(name)
+            storage_key = identity_mod.allocate_storage_key(
+                self.game, given_name, surname
+            )
+            char = Character(storage_key)
+            identity_mod.stamp_new_identity(
+                char, self.game, given_name, surname
+            )
             char.password_hash = auth.hash_password(password)
             char.session = self       # so chargen prompts can reach the client
             self.character = char
+            # Staff `gm users` shows flags=creating while prompts continue;
+            # still NOT on game.sessions (no who / room broadcasts yet).
+            self._set_creating()
             # Staff ping as soon as the name+password stick -- before
             # chargen questions, so GMs see "is making a character…"
-            # while the player is still answering prompts.
+            # while the player is still answering prompts. IP clause is
+            # head_gm-only (see gm_notify.format_from).
             from engine import gm_notify
+            legal = identity_mod.legal_public_name(char, force_surname=True)
             gm_notify.ping_gms(
                 self.game,
-                f"{name} has connected{gm_notify.format_from(self)} "
+                f"{legal} has connected{{from}} "
                 "and is making a character...",
                 exclude=char,
+                peer_session=self,
             )
             if not await hooks.run_chargen(self, char):
                 # Client hung up mid-chargen -- do not place or persist.
@@ -576,9 +948,12 @@ class Session:
                 start_room = self.game.start_room
             char.chargen_start_room_key = None  # consumed -- one-shot only
             char.move_to(start_room)
-            self.game.sessions.append(self)   # register for 'who' and broadcasts
-            start_room.broadcast(f"{name} materializes.", exclude=char)
-            self.send(f"\r\nWelcome, {name}! Type 'help' for commands.")
+            self._promote_to_sessions()  # register for 'who' and broadcasts
+            start_room.broadcast(f"{legal} materializes.", exclude=char)
+            self.send(
+                f"\r\nWelcome, {legal}! Type 'help newbie' to get started "
+                f"(or 'help' for the topic list)."
+            )
             # Post-placement game content (path home stamp + tutorial, ...).
             # Must run AFTER move_to -- see set_after_new_character's
             # docstring on engine/hooks.py. Path home stamping lives in
@@ -588,7 +963,25 @@ class Session:
             # Same attach hook as reconnect (mail notify, …).
             hooks.after_session_attach(char, self.game)
 
-        self.game.save()              # persist the new/reconnected character now
+        # Persist now -- but never let a save bug kill the session before
+        # play(). Live hit: gear_bag rows + old CHECK (room|character only)
+        # raised IntegrityError here; Mudlet stayed connected with no
+        # command loop while the world kept ticking ("commands don't parse").
+        try:
+            self.game.save()
+        except Exception as exc:
+            print(
+                f"[connection] post-login save failed ({exc!r}) -- "
+                "entering play anyway",
+                flush=True,
+            )
+            try:
+                self.send(
+                    "(World save hiccup on login -- you are still in. "
+                    "Staff have been notified via the server log.)"
+                )
+            except Exception:
+                pass
         # Gateway: remember who is on this held socket for the next game boot.
         if self.character is not None:
             self._notify_gateway_bound(self.character.key)
@@ -604,7 +997,14 @@ class Session:
         here -- skipping the name/password prompt above entirely, since a
         copyover already knows who was on this socket before the reload.
         """
-        dispatch(self.character, "look", self.game)   # show them the room right away
+        try:
+            dispatch(self.character, "look", self.game)   # show them the room right away
+        except Exception:
+            # Same guard as the command loop below -- a look/weather bug must
+            # not kill the session on login (live: off-plane macro None crash).
+            import traceback
+            traceback.print_exc()
+            self.send("Something went wrong showing the room -- you are still in.")
 
         # ---- PLAYING STATE ----
         # Loop forever reading commands until the session stops being 'alive'.
@@ -621,9 +1021,15 @@ class Session:
                 # __init__'s comment on report_capture.
                 self._handle_report_capture_line(line)
                 continue
-            # Record the raw line BEFORE dispatch so a crash still lands in
-            # history; traceback stays None until the except block fills it.
-            entry = [line, None]
+            if self.help_edit is not None:
+                # HEDIT modal editor is active: every line is a buffer edit
+                # (/i, /d, /r, ...) or an appended body line, never a normal
+                # game command -- same gate shape as report_capture above.
+                self._handle_help_edit_line(line)
+                continue
+            # Record BEFORE dispatch so a crash still lands in history;
+            # redact setpass so plaintext never hits bug reports (H2).
+            entry = [history_line_for_storage(line), None]
             self.history.append(entry)
             # Classic snoop: GMs watching this character also see what they type.
             from engine import snoop
@@ -661,11 +1067,22 @@ class Session:
             from commands import _report_history
             description = "\n".join(self.report_capture["lines"]).strip()
             kind = self.report_capture["kind"]
+            # Optional generic prefix (e.g. cmd_helpsubmit stamps the
+            # proposed keyword ahead of the pasted body) -- not report-kind
+            # specific, any future paste-capture caller can use it.
+            prefix = self.report_capture.get("prefix")
             self.report_capture = None
             if not description:
                 self.send("Empty report -- nothing logged.")
                 return
-            noun = "bug report" if kind == reports.BUG else "suggestion"
+            if prefix:
+                description = f"{prefix}\n{description}"
+            if kind == reports.BUG:
+                noun = "bug report"
+            elif kind == reports.HELP:
+                noun = "help idea"
+            else:
+                noun = "suggestion"
             bug_filing.record_and_confirm(
                 self.character, kind, description,
                 _report_history(self.character), self.game.report_dir, noun,
@@ -676,6 +1093,161 @@ class Session:
             self.send("Cancelled -- nothing logged.")
             return
         self.report_capture["lines"].append(line)
+
+    def _handle_help_edit_line(self, line):
+        """One line while the HEDIT modal editor is active (see __init__'s
+        help_edit comment and engine.verbs.basic.cmd_hedit, which starts
+        it). A line starting with '/' is an editor command; anything else
+        is appended to the body buffer as-is -- same "plain text just
+        appends" UX as report_capture, plus modal line-editing commands
+        (docs/plans/helpfile_editing_system.md).
+        """
+        from engine import help_db, style
+
+        state = self.help_edit
+        stripped = line.strip()
+        if not stripped.startswith("/"):
+            state["body"].append(line)
+            self.send(f"[{len(state['body'])}] {line}")
+            return
+
+        parts = stripped[1:].split(maxsplit=1)
+        cmd = (parts[0].lower() if parts else "")
+        rest = parts[1] if len(parts) > 1 else ""
+
+        if cmd == "cancel":
+            self.help_edit = None
+            self.send(f"Cancelled editing '{state['keyword']}' -- nothing saved.")
+            return
+
+        if cmd == "list":
+            lines = [f"Editing '{state['keyword']}'  "
+                     f"(category={state['category'] or '-'}  "
+                     f"aliases={', '.join(state['aliases']) or '-'}  "
+                     f"gm_only={state['gm_only']}  is_ic={state['is_ic']})"]
+            if state["syntax"]:
+                lines.append("Syntax:")
+                for i, s in enumerate(state["syntax"], start=1):
+                    lines.append(f"  s{i}: {s}")
+            lines.append("Body:")
+            if not state["body"]:
+                lines.append("  (empty)")
+            for i, b in enumerate(state["body"], start=1):
+                lines.append(f"  {i}: {b}")
+            self.send("\r\n".join(lines))
+            return
+
+        if cmd == "i":
+            sub = rest.split(maxsplit=1)
+            if len(sub) != 2 or not sub[0].isdigit():
+                self.send("Usage: /i <line> <text>")
+                return
+            pos = int(sub[0])
+            if pos < 1 or pos > len(state["body"]) + 1:
+                self.send(f"Line must be between 1 and {len(state['body']) + 1}.")
+                return
+            state["body"].insert(pos - 1, sub[1])
+            self.send(f"Inserted at line {pos}.")
+            return
+
+        if cmd == "d":
+            if not rest.strip().isdigit():
+                self.send("Usage: /d <line>")
+                return
+            pos = int(rest.strip())
+            if pos < 1 or pos > len(state["body"]):
+                self.send(f"No line {pos} -- body has {len(state['body'])} lines.")
+                return
+            removed = state["body"].pop(pos - 1)
+            self.send(f"Deleted line {pos}: {removed}")
+            return
+
+        if cmd == "r":
+            sub = rest.split(maxsplit=1)
+            if len(sub) != 2:
+                self.send("Usage: /r <pattern> <replacement>")
+                return
+            pattern, replacement = sub
+            try:
+                joined = re.sub(pattern, replacement, "\n".join(state["body"]))
+            except re.error as exc:
+                self.send(f"Bad regex: {exc}")
+                return
+            state["body"] = joined.split("\n")
+            self.send("Replaced.")
+            return
+
+        if cmd == "syntax":
+            if not rest:
+                self.send("Usage: /syntax <text>")
+                return
+            state["syntax"].append(rest)
+            self.send(f"Syntax line {len(state['syntax'])} added.")
+            return
+
+        if cmd == "category":
+            state["category"] = rest.strip()
+            self.send(f"Category set to '{state['category']}'.")
+            return
+
+        if cmd == "alias":
+            alias = rest.strip().lower()
+            if not alias:
+                self.send("Usage: /alias <name>")
+                return
+            if alias not in state["aliases"]:
+                state["aliases"].append(alias)
+            self.send(f"Aliases: {', '.join(state['aliases'])}")
+            return
+
+        if cmd == "gm":
+            state["gm_only"] = not state["gm_only"]
+            self.send(f"gm_only is now {state['gm_only']}.")
+            return
+
+        if cmd == "ic":
+            state["is_ic"] = not state["is_ic"]
+            self.send(f"is_ic is now {state['is_ic']}.")
+            return
+
+        if cmd == "preview":
+            body_lines = list(state["body"])
+            if state["syntax"]:
+                body_lines = [f"Syntax: {s}" for s in state["syntax"]] + [""] + body_lines
+            framed = style.format_tome(
+                state["keyword"], body_lines,
+                screenreader=bool(getattr(self.character, "screenreader", False)),
+            )
+            self.send("\r\n".join(framed))
+            return
+
+        if cmd == "save":
+            if not state["body"]:
+                self.send("Nothing to save -- body is empty. /cancel to abort.")
+                return
+            entry = help_db.save_entry(
+                self.game.db,
+                keyword=state["keyword"],
+                category=state["category"],
+                body_text="\n".join(state["body"]),
+                syntax_block="\n".join(state["syntax"]),
+                aliases=state["aliases"],
+                gm_only=state["gm_only"],
+                is_ic=state["is_ic"],
+                author=getattr(self.character, "key", "?"),
+            )
+            self.help_edit = None
+            self.send(
+                f"Saved help page '{entry['primary_keyword']}' "
+                f"({len(state['body'])} body lines). It now overrides any "
+                "static page of the same name."
+            )
+            return
+
+        self.send(
+            "Unknown editor command. Try: /list /i /d /r /syntax /category "
+            "/alias /gm /ic /preview /save /cancel"
+        )
 
     def _take_over_session(self, character):
         """Kick the live Session on ``character`` so this login can attach.
@@ -699,6 +1271,8 @@ class Session:
             pass
         # Stop the old play loop; clear the Character link before close so
         # a later old.disconnect() is a no-op for Echo broadcast.
+        from engine import hooks
+        hooks.on_session_disconnect(character, self.game, to_echo=False)
         old.alive = False
         old.character = None
         character.session = None
@@ -718,65 +1292,89 @@ class Session:
         # an invulnerable, session-less figure — so we detach the session but
         # deliberately do NOT remove the character from its room.
         self.alive = False
-        # Capture name + peer before we clear session / leave sessions list,
+        # Capture name before we clear session / leave sessions list,
         # so the staff ping still has a readable label (mid-chargen included).
+        # Peer IP is filled per recipient at ping time (head_gm only).
         disconnect_name = None
-        disconnect_from = ""
         leaving = self.character
         if leaving is not None:
-            disconnect_name = leaving.key
-            from engine import gm_notify
-            disconnect_from = gm_notify.format_from(self)
+            # Public face for staff ping -- never gmspirit:/husk: keys.
+            from engine.command_support import _presence_face
+            disconnect_name = _presence_face(leaving)
         if self.character:
             # Drop any snoop THIS character was running (they're leaving);
             # keep snoopers aimed *at* them -- an Echo is still watchable.
             from engine import snoop
             snoop.stop(self.character, quiet=True)
-            # Exit GM form first so the resting-form prop is cleaned up and
-            # the Echo rematerializes at the body they left (not mid-map).
-            # Inlined (no supers import -- engine stays game-agnostic).
-            if getattr(self.character, "gm_mode", False):
+            from engine import hooks
+            hooks.on_session_disconnect(self.character, self.game)
+            # Drop GM staff spirit on logout: body is already a Cadence Echo.
+            # Destroy the ephemeral spirit but KEEP gm_away + gm_staff_form
+            # so reconnect / copyover can restore `gm on` (no second playable
+            # body). Inlined (no supers import -- engine stays game-agnostic).
+            if getattr(self.character, "gm_mode", False) or getattr(
+                self.character, "gm_spirit", False
+            ):
                 body = getattr(self.character, "gm_mode_body", None)
-                body_room = getattr(self.character, "gm_mode_body_room", None)
-                if (
-                    body_room is not None
-                    and body is not None
-                    and body in getattr(body_room, "contents", [])
+                body_key = getattr(self.character, "gm_body_key", None)
+                if body is None and body_key:
+                    for obj in getattr(self.game, "characters", ()) or ():
+                        if getattr(obj, "key", None) == body_key:
+                            body = obj
+                            break
+                if body is not None:
+                    # Intent survives quit -- body stays true-invis Echo.
+                    body.gm_away = True
+                    body.gm_staff_form = True
+                    body.gm_spirit_key = None
+                    # Remember watch-room so reconnect restores there
+                    # (not over wherever Cadence walked the Echo).
+                    watch = getattr(self.character, "location", None)
+                    if watch is not None and getattr(watch, "key", None):
+                        body.gm_spirit_room_key = watch.key
+                    # Staff ping should name the real login, not gmspirit:Key.
+                    from engine.command_support import _presence_face
+                    disconnect_name = _presence_face(body)
+                    leaving = body
+                # Despawn the spirit Character (Room.remove unregisters).
+                spirit = self.character
+                spirit.gm_mode = False
+                spirit.gm_spirit = False
+                spirit.gm_mode_body = None
+                spirit.gm_body_key = None
+                spirit_room = getattr(spirit, "location", None)
+                if spirit_room is not None and spirit in getattr(
+                    spirit_room, "contents", []
                 ):
-                    body_room.remove(body)
-                # Sweep orphaned resting props tagged for this character.
-                owner = self.character.key
-                for room in self.game.rooms.values():
-                    for obj in list(room.contents):
-                        if (
-                            getattr(obj, "gm_resting_form", False)
-                            and getattr(obj, "gm_resting_owner", None) == owner
-                        ):
-                            if body_room is None:
-                                body_room = room
-                            room.remove(obj)
-                if body_room is not None and self.character.location is not body_room:
-                    self.character.move_to(body_room)
-                self.character.gm_mode = False
-                self.character.gm_mode_body = None
-                self.character.gm_mode_body_room = None
-            self.character.session = None    # the character is now an Echo
-            break_follows(self.character)
-            if self.character.location:
-                # session is already None, so the Echo itself can't receive this.
-                self.character.location.broadcast(
-                    f"{self.character.key} goes still, leaving only an echo."
-                )
+                    spirit_room.remove(spirit)
+                # Body is already session-less -- leave it as Echo. No
+                # "goes still" broadcast (body already looks like an Echo).
+                spirit.session = None
+                self.character = None
+                break_follows(spirit)
+            else:
+                self.character.session = None    # the character is now an Echo
+                break_follows(self.character)
+                if self.character.location:
+                    # session is already None, so the Echo itself can't receive this.
+                    # Public face -- never raw storage keys in room traffic.
+                    from engine.command_support import _presence_face
+                    face = _presence_face(self.character)
+                    self.character.location.broadcast(
+                        f"{face} goes still, leaving only an echo."
+                    )
         if self in self.game.sessions:
             self.game.sessions.remove(self)
+        self._leave_connecting()
         # Staff ping after dropping from sessions so the leaver is not in
         # the recipient walk; exclude= still guards FakeSession edge cases.
         if disconnect_name:
             from engine import gm_notify
             gm_notify.ping_gms(
                 self.game,
-                f"{disconnect_name} has disconnected{disconnect_from}.",
+                f"{disconnect_name} has disconnected{{from}}.",
                 exclude=leaving,
+                peer_session=self,
             )
         self.game.save()              # persist the Echo's final position/inventory
         # Gateway: drop the public TCP on intentional quit / client EOF path.

@@ -20,36 +20,35 @@ from collections import deque
 
 import persistence
 from engine import bug_webhook  # noqa: F401 -- loads webhook helpers (GM squashbugs)
+from engine import discord_bridge  # noqa: F401 -- tagged Discord radio bridge
 from engine import copyover
 from world import build_world, Character
 from engine.connection import Session
+# Tick pipeline is generic engine infrastructure (two-repo purity Stage 1):
+# a lean engine boot gets a working (empty) tick loop even with SUPERS absent.
+from engine.tick_registry import run_ticks, run_ticks_async
+# game_select is the single choke point that picks SUPERS, basegame, or a
+# lean engine (RIFTFORGE_GAME) -- see game_select.py's docstring. Nothing
+# else in server.py imports `supers` or `basegame` directly.
+import game_select
 
-# Soft-optional SUPERS: register hooks / ticks only when the game package
-# is installed. Lean engine smoke renames supers/ aside and still imports us.
-_HAS_SUPERS = False
-register_all_hooks = None
-register_default_ticks = None
-run_ticks = None
+# _HAS_SUPERS specifically means "SUPERS is the active game" -- it still
+# gates every SUPERS-only boot backfill below (homesteads, gathering,
+# personal realms, Cadence gm-spirit purge, ...) exactly as before, since
+# none of those have a basegame equivalent yet. make_training_dummy is a
+# SUPERS-content helper (world.py), not something basegame provides.
+_HAS_SUPERS = game_select.game_name() == "supers"
 make_training_dummy = None
-
-try:
-    from supers.bootstrap import register_all_hooks as _register_all_hooks
-    from supers.tick_bootstrap import register_default_ticks as _register_default_ticks
-    from supers.tick_registry import run_ticks as _run_ticks
+if _HAS_SUPERS:
     from world import make_training_dummy as _make_training_dummy
-
-    register_all_hooks = _register_all_hooks
-    register_default_ticks = _register_default_ticks
-    run_ticks = _run_ticks
     make_training_dummy = _make_training_dummy
-    _HAS_SUPERS = True
-except ImportError:
-    pass
+
+register_all_hooks = game_select.register_all_hooks
+register_default_ticks = game_select.register_default_ticks
 
 # Game registers Character attach, persist blob, chargen, and help before any
 # Character is constructed (docs/ENGINE_CONSUMER.md).
-if _HAS_SUPERS and register_all_hooks is not None:
-    register_all_hooks()
+register_all_hooks()
 
 # Milestone E (a live player suggestion, section 4-E's pacing follow-up):
 # a compressed in-game clock so the world has a sense of elapsed time
@@ -70,6 +69,10 @@ class Game:
     def __init__(self, db_path="riftforge.db"):
         # db_path is a parameter so the smoke test can point it at a throwaway
         # file (or ":memory:") instead of the real save file.
+        # Prove life before the potentially long build_world / load_world
+        # path so hang recovery does not treat a slow boot as a freeze.
+        from engine import game_heartbeat
+        game_heartbeat.touch_heartbeat("game_init")
         # Live Character roster (engine/char_index.py). RoomMap stamps
         # room.game on every insert so Room.add/remove keep the set
         # truthful (including procedural dungeons and smoke ad-hoc rooms).
@@ -85,11 +88,17 @@ class Game:
         import maps as maps_module
         self.map_registry = dict(maps_module.LAST_MAP_REGISTRY)
         self.sessions = []                # every connected Session (starts empty)
+        # Mid-login / mid-chargen sockets that are NOT on `sessions` yet.
+        # `gm users` lists these with flags=login|creating; public `who`
+        # and room broadcasts still use `sessions` only (no half-made Echo).
+        self.connecting_sessions = []
         # Wall-clock unix time of this process boot -- MSSP UPTIME (engine/mssp.py).
         # Not persisted; resets on every restart / copyover process spawn.
         self.started_at = time.time()
         # Global OOC ring buffer: bare `ooc` shows the last 20 channel lines.
-        # In-memory only -- clears on restart / copyover (not a persistent log).
+        # Kept in meta via save_ooc_history so copyover / restart keep recent
+        # chat (still a short ring — not a forever log). Refilled after db
+        # connect below.
         self.ooc_history = deque(maxlen=20)
         # Where bug_reports.log / suggestions.log / help_misses.log live.
         # Same directory as the save file so Docker's host volume keeps
@@ -120,22 +129,94 @@ class Game:
             self.calendar_epoch_day = max(0, int(stored_epoch))
         game_calendar.set_active_epoch_day_offset(self.calendar_epoch_day)
         # Lean / pre-seed defaults so the first save() (fresh world) never
-        # trips AttributeError in persistence.save_moral_state. SUPERS boot
-        # overwrites these from DB / balance.ensure_game_defaults below.
+        # trips AttributeError in persistence.save_moral_state. Persisted
+        # meta is loaded immediately below -- BEFORE any save() -- so boot
+        # backfills (training dummy, head_gm, …) cannot wipe plane banks,
+        # World Tide, gmworld lifetime tallies, or death beacons.
         self.vampire_townsfolk_kills = 0
         self.moral_balance = 0
+        self.heaven_soul_count = 0
+        self.hell_soul_count = 0
+        # Physical phone number allocator (supers/phone.py); 555-XXXX.
+        self.next_phone_seq = 1000
+        self.hue_courts = {}
+        self.death_beacons = {}
+        # Chuck Author mantle-resume (meta JSON; idle until load/restore).
+        self.author_mantle_event = {}
         self.eclipse_until_tick = 0
         self.moral_event_cooldown_until = 0
         self.moral_maxed_side = None
         self.moral_maxed_since_tick = 0
         self.moral_last_casualty_tick = 0
         self.moral_scout_cooldown_until = 0
+        # Host/Infernal holy war (gm holywar) -- default OFF until staff
+        # flips it; later becomes a scheduled world event outside Tide.
+        self.holy_war_active = False
         self.rumor_boards = {}
+        # GM gmworld lifetime counters (haunts / missions / tips / …).
+        self.lifetime_stats = {}
+        # Lebanon Adoption Agency weekly board (supers/pet.py).
+        self.pet_adoption = {}
+        # GM Cadence chance overrides (``gm chances``) -- empty = defaults.
+        self.cadence_chances = {}
+        # GM Cadence scale / LOD / priority (``gm cadence``) -- empty = defaults.
+        self.cadence_scale = {}
+        # GM immortal incap stun overrides (``gm incap``) -- empty = defaults.
+        self.incap_tuning = {}
+        # GM outgoing damage soft-cap (``gm outgoing``) -- empty = defaults.
+        self.outgoing_damage_tuning = {}
+        # GM nest/hub body decay TTLs (``gm bodydecay``) -- empty = defaults.
+        self.corpse_decay_tuning = {}
+        # GM Hell exile TTL (``gm hellexile``) -- empty = defaults.
+        self.hell_exile_tuning = {}
+        # GM Purgatory pit loot knobs (``gm pit drops``) -- empty = defaults.
+        self.pit_drop_tuning = {}
+        # GM runtime verb blocks (``gm disable <verb>``) -- in-memory toggle set.
+        self.disabled_verbs = set()
+        self.homestead_plots = {}
+        self.gather_nodes = {}
+        self.personal_realms = {}
+        self._load_persisted_meta()
+
+        # Hot-loaded deferred maps (gm maps load) — restore BEFORE
+        # load_world so characters saved inside Lebanon / etc. still have
+        # rooms. See supers/map_runtime.py + runtime_maps.json.
+        # ensure_deferred_maps_for_saved_rooms covers the Area Studio case
+        # where zone JSON exists but runtime_maps.json was never written.
+        if _HAS_SUPERS:
+            from supers import map_runtime as map_runtime_mod
+            map_runtime_mod.restore_runtime_maps(self)
+            map_runtime_mod.ensure_deferred_maps_for_saved_rooms(self)
+
+        # D41: rebuild homestead pockets + gather nodes BEFORE load_world
+        # so character room_key / floor items inside a shack resolve.
+        if _HAS_SUPERS:
+            from supers import homestead as homestead_mod
+            from supers import gathering as gathering_mod
+            homestead_mod.load_homesteads(self.db, self)
+            gathering_mod.load_gather_nodes(self.db, self)
+            from supers import personal_realm as personal_realm_mod
+            personal_realm_mod.load_personal_realms(self.db, self)
 
         if persistence.is_seeded(self.db):
             # A returning world: restore every character (as an Echo) and every
             # item to wherever they were when the server last saved.
             persistence.load_world(self.db, self)
+            # Drop any zombie gmspirit: rows that older saves still had
+            # (load also skips them; this covers in-memory leftovers).
+            if _HAS_SUPERS:
+                try:
+                    from supers import cadence as cadence_mod
+                    cadence_mod.purge_orphan_gm_spirits(self)
+                except Exception:
+                    # Boot cleanup is best-effort, but a failure here means
+                    # zombie gmspirit rows may linger -- log it instead of
+                    # hiding it so staff can see the world came up dirty.
+                    print(
+                        "[server] purge_orphan_gm_spirits failed during load:",
+                        flush=True,
+                    )
+                    traceback.print_exc()
         else:
             # Brand-new world: place the starter items, then record that we did
             # so they're never placed again (see build_world's docstring).
@@ -146,104 +227,24 @@ class Game:
 
         if _HAS_SUPERS:
             self._seed_supers_content()
+        elif game_select.game_name() == "basegame":
+            game_select.seed_content(self)
+            register_default_ticks(self)
         else:
-            # Lean engine: rumor boards from meta only (no Cadence seed).
-            self.rumor_boards = persistence.load_rumor_boards(self.db)
+            # Lean engine: rumor boards already loaded in _load_persisted_meta.
+            pass
 
-    def _seed_supers_content(self):
-        """Idempotent SUPERS backfills (dummy, Cadence, immersion, ticks).
+    def _load_persisted_meta(self):
+        """Load Game meta counters from SQLite before any boot save().
 
-        Only called when the supers package imported successfully at boot.
+        ``Game.save()`` always writes plane soul banks, moral state,
+        lifetime_stats, death beacons, hue courts, and rumor boards. Boot
+        used to set those fields to empty defaults, then call ``save()``
+        while backfilling the training dummy / head GM -- which wrote
+        zeros over live Heaven/Hell tallies (and could wipe Tide /
+        gmworld lifetime too). Load first; defaults above only apply when
+        meta keys are missing (fresh world).
         """
-        # Milestone 5b: backfill the training dummy idempotently, NOT as
-        # first-boot seed content -- a database seeded before this feature
-        # existed (e.g. the real riftforge.db) already took the "if not
-        # seeded" branch above and would otherwise never get one. Checking
-        # "does it already exist" instead of "is this a fresh database"
-        # handles both a brand-new world AND an old save the same way.
-        dummy = self.find_character("a training dummy")
-        if not dummy:
-            dummy = make_training_dummy()
-            dummy.move_to(self.start_room)
-            self.save()
-        elif not dummy.spar_only:
-            # Self-healing (same spirit as persistence.py's float-drift
-            # round() fix): a dummy saved before Milestone F added
-            # spar_only loads with the field defaulted to False, which
-            # would silently let a real lethal 'attack' through against
-            # it instead of redirecting to sparring. Patch it back once.
-            dummy.spar_only = True
-            self.save()
-
-        # GM/admin tooling: the same idempotent-backfill shape as the training
-        # dummy above, for the same reason -- a database seeded (or even just
-        # played on) before this feature existed will never take a "first
-        # Head-GM bootstrap: if nobody holds head_gm yet and a character
-        # named "Wits" exists without a rank, grant her head_gm. Immersion
-        # cast members may already hold ordinary "gm" -- that must not block
-        # the head-GM backfill (they are catalog staff, not the live head).
-        all_characters = list(self.characters)
-        has_head = any(
-            getattr(c, "gm_rank", None) == "head_gm" for c in all_characters
-        )
-        if not has_head:
-            wits = self.find_character("Wits")
-            if wits is not None and not wits.gm_rank:
-                wits.gm_rank = "head_gm"
-                self.save()
-
-        # Cadence town simulation (docs/SYSTEMS_DESIGN.md D33 slice): place
-        # every rostered town NPC (content/npcs/*.json) not already in the
-        # world. Same idempotent-backfill shape as the training dummy above,
-        # for the same reason -- this must also backfill an existing save
-        # that predates (or just hasn't yet authored) a given townsperson.
-        from supers import cadence
-        from supers import lodging
-        cadence.ensure_town_npcs(self)
-        # Immersion GM cast (Buffy / Constantine / …): git-tracked JSON
-        # under content/immersion/ -- create-or-update on every boot so
-        # live/local DBs no longer need per-character seed scripts.
-        from supers import immersion as immersion_mod
-        immersion_mod.ensure_all(self)
-        # Awakened Nature homezone tutorial mentors (Marrow/Seraphiel/
-        # Ashmouth/Gorge/Emberwake): same idempotent-backfill shape as
-        # immersion cast -- seed once, skip if already present.
-        from supers import tutorial as tutorial_mod
-        tutorial_mod.ensure_mentors(self)
-        # Mission givers (Bobby, …): validate portal rooms + stamp
-        # mission_giver onto rostered NPCs after Cadence seeds them.
-        from supers import missions as missions_mod
-        missions_mod.ensure_givers(self)
-        # Singer House: vampire_safe + salt/iron/devil's-trap wards.
-        from supers import singer_house as singer_house_mod
-        singer_house_mod.ensure_singer_house_wards(self)
-        # Lodging: backfill bed furniture on long-lived DBs, then stamp
-        # roster home beds so Cadence prefers owned beds.
-        lodging.ensure_beds(self)
-        lodging.assign_roster_bed_owners(self)
-        # Retroactive home_zone / home_room_key heal for players + Echoes
-        # created before path stamps (Vagan/Velan wilderness stuck case).
-        cadence.heal_all_home_anchors(self)
-        # Home grocery stock: backfill refrigerator furniture on is_house
-        # rooms (long-lived DBs / maps that predate fridge seed_items).
-        from supers import grocery as grocery_mod
-        grocery_mod.ensure_fridges(self)
-        # Buffy/Angel easter egg: mutual lovers + Angel's mausoleum home
-        # when both characters exist (idempotent; no-op otherwise).
-        # Faith: mutual friends with Buffy and Angel when she exists.
-        # (ensure_all already runs bond helpers; keep these for older
-        # call-order safety if ensure_all is ever skipped.)
-        from supers import relationships as relationships_mod
-        relationships_mod.ensure_buffy_angel_bond(self)
-        relationships_mod.ensure_faith_bonds(self)
-        relationships_mod.ensure_illyria_bonds(self)
-        relationships_mod.ensure_winchester_bonds(self)
-        relationships_mod.ensure_constantine_bonds(self)
-        # Cadence #50: Vampire townsfolk-kill counter for hunter escalation.
-        self.vampire_townsfolk_kills = 0
-        # Evil Strikes Back: world Good/Evil meter + eclipse (meta table).
-        from supers import balance as balance_module
-        balance_module.ensure_game_defaults(self)
         moral = persistence.load_moral_state(self.db)
         self.moral_balance = moral["moral_balance"]
         self.eclipse_until_tick = moral["eclipse_until_tick"]
@@ -260,8 +261,317 @@ class Game:
         self.moral_scout_cooldown_until = moral.get(
             "moral_scout_cooldown_until", 0
         )
-        # D63 player rumor boards (meta JSON; separate from Cadence gossip).
+        self.holy_war_active = bool(moral.get("holy_war_active", False))
+        plane_souls = persistence.load_plane_soul_counts(self.db)
+        self.heaven_soul_count = plane_souls["heaven_soul_count"]
+        self.hell_soul_count = plane_souls["hell_soul_count"]
+        self.next_phone_seq = plane_souls.get("next_phone_seq", 1000) or 1000
+        self.hue_courts = persistence.load_hue_courts(self.db)
+        self.death_beacons = persistence.load_death_beacons(self.db)
+        # Chuck Author mantle-resume event (phase survives copyover).
+        self.author_mantle_event = persistence.load_author_mantle_event(
+            self.db
+        )
+        # Recent OOC lines (bare `ooc` replay) — survive copyover / restart.
+        for _ooc_line in persistence.load_ooc_history(self.db):
+            self.ooc_history.append(_ooc_line)
         self.rumor_boards = persistence.load_rumor_boards(self.db)
+        raw_lifetime = persistence.load_lifetime_stats(self.db)
+        if _HAS_SUPERS:
+            from supers import world_stats as world_stats_mod
+            self.lifetime_stats = world_stats_mod.normalize_loaded(
+                raw_lifetime
+            )
+        else:
+            self.lifetime_stats = raw_lifetime or {}
+        raw_pet_adoption = persistence.load_pet_adoption(self.db)
+        if _HAS_SUPERS:
+            from supers import pet as pet_mod
+            self.pet_adoption = pet_mod.normalize_adoption_stock(
+                raw_pet_adoption
+            )
+            pet_mod.ensure_adoption_stock(self)
+        else:
+            self.pet_adoption = raw_pet_adoption or {}
+        raw_chances = persistence.load_cadence_chances(self.db)
+        if _HAS_SUPERS:
+            from supers import cadence_chances as chances_mod
+            self.cadence_chances = chances_mod.normalize_loaded(raw_chances)
+        else:
+            self.cadence_chances = raw_chances or {}
+        raw_scale = persistence.load_cadence_scale(self.db)
+        if _HAS_SUPERS:
+            from supers import cadence_scale as scale_mod
+            self.cadence_scale = scale_mod.normalize_loaded(raw_scale)
+        else:
+            self.cadence_scale = raw_scale or {}
+        raw_wfs = persistence.load_winchester_failsafe(self.db)
+        if _HAS_SUPERS:
+            from supers import winchester_failsafe as wfs_mod
+            self.winchester_failsafe = raw_wfs or {}
+            wfs_mod.ensure_game_state(self)
+            wfs_mod.restore_active_job_stamps(self)
+        else:
+            self.winchester_failsafe = raw_wfs or {}
+        raw_cairport = persistence.load_cadence_airport(self.db)
+        if _HAS_SUPERS:
+            from supers import cadence_airport as cairport_mod
+            self.cadence_airport = raw_cairport or {}
+            cairport_mod.ensure_game_state(self)
+        else:
+            self.cadence_airport = raw_cairport or {}
+        raw_incap = persistence.load_incap_tuning(self.db)
+        if _HAS_SUPERS:
+            from supers import incap_tuning as incap_tuning_mod
+            self.incap_tuning = incap_tuning_mod.normalize_loaded(raw_incap)
+        else:
+            self.incap_tuning = raw_incap or {}
+        raw_outgoing = persistence.load_outgoing_damage_tuning(self.db)
+        if _HAS_SUPERS:
+            from supers import outgoing_damage_tuning as outgoing_mod
+            self.outgoing_damage_tuning = outgoing_mod.normalize_loaded(
+                raw_outgoing
+            )
+        else:
+            self.outgoing_damage_tuning = raw_outgoing or {}
+        raw_bodydecay = persistence.load_corpse_decay_tuning(self.db)
+        if _HAS_SUPERS:
+            from supers import corpse_decay_tuning as bodydecay_mod
+            self.corpse_decay_tuning = bodydecay_mod.normalize_loaded(
+                raw_bodydecay
+            )
+        else:
+            self.corpse_decay_tuning = raw_bodydecay or {}
+        raw_hellexile = persistence.load_hell_exile_tuning(self.db)
+        if _HAS_SUPERS:
+            from supers import hell_exile_tuning as hellexile_mod
+            self.hell_exile_tuning = hellexile_mod.normalize_loaded(
+                raw_hellexile
+            )
+        else:
+            self.hell_exile_tuning = raw_hellexile or {}
+        raw_pit_drops = persistence.load_pit_drop_tuning(self.db)
+        if _HAS_SUPERS:
+            from supers.purgatory_dungeon import drop_tuning as pit_drops_mod
+            self.pit_drop_tuning = pit_drops_mod.normalize_loaded(raw_pit_drops)
+        else:
+            self.pit_drop_tuning = raw_pit_drops or {}
+
+    def _seed_supers_content(self):
+        """Idempotent SUPERS backfills (dummy, Cadence, immersion, ticks).
+
+        Only called when the supers package imported successfully at boot.
+        """
+        # Milestone 5b: backfill the training dummy idempotently, NOT as
+        # first-boot seed content -- a database seeded before this feature
+        # existed (e.g. the real riftforge.db) already took the "if not
+        # seeded" branch above and would otherwise never get one. Checking
+        # "does it already exist" instead of "is this a fresh database"
+        # handles both a brand-new world AND an old save the same way.
+        dummy = self.find_character("a training dummy")
+        if not dummy:
+            dummy = make_training_dummy()
+            # Gym floor -- Plaza is no_loiter (NPCs / dummies cannot stand there).
+            from supers import starter_town as starter_town_mod
+            gym = self.rooms.get(starter_town_mod.GYM_KEY) or self.start_room
+            dummy.move_to(gym)
+            self.save()
+        elif not dummy.spar_only:
+            # Self-healing (same spirit as persistence.py's float-drift
+            # round() fix): a dummy saved before Milestone F added
+            # spar_only loads with the field defaulted to False, which
+            # would silently let a real lethal 'attack' through against
+            # it instead of redirecting to sparring. Patch it back once.
+            dummy.spar_only = True
+            self.save()
+
+        # Head GM is never auto-granted from a hard-coded name (pen-test C2).
+        # Promote via an existing head GM, or seed gm_rank in the DB / a
+        # one-shot ops script — Game.__init__ must not mint staff ranks.
+        # Once a character already holds head_gm, boot ensures T4 God-level
+        # staff powers without rewriting their play Path (Reaper ferry OK).
+        from supers import creation as creation_mod
+        if creation_mod.ensure_all_head_gm_mantles(self):
+            self.save()
+
+        # Cadence town simulation (docs/SYSTEMS_DESIGN.md D33 slice): place
+        # every rostered town NPC (content/npcs/*.json) not already in the
+        # world. Same idempotent-backfill shape as the training dummy above,
+        # for the same reason -- this must also backfill an existing save
+        # that predates (or just hasn't yet authored) a given townsperson.
+        from supers import cadence
+        from supers import lodging
+        from supers import npc_appearance as npc_appearance_mod
+        npc_appearance_mod.heal_all_npc_appearances(self, catalogs_only=True)
+        cadence.ensure_town_npcs(self)
+        # Immersion GM cast (Buffy / Constantine / …): git-tracked JSON
+        # under content/immersion/ -- create-or-update on every boot so
+        # live/local DBs no longer need per-character seed scripts.
+        from supers import immersion as immersion_mod
+        immersion_mod.ensure_all(self)
+        npc_appearance_mod.heal_all_npc_appearances(self, live_only=True)
+        # You are what you drive: Cadence/immersion random rides + live
+        # owned vehicle interiors (idempotent).
+        from supers import vehicle_kit as vehicle_kit_mod
+        vehicle_kit_mod.ensure_all_owned_vehicles(self)
+        # Cabin self-park soft-lock: parked_room must never be Inside …
+        # (ensure used to stamp curb from a body restored into its cabin).
+        from supers import vehicles as vehicles_mod
+        vehicles_mod.heal_cabin_self_parks(self)
+        vehicles_mod.heal_invalid_indoor_parks(self)
+        # Older saves kept interior room_key but not in_vehicle -- relink
+        # so leave/drive work (Dean stuck in Sam's Suburban, etc.).
+        vehicles_mod.heal_vehicle_board_state(self)
+        # Strip Cadence cars wrongly stamped onto living husks (live
+        # husk:Crowley Toyota + who title leak). After ensure so we
+        # clear persisted kits that ensure would otherwise rehydrate.
+        vehicle_kit_mod.heal_living_husk_vehicles(self)
+        # Lebanon starter transplant: yank bodies off wastes-town / old
+        # bunker road onto Lebanon Square / America (35,11).
+        from supers import starter_town as starter_town_mod
+        starter_town_mod.heal_lebanon_transplant(self)
+        # Purge resurrected Neighborhood*House* template interiors (and
+        # rewrite lebanon.json / map backup) so live protect cannot keep
+        # bringing them back.
+        starter_town_mod.heal_lebanon_orphan_template_houses(self)
+        # Civic look titles (Lebanon Pawn Shop, Town Clinic, …) -- keep
+        # storage keys stable while look_title never leaks unowned shopN.
+        starter_town_mod.heal_lebanon_civic_titles(self)
+        # Sheriff dig typos → office + Cell A/B; seat Deputy Vale at desk.
+        starter_town_mod.heal_sheriff_office(self)
+        starter_town_mod.heal_sewer_evil_zones(self)
+        # Lawrence house lots: numbered street exits (415 → porch). Old
+        # cardinal dig left only the last porch reachable from the curb.
+        from supers import lawrence_town as lawrence_town_mod
+        lawrence_town_mod.heal_lawrence_lot_exits(self)
+        # Legal name + CNUM backfill (legacy bodies get given_name from key).
+        from engine import char_identity as char_identity_mod
+        char_identity_mod.heal_all_character_identities(self)
+        # Dual-layer America overland: migrate legacy cell occupancy to
+        # macro/micro virtual presence (never deletes characters).
+        from supers import overland as overland_mod
+        overland_mod.heal_dual_layer_positions(self)
+        # Yank Cadence bodies stranded far on the America foot grid
+        # (Faith/Buffy/Riot soft-lock after Lebanon adoption).
+        overland_mod.heal_stranded_overland_cadence(self)
+        # Immersion catalog re-stamps Chuck mortal_conceal=true every boot.
+        # If an Author mantle event was mid-flight, quietly re-reveal /
+        # respawn the Unmade shade so copyover does not erase lore.
+        from supers import author_event as author_event_mod
+        author_event_mod.restore_after_boot(self)
+        # Clear vessel_host_key / possessed_by that point at missing bodies
+        # (despawned husk, pre-rename save, etc.) so spirits are not stuck.
+        from supers import vessel as vessel_mod
+        vessel_mod.heal_dangling_possession(self)
+        from supers import personal_realm as personal_realm_mod
+        personal_realm_mod.heal_personal_realm_invariants(self)
+        # Repair Mantle + living-husk desync (dual-corporeal after an
+        # older Item-only spirit body relink) -- Castiel walking while
+        # Jimmy is also vacant/corporeal.
+        vessel_mod.heal_living_husk_invariants(self)
+        # Migrate legacy soft gm fold (body still in room) into hard vault.
+        from supers import fold_vault as fold_vault_mod
+        fold_vault_mod.heal_soft_folded_to_vault(self)
+        # Permanent pets: clear dangling bonds / park ownerless strays.
+        from supers import pet as pet_mod
+        pet_mod.heal_pet_invariants(self)
+        # Awakened Nature homezone tutorial mentors (Marrow/Seraphiel/
+        # Ashmouth/Gorge/Emberwake): same idempotent-backfill shape as
+        # immersion cast -- seed once, skip if already present.
+        from supers import tutorial as tutorial_mod
+        tutorial_mod.ensure_mentors(self)
+        # Copyover boot: vault unfinished homezone lessons before classic
+        # execv reattach. Gateway mode defers this until after welcome
+        # reattach (gateway_client) so held TCP clients are not vaulted
+        # while still connected -- session is never persisted, so every
+        # body looks offline at Game.__init__.
+        from engine.gateway_client import gateway_enabled
+
+        if not gateway_enabled():
+            tutorial_mod.heal_incomplete_tutorial_offline(self)
+        # Plane Temper (and other authored) drill motes -- ephemeral hostiles
+        # vanish across restart; re-seed any active opener's spawns.
+        from supers import quests as quests_mod
+        quests_mod.ensure_active_quest_spawns(self)
+        # Mission givers (Bobby, …): validate portal rooms + stamp
+        # mission_giver onto rostered NPCs after Cadence seeds them.
+        from supers import missions as missions_mod
+        missions_mod.ensure_givers(self)
+        # Mid-delve copyover/restart: ephemeral stronghold/procedural rooms
+        # die; persistence stubs trap hunters until we evacuate to the board.
+        missions_mod.heal_all_orphaned_ephemeral_locations(self)
+        from supers.purgatory_dungeon import floor as pit_floor_mod
+        pit_floor_mod.heal_orphaned_pit_rooms(self)
+        # Singer House: vampire_safe + salt/iron/devil's-trap wards.
+        from supers import singer_house as singer_house_mod
+        singer_house_mod.ensure_singer_house_wards(self)
+        # Lodging: free tap / TV / wash on houses, apartments, hotels
+        # (and homestead chambers), then bed furniture + roster owners.
+        lodging.ensure_home_basics(self)
+        lodging.ensure_house_home_links(self)
+        lodging.ensure_living_room_media(self)
+        lodging.ensure_beds(self)
+        lodging.assign_roster_bed_owners(self)
+        # Street-home shell: number → porch → living → branches (titles +
+        # outdoor flags). Memory-only; populate fixshell persists JSON.
+        from supers import populate as populate_mod
+        populate_mod.heal_street_home_shell_live(self)
+        # Retroactive home_zone / home_room_key heal for players + Echoes
+        # created before path stamps (Vagan/Velan wilderness stuck case).
+        cadence.heal_all_home_anchors(self)
+        # Lifetime playtime: backfill total_playtime_ticks from the newbie
+        # active-play clock when the lifetime counter under-counts.
+        from supers import connection_log as connection_log_mod
+        connection_log_mod.heal_all_playtime(self)
+        # Bug reporters: lifetime Bugs squashed tally from resolved tickets
+        # in bug_reports.log (retroactive + idempotent on every boot).
+        from supers import bug_reporter_credit as bug_reporter_credit_mod
+        bug_reporter_credit_mod.heal_all_bugs_squashed(self)
+        # Home grocery stock: backfill refrigerator furniture on is_house
+        # rooms (long-lived DBs / maps that predate fridge seed_items).
+        from supers import grocery as grocery_mod
+        grocery_mod.ensure_fridges(self)
+        # Wayfinding furniture signs (Lawrence junctions + future towns).
+        from supers import wayfinding as wayfinding_mod
+        wayfinding_mod.ensure_wayfinding_signs(self)
+        # Buffy/Angel easter egg: mutual lovers + Angel's mausoleum home
+        # when both characters exist (idempotent; no-op otherwise).
+        # Faith: mutual friends with Buffy and Angel when she exists.
+        # (ensure_all already runs bond helpers; keep these for older
+        # call-order safety if ensure_all is ever skipped.)
+        from supers import relationships as relationships_mod
+        relationships_mod.ensure_buffy_angel_bond(self)
+        relationships_mod.ensure_faith_bonds(self)
+        relationships_mod.ensure_illyria_bonds(self)
+        relationships_mod.ensure_winchester_bonds(self)
+        relationships_mod.ensure_constantine_bonds(self)
+        relationships_mod.ensure_benny_bonds(self)
+        # Cadence #50: Vampire townsfolk-kill counter for hunter escalation.
+        self.vampire_townsfolk_kills = 0
+        # Evil Strikes Back: ensure Game fields exist; meta already loaded in
+        # ``_load_persisted_meta`` before any early boot save().
+        from supers import balance as balance_module
+        balance_module.ensure_game_defaults(self)
+        # Celestial Prince / Grigori hue seats -- re-apply from meta JSON
+        # (already loaded as raw dict) then reconcile occupants.
+        from supers import celestial_court as celestial_court_mod
+        celestial_court_mod.load_hue_courts_into_game(
+            self, persistence.load_hue_courts(self.db)
+        )
+        celestial_court_mod.reconcile_courts(self)
+        # Refresh death beacons / rumor boards / lifetime after Cadence seed
+        # (idempotent; keeps copyover-safe rebuild paths consistent).
+        self.death_beacons = persistence.load_death_beacons(self.db)
+        self.rumor_boards = persistence.load_rumor_boards(self.db)
+        from supers import world_stats as world_stats_mod
+        self.lifetime_stats = world_stats_mod.normalize_loaded(
+            persistence.load_lifetime_stats(self.db)
+        )
+        from supers import pet as pet_mod
+        self.pet_adoption = pet_mod.normalize_adoption_stock(
+            persistence.load_pet_adoption(self.db)
+        )
+        pet_mod.ensure_adoption_stock(self)
         self.save()
         register_default_ticks(self)
 
@@ -270,11 +580,117 @@ class Game:
 
         Uses the live ``game.characters`` roster (players, Echoes, NPCs)
         instead of walking every room -- the map is ~12k cells.
+
+        Supports ordinals: ``2.carl``, ``other carl``, ``second carl``.
+
+        Resolution order (first hit wins when unambiguous):
+          1. Exact ``Character.key`` match (so bare ``Wits`` prefers the
+             mortal body over ``gmspirit:Wits`` when both exist -- set
+             iteration used to return the spirit first and break
+             ``where`` / ``goto`` / ``who`` tooling)
+          2. Exact match on ``husk:Name`` / ``gmspirit:Name`` when the
+             query is bare ``Name`` and no exact bare key existed (so
+             ``hakai Albert`` still finds ``husk:Albert`` when Albert is
+             gone)
+          3. Exact ``assumed_face`` / ``husk_display_name`` / given_name
+             (and given+surname) match
+          4. Substring / ordinal collect via identity needles
         """
-        needle = name.lower()
+        from engine.char_identity import (
+            character_given_name,
+            character_surname,
+            parse_target_ordinal,
+            pick_ordinal,
+        )
+        from engine.command_support import _collect_character_matches
+
+        raw = (name or "").strip()
+        if not raw:
+            return None
+        ordinal, rest = parse_target_ordinal(raw)
+        needle = (rest or "").strip().lower()
+        if not needle:
+            return None
+
+        # With an ordinal, collect all substring matches and pick.
+        if ordinal is not None:
+            matches = _collect_character_matches(rest, list(self.characters))
+            return pick_ordinal(matches, ordinal)
+
+        # Two-pass exact: never let an ephemeral prefix steal a bare key.
+        face_hit = None
+        given_hits = []
+        ephemeral_hit = None
         for obj in self.characters:
-            if obj.key.lower() == needle:
+            key = (getattr(obj, "key", None) or "").lower()
+            if key == needle:
                 return obj
+            if ephemeral_hit is None and ":" in key:
+                prefix, _, rest_key = key.partition(":")
+                if prefix in ("husk", "gmspirit") and rest_key == needle:
+                    ephemeral_hit = obj
+            face = (
+                getattr(obj, "assumed_face", None)
+                or getattr(obj, "husk_display_name", None)
+                or ""
+            )
+            if face_hit is None and face and face.lower() == needle:
+                face_hit = obj
+            given = character_given_name(obj).lower()
+            sur = character_surname(obj).lower()
+            if given == needle:
+                given_hits.append(obj)
+            elif sur and f"{given} {sur}" == needle:
+                given_hits.append(obj)
+            elif sur and f"{given}{sur}" == needle:
+                given_hits.append(obj)
+        if ephemeral_hit is not None:
+            return ephemeral_hit
+        if face_hit is not None:
+            return face_hit
+        if len(given_hits) == 1:
+            return given_hits[0]
+        if len(given_hits) > 1:
+            # Ambiguous without ordinal -- first hit (legacy). Prefer
+            # callers that peel ``2.name`` before reaching here.
+            return given_hits[0]
+        return None
+
+    def find_login_character(self, name):
+        """Resolve a password / gateway login to the corporeal body only.
+
+        Never returns ``husk:Name`` or ``gmspirit:Name`` -- those are
+        ephemeral / vessel storage keys. Login attach must hit the real
+        player Character so we never dual-control a husk or zombie spirit.
+
+        Matches exact storage key OR unique given_name (legacy single Carl).
+        Duplicate given names must disambiguate via surname in connection.py.
+        """
+        from engine.char_identity import (
+            character_given_name,
+            is_login_player_body,
+        )
+        from engine.command_support import strip_ephemeral_storage_prefix
+
+        needle = strip_ephemeral_storage_prefix(name or "").strip().lower()
+        if not needle or needle == "?":
+            return None
+        key_hit = None
+        given_hits = []
+        for obj in self.characters:
+            if not is_login_player_body(obj):
+                continue
+            key = (getattr(obj, "key", None) or "")
+            key_low = key.lower()
+            if key_low == needle:
+                key_hit = obj
+                break
+            if character_given_name(obj).lower() == needle:
+                given_hits.append(obj)
+        if key_hit is not None:
+            return key_hit
+        if len(given_hits) == 1:
+            return given_hits[0]
         return None
 
     def broadcast_all(self, message):
@@ -310,33 +726,118 @@ class Game:
             self.db, getattr(self, "calendar_epoch_day", 0)
         )
         persistence.save_moral_state(self.db, self)
+        persistence.save_plane_soul_counts(self.db, self)
+        # Normalize hue courts before engine-pure meta write.
+        try:
+            from supers import celestial_court as celestial_court_mod
+            self.hue_courts = celestial_court_mod.serialize_hue_courts(self)
+        except ImportError:
+            pass
+        persistence.save_hue_courts(self.db, self)
+        persistence.save_death_beacons(self.db, self)
+        persistence.save_author_mantle_event(self.db, self)
+        persistence.save_ooc_history(self.db, self)
         persistence.save_rumor_boards(self.db, self)
+        persistence.save_lifetime_stats(self.db, self)
+        persistence.save_pet_adoption(self.db, self)
+        persistence.save_cadence_chances(self.db, self)
+        persistence.save_cadence_scale(self.db, self)
+        persistence.save_winchester_failsafe(self.db, self)
+        persistence.save_cadence_airport(self.db, self)
+        persistence.save_incap_tuning(self.db, self)
+        persistence.save_outgoing_damage_tuning(self.db, self)
+        persistence.save_corpse_decay_tuning(self.db, self)
+        persistence.save_hell_exile_tuning(self.db, self)
+        persistence.save_pit_drop_tuning(self.db, self)
+        # D41 wilds homestead + gather nodes (same save pulse as the world).
+        if _HAS_SUPERS:
+            try:
+                from supers import homestead as homestead_mod
+                from supers import gathering as gathering_mod
+                homestead_mod.save_homesteads(self.db, self)
+                gathering_mod.save_gather_nodes(self.db, self)
+                from supers import personal_realm as personal_realm_mod
+                personal_realm_mod.save_personal_realms(self.db, self)
+            except Exception:
+                # Never let a homestead codec abort the rest of the snapshot.
+                traceback.print_exc()
 
     async def tick_loop(self):
-        """The heartbeat. Fires every 3 seconds, forever."""
+        """The heartbeat. Fires every 3 seconds, forever.
+
+        Also stamps ``.game_heartbeat`` so ``watch_and_run`` can kill a
+        hung process that never exits (asyncio thread stuck in on_tick /
+        autosave / etc.). Touch *before* the heartbeat so a hang inside
+        the tick still leaves a last-good stamp for the age check.
+
+        Production uses ``run_heartbeat_async`` so Cadence can yield
+        between actors; smoke/tools still call sync ``on_tick``.
+        """
+        from engine import game_heartbeat
+        game_heartbeat.touch_heartbeat("tick_loop_start")
         while True:
             await asyncio.sleep(3)        # pause 3s WITHOUT freezing the server
+            # Stamp before work: if the heartbeat blocks forever, the watcher
+            # sees this mtime go stale and force-restarts.
+            game_heartbeat.touch_heartbeat("pre_tick")
             try:
-                self.on_tick()
+                await self.run_heartbeat_async()
             except Exception:
                 print("[tick_loop] a tick raised an exception -- skipping it, "
                       "heartbeat continues:")
                 traceback.print_exc()
+            # Stamp after work so a completed heavy tick resets the clock.
+            game_heartbeat.touch_heartbeat("post_tick")
+
+    async def run_heartbeat_async(self):
+        """Advance clock, run the async tick pipeline, autosave when due.
+
+        Cadence ``tick_async`` yields between actors so player commands
+        can run on the same asyncio loop during a long lifestyle pass.
+        """
+        self.game_time_ticks += 1
+        await run_ticks_async(self)
+        self._maybe_autosave()
 
     def on_tick(self):
-        # Advance the compressed clock, then run the ordered handler pipeline
-        # registered in supers.tick_bootstrap.register_default_ticks (when
-        # SUPERS is installed). Lean engine: clock + autosave only.
-        self.game_time_ticks += 1
-        if _HAS_SUPERS and run_ticks is not None:
-            run_ticks(self)
-        # Autosave every AUTOSAVE_EVERY_TICKS heartbeats (~60s at 3s/tick),
-        # not every tick: wipe+rewrite SQLite across ~12k rooms blocked the
-        # single asyncio thread and felt like command lag. Connect /
-        # disconnect / shutdown still call save() immediately.
-        if self.game_time_ticks % AUTOSAVE_EVERY_TICKS == 0:
-            self.save()
+        """Sync heartbeat for smoke/tools -- no Cadence yields.
 
+        Production ``tick_loop`` uses ``run_heartbeat_async`` instead.
+        """
+        self.game_time_ticks += 1
+        run_ticks(self)
+        self._maybe_autosave()
+
+    def _maybe_autosave(self):
+        """Autosave every AUTOSAVE_EVERY_TICKS heartbeats (~60s at 3s/tick).
+
+        Wipe+rewrite SQLite across ~12k rooms blocks the single asyncio
+        thread and felt like command lag. Connect / disconnect / shutdown
+        still call save() immediately.
+        """
+        if self.game_time_ticks % AUTOSAVE_EVERY_TICKS != 0:
+            return
+        from engine import diag_export
+        import time as _save_time
+        _diag = diag_export.diag_enabled()
+        _t_save = _save_time.perf_counter() if _diag else None
+        self.save()
+        if _diag and _t_save is not None:
+            diag_export.append_event(
+                "D",
+                "server.py:on_tick:autosave",
+                "autosave_ms",
+                {
+                    "save_ms": round(
+                        (_save_time.perf_counter() - _t_save) * 1000.0, 2
+                    ),
+                    "game_time_ticks": self.game_time_ticks,
+                    "n_rooms": len(getattr(self, "rooms", {}) or {}),
+                    "n_chars": len(
+                        getattr(self, "characters", ()) or ()
+                    ),
+                },
+            )
 
 async def handle_client(reader, writer, game):
     """Called once per new connection. Each client runs its own Session coroutine
@@ -357,6 +858,9 @@ async def handle_client(reader, writer, game):
                 session.character.session = None
             if session in game.sessions:
                 game.sessions.remove(session)
+            connecting = getattr(game, "connecting_sessions", None)
+            if connecting is not None and session in connecting:
+                connecting.remove(session)
             try:
                 session.writer.close()
             except Exception:
@@ -364,21 +868,24 @@ async def handle_client(reader, writer, game):
 
 
 async def main():
+    # Prove the child is alive during long Game() / world load so the
+    # watcher boot-grace clock has a fresh stamp once import finishes.
+    from engine import game_heartbeat
+    game_heartbeat.touch_heartbeat("main_enter")
     game = Game()
+    game_heartbeat.touch_heartbeat("game_ready")
     from engine.gateway_client import GatewayBridge, gateway_enabled
-
-    # Start the heartbeat as its own background task so it runs ALONGSIDE the
-    # server (create_task schedules it without waiting for it to finish).
-    asyncio.create_task(game.tick_loop())
 
     if gateway_enabled():
         # Level 3 gateway: do not bind :4000; speak IPC and reattach held clients.
-        # In-process copyover is unused here — watch_and_run restarts the game.
+        # SIGUSR1 still runs copyover._perform: announce Veil line, save, exit
+        # so watch_and_run can respawn (clients stay on the gateway).
         print(
             "SUPERS engine behind gateway "
             f"(IPC {os.environ.get('RIFTFORGE_GATEWAY_IPC', '127.0.0.1:4001')})",
             flush=True,
         )
+        copyover.install_signal_handler(game)
 
         def _session_factory(reader, writer, g, gateway_session_id=None):
             return Session(
@@ -386,6 +893,12 @@ async def main():
             )
 
         bridge = GatewayBridge(game, _session_factory)
+        # So copyover can CTRL ``planned_restart`` before exiting (Discord
+        # must not treat every watcher/auto-deploy reload as a crash).
+        game.gateway_bridge = bridge
+        # tick_loop starts inside GatewayBridge after the welcome/reattach
+        # CTRL (see engine/gateway_client.py) so Cadence cannot move
+        # sessionless PCs before sockets rebind.
         try:
             await bridge.connect_and_run()
         finally:
@@ -410,8 +923,12 @@ async def main():
     # no-op UNLESS this process was just exec'd BY a copyover -- in which
     # case it reattaches every preserved connection to its character here,
     # now that game.sessions/find_character are ready to be used.
+    #
+    # Start tick_loop only AFTER resume so Cadence / no_loiter cannot move
+    # reattaching PCs while they are still sessionless Echoes.
     copyover.install_signal_handler(game)
     await copyover.resume(game)
+    asyncio.create_task(game.tick_loop())
 
     try:
         async with server:                # keep the server open...
@@ -426,6 +943,12 @@ async def main():
 if __name__ == "__main__":
     # This block runs only when you execute `python server.py` directly.
     # asyncio.run() starts the event loop and runs main() until it finishes.
+    # Earliest stamp: covers import-time delays before async main() runs.
+    try:
+        from engine import game_heartbeat as _hb
+        _hb.touch_heartbeat("process_start")
+    except Exception:
+        pass
     try:
         asyncio.run(main())
     except KeyboardInterrupt:              # Ctrl-C

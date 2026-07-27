@@ -31,7 +31,10 @@ PUBLIC_PATHS = (
     "commands.py",
     "server.py",
     "maps.py",
+    "game_select.py",
+    "basegame",
     "tools/engine_smoke.py",
+    "tools/basegame_smoke.py",
     "tools/packaging_smoke.py",
     "tools/export_public_engine.py",
     "docs/ENGINE_CONSUMER.md",
@@ -66,19 +69,19 @@ pip install -e .
 ## Smoke
 
 ```bash
-python tools/engine_smoke.py
+python tools/engine_smoke.py      # lean engine, no game package present
+python tools/basegame_smoke.py    # basegame, the reference game below
 ```
-
-That check is meant to pass with no game package present.
 
 ## Layout
 
 | Path | Role |
 |------|------|
-| `engine/` | Generic MUD core (sessions, verbs, hooks, persistence helpers, …) |
+| `engine/` | Generic MUD core (sessions, verbs, hooks, persistence helpers, stat spine, …) |
 | `world.py` / `persistence.py` / `command_support.py` | Thin root facades over the engine cores |
-| `server.py` / `commands.py` / `maps.py` | Shared boot + dispatch + map loader |
-| `content/maps/demo.json` | Minimal demo map for a bare install |
+| `server.py` / `commands.py` / `maps.py` / `game_select.py` | Shared boot + dispatch + map loader + game-package chooser |
+| `basegame/` | A small, complete reference game built on the engine — ordinary humans, four jobs, its own town + wilds map, a `score` command |
+| `content/maps/demo.json` | Minimal demo map for a bare install (no game package) |
 | `docs/ENGINE_CONSUMER.md` | How a game registers hooks on the engine |
 | `docs/RELEASING_RIFTFORGE.md` / `docs/UPGRADING_RIFTFORGE.md` | Cut / consume a release |
 
@@ -90,8 +93,24 @@ telnet localhost 4000
 ```
 
 Without a game package registered, you get a lean engine demo — enough to
-prove sessions, rooms, and the tick loop. A full game supplies chargen, help
-topics, combat, and content via `engine.hooks` at boot.
+prove sessions, rooms, and the tick loop.
+
+## Run the reference game
+
+```bash
+RIFTFORGE_GAME=basegame python server.py
+telnet localhost 4000
+```
+
+`basegame` is a small, complete example of "a game built on top of the
+engine" — chargen (pick a job, a short point-buy across the shared six
+primary stats), a demo town + wilds map, and a `score` command showing
+your Path/stats/Tier/HP. It's a good starting point for building your own
+game, or for editing `basegame/verbs/character.py`'s `score` command
+directly to see how a character sheet is put together. A full game
+supplies chargen, help topics, combat, and content via `engine.hooks` at
+boot -- `basegame/bootstrap.py` is a small, readable example of exactly
+that wiring.
 
 ## Docs
 

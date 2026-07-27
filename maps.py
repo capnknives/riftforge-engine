@@ -28,12 +28,14 @@ characters; maps describe the world they stand in).
 
 Grid ↔ pocket zone travel (towns, spirit gates, dungeon mouths) is authored
 in top-level pockets[] at creation time -- {kind, at: [x,y], hub_room,
-enter_as}. The loader wires Room.zone_entries / zone_exit_to so players use
-enter <name> / exit. Do not also author grid.portals or hub exits.out for
-the same pair; leftover in/out for that pair is stripped as a safety net.
-Nested indoor doors and Plaza↔Cinder Reach still use in/out/leave.
-Authoring SoT: docs/CONTENT_AUTHORING.md, help build-maps, map editor
-Pockets panel.
+enter_as}. The loader wires Room.zone_entries on the grid cell and stamps
+zone_exit + zone_exit_to on the hub only (the mouth), so players use
+enter <name> / exit from that room -- not from house interiors. Do not
+also author grid.portals or hub exits.out for the same pair; leftover
+in/out for that pair is stripped as a safety net. Nested indoor doors
+still use in/out/leave (elemental reaches use their own portals; Central
+Plaza no longer links into Cinder Reach). Authoring SoT:
+docs/CONTENT_AUTHORING.md, help build-maps, map editor Pockets panel.
 """
 
 import glob
@@ -50,12 +52,19 @@ from world import Room
 # content/maps/ of its own can point this somewhere else before calling
 # load_all_maps(); a bare SUPERS checkout never needs to touch it.
 _MAPS_DIR = os.path.join(os.path.dirname(__file__), "content", "maps")
+# Pocket / zone-only JSON (no overland grid) may live here -- same schema
+# as content/maps/*.json. Folder vocabulary (map file vs zone file vs
+# Cadence room ``zone`` string): docs/CONTENT_AUTHORING.md + help build-maps.
+# Alien / plane stubs without a grid (stellar_orbit, umbral_vault) stay under
+# content/maps/ on purpose -- do not move them into zones/.
+_ZONES_DIR = os.path.join(os.path.dirname(__file__), "content", "zones")
 
 
 def set_maps_dir(path):
     """Point the map loader at a different content/maps/ directory.
 
     Pass None to restore the default (this repo's own content/maps/).
+    Does not change content/zones/ (use set_zones_dir).
     """
     global _MAPS_DIR
     _MAPS_DIR = (
@@ -67,6 +76,20 @@ def set_maps_dir(path):
 def get_maps_dir():
     """Return the directory load_all_maps() currently reads from."""
     return _MAPS_DIR
+
+
+def set_zones_dir(path):
+    """Point the zone loader at a different content/zones/ directory."""
+    global _ZONES_DIR
+    _ZONES_DIR = (
+        path if path is not None
+        else os.path.join(os.path.dirname(__file__), "content", "zones")
+    )
+
+
+def get_zones_dir():
+    """Return the pocket/zone JSON directory."""
+    return _ZONES_DIR
 
 # D25's second fork (docs/SYSTEMS_DESIGN.md section 10): area_type is a
 # formal, engine-read tag (not just editor UI metadata), so it needs a
@@ -89,6 +112,9 @@ AREA_TYPES = {
     "lake": [],
     "forest": [],
     "plains": [],
+    # Fire Plane Heart Furnace cells (Cinder Reach) -- landmark heat,
+    # not wild-by-default (see WILD_AREA_TYPES); no random wilderness rolls.
+    "furnace": [],
 }
 
 # Legacy map JSON may still say area_type "wilderness" from before bug #26
@@ -128,6 +154,14 @@ KNOWN_RESOURCE_TAGS = frozenset({
     # Leisure venue flavors (personality prefs; still need entertainment/social
     # on the room for ambient sate). library also marks hunter research dens.
     "bar", "arcade", "theater", "library", "park", "plaza", "nightlife",
+    # Human Mundane Nerve Work floors (Path-flavored rooms in wastes town).
+    # Preference / montage tags only -- they do NOT create need meters.
+    # See supers/mundane.py NERVE_WORK_TAGS.
+    "clinic", "jail", "case", "tip", "workshop", "salvage",
+    "barracks", "spar", "ritual", "fence",
+    "lab", "patrol",
+    # Tornado / severe-weather cellar (weather_climatology shelter table).
+    "storm_shelter",
 })
 
 # Controlled plane vocabulary (map JSON top-level "plane"). Realm is the
@@ -135,7 +169,7 @@ KNOWN_RESOURCE_TAGS = frozenset({
 PLANES = frozenset({
     "earth", "fire", "water", "air", "stone",
     "heaven", "hell", "purgatory", "dream",
-    "stellar",
+    "stellar", "umbral",
 })
 
 # plane -> realm family. Cosmic Favor's elemental/eldritch tether is a
@@ -153,6 +187,7 @@ REALM_FOR_PLANE = {
     "purgatory": "spirit",
     "dream": "spirit",
     "stellar": "void",
+    "umbral": "void",
 }
 
 # Pocket kinds for map JSON pockets[] metadata (authors/tools).
@@ -161,6 +196,10 @@ POCKET_KINDS = frozenset({"settlement", "dungeon", "landmark"})
 # Filled by the most recent load_all_maps() call -- Game may copy this onto
 # game.map_registry. Keys are map file "id" strings.
 LAST_MAP_REGISTRY = {}
+
+# Map/zone files present on disk with ``"autoload": false`` (skipped at boot).
+# Refreshed by load_all_maps() / catalog_map_files(). Keys are map ids.
+LAST_DEFERRED_MAPS = {}
 
 # D29 overland ASCII minimap (docs/SYSTEMS_DESIGN.md section 10): one
 # letter per area_type so telnet clients that ignore color still read
@@ -175,6 +214,71 @@ AREA_TYPE_GLYPH = {
     "lake": "L",
     "forest": "F",
     "plains": "P",
+    "furnace": "H",
+}
+
+# Atlas / highway-map glyph set (xycoordmapUSguidelines): topography uses
+# shape symbols; cities and routes stamp map_glyph on top. Used when a
+# grid sets ``"glyph_set": "atlas"`` (stamped onto every cell).
+ATLAS_AREA_GLYPH = {
+    "ruins": ":",
+    "city": "*",
+    "mountains": "^",
+    "ocean": "~",
+    "lake": "o",
+    "forest": "T",
+    "plains": ".",
+    "furnace": "H",
+}
+
+# Layer colors for atlas maps -- letter/glyph is still the primary signal;
+# ANSI only accents (section 8 a11y). Bright routes over muted topo.
+# (Foreground-only escapes -- used for non-filled atlas fallbacks and the
+# legend. The FILLED "Forgotten Kingdoms" look composes fg+bg below.)
+MAP_LAYER_COLOR = {
+    "ocean": "\x1b[34m",           # blue water
+    "plains": "\x1b[32m",          # muted green fields
+    "mountains": "\x1b[90m",       # dark grey rock
+    "lake": "\x1b[94m",            # bright blue
+    "forest": "\x1b[32m",
+    "highway": "\x1b[33m",         # yellow asphalt / Impala road
+    "mountain_highway": "\x1b[33m",  # yellow pass through Rockies
+    "city": "\x1b[97m",            # bright white hub letter
+}
+
+# --- Filled "Forgotten Kingdoms" atlas palette ------------------------
+# When a grid opts in with ``"glyph_set": "atlas"`` we paint each cell as a
+# solid COLORED BLOCK (ANSI background) with the glyph on top -- a filled
+# overland map (blue sea, green land, grey rock) instead of glyphs on
+# black. These are the numeric SGR codes; _room_display_color composes them
+# into a "\x1b[<fg>;<bg>m" escape. Only atlas maps use this path, so the
+# Wastes / elemental reaches keep their plain foreground look untouched.
+# a11y: the glyph is still the primary signal (section 8) -- the ASCII map
+# is a sighted surface; screen-reader players get directional text instead.
+ATLAS_BG = {                        # background fill per terrain
+    "ocean": "44",                  # blue sea
+    "lake": "46",                   # cyan freshwater
+    "plains": "42",                 # green fields
+    "forest": "42",                 # green timber
+    "mountains": "100",             # bright-black (grey) rock
+    "city": "41",                   # red hub block
+    "ruins": "100",
+    "furnace": "41",
+}
+ATLAS_TOPO_FG = {                   # glyph color when the cell is bare topo
+    "ocean": "96",                  # bright-cyan ripples on blue
+    "lake": "97",
+    "plains": "30",                 # black stipple on green
+    "forest": "30",
+    "mountains": "37",              # white peaks on grey
+    "city": "97",
+    "ruins": "37",
+    "furnace": "97",
+}
+ATLAS_LAYER_FG = {                  # glyph color for a bright overlay layer
+    "highway": "93",                # bright-yellow asphalt on the terrain
+    "mountain_highway": "93",       # yellow pass over grey rock
+    "city": "97",                   # bright-white hub letter on red
 }
 
 # ANSI 16-color escapes (stdlib only -- no third-party color libs).
@@ -189,6 +293,7 @@ AREA_TYPE_COLOR = {
     "lake": "\x1b[94m",         # bright blue
     "forest": "\x1b[32m",       # green
     "plains": "\x1b[92m",       # bright green
+    "furnace": "\x1b[91m",      # bright red -- Heart Furnace heat
 }
 
 # Suggestion #8 plane color modifiers: same tile letters, different
@@ -464,6 +569,114 @@ PLANE_AREA_DESCRIPTIONS = {
     },
 }
 
+
+def ensure_hand_room_identity(room_data, *, where="map"):
+    """Ensure a hand-authored room dict has a non-empty storage ``key``.
+
+    Storage key is what character ``room_key`` / dig / goto persist on.
+    Optional ``title`` is player-facing look text and may match the key.
+
+    If ``key`` is missing or blank but ``title`` is set, copy title → key
+    (builder typed a name and left key empty). If both are empty, raise
+    ``ValueError`` so boot / Studio save fail loud instead of inventing
+    a silent Plaza dump later.
+
+    Mutates ``room_data`` in place; returns the resolved key string.
+    """
+    if not isinstance(room_data, dict):
+        raise ValueError(f"{where}: room entry must be a dict")
+    key = str(room_data.get("key") or "").strip()
+    title = str(room_data.get("title") or "").strip()
+    if not key and title:
+        key = title
+        room_data["key"] = key
+    elif key:
+        room_data["key"] = key
+    if not key:
+        raise ValueError(
+            f"{where}: hand room needs a non-empty 'key' "
+            f"(or a 'title' to copy into key) -- got key={room_data.get('key')!r} "
+            f"title={room_data.get('title')!r}"
+        )
+    # Keep title only when it differs from the storage key (look falls
+    # back to key otherwise).
+    if title and title != key:
+        room_data["title"] = title
+    else:
+        room_data.pop("title", None)
+    return key
+
+
+def qualify_hand_room_key(map_id, local_name, *, taken=None):
+    """Map-scope a builder-typed room name into a globally unique storage key.
+
+    Room identity in ``game.rooms`` is still a flat global string, but dig /
+    Area Studio builders type short zone-local names (``Apartment Floor C``).
+    This helper stores ``{map_id}:Apartment Floor C`` and returns the short
+    string as the look ``title`` so towns can reuse the same display name.
+
+    Rules:
+      * ``map_id:Name`` already for this map → keep (normalize map_id case).
+      * ``other:Name`` (explicit foreign qualify) → keep as typed.
+      * bare ``Name`` → ``{map_id}:Name`` with title ``Name``.
+      * If the preferred key is in ``taken``, append `` #2``, `` #3``, …
+
+    Returns ``(storage_key, title)``. ``title`` is always the short look
+    name when the key is qualified; callers may omit writing title when it
+    equals the key (should not happen for qualified digs).
+    """
+    map_id = (map_id or "").strip() or "map"
+    local = (local_name or "").strip()
+    if not local:
+        raise ValueError("room name required to qualify a hand-room key")
+    taken = {str(k) for k in (taken or ())}
+
+    prefix = f"{map_id}:"
+    if local.lower().startswith(prefix.lower()):
+        rest = local[len(prefix):].strip() or local
+        key = f"{map_id}:{rest}"
+        title = rest
+    elif ":" in local:
+        # Staff typed an explicit map:name — trust it; look name is the tail.
+        key = local
+        tail = local.split(":", 1)[1].strip()
+        title = tail or local
+    else:
+        key = f"{map_id}:{local}"
+        title = local
+
+    base = key
+    n = 2
+    while key in taken:
+        key = f"{base} #{n}"
+        n += 1
+    return key, title
+
+
+def ensure_map_hand_room_keys(data, *, filename="map"):
+    """Run ``ensure_hand_room_identity`` on every hand room in a map dict.
+
+    Also rewrites exit / pocket hub strings that pointed at the old blank
+    identity are not needed -- blank keys never linked. Returns how many
+    rooms received a key copied from title.
+    """
+    if not isinstance(data, dict):
+        return 0
+    filled = 0
+    rooms = data.get("rooms") or []
+    for i, room_data in enumerate(rooms):
+        if not isinstance(room_data, dict):
+            continue
+        before = str(room_data.get("key") or "").strip()
+        ensure_hand_room_identity(
+            room_data, where=f"{filename} rooms[{i}]",
+        )
+        after = str(room_data.get("key") or "").strip()
+        if not before and after:
+            filled += 1
+    return filled
+
+
 def _normalize_area_type(area_type):
     """Resolve a map JSON area_type, including legacy aliases, to a catalog value."""
     if area_type is None:
@@ -599,9 +812,82 @@ def _cell_color(plane, area_type):
     return plane_palette.get(area_type) or AREA_TYPE_COLOR.get(area_type, "")
 
 
-def _cell_glyph(area_type):
-    """Single-character terrain token for one area_type (D29)."""
-    return AREA_TYPE_GLYPH.get(area_type, "?")
+def _cell_glyph(area_type, *, glyph_set=None):
+    """Single-character terrain token for one area_type (D29 / atlas)."""
+    table = ATLAS_AREA_GLYPH if glyph_set == "atlas" else AREA_TYPE_GLYPH
+    return table.get(area_type, "?")
+
+
+def _room_display_glyph(room):
+    """Pick the ASCII glyph for one room on minimap / full atlas.
+
+    Priority: authored ``map_glyph`` (city letter, highway =/|/+) >
+    glyph_set / area_type table. Always a single printable character.
+    """
+    authored = getattr(room, "map_glyph", None)
+    if authored:
+        text = str(authored).strip()
+        if text:
+            # One cell only -- never let JSON paste a multi-char mess.
+            return text[0]
+    glyph_set = getattr(room, "glyph_set", None)
+    return _cell_glyph(getattr(room, "area_type", "plains"), glyph_set=glyph_set)
+
+
+def _room_display_color(room):
+    """ANSI prefix for one atlas/minimap cell, or empty string.
+
+    Atlas maps (``glyph_set == "atlas"``) render as FILLED colored blocks:
+    a background fill from the terrain (ATLAS_BG) plus a foreground glyph
+    color -- bright yellow for a highway layer / white for a city, else a
+    readable topo tint (ATLAS_TOPO_FG). Composed into one "\\x1b[fg;bgm"
+    escape. Non-atlas maps keep the old foreground-only palette so the
+    Wastes / elemental reaches look exactly as before. Glyph stays the
+    primary signal (section 8 a11y); color only accents.
+    """
+    if getattr(room, "glyph_set", None) == "atlas":
+        area = getattr(room, "area_type", "plains") or "plains"
+        bg = ATLAS_BG.get(area, "40")            # default black fill
+        layer = getattr(room, "map_layer", None)
+        if layer:
+            # A road / city overlay: bright foreground on the terrain fill.
+            fg = ATLAS_LAYER_FG.get(str(layer).strip().lower())
+            if fg is None:
+                fg = ATLAS_TOPO_FG.get(area, "37")
+        else:
+            fg = ATLAS_TOPO_FG.get(area, "37")
+        return f"\x1b[{fg};{bg}m"
+    # Non-atlas maps: original foreground-only behavior.
+    layer = getattr(room, "map_layer", None)
+    if layer:
+        color = MAP_LAYER_COLOR.get(str(layer).strip().lower())
+        if color:
+            return color
+    return _cell_color(
+        getattr(room, "plane", "earth"),
+        getattr(room, "area_type", "plains"),
+    )
+
+
+def _map_legend_for(rooms_sample):
+    """Legend line: atlas symbols when any cell uses them, else letters."""
+    # If any room in the window uses map_glyph / atlas set, show atlas key.
+    uses_atlas = False
+    for room in rooms_sample:
+        if room is None:
+            continue
+        if getattr(room, "map_glyph", None) or getattr(room, "glyph_set", None) == "atlas":
+            uses_atlas = True
+            break
+    if uses_atlas:
+        return (
+            "@=you *=city .=plains ^=mtn ~=ocean o=lake "
+            "==EW-hwy |=NS-hwy +=junction T=forest "
+            "(bright=highway/city; muted=topo)"
+        )
+    return " ".join(
+        f"{AREA_TYPE_GLYPH[t]}={t}" for t in sorted(AREA_TYPE_GLYPH)
+    )
 
 
 def render_minimap(rooms, center_room, radius=MINIMAP_RADIUS, use_color=True):
@@ -628,6 +914,7 @@ def render_minimap(rooms, center_room, radius=MINIMAP_RADIUS, use_color=True):
         prefix, cx, cy = parsed
 
     rows = []
+    seen_rooms = []
     for dy in range(radius, -radius - 1, -1):  # north (high y) first
         cells = []
         for dx in range(-radius, radius + 1):   # west (low x) first
@@ -642,21 +929,333 @@ def render_minimap(rooms, center_room, radius=MINIMAP_RADIUS, use_color=True):
                 # at a boundary is obvious without inventing terrain.
                 cells.append(" ")
                 continue
-            glyph = _cell_glyph(getattr(neighbor, "area_type", "plains"))
+            seen_rooms.append(neighbor)
+            glyph = _room_display_glyph(neighbor)
             if use_color:
-                color = _cell_color(
-                    getattr(neighbor, "plane", "earth"),
-                    getattr(neighbor, "area_type", "plains"),
-                )
+                color = _room_display_color(neighbor)
                 if color:
                     glyph = f"{color}{glyph}{ANSI_RESET}"
             cells.append(glyph)
         rows.append("".join(cells))
 
-    legend = " ".join(
-        f"{AREA_TYPE_GLYPH[t]}={t}" for t in sorted(AREA_TYPE_GLYPH)
-    )
+    legend = _map_legend_for(seen_rooms or [center_room])
     header = f"{prefix} ({cx}, {cy})  (@ = you)"
+    return "\n".join([header, *rows, legend])
+
+
+# Directions that place a neighbor on the XY town minimap (Y north).
+# up/down/in/out and street-door labels stay off the XY plane.
+_LAYOUT_XY_DELTA = {
+    "north": (0, 1), "south": (0, -1),
+    "east": (1, 0), "west": (-1, 0),
+    "northeast": (1, 1), "northwest": (-1, 1),
+    "southeast": (1, -1), "southwest": (-1, -1),
+}
+
+# Default radius for town exit-graph / layout windows (smaller than
+# overland 7x7 -- indoor graphs get noisy fast).
+TOWN_MINIMAP_RADIUS = 2
+# Shorter windows when the map is embedded in look (not bare ``map``).
+LOOK_TOWN_MINIMAP_RADIUS = 1   # 3x3
+LOOK_GRID_MINIMAP_RADIUS = 2   # 5x5 instead of 7x7
+
+
+def _town_room_glyph(room):
+    """Single glyph for a town neighbor on the local map.
+
+    Prefers authored map_glyph, else first letter of the look title,
+    else '#'. Always one printable character.
+    """
+    authored = getattr(room, "map_glyph", None)
+    if authored:
+        text = str(authored).strip()
+        if text:
+            return text[0]
+    title = ""
+    if hasattr(room, "look_title"):
+        try:
+            title = room.look_title() or ""
+        except Exception:
+            title = getattr(room, "key", "") or ""
+    else:
+        title = getattr(room, "key", "") or ""
+    for ch in str(title):
+        if ch.isalnum():
+            return ch.upper()
+    return "#"
+
+
+def _rooms_by_layout(rooms, map_id, layout_z):
+    """Index hand rooms by (layout_x, layout_y) for one map_id + z layer.
+
+    Skips grid cells and rooms missing layout. When two rooms share a
+    cell, the first wins (collision is a Studio authoring issue).
+    """
+    index = {}
+    for room in rooms.values():
+        if getattr(room, "grid_prefix", None) is not None:
+            continue
+        if getattr(room, "map_id", None) != map_id:
+            continue
+        lx = getattr(room, "layout_x", None)
+        ly = getattr(room, "layout_y", None)
+        if lx is None or ly is None:
+            continue
+        lz = getattr(room, "layout_z", None)
+        if lz is None:
+            lz = 0
+        if int(lz) != int(layout_z):
+            continue
+        key = (int(lx), int(ly))
+        if key not in index:
+            index[key] = room
+    return index
+
+
+def render_layout_minimap(
+    rooms, center_room, radius=TOWN_MINIMAP_RADIUS, use_color=True,
+):
+    """Local ASCII window from Studio layout coords (same map_id + z).
+
+    Returns None when the center room has no layout_x/y. North is high y.
+    """
+    cx = getattr(center_room, "layout_x", None)
+    cy = getattr(center_room, "layout_y", None)
+    if cx is None or cy is None:
+        return None
+    map_id = getattr(center_room, "map_id", None)
+    if not map_id:
+        return None
+    lz = getattr(center_room, "layout_z", None)
+    if lz is None:
+        lz = 0
+    index = _rooms_by_layout(rooms, map_id, lz)
+    rows = []
+    for dy in range(radius, -radius - 1, -1):
+        cells = []
+        for dx in range(-radius, radius + 1):
+            if dx == 0 and dy == 0:
+                cells.append("@")
+                continue
+            neighbor = index.get((int(cx) + dx, int(cy) + dy))
+            if neighbor is None:
+                cells.append(" ")
+                continue
+            glyph = _town_room_glyph(neighbor)
+            if use_color:
+                color = _room_display_color(neighbor)
+                if color:
+                    glyph = f"{color}{glyph}{ANSI_RESET}"
+            cells.append(glyph)
+        rows.append("".join(cells))
+    label = getattr(center_room, "zone", None) or map_id
+    header = f"{label}  (@ = you)"
+    legend = "@=you  letter=nearby room  (layout)"
+    return "\n".join([header, *rows, legend])
+
+
+def render_exit_graph_minimap(
+    rooms, center_room, radius=TOWN_MINIMAP_RADIUS, use_color=True,
+):
+    """BFS exit-graph local map for hand rooms without layout coords.
+
+    Walks cardinal/diagonal exits only (skips up/down/in/out and door
+    labels). Places each reached room relative to the center; collisions
+    keep the first occupant. Returns None only when center_room is None.
+    """
+    _ = rooms  # rooms dict unused -- we walk live exit pointers
+    if center_room is None:
+        return None
+    # pos -> room; center at (0, 0)
+    placed = {(0, 0): center_room}
+    # BFS: queue of (room, x, y, depth)
+    from collections import deque
+    queue = deque([(center_room, 0, 0, 0)])
+    seen = {id(center_room)}
+    while queue:
+        room, x, y, depth = queue.popleft()
+        if depth >= radius:
+            continue
+        exits = getattr(room, "exits", None) or {}
+        for direction, dest in exits.items():
+            delta = _LAYOUT_XY_DELTA.get(str(direction).lower())
+            if delta is None or dest is None:
+                continue
+            nx, ny = x + delta[0], y + delta[1]
+            # Stay inside the visible window.
+            if abs(nx) > radius or abs(ny) > radius:
+                continue
+            dest_id = id(dest)
+            if dest_id in seen:
+                continue
+            seen.add(dest_id)
+            if (nx, ny) not in placed:
+                placed[(nx, ny)] = dest
+            queue.append((dest, nx, ny, depth + 1))
+
+    rows = []
+    for dy in range(radius, -radius - 1, -1):
+        cells = []
+        for dx in range(-radius, radius + 1):
+            if dx == 0 and dy == 0:
+                cells.append("@")
+                continue
+            neighbor = placed.get((dx, dy))
+            if neighbor is None:
+                cells.append(" ")
+                continue
+            glyph = _town_room_glyph(neighbor)
+            if use_color:
+                color = _room_display_color(neighbor)
+                if color:
+                    glyph = f"{color}{glyph}{ANSI_RESET}"
+            cells.append(glyph)
+        rows.append("".join(cells))
+    label = (
+        getattr(center_room, "zone", None)
+        or getattr(center_room, "map_id", None)
+        or "local"
+    )
+    header = f"{label}  (@ = you)"
+    legend = "@=you  letter=linked room  (exits)"
+    return "\n".join([header, *rows, legend])
+
+
+def render_local_map(
+    rooms, center_room, radius=None, use_color=True, *, compact=False,
+):
+    """Dispatcher: overland grid, Studio layout, or exit-graph town map.
+
+    Returns a multi-line string (\\n joined) or None when nothing can
+    render (no room). Grid cells keep the full overland radius; town
+    windows default to TOWN_MINIMAP_RADIUS.
+
+    ``compact`` (look embed): smaller radius and no header/legend so the
+    room sheet stays short; bare ``map`` leaves this False.
+    """
+    if center_room is None:
+        return None
+    is_grid = (
+        getattr(center_room, "grid_prefix", None) is not None
+        or parse_grid_key(getattr(center_room, "key", "") or "") is not None
+    )
+    if is_grid:
+        if radius is None:
+            r = LOOK_GRID_MINIMAP_RADIUS if compact else MINIMAP_RADIUS
+        else:
+            r = radius
+        rendered = render_minimap(
+            rooms, center_room, radius=r, use_color=use_color,
+        )
+    else:
+        if radius is None:
+            town_r = (
+                LOOK_TOWN_MINIMAP_RADIUS if compact else TOWN_MINIMAP_RADIUS
+            )
+        else:
+            town_r = radius
+        rendered = None
+        # Prefer authored Studio layout when both x and y are stamped.
+        if (
+            getattr(center_room, "layout_x", None) is not None
+            and getattr(center_room, "layout_y", None) is not None
+        ):
+            rendered = render_layout_minimap(
+                rooms, center_room, radius=town_r, use_color=use_color,
+            )
+        if not rendered:
+            rendered = render_exit_graph_minimap(
+                rooms, center_room, radius=town_r, use_color=use_color,
+            )
+    if not rendered:
+        return None
+    if compact:
+        # Drop header + legend -- look only needs the glyph window.
+        lines = rendered.split("\n")
+        if len(lines) >= 3:
+            return "\n".join(lines[1:-1])
+    return rendered
+
+
+def render_full_grid(
+    rooms,
+    center_room,
+    *,
+    width,
+    height,
+    use_color=True,
+    wrap=False,
+    mark_you=True,
+):
+    """Build an ASCII dump of an entire overland grid (giant map).
+
+    Same glyphs / @-you / north-up convention as ``render_minimap``, but
+    every cell from (0,0) to (width-1, height-1) is drawn. Missing cells
+    (should not happen on a healthy stamp) render as blank. ``wrap`` is
+    only used in the header tip -- the dump always shows the full
+    rectangle; torus edges are invisible on paper.
+
+    ``mark_you`` (default True) draws ``@`` at the center room's grid
+    coords. Bare travel ``atlas`` passes False when the viewer is not on
+    America so the dump does not lie about position.
+
+    Returns a multi-line string (\\n joined) or None if ``center_room`` is
+    not a stamped grid cell / bounds are invalid.
+    """
+    prefix = getattr(center_room, "grid_prefix", None)
+    cx = getattr(center_room, "grid_x", None)
+    cy = getattr(center_room, "grid_y", None)
+    if prefix is None or cx is None or cy is None:
+        parsed = parse_grid_key(center_room.key)
+        if parsed is None:
+            return None
+        prefix, cx, cy = parsed
+    try:
+        width = int(width)
+        height = int(height)
+    except (TypeError, ValueError):
+        return None
+    if width < 1 or height < 1:
+        return None
+
+    rows = []
+    seen_rooms = []
+    # North (high y) at the top of the printout -- same as minimap.
+    for y in range(height - 1, -1, -1):
+        cells = []
+        for x in range(width):
+            if mark_you and x == cx and y == cy:
+                cells.append("@")
+                continue
+            neighbor = rooms.get(f"{prefix} ({x}, {y})")
+            if neighbor is None:
+                cells.append(" ")
+                continue
+            seen_rooms.append(neighbor)
+            glyph = _room_display_glyph(neighbor)
+            if use_color:
+                color = _room_display_color(neighbor)
+                if color:
+                    glyph = f"{color}{glyph}{ANSI_RESET}"
+            cells.append(glyph)
+        rows.append("".join(cells))
+
+    legend = _map_legend_for(seen_rooms or [center_room])
+    wrap_note = "  (wraps at edges)" if wrap else ""
+    if mark_you:
+        header = (
+            f"{prefix} FULL {width}x{height}  you=({cx}, {cy})  (@ = you)"
+            f"{wrap_note}"
+        )
+    else:
+        header = (
+            f"{prefix} FULL {width}x{height}  (reference atlas)"
+            f"{wrap_note}"
+        )
+    # Optional south-edge ruler so wide atlases stay oriented (every 10).
+    if width >= 10:
+        ruler = "".join(str(x % 10) for x in range(width))
+        rows.append(ruler)
     return "\n".join([header, *rows, legend])
 
 
@@ -678,25 +1277,170 @@ def _description_for_cell(plane, area_type, x, y, map_default):
     return template.format(x=x, y=y)
 
 
-def _load_map_files():
-    """Read and parse every content/maps/*.json file.
+def _map_id_for(filename, data):
+    """Stable map id: JSON ``id`` or basename without .json."""
+    return data.get("id") or os.path.splitext(filename)[0]
 
-    Returns a list of (filename, data) pairs -- filename is kept alongside
-    each dict purely so error messages below can say WHICH file a bad
-    reference came from. sorted() makes load order (and therefore which
-    file an error blames first) deterministic across platforms, even
-    though correctness never depends on order: every exit is resolved
-    against the shared `rooms` dict in a second pass, not the current
-    file's own rooms.
+
+def _autoload_enabled(data):
+    """True unless the file explicitly sets ``"autoload": false``.
+
+    Deferred maps stay on disk for ``gm maps load`` but are skipped at boot
+    so they do not register rooms, NPCs (via missing home_room), or world
+    catalog rows until a GM hot-loads them.
+    """
+    return data.get("autoload", True) is not False
+
+
+def iter_map_json_paths():
+    """Yield absolute paths for every content/maps + content/zones JSON.
+
+    Duplicate basenames across the two directories raise ValueError (same
+    rule as boot load).
     """
     paths = sorted(glob.glob(os.path.join(_MAPS_DIR, "*.json")))
-    maps = []
+    if os.path.isdir(_ZONES_DIR):
+        paths.extend(sorted(glob.glob(os.path.join(_ZONES_DIR, "*.json"))))
+    seen = set()
     for path in paths:
+        base = os.path.basename(path)
+        if base in seen:
+            raise ValueError(
+                f"duplicate map/zone filename {base!r} under content/maps "
+                f"and content/zones -- rename one"
+            )
+        seen.add(base)
+        yield path
+
+
+def resolve_map_file(name):
+    """Find a map/zone JSON by id, basename, or basename.json.
+
+    Returns (abspath, basename, data, kind) where kind is ``map`` or
+    ``zone``. Raises FileNotFoundError if nothing matches.
+    """
+    needle = (name or "").strip()
+    if not needle:
+        raise FileNotFoundError("empty map name")
+    if not needle.endswith(".json"):
+        candidates = (needle + ".json", needle)
+    else:
+        candidates = (needle, needle[:-5])
+    needles = {c.lower() for c in candidates}
+    needles.add(needle.lower())
+    for path in iter_map_json_paths():
+        base = os.path.basename(path)
         with open(path, "r", encoding="utf-8") as f:
-            # os.path.basename: just "wastes.json", not the full path --
-            # shorter and just as useful in an error message.
-            maps.append((os.path.basename(path), json.load(f)))
+            data = json.load(f)
+        map_id = _map_id_for(base, data)
+        if (
+            base.lower() in needles
+            or map_id.lower() in needles
+            or os.path.splitext(base)[0].lower() in needles
+        ):
+            kind = "zone" if os.path.dirname(path).endswith("zones") else "map"
+            return path, base, data, kind
+    raise FileNotFoundError(f"no map/zone file matching {name!r}")
+
+
+def catalog_map_files():
+    """Return metadata for every on-disk map/zone (loaded or deferred).
+
+    Each row: id, filename, kind, plane, autoload, path, hub_hint
+    (runtime_hub or first room key).
+    """
+    rows = []
+    for path in iter_map_json_paths():
+        base = os.path.basename(path)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        map_id = _map_id_for(base, data)
+        kind = "zone" if os.path.dirname(path).endswith("zones") else "map"
+        rooms = data.get("rooms") or []
+        hub = data.get("runtime_hub") or (
+            rooms[0].get("key") if rooms else None
+        )
+        rows.append({
+            "id": map_id,
+            "filename": base,
+            "kind": kind,
+            "plane": data.get("plane") or "earth",
+            "autoload": _autoload_enabled(data),
+            "path": path,
+            "hub_hint": hub,
+            "room_count": len(rooms),
+            "has_grid": bool(data.get("grid")),
+        })
+    rows.sort(key=lambda r: (r["kind"], r["id"]))
+    return rows
+
+
+def _load_map_files(*, include_deferred=False):
+    """Read and parse content/maps/*.json plus content/zones/*.json.
+
+    Zone files use the same map JSON schema (typically pocket-only rooms).
+    Returns a list of (filename, data) pairs -- filename is basename so
+    error messages stay short. sorted() makes load order deterministic.
+    Duplicate basenames across maps/ and zones/ fail loud at boot.
+
+    Files with ``"autoload": false`` are skipped unless include_deferred
+    is True (used by catalog / hot-load, not by boot).
+    """
+    global LAST_DEFERRED_MAPS
+    maps = []
+    deferred = {}
+    for path in iter_map_json_paths():
+        base = os.path.basename(path)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        map_id = _map_id_for(base, data)
+        if not _autoload_enabled(data):
+            deferred[map_id] = {
+                "filename": base,
+                "path": path,
+                "plane": data.get("plane") or "earth",
+                "kind": (
+                    "zone" if os.path.dirname(path).endswith("zones")
+                    else "map"
+                ),
+            }
+            if not include_deferred:
+                continue
+        maps.append((base, data))
+    LAST_DEFERRED_MAPS = deferred
     return maps
+
+
+def _room_looks_like_sewer(key, title=None):
+    """True when key/title names an underground sewer (evil_zone convention).
+
+    Future towns get nest / nightlife playgrounds without hand-tagging every
+    tunnel cell. Explicit JSON ``evil_zone: false`` still wins at load.
+    """
+    blob = f"{key or ''} {title or ''}".lower()
+    return "sewer" in blob
+
+
+def _stamp_room_city_meta(room, data):
+    """Copy zone/map city_name + color roles onto a live Room.
+
+    See docs/AREA_BUILDING.md. No-op when the file omits city fields
+    entirely (overland grids, hollows without a city header yet).
+    """
+    if room is None or not isinstance(data, dict):
+        return
+    if not any(
+        k in data
+        for k in ("city_name", "city_color", "sub_color", "main_colors")
+    ):
+        return
+    from engine.room_naming import parse_city_meta
+
+    meta = parse_city_meta(data)
+    room.city_name = meta["city_name"] or None
+    room.city_color = meta["city_color"]
+    room.sub_color = meta["sub_color"]
+    room.main_colors = dict(meta["main_colors"])
 
 
 def _add_room(rooms, filename, key, description, gravity=1.0,
@@ -704,15 +1448,31 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
               plane=None, realm=None, map_id=None,
               grid_prefix=None, grid_x=None, grid_y=None,
               resources=None, zone=None, resource_capacity=None,
-              consecrated=None, evil_zone=None, is_house=None, is_grave=None,
-              private_home=None, vampire_safe=None, hunter_safe=None,
+              consecrated=None, evil_zone=None, dungeon=None,
+              no_random_spawn=None,
+              zone_exit=None,
+              is_house=None, is_grave=None,
+              private_home=None, is_hotel_room=None,
+              is_home=None, main_homeroom=None,
+              vampire_safe=None, hunter_safe=None,
+              no_combat=None,
+              no_loiter=None,
               evil_ward=None,
               is_cell=None, robable=None,
-              outdoor=None, floor_sleep=None, vampire_nest=None, hospital=None,
+              outdoor=None, floor_sleep=None, has_bunks=None,
+              vampire_nest=None, spawn_nest=None,
+              spawn_hub=None,
+              hospital=None,
+              mechanic=None,
               devils_trap=None, salt_line=None, iron_ward=None,
               devils_gate=None, unholy=None, crossroads=None, demon_deal=None,
-              jobs=None, dark=None,
-              hidden_directions=None):
+              jobs=None, vendor_stock=None, dark=None,
+              hidden_directions=None, title=None,
+              map_glyph=None, map_layer=None, glyph_set=None,
+              vnum=None, layout=None,
+              croatoan_contaminated=None, croatoan_quarantine=None,
+              croatoan_seal=None, croatoan_blood=None, croatoan_panic=None,
+              remodel_type=None, remodel_inbound_exit=None):
     """Create one Room and insert it into the shared `rooms` dict.
 
     Raises loudly if `key` is already taken -- by an earlier room in this
@@ -725,6 +1485,28 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
     Optional plane/realm/map_id/grid_* args are stamped by _build_grid
     (and by hand-authored rooms that inherit their map file's plane) for
     the D29 minimap, suggestion #8 overlays, and realm catalog tooling.
+
+    Optional title is the player-facing look name when it should differ
+    from the unique storage key (highway stretches, etc.). Empty/omitted
+    keeps look_title() falling back to key.
+
+    Optional vnum is the hand-room mapper id (``CA00001``). Validated and
+    checked for global uniqueness across ``rooms`` already loaded. Grid
+    cells must omit it. Missing vnum is allowed (retro script / dig assign).
+
+    Optional map_glyph / map_layer / glyph_set control atlas minimap art
+    (earth_america US road-atlas style): glyph overrides the area_type
+    letter; layer picks the terrain fill + bright highway/city colors;
+    glyph_set \"atlas\" switches the default topography symbols (~ . ^ o)
+    and turns on the filled colored-block render.
+
+    Optional layout is Area Studio canvas coords
+    (``{\"x\": int, \"y\": int, \"z\": int}``). Stamped onto Room.layout_*
+    for the town local minimap; omitted leaves those None (exit-graph
+    fallback).
+
+    Optional remodel_type / remodel_inbound_exit come from house remodel
+    stamps (kitchen gate, garage named exits).
     """
     if key in rooms:
         raise ValueError(
@@ -733,6 +1515,42 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
         )
     room = Room(key, description)
     room.gravity = gravity
+    # Player-facing title (optional). Strip empties so "" never shadows key.
+    if title is not None:
+        cleaned = str(title).strip()
+        room.title = cleaned or None
+    # Hand-room vnum (optional). Never on grid cells (grid_prefix set below).
+    if vnum is not None and str(vnum).strip():
+        if grid_prefix is not None:
+            raise ValueError(
+                f"{filename}: room key {key!r} is a grid cell -- must not "
+                f"have a vnum (got {vnum!r})"
+            )
+        from engine import room_vnum as room_vnum_mod
+        try:
+            normalized = room_vnum_mod.validate_vnum(vnum)
+        except ValueError as err:
+            raise ValueError(
+                f"{filename}: room key {key!r}: {err}"
+            ) from err
+        for other in rooms.values():
+            other_v = getattr(other, "vnum", None)
+            if other_v and other_v == normalized:
+                raise ValueError(
+                    f"{filename}: room key {key!r} vnum {normalized!r} "
+                    f"already used by {other.key!r}"
+                )
+        room.vnum = normalized
+    # Atlas minimap overrides (optional).
+    if map_glyph is not None:
+        g = str(map_glyph).strip()
+        room.map_glyph = g[0] if g else None
+    if map_layer is not None:
+        layer = str(map_layer).strip().lower()
+        room.map_layer = layer or None
+    if glyph_set is not None:
+        gs = str(glyph_set).strip().lower()
+        room.glyph_set = gs or None
     # area_type=None (JSON omitted it) falls back to Room's own default
     # ("plains") for backward compatibility with map files written before
     # this field existed. Legacy JSON that still says "wilderness" is
@@ -807,6 +1625,14 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
                     f"room {key!r}: each jobs entry must be a non-empty string"
                 )
         room.jobs = [j.strip() for j in jobs]
+    # Settlement/zone shop catalogs (raw item refs OK -- supers.economy
+    # resolves on first use). Grid cells should leave this omitted.
+    if vendor_stock is not None:
+        if not isinstance(vendor_stock, list):
+            raise ValueError(
+                f"room {key!r}: 'vendor_stock' must be a list of ware dicts"
+            )
+        room.vendor_stock = list(vendor_stock)
     if zone is not None:
         room.zone = zone
     if resource_capacity is not None:
@@ -821,11 +1647,31 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
     # False; explicit true marks chapels / holy ground for minister bonus.
     if consecrated is not None:
         room.consecrated = bool(consecrated)
-    # D34: eviltown flag -- evil_zone=None (omitted) keeps Room default False;
-    # explicit true marks a haunt for evil NPCs (a sewer, say) within an
-    # otherwise ordinary settlement. See Room.evil_zone's own comment.
+    # D34: eviltown flag -- evil_zone=None (omitted) usually keeps Room
+    # default False. Sewer-named rooms are the convention carve-out: future
+    # towns get an underground evil playground without hand-tagging every
+    # tunnel (Lebanon sewers + nests). Explicit false still wins.
+    if evil_zone is None and _room_looks_like_sewer(key, title):
+        evil_zone = True
     if evil_zone is not None:
         room.evil_zone = bool(evil_zone)
+    # Pocket mouth: zone_exit=None (omitted) keeps False; explicit true marks
+    # a room where players may type `exit` to leave the zone (Southern
+    # Highway, South Gate, dungeon Entrance). Pocket linking also stamps
+    # this True on hub_room. See Room.zone_exit.
+    if zone_exit is not None:
+        room.zone_exit = bool(zone_exit)
+    # Authored leveling dungeon -- omitted keeps False; explicit true marks
+    # players-only PvE (Cadence cannot path in; see Room.dungeon).
+    if dungeon is not None:
+        room.dungeon = bool(dungeon)
+        # Dungeon zones default to no wilderness / procedural random rolls
+        # unless the room explicitly sets no_random_spawn.
+        if no_random_spawn is None and room.dungeon:
+            room.no_random_spawn = True
+    # Explicit no_random_spawn wins (True or False) when authored.
+    if no_random_spawn is not None:
+        room.no_random_spawn = bool(no_random_spawn)
     # Sanctuary flags -- omitted keeps Room defaults (False). Vampires avoid
     # vampire_safe; hunters avoid hunter_safe (see supers/cadence.py).
     # evil_ward hard-blocks Demons / Vampires / possessed / evil alignment
@@ -834,6 +1680,11 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
         room.vampire_safe = bool(vampire_safe)
     if hunter_safe is not None:
         room.hunter_safe = bool(hunter_safe)
+    # Civic peace: no attack/spar/aggro (Central Plaza). Omitted -> False.
+    if no_combat is not None:
+        room.no_combat = bool(no_combat)
+    if no_loiter is not None:
+        room.no_loiter = bool(no_loiter)
     if evil_ward is not None:
         room.evil_ward = bool(evil_ward)
     # Cadence D39/D49: house homes and grave plots (omitted -> Room defaults).
@@ -844,27 +1695,57 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
     # Private-home hard door (entryway / apartment unit). Omitted -> False.
     if private_home is not None:
         room.private_home = bool(private_home)
+    # Multi-room house link (boot also heals via ensure_house_home_links).
+    if is_home is not None:
+        room.is_home = bool(is_home)
+    if main_homeroom is not None:
+        # Empty string clears; otherwise store the hub room key.
+        text = str(main_homeroom).strip()
+        room.main_homeroom = text or None
+    # Rent hotel guest room (populated floors / hand JSON). Omitted -> False.
+    if is_hotel_room is not None:
+        room.is_hotel_room = bool(is_hotel_room)
     # Jail cell + robable counters (crime / deputy loop).
     if is_cell is not None:
         room.is_cell = bool(is_cell)
     if robable is not None:
         room.robable = bool(robable)
-    # Outdoor exposure: explicit JSON wins; omitted defaults to wilderness
-    # so overland grids are outdoor without tagging every cell. Hand-
-    # authored indoor rooms omit the field and stay False (Room default)
-    # unless wilderness=true. Town streets set "outdoor": true explicitly.
+    # Outdoor exposure: explicit JSON wins. When omitted, defaults to
+    # wilderness so classic overland grids stay open-sky without tagging
+    # every cell. Dual-layer America sets grid outdoor:true with
+    # wilderness:false (sky/weather while driving; encounters only on
+    # virtual foot micro). Hand-authored indoor rooms omit both and stay
+    # False (Room default) unless wilderness=true. Town streets set
+    # "outdoor": true explicitly. Sewer-named rooms default indoor.
+    if outdoor is None and _room_looks_like_sewer(key, title):
+        outdoor = False
     if outdoor is not None:
         room.outdoor = bool(outdoor)
     else:
         room.outdoor = bool(room.wilderness)
-    # Floor-sleep / vampire-nest flags (omitted -> Room defaults False).
+    # Floor-sleep / bunk / vampire-nest flags (omitted -> Room defaults False).
     if floor_sleep is not None:
         room.floor_sleep = bool(floor_sleep)
+    if has_bunks is not None:
+        room.has_bunks = bool(has_bunks)
     if vampire_nest is not None:
         room.vampire_nest = bool(vampire_nest)
+    # Live spawn den type (vampire|demon|beast|ghost). Explicit spawn_nest
+    # wins; vampire_nest True aliases to "vampire" when spawn_nest omitted.
+    if spawn_nest is not None and str(spawn_nest).strip():
+        room.spawn_nest = str(spawn_nest).strip().lower()
+    elif room.vampire_nest:
+        room.spawn_nest = "vampire"
+    # Soul / soldier hubs (Guild, Motel, Heaven/Hell barracks).
+    if spawn_hub is not None and str(spawn_hub).strip():
+        room.spawn_hub = str(spawn_hub).strip().lower()
     # Evil Strikes Back: Town Clinic / hospital rooms.
     if hospital is not None:
         room.hospital = bool(hospital)
+    # Town mechanic wrench desk (omitted -> Room default False).
+    # Home remodeled garages stay storage -- do not stamp mechanic there.
+    if mechanic is not None:
+        room.mechanic = bool(mechanic)
     # Thin D44 authored traps (omitted -> Room defaults False).
     if devils_trap is not None:
         room.devils_trap = bool(devils_trap)
@@ -882,7 +1763,31 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
         room.crossroads = bool(crossroads)
     if demon_deal is not None:
         room.demon_deal = bool(demon_deal)
-    # D67 dark rooms (omitted -> Room default False).
+    # Croatoan remnant / surge room stamps (supers/croatoan.py).
+    if croatoan_contaminated is not None:
+        room.croatoan_contaminated = bool(croatoan_contaminated)
+    if croatoan_quarantine is not None:
+        room.croatoan_quarantine = bool(croatoan_quarantine)
+    if croatoan_seal is not None:
+        room.croatoan_seal = bool(croatoan_seal)
+    if croatoan_blood is not None:
+        try:
+            room.croatoan_blood = max(0, min(3, int(croatoan_blood)))
+        except (TypeError, ValueError):
+            room.croatoan_blood = 0
+    if croatoan_panic is not None:
+        try:
+            room.croatoan_panic = max(0, min(3, int(croatoan_panic)))
+        except (TypeError, ValueError):
+            room.croatoan_panic = 0
+    # House remodel stamps (kitchen cook gate / garage named exits).
+    if remodel_type is not None and str(remodel_type).strip():
+        room.remodel_type = str(remodel_type).strip().lower()
+    if remodel_inbound_exit is not None and str(remodel_inbound_exit).strip():
+        room.remodel_inbound_exit = str(remodel_inbound_exit).strip().lower()
+    # D67 dark rooms (omitted -> Room default False). Sewers default dark.
+    if dark is None and _room_looks_like_sewer(key, title):
+        dark = True
     if dark is not None:
         room.dark = bool(dark)
     # D66 secret exits: list of direction strings; validated against
@@ -906,6 +1811,16 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
         room.grid_prefix = grid_prefix
         room.grid_x = grid_x
         room.grid_y = grid_y
+    # Studio / dig layout canvas (town minimap). Invalid blobs stay None.
+    if isinstance(layout, dict) and "x" in layout and "y" in layout:
+        try:
+            room.layout_x = int(layout["x"])
+            room.layout_y = int(layout["y"])
+            room.layout_z = int(layout.get("z", 0) or 0)
+        except (TypeError, ValueError):
+            room.layout_x = None
+            room.layout_y = None
+            room.layout_z = None
     rooms[key] = room
 
 
@@ -954,6 +1869,12 @@ def _build_grid(rooms, filename, grid, plane=None, realm=None, map_id=None):
     # .get(...) with no default (None, not False) preserves "unspecified
     # vs. explicit" -- see _add_room's wilderness=None case.
     wilderness = grid.get("wilderness")
+    # Same shape as wilderness: omitted means "inherit outdoor-from-
+    # wilderness in _add_room"; true/false stamps every cell unless a
+    # cell_overrides entry punches through (America Overland: outdoor
+    # true + wilderness false so the atlas is open sky without roadside
+    # wilderness ticks while you drive).
+    outdoor = grid.get("outdoor")
     # The D25 terrain tag (see AREA_TYPES above); .get(...) with no default
     # leaves this None when the JSON omits it, so _add_room's "unspecified
     # falls back to wilderness" rule applies uniformly instead of this
@@ -973,6 +1894,12 @@ def _build_grid(rooms, filename, grid, plane=None, realm=None, map_id=None):
     bestiary_categories = grid.get("bestiary_categories")
     default_description = grid["default_description"]
     overrides = grid.get("cell_overrides", {})
+    # Optional atlas glyph set for this whole grid (earth_america, …).
+    grid_glyph_set = grid.get("glyph_set")
+    # Cadence confinement for whole grids (Elemental Reaches, …). Cell
+    # overrides may punch through; omitted keeps zone=None (Wastes-style).
+    grid_zone = grid.get("zone")
+
 
     for x in range(width):
         for y in range(height):
@@ -1018,35 +1945,131 @@ def _build_grid(rooms, filename, grid, plane=None, realm=None, map_id=None):
                         x, y,
                         default_description,
                     )
+            # Per-cell cover / flag stamps (Area Studio + hand JSON): when
+            # a cell_overrides entry sets wilderness/outdoor/resources/
+            # spawn_nest/… those punch through the grid-wide defaults the
+            # same way area_type already does. Omitted keys fall back to
+            # the grid-wide value (or None) so _add_room keeps its
+            # "unspecified vs explicit" defaults.
+            cell_wilderness = override.get("wilderness", wilderness)
+            # outdoor: cell override wins; else grid outdoor; else None
+            # so _add_room still defaults outdoor from wilderness.
+            cell_outdoor = override.get("outdoor", outdoor)
+            cell_glyph_set = override.get("glyph_set", grid_glyph_set)
+            # Zone: cell override wins; else grid-wide Cadence zone.
+            if "zone" in override:
+                cell_zone = override.get("zone")
+            else:
+                cell_zone = grid_zone
             _add_room(
                 rooms, filename, key, description, gravity,
-                wilderness, cell_area_type, cell_bestiary_categories,
+                cell_wilderness, cell_area_type, cell_bestiary_categories,
                 plane=plane, realm=realm, map_id=map_id,
                 grid_prefix=prefix, grid_x=x, grid_y=y,
+                resources=override.get("resources"),
+                zone=cell_zone,
+                resource_capacity=override.get("resource_capacity"),
+                consecrated=override.get("consecrated"),
+                evil_zone=override.get("evil_zone"),
+                dungeon=override.get("dungeon"),
+                no_random_spawn=override.get("no_random_spawn"),
+                zone_exit=override.get("zone_exit"),
+                is_house=override.get("is_house"),
+                is_grave=override.get("is_grave"),
+                private_home=override.get("private_home"),
+                is_hotel_room=override.get("is_hotel_room"),
+                is_home=override.get("is_home"),
+                main_homeroom=override.get("main_homeroom"),
+                vampire_safe=override.get("vampire_safe"),
+                hunter_safe=override.get("hunter_safe"),
+                no_combat=override.get("no_combat"),
+                no_loiter=override.get("no_loiter"),
+                evil_ward=override.get("evil_ward"),
+                is_cell=override.get("is_cell"),
+                robable=override.get("robable"),
+                outdoor=cell_outdoor,
+                floor_sleep=override.get("floor_sleep"),
+                has_bunks=override.get("has_bunks"),
+                vampire_nest=override.get("vampire_nest"),
+                spawn_nest=override.get("spawn_nest"),
+                hospital=override.get("hospital"),
+                mechanic=override.get("mechanic"),
+                devils_trap=override.get("devils_trap"),
+                salt_line=override.get("salt_line"),
+                iron_ward=override.get("iron_ward"),
+                devils_gate=override.get("devils_gate"),
+                unholy=override.get("unholy"),
+                crossroads=override.get("crossroads"),
+                demon_deal=override.get("demon_deal"),
+                jobs=override.get("jobs"),
+                dark=override.get("dark"),
+                hidden_directions=override.get("hidden_directions"),
+                title=override.get("title"),
+                map_glyph=override.get("map_glyph"),
+                map_layer=override.get("map_layer"),
+                glyph_set=cell_glyph_set,
             )
+            # Heart Furnace deep cell (Cinder Reach) -- stamp after create.
+            if override.get("furnace_deep"):
+                rooms[key].furnace_deep = True
 
 
 def _link_grid_neighbors(rooms, grid):
-    """Wire north/south/east/west exits between every cell of one map's
-    grid. Cardinal convention: north = y+1, south = y-1, east = x+1,
-    west = x-1 -- same as the old build_world(). Edges omit the outward
-    exit (no wraparound), so cmd_move's "You can't go that way" hard-walls
-    the grid boundary exactly as it always has.
+    """Wire cardinal + diagonal exits between every cell of one map's grid.
+
+    Convention: north = y+1, south = y-1, east = x+1, west = x-1 -- same
+    as landmark bearings. Diagonals (ne/nw/se/sw) are king-move links so
+    overland walking matches 8-way landmark hints (suggestion #80).
+
+    By default edges omit outward exits (hard walls). Set ``"wrap": true``
+    on the grid JSON for a torus / globe loop: leaving the east edge lands
+    on the west edge (and the same for N/S and diagonals). Walk pathfinding
+    follows exits, so wrap works for ``walk`` without a separate math path.
     """
     prefix = grid["key_prefix"]
     width = grid["width"]
     height = grid["height"]
+    # Explicit True only -- omit / false / null keep hard edges (Wastes).
+    wrap = grid.get("wrap") is True
+
+    def _cell(nx, ny):
+        """Resolve neighbor coords; wrap with modulo, else None off-edge."""
+        if wrap:
+            # Python's % on positives is fine; keep nx/ny in range for keys.
+            return rooms[f"{prefix} ({nx % width}, {ny % height})"]
+        if 0 <= nx < width and 0 <= ny < height:
+            return rooms[f"{prefix} ({nx}, {ny})"]
+        return None
+
     for x in range(width):
         for y in range(height):
             room = rooms[f"{prefix} ({x}, {y})"]
-            if y + 1 < height:
-                room.exits["north"] = rooms[f"{prefix} ({x}, {y + 1})"]
-            if y - 1 >= 0:
-                room.exits["south"] = rooms[f"{prefix} ({x}, {y - 1})"]
-            if x + 1 < width:
-                room.exits["east"] = rooms[f"{prefix} ({x + 1}, {y})"]
-            if x - 1 >= 0:
-                room.exits["west"] = rooms[f"{prefix} ({x - 1}, {y})"]
+            # Cardinals.
+            north = _cell(x, y + 1)
+            if north is not None:
+                room.exits["north"] = north
+            south = _cell(x, y - 1)
+            if south is not None:
+                room.exits["south"] = south
+            east = _cell(x + 1, y)
+            if east is not None:
+                room.exits["east"] = east
+            west = _cell(x - 1, y)
+            if west is not None:
+                room.exits["west"] = west
+            # Diagonals -- canonical keys match DIRECTIONS ("ne" -> "northeast").
+            ne = _cell(x + 1, y + 1)
+            if ne is not None:
+                room.exits["northeast"] = ne
+            nw = _cell(x - 1, y + 1)
+            if nw is not None:
+                room.exits["northwest"] = nw
+            se = _cell(x + 1, y - 1)
+            if se is not None:
+                room.exits["southeast"] = se
+            sw = _cell(x - 1, y - 1)
+            if sw is not None:
+                room.exits["southwest"] = sw
 
 
 def _link_grid_portals(rooms, filename, grid):
@@ -1116,10 +2139,11 @@ def _link_pockets(rooms, filename, data):
     """Wire grid <-> pocket zone travel via enter/exit (not exits{}).
 
     Each pocket names a grid cell (at [x,y]) and a hub_room. Links land on
-    Room.zone_entries (gateway cell) and Room.zone_exit_to (hub + every
-    room sharing the hub's zone) so cardinal / in / out movement never
-    walks the pocket boundary. Legacy exits['in']/['out'] and matching
-    grid.portals for the same pair are stripped so the verbs stay separate.
+    Room.zone_entries (gateway cell) and stamp zone_exit + zone_exit_to on
+    the hub only (the mouth you enter into -- e.g. Southern Highway). Side
+    streets and house interiors stay unflagged so `exit` cannot teleport
+    from indoors. Legacy exits['in']/['out'] and matching grid.portals for
+    the same pair are stripped so the verbs stay separate.
     """
     pockets = data.get("pockets") or []
     if not pockets:
@@ -1179,6 +2203,8 @@ def _link_pockets(rooms, filename, data):
             )
 
         # Zone travel (enter / exit) -- not movement exits.
+        # Only the pocket hub is a zone_exit mouth: exit from Southern
+        # Highway / South Gate / etc., not every house or sewer room.
         for alias in _pocket_enter_aliases(hub, pocket):
             prior = cell.zone_entries.get(alias)
             if prior is not None and prior is not hub:
@@ -1188,14 +2214,7 @@ def _link_pockets(rooms, filename, data):
                 )
             cell.zone_entries[alias] = hub
         hub.zone_exit_to = cell
-        # Every room in the same Cadence zone can `exit` back to the grid.
-        zone_id = getattr(hub, "zone", None)
-        if zone_id:
-            for other in rooms.values():
-                if getattr(other, "zone", None) == zone_id:
-                    other.zone_exit_to = cell
-        else:
-            hub.zone_exit_to = cell
+        hub.zone_exit = True
 
         # Strip legacy in/out so cmd_move / in / out cannot walk the link.
         if cell.exits.get(direction) is hub:
@@ -1226,7 +2245,249 @@ def _link_pockets(rooms, filename, data):
     return hub_keys
 
 
-def load_all_maps():
+def _stamp_registry_entry(registry, filename, data, plane, realm, map_id):
+    """Write one map_registry row (boot or hot-load)."""
+    from engine.room_naming import parse_city_meta
+
+    grid = data.get("grid")
+    city_meta = parse_city_meta(data)
+    registry[map_id] = {
+        "realm": realm,
+        "plane": plane,
+        "grid_prefix": grid["key_prefix"] if grid else None,
+        "width": grid["width"] if grid else None,
+        "height": grid["height"] if grid else None,
+        # Torus / globe neighbor loop (see _link_grid_neighbors).
+        "wrap": bool(grid and grid.get("wrap") is True),
+        "pocket_hubs": list(
+            p.get("hub_room") for p in (data.get("pockets") or [])
+            if p.get("hub_room")
+        ),
+        "filename": filename,
+        "autoload": _autoload_enabled(data),
+        "runtime_hub": data.get("runtime_hub"),
+        # Official city label + ROOM NAME paint roles (docs/AREA_BUILDING.md).
+        "city_name": city_meta["city_name"],
+        "city_color": city_meta["city_color"],
+        "sub_color": city_meta["sub_color"],
+        "main_colors": city_meta["main_colors"],
+    }
+
+
+def create_rooms_from_map_data(rooms, filename, data):
+    """Pass-1: create grid cells + hand rooms from one map JSON into rooms.
+
+    Returns (map_id, plane, realm, grid_was_built). Raises on key collision
+    or unknown plane — same rules as boot.
+    """
+    plane, realm = _resolve_plane_and_realm(filename, data)
+    map_id = _map_id_for(filename, data)
+    grid = data.get("grid")
+    if grid:
+        # Hot-load of a second grid with a colliding prefix must fail loud.
+        prefix = grid["key_prefix"]
+        for existing in rooms.values():
+            if getattr(existing, "grid_prefix", None) == prefix:
+                raise ValueError(
+                    f"{filename}: grid key_prefix {prefix!r} already used "
+                    f"by a loaded room"
+                )
+        _build_grid(
+            rooms, filename, grid,
+            plane=plane, realm=realm, map_id=map_id,
+        )
+    for room_data in data.get("rooms", []):
+        ensure_hand_room_identity(
+            room_data, where=f"{filename} hand room",
+        )
+        room_dungeon = (
+            room_data["dungeon"] if "dungeon" in room_data
+            else data.get("dungeon")
+        )
+        room_no_random = (
+            room_data["no_random_spawn"] if "no_random_spawn" in room_data
+            else data.get("no_random_spawn")
+        )
+        _add_room(
+            rooms,
+            filename,
+            room_data["key"],
+            room_data["description"],
+            room_data.get("gravity", 1.0),
+            room_data.get("wilderness"),
+            room_data.get("area_type"),
+            room_data.get("bestiary_categories"),
+            plane=plane,
+            realm=realm,
+            map_id=map_id,
+            resources=room_data.get("resources"),
+            zone=room_data.get("zone"),
+            resource_capacity=room_data.get("resource_capacity"),
+            consecrated=room_data.get("consecrated"),
+            evil_zone=room_data.get("evil_zone"),
+            dungeon=room_dungeon,
+            no_random_spawn=room_no_random,
+            zone_exit=room_data.get("zone_exit"),
+            is_house=room_data.get("is_house"),
+            is_grave=room_data.get("is_grave"),
+            private_home=room_data.get("private_home"),
+            is_hotel_room=room_data.get("is_hotel_room"),
+            is_home=room_data.get("is_home"),
+            main_homeroom=room_data.get("main_homeroom"),
+            vampire_safe=room_data.get("vampire_safe"),
+            hunter_safe=room_data.get("hunter_safe"),
+            no_combat=room_data.get("no_combat"),
+            no_loiter=room_data.get("no_loiter"),
+            evil_ward=room_data.get("evil_ward"),
+            is_cell=room_data.get("is_cell"),
+            robable=room_data.get("robable"),
+            outdoor=room_data.get("outdoor"),
+            floor_sleep=room_data.get("floor_sleep"),
+            has_bunks=room_data.get("has_bunks"),
+            vampire_nest=room_data.get("vampire_nest"),
+            spawn_nest=room_data.get("spawn_nest"),
+            spawn_hub=room_data.get("spawn_hub"),
+            hospital=room_data.get("hospital"),
+            mechanic=room_data.get("mechanic"),
+            devils_trap=room_data.get("devils_trap"),
+            salt_line=room_data.get("salt_line"),
+            iron_ward=room_data.get("iron_ward"),
+            devils_gate=room_data.get("devils_gate"),
+            unholy=room_data.get("unholy"),
+            crossroads=room_data.get("crossroads"),
+            demon_deal=room_data.get("demon_deal"),
+            jobs=room_data.get("jobs"),
+            vendor_stock=room_data.get("vendor_stock"),
+            dark=room_data.get("dark"),
+            hidden_directions=room_data.get("hidden_directions"),
+            title=room_data.get("title"),
+            vnum=room_data.get("vnum"),
+            croatoan_contaminated=room_data.get("croatoan_contaminated"),
+            croatoan_quarantine=room_data.get("croatoan_quarantine"),
+            croatoan_seal=room_data.get("croatoan_seal"),
+            croatoan_blood=room_data.get("croatoan_blood"),
+            croatoan_panic=room_data.get("croatoan_panic"),
+            layout=room_data.get("layout"),
+            remodel_type=room_data.get("remodel_type"),
+            remodel_inbound_exit=room_data.get("remodel_inbound_exit"),
+        )
+        _stamp_room_city_meta(rooms[room_data["key"]], data)
+    return map_id, plane, realm, bool(grid)
+
+
+def link_map_data(rooms, filename, data):
+    """Pass-2: wire exits, pockets, and collect seed_items for one file.
+
+    Returns list of (Item, room_key) seed pairs (caller places them).
+    """
+    seed_items = []
+    grid = data.get("grid")
+    if grid:
+        _link_grid_neighbors(rooms, grid)
+        _link_grid_portals(rooms, filename, grid)
+    for room_data in data.get("rooms", []):
+        _link_room_exits(rooms, filename, room_data)
+        for item_data in room_data.get("seed_items", []):
+            from engine.hooks import make_world_item
+            room_key = room_data["key"]
+            seed_items.append((
+                make_world_item(
+                    item_data,
+                    where=f"{filename}: room {room_key!r} seed_items",
+                ),
+                room_key,
+            ))
+    _link_pockets(rooms, filename, data)
+    return seed_items
+
+
+def wire_pocket_at_cell(
+    rooms,
+    *,
+    host_prefix,
+    host_width,
+    host_height,
+    x,
+    y,
+    hub_key,
+    kind="settlement",
+    enter_as=None,
+    visible_as=None,
+    filename="(runtime)",
+):
+    """Attach hub_room to an overland cell for enter/exit (runtime or boot).
+
+    Same rules as pockets[] in map JSON. Mutates cell.zone_entries and
+    stamps zone_exit + zone_exit_to on the hub only. Returns the cell Room.
+    """
+    if kind not in POCKET_KINDS:
+        raise ValueError(
+            f"{filename}: pocket kind {kind!r} -- must be one of "
+            f"{sorted(POCKET_KINDS)}"
+        )
+    x, y = int(x), int(y)
+    if not (0 <= x < int(host_width) and 0 <= y < int(host_height)):
+        raise ValueError(
+            f"{filename}: pocket at [{x}, {y}] outside grid "
+            f"{host_width}x{host_height}"
+        )
+    if hub_key not in rooms:
+        raise ValueError(f"{filename}: hub_room {hub_key!r} unknown")
+    cell_key = f"{host_prefix} ({x}, {y})"
+    if cell_key not in rooms:
+        raise ValueError(f"{filename}: overland cell {cell_key!r} missing")
+    cell = rooms[cell_key]
+    hub = rooms[hub_key]
+    pocket = {
+        "kind": kind,
+        "at": [x, y],
+        "hub_room": hub_key,
+        "enter_as": list(enter_as or []),
+        "visible_as": visible_as or "",
+    }
+    for alias in _pocket_enter_aliases(hub, pocket):
+        prior = cell.zone_entries.get(alias)
+        if prior is not None and prior is not hub:
+            raise ValueError(
+                f"{filename}: enter alias {alias!r} already points at "
+                f"{prior.key!r}"
+            )
+        cell.zone_entries[alias] = hub
+    hub.zone_exit_to = cell
+    hub.zone_exit = True
+    visible = str(visible_as or "").strip()
+    if visible:
+        _LANDMARKS_BY_PREFIX.setdefault(host_prefix, []).append({
+            "x": x,
+            "y": y,
+            "name": visible,
+        })
+    return cell
+
+
+def unwire_pockets_pointing_at(rooms, hub_keys, host_prefix=None):
+    """Remove zone_entries / landmarks that target hubs being unloaded."""
+    hub_set = set(hub_keys)
+    for room in rooms.values():
+        entries = getattr(room, "zone_entries", None) or {}
+        for alias, dest in list(entries.items()):
+            if dest is not None and getattr(dest, "key", None) in hub_set:
+                del entries[alias]
+    if host_prefix and host_prefix in _LANDMARKS_BY_PREFIX:
+        # Landmarks do not store hub keys; leave them — load path can
+        # re-add. Strip nothing here to avoid deleting unrelated vistas.
+        pass
+
+
+def rooms_for_map_id(rooms, map_id):
+    """Return list of Room objects stamped with this map_id."""
+    return [
+        r for r in rooms.values()
+        if getattr(r, "map_id", None) == map_id
+    ]
+
+
+def load_all_maps(*, include_deferred=False):
     """Load every content/maps/*.json file and build the live world from
     them.
 
@@ -1247,9 +2508,15 @@ def load_all_maps():
     a file loaded before or after the current one -- without caring about
     load order. Pocket zone links (enter/exit) are wired after exits so
     legacy in/out portal pairs can be stripped cleanly.
+
+    ``include_deferred`` (default False): when True, also load files with
+    ``"autoload": false`` (e.g. Lebanon). Boot stays False so deferred
+    zones wait for ``gm maps load``. Save validators (in-game dig/link,
+    Area Studio) pass True so exits that point at hot-loadable rooms are
+    checked instead of falsely reporting "unknown room".
     """
     global LAST_MAP_REGISTRY, _LANDMARKS_BY_PREFIX
-    map_files = _load_map_files()
+    map_files = _load_map_files(include_deferred=include_deferred)
 
     # Fresh registry each load so copyover / re-import never duplicates.
     _LANDMARKS_BY_PREFIX = {}
@@ -1278,6 +2545,19 @@ def load_all_maps():
                 plane=plane, realm=realm, map_id=map_id,
             )
         for room_data in data.get("rooms", []):
+            # Top-level "dungeon": true stamps every room unless the room
+            # sets its own dungeon key (players-only leveling zones).
+            ensure_hand_room_identity(
+                room_data, where=f"{filename} hand room",
+            )
+            room_dungeon = (
+                room_data["dungeon"] if "dungeon" in room_data
+                else data.get("dungeon")
+            )
+            room_no_random = (
+                room_data["no_random_spawn"] if "no_random_spawn" in room_data
+                else data.get("no_random_spawn")
+            )
             _add_room(
                 rooms,
                 filename,
@@ -1295,18 +2575,30 @@ def load_all_maps():
                 resource_capacity=room_data.get("resource_capacity"),
                 consecrated=room_data.get("consecrated"),
                 evil_zone=room_data.get("evil_zone"),
+                dungeon=room_dungeon,
+                no_random_spawn=room_no_random,
+                zone_exit=room_data.get("zone_exit"),
                 is_house=room_data.get("is_house"),
                 is_grave=room_data.get("is_grave"),
                 private_home=room_data.get("private_home"),
+                is_hotel_room=room_data.get("is_hotel_room"),
+                is_home=room_data.get("is_home"),
+                main_homeroom=room_data.get("main_homeroom"),
                 vampire_safe=room_data.get("vampire_safe"),
                 hunter_safe=room_data.get("hunter_safe"),
+                no_combat=room_data.get("no_combat"),
+                no_loiter=room_data.get("no_loiter"),
                 evil_ward=room_data.get("evil_ward"),
                 is_cell=room_data.get("is_cell"),
                 robable=room_data.get("robable"),
                 outdoor=room_data.get("outdoor"),
                 floor_sleep=room_data.get("floor_sleep"),
+                has_bunks=room_data.get("has_bunks"),
                 vampire_nest=room_data.get("vampire_nest"),
+                spawn_nest=room_data.get("spawn_nest"),
+                spawn_hub=room_data.get("spawn_hub"),
                 hospital=room_data.get("hospital"),
+                mechanic=room_data.get("mechanic"),
                 devils_trap=room_data.get("devils_trap"),
                 salt_line=room_data.get("salt_line"),
                 iron_ward=room_data.get("iron_ward"),
@@ -1315,21 +2607,22 @@ def load_all_maps():
                 crossroads=room_data.get("crossroads"),
                 demon_deal=room_data.get("demon_deal"),
                 jobs=room_data.get("jobs"),
+                vendor_stock=room_data.get("vendor_stock"),
                 dark=room_data.get("dark"),
                 hidden_directions=room_data.get("hidden_directions"),
+                title=room_data.get("title"),
+                vnum=room_data.get("vnum"),
+                croatoan_contaminated=room_data.get("croatoan_contaminated"),
+                croatoan_quarantine=room_data.get("croatoan_quarantine"),
+                croatoan_seal=room_data.get("croatoan_seal"),
+                croatoan_blood=room_data.get("croatoan_blood"),
+                croatoan_panic=room_data.get("croatoan_panic"),
+                layout=room_data.get("layout"),
+                remodel_type=room_data.get("remodel_type"),
+                remodel_inbound_exit=room_data.get("remodel_inbound_exit"),
             )
-        registry[map_id] = {
-            "realm": realm,
-            "plane": plane,
-            "grid_prefix": grid["key_prefix"] if grid else None,
-            "width": grid["width"] if grid else None,
-            "height": grid["height"] if grid else None,
-            "pocket_hubs": list(
-                p.get("hub_room") for p in (data.get("pockets") or [])
-                if p.get("hub_room")
-            ),
-            "filename": filename,
-        }
+            _stamp_room_city_meta(rooms[room_data["key"]], data)
+        _stamp_registry_entry(registry, filename, data, plane, realm, map_id)
 
     # Pass 2: every Room now exists, so wire exits and collect the rest.
     for filename, data in map_files:

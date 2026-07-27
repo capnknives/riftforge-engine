@@ -126,7 +126,12 @@ def main():
     c = Character("LeanEngine")
     assert c.key == "LeanEngine"
     assert not hasattr(c, "origin"), c.__dict__.keys()
-    assert not hasattr(c, "stats"), c.__dict__.keys()
+    # stats/tier are generic engine content now (engine/stats.py) -- a bare
+    # Character gets the real default spine, not a SUPERS-only extra.
+    assert c.stats == {
+        "POW": 5.0, "VIT": 5.0, "FOC": 5.0, "FIN": 5.0, "RES": 5.0, "PRE": 5.0,
+    }, c.stats
+    assert c.tier == 0
 
     c.session = _FakeSession()
     cmd_who(c, "", _FakeGame())
@@ -192,7 +197,55 @@ def main():
     lean_game = server_mod.Game(db_path=":memory:")
     assert lean_game.start_room is not None
     assert lean_game.find_character("a training dummy") is None
+
+    # Stage 1 two-repo purity: the tick pipeline is generic engine
+    # infrastructure now, not gated behind SUPERS presence -- a lean boot
+    # should run a (empty) heartbeat with zero registered handlers. No game
+    # has registered anything yet, so `_tick_handlers` may not even exist
+    # (register_tick lazily creates it) -- run_ticks tolerates that via
+    # getattr(..., ()).
+    server_mod.run_ticks(lean_game)
+    assert getattr(lean_game, "_tick_handlers", []) == []
+    assert len(lean_game._tick_stats) == 1
+
+    import asyncio
+    asyncio.run(server_mod.run_ticks_async(lean_game))
+    assert len(lean_game._tick_stats) == 2
     lean_game.db.close()
+
+    # Catalog-loader foundation: engine.content_store / content_validate
+    # moved out of supers/ in Stage 1 -- prove they work with SUPERS absent.
+    import tempfile
+    from engine import content_store, content_validate
+
+    content_validate.require_keys({"id": "a", "name": "b"}, ["id", "name"], "test")
+    content_validate.unique_ids([{"id": "a"}, {"id": "b"}], "test")
+    try:
+        content_validate.unique_ids([{"id": "a"}, {"id": "a"}], "test")
+        raise AssertionError("duplicate ids should raise")
+    except AssertionError as exc:
+        assert "duplicate" in str(exc)
+
+    content_store.require_snake_id("a_valid_id")
+    try:
+        content_store.require_snake_id("Not Valid")
+        raise AssertionError("bad snake_case id should raise")
+    except ValueError:
+        pass
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = os.path.join(tmpdir, "roundtrip.json")
+        content_store.save_json(tmp_path, {"a": 1})
+        assert content_store.load_json(tmp_path) == {"a": 1}
+
+    from engine import tick_registry
+
+    fired = []
+    tick_registry.register_tick(lean_game, lambda g: fired.append(g), order=5, name="probe")
+    tick_registry.run_ticks(lean_game)
+    assert fired == [lean_game]
+    tick_registry.clear_ticks(lean_game)
+    assert lean_game._tick_handlers == []
 
     print("engine_smoke_ok")
     return 0

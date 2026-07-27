@@ -31,8 +31,10 @@ No networking here -- SilentSession.send only appends to an in-memory
 list. Keep Cadence planners thin: decide *what* to do, then npc_do the
 verb (or call a shared domain helper that cmd_* also uses). Full telnet
 dispatch for every AI step is not required -- pathfinding and need meters
-may stay planner-side -- but when a verb exists, prefer this path over an
-NPC-only shortcut that looks different in the room.
+may stay planner-side -- but when a verb exists, **always prefer npc_do**
+over an NPC-only shortcut that looks different in the room (AGENTS.md
+rule 9). Only skip npc_do when a design note says so, or no player verb
+exists / would not make sense.
 """
 
 
@@ -68,6 +70,20 @@ class SilentSession:
         return
 
 
+def _log_activity_error(where, character):
+    """Surface a duck-typed activity-logger failure without killing the AI step.
+
+    The Echo / kit transcript is a best-effort side effect, so a broken
+    logger must not abort npc_do -- but swallowing it silently hid real bugs
+    in the supers.activity_log wiring. Log once with a traceback so the
+    regression is visible in the server console.
+    """
+    import traceback
+    key = getattr(character, "key", None)
+    print(f"[npc_act] activity {where} failed for {key!r}:", flush=True)
+    traceback.print_exc()
+
+
 def npc_do(character, raw, game):
     """Run one player verb as an NPC / Echo via commands.dispatch.
 
@@ -98,7 +114,7 @@ def npc_do(character, raw, game):
         try:
             logger.do(raw)
         except Exception:
-            pass
+            _log_activity_error("logger.do", character)
     try:
         # GMs snooping this actor see the verb they "typed" (same ] tag as
         # a live player's Session.play path).
@@ -111,7 +127,7 @@ def npc_do(character, raw, game):
         try:
             logger.you(silent.lines)
         except Exception:
-            pass
+            _log_activity_error("logger.you", character)
     # Relay AI verb feedback to an idlemode spectator (not SilentSession).
     if (
         previous is not None

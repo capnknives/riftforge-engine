@@ -5,6 +5,9 @@ Generic MUD chrome: dark rooms need a carried light source to see look
 contents; hidden exits stay invisible until a character searches (or
 already knows them). No SUPERS imports -- Item.provides_light and
 Room.dark / Room.hidden_directions are plain engine fields.
+
+Night-sight (gods, monsters, Umbral, …) is a game hook via
+engine.hooks.can_see_in_dark -- the bare engine never grants it.
 """
 
 
@@ -17,12 +20,20 @@ def has_light_source(character):
 
 
 def can_see_room(character, room):
-    """True unless the room is dark and the character has no light."""
+    """True unless the room is dark and the character has no light/night-sight.
+
+    Order: lit rooms always visible; dark rooms need either a carried
+    ``provides_light`` item or the game's ``can_see_in_dark`` hook.
+    """
     if room is None:
         return True
     if not getattr(room, "dark", False):
         return True
-    return has_light_source(character)
+    if has_light_source(character):
+        return True
+    # Game-specific piercers (GM form, Monster Origin, Umbral, …).
+    from engine import hooks
+    return hooks.can_see_in_dark(character, room)
 
 
 def exit_is_hidden(room, direction):

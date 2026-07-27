@@ -28,6 +28,10 @@ Unix-only (execv/SIGUSR1/fd inheritance are POSIX concepts) -- on Windows,
 install_signal_handler() is a no-op, so start-server.bat's plain
 `python server.py` usage is completely unaffected either way.
 
+Gateway mode (RIFTFORGE_GATEWAY=1): SIGUSR1 still runs _perform, but after
+announcing MSG_BEFORE and saving, the game exits so watch_and_run can
+respawn it. Client TCP stays on engine.gateway; reattach sends MSG_AFTER.
+
 Deliberately NOT covered here (see HANDOFF.md for the reasoning):
 - The listening socket itself isn't preserved -- a brand-new connection
   attempt in the split second before the new process rebinds just gets
@@ -45,6 +49,16 @@ import socket
 import sys
 
 STATE_PATH = ".copyover_state.json"
+
+# Player-facing lines (plain tags -- never color alone). Shared by classic
+# execv copyover, gateway graceful restart, and gateway reattach.
+MSG_BEFORE = (
+    "*** The Veil shudders. Something ancient is rewriting the bones of "
+    "this world. Hold on. ***"
+)
+MSG_AFTER = (
+    "*** The Veil settles. You are still here. ***"
+)
 
 
 def install_signal_handler(game):
@@ -70,44 +84,105 @@ def trigger(game):
     asyncio.create_task(_perform(game))
 
 
+async def _announce_before(game):
+    """Send MSG_BEFORE to every logged-in session and drain (best-effort)."""
+    for session in list(game.sessions):
+        if not session.character:
+            continue
+        session.send(MSG_BEFORE)
+        try:
+            await session.writer.drain()
+        except (ConnectionResetError, BrokenPipeError, TimeoutError,
+                ConnectionError, OSError) as exc:
+            # Dead / half-open sockets must not abort the whole reload.
+            print(
+                f"[copyover] skipping dead session "
+                f"({session.character.key}): {exc!r}",
+                flush=True,
+            )
+
+
+async def _notify_gateway_planned_restart(game):
+    """Best-effort CTRL to the gateway: this exit is a planned reload.
+
+    Looks on ``game.gateway_bridge`` first (set by server.py), then any
+    live session's bridge. Fail-soft -- missing bridge still exits; Discord
+    grace alone covers short restarts.
+    """
+    bridge = getattr(game, "gateway_bridge", None)
+    if bridge is None:
+        for session in list(getattr(game, "sessions", None) or []):
+            bridge = getattr(session, "gateway_bridge", None)
+            if bridge is not None:
+                break
+    if bridge is None:
+        return
+    notify = getattr(bridge, "notify_planned_restart", None)
+    if not callable(notify):
+        return
+    try:
+        await notify()
+    except Exception as exc:
+        print(
+            f"[copyover] planned_restart notify failed: {exc!r}",
+            flush=True,
+        )
+
+
 async def _perform(game):
-    """Freeze every connected session, dump enough state to reattach them,
-    and replace this process with a fresh one running the current code on
-    disk. Never returns on success -- execv() replaces the running program
-    entirely. On failure (execv itself raised), logs it and returns,
-    leaving the OLD process running rather than crashing.
+    """Announce, save, then hot-reload.
+
+    Two modes:
+      - Direct telnet (no gateway): freeze fds, write state, os.execv
+        (classic copyover -- never returns on success).
+      - Gateway mode: clients stay on the gateway. Announce MSG_BEFORE,
+        save, then exit so watch_and_run can respawn the game; reattach
+        sends MSG_AFTER. Do not execv (no inheritable client fds here).
     """
     print("[copyover] reload requested -- freezing connections briefly", flush=True)
+
+    from engine.gateway_client import gateway_enabled
+
+    await _announce_before(game)
+
+    # Persist the world NOW -- the new process's Game.__init__ reloads from
+    # disk, so whatever isn't saved here is lost, same as any other restart.
+    game.save()
+
+    if gateway_enabled():
+        # Watcher holds :4000; exiting is the reload. Players already got
+        # MSG_BEFORE; MSG_AFTER lands on gateway reattach in connection.py.
+        # Tell the gateway first so WKNZ Discord does not treat this as a
+        # crash (auto-deploy / code watch restarts are routine).
+        await _notify_gateway_planned_restart(game)
+        print(
+            "[copyover] gateway mode -- exiting for watcher respawn "
+            "(clients held)",
+            flush=True,
+        )
+        # Hard exit from an asyncio task (sys.exit alone would not stop PID 1
+        # child cleanly enough for the watcher to reap immediately).
+        os._exit(0)
+        return  # unreachable after _exit; kept for tests that stub _exit
 
     entries = []
     for session in list(game.sessions):
         if not session.character:
             # Still on the name/password prompt -- nothing to reattach to.
-            # This connection just closes when execv() replaces the process;
-            # a rare, accepted edge case (see copyover.py's module docstring).
             continue
-        session.send("*** The world flickers -- reality is reforming. Hold on. ***")
-        try:
-            await session.writer.drain()
-        except (ConnectionResetError, BrokenPipeError, TimeoutError,
-                ConnectionError, OSError) as exc:
-            # Dead / half-open sockets raise more than reset/pipe -- live
-            # hit TimeoutError (errno 110) on drain and aborted the whole
-            # copyover before execv. Skip this session; keep reloading.
-            print(f"[copyover] skipping dead session "
-                  f"({session.character.key}): {exc!r}", flush=True)
-            continue
-
         sock = session.writer.get_extra_info("socket")
         if sock is None:
             continue
         fd = sock.fileno()
         os.set_inheritable(fd, True)   # survive the execv() below
-        entries.append({"fd": fd, "name": session.character.key})
-
-    # Persist the world NOW -- the new process's Game.__init__ reloads from
-    # disk, so whatever isn't saved here is lost, same as any other restart.
-    game.save()
+        # Freeze the login body name -- never gmspirit:Key -- so resume
+        # finds the corporeal Character; after_session_attach restores
+        # gm on when gm_staff_form is set.
+        from engine.command_support import strip_ephemeral_storage_prefix
+        actor = session.character
+        bind_name = getattr(actor, "gm_body_key", None) or actor.key
+        bind_name = strip_ephemeral_storage_prefix(bind_name)
+        entries.append({"fd": fd, "name": bind_name})
 
     with open(STATE_PATH, "w") as f:
         json.dump(entries, f)
@@ -152,10 +227,28 @@ async def resume(game):
     from engine.connection import Session
 
     for entry in entries:
-        char = game.find_character(entry["name"])
+        # Prefer exact login body (never husk: / gmspirit: leftovers).
+        finder = getattr(game, "find_login_character", None)
+        if callable(finder):
+            char = finder(entry["name"])
+        else:
+            char = game.find_character(entry["name"])
         if not char:
-            continue   # shouldn't happen -- the world was just reloaded from
-                       # the save _perform() made moments before execv
+            # Unfinished homezone lesson: boot heal vaulted the body; do not
+            # drop the socket -- send them through login instead.
+            from engine import hooks
+
+            if hooks.is_tutorial_incomplete_vault(game, entry["name"]):
+                try:
+                    sock = socket.socket(fileno=entry["fd"])
+                    reader, writer = await asyncio.open_connection(sock=sock)
+                except OSError:
+                    continue
+                session = Session(reader, writer, game)
+                game.sessions.append(session)
+                session.send(MSG_AFTER)
+                asyncio.create_task(_resume_login(session))
+            continue
         try:
             sock = socket.socket(fileno=entry["fd"])
             reader, writer = await asyncio.open_connection(sock=sock)
@@ -170,14 +263,28 @@ async def resume(game):
         session.reset_gmcp()
         from engine import gmcp
         from engine import mssp
+        from engine import hooks
         gmcp.offer_gmcp(session)
         mssp.offer_mssp(session)
-        session.send("*** The world reforms around you. You're still here. ***")
+        # Same post-attach hook as a normal login (pending Tier break, mail
+        # notify, GMCP Char vitals/status). Without this, copyover resumes
+        # skip mail/GMCP that login would have pushed. Also restores
+        # `gm on` when the body has gm_staff_form.
+        hooks.after_session_attach(char, game)
+        session.send(MSG_AFTER)
         asyncio.create_task(_resume_client(session))
 
     # If a bug-fix deploy was in flight, announce it is live and mark resolved.
     from engine import deploy_notify
     await deploy_notify.on_resume(game)
+
+
+async def _resume_login(session):
+    """Run login prompts after copyover when the body was tutorial-folded."""
+    try:
+        await session.run()
+    except (ConnectionResetError, BrokenPipeError):
+        session.disconnect()
 
 
 async def _resume_client(session):

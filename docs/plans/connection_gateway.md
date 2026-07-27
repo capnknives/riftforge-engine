@@ -31,6 +31,11 @@ Env: `RIFTFORGE_GATEWAY=1` enables gateway mode (Docker default via
 `watch_and_run`). `RIFTFORGE_GATEWAY=0` keeps direct telnet + in-process
 copyover (Windows / learning).
 
+**IPC must stay loopback** (`127.0.0.1:4001` default). Gateway and
+`gateway_client` refuse a non-loopback `RIFTFORGE_GATEWAY_IPC` host unless
+`RIFTFORGE_GATEWAY_IPC_ALLOW_NONLOCAL=1` (unsafe on live). Never publish
+`:4001` in Docker/UFW — reattach skips the password by design.
+
 ## IPC framing
 
 Length-prefixed frames (`uint32` big-endian length of body):
@@ -39,7 +44,12 @@ Length-prefixed frames (`uint32` big-endian length of body):
 - **CTRL** (`type=0x02`): UTF-8 JSON
 
 CTRL from game: `hello`, `bound` `{sid,name}`, `unbound` `{sid}`, `ping`
-CTRL from gateway: `welcome` `{sessions:[{sid,name|null}]}`, `open` `{sid}`, `close` `{sid}`
+CTRL from gateway: `welcome` `{sessions:[{sid,name|null,peer?}]}`,
+`open` `{sid,peer?}`, `close` `{sid}`
+
+`peer` is the public telnet client host (string). The game Session writer
+exposes it via `get_extra_info("peername")` for banlist + head-GM-only
+`from …` staff pings; junior GMs do not see IPs on the ops channel.
 
 ## Reattach
 
@@ -49,6 +59,20 @@ CTRL from gateway: `welcome` `{sessions:[{sid,name|null}]}`, `open` `{sid}`, `cl
    Character and resumes `Session.play()` (no `disconnect()` — no Echo).
 4. Sessions without a name reset to the login prompt.
 5. New accepts while game is up: gateway `open` + DATA forward.
+
+**Player warnings:** watch_and_run SIGUSR1s the game on code change (not a
+silent kill). `copyover._perform` sends the Veil “hold on” line, saves,
+then exits; reattach sends the Veil “still here” line. Bug-fix
+`deploy_notify.on_resume` runs after gateway `welcome` (same as after
+classic copyover resume).
+
+**Hold music (elevator):** while game IPC is down and clients are held,
+`engine/gateway.py` periodically writes plain `[WAIT]` Veil lines to
+those sockets (grace default 5s, interval default 20s). Disable with
+`RIFTFORGE_GATEWAY_HOLD_MUSIC=0`. This is gateway-side on purpose — the
+dead game cannot speak. Shipping / editing gateway sources still
+restarts gateway + game once (clients drop); after that, crash downtime
+keeps clients and plays hold lines.
 
 ## Watcher
 

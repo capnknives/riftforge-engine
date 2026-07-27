@@ -31,6 +31,9 @@ SERVER_SUPPORTS = (
     "Room.Info 1",
     "Comm 1",
     "Comm.Channel 1",
+    # Live combat-pit / Mudlet spectator channel (supers/combat_viz.py).
+    "RiftForge.Combat 1",
+    "RiftForge.Char 1",
 )
 
 
@@ -241,8 +244,10 @@ def push_char_name(character):
     session = getattr(character, "session", None)
     if session is None or not client_supports(session, "Char.Name"):
         return
-    key = getattr(character, "key", "") or ""
-    session.send_gmcp("Char.Name", {"name": key, "fullname": key})
+    # Public face (Wits(GM) / Jimmy Novak) -- never gmspirit: / husk: keys.
+    from engine.command_support import _display_name
+    name = _display_name(character) if character is not None else ""
+    session.send_gmcp("Char.Name", {"name": name, "fullname": name})
 
 
 def push_char_status(character):
@@ -251,8 +256,9 @@ def push_char_status(character):
     if session is None or not client_supports(session, "Char.Status"):
         return
     from engine import hooks
+    from engine.command_support import _display_name
     payload = {
-        "name": getattr(character, "key", "") or "",
+        "name": _display_name(character) if character is not None else "",
         "idle": "1" if getattr(character, "idle_mode", False) else "0",
         "gm": "1" if getattr(character, "gm_mode", False) else "0",
     }
@@ -280,6 +286,31 @@ def push_vitals(character):
         session.send_gmcp("Char.Vitals", payload)
 
 
+def push_combat_swing(character, event):
+    """Send RiftForge.Combat.Swing (live pit / Mudlet spectator).
+
+    Emits whenever the session has GMCP enabled. The package is advertised
+    in Core.Supports.Set; clients that ignore unknown packages stay fine.
+    Never invents outcomes — payload is built upstream from a frozen brief.
+    """
+    session = getattr(character, "session", None)
+    if session is None or not getattr(session, "gmcp_enabled", False):
+        return
+    if not isinstance(event, dict):
+        return
+    session.send_gmcp("RiftForge.Combat.Swing", event)
+
+
+def push_char_pose(character, event):
+    """Send RiftForge.Char.Pose (personal-mode idle facing for the pit)."""
+    session = getattr(character, "session", None)
+    if session is None or not getattr(session, "gmcp_enabled", False):
+        return
+    if not isinstance(event, dict):
+        return
+    session.send_gmcp("RiftForge.Char.Pose", event)
+
+
 def push_char_identity(character):
     """Name + Status together (login / Supports / rename)."""
     push_char_name(character)
@@ -291,11 +322,16 @@ def room_info_payload(character):
 
     Engine-safe fields only (no SUPERS). Returns None when there is no room.
     Dark rooms still get id/name/area; desc and exits are omitted until seen.
+
+    Hand rooms with a ``vnum`` emit a Mudlet-safe packed integer as ``num``
+    plus the human code as ``id``. Grid / unstamped rooms use ``num`` 0.
+    Exit targets are packed ints when the destination has a vnum, else -1.
     """
     room = getattr(character, "location", None)
     if room is None:
         return None
     from engine import hooks
+    from engine import room_vnum as room_vnum_mod
     from engine import vision as vision_mod
 
     can_see = vision_mod.can_see_room(character, room)
@@ -311,14 +347,43 @@ def room_info_payload(character):
                 continue
             if not hooks.look_exit_visible(dest, game):
                 continue
-            exits[direction] = getattr(dest, "key", str(dest))
+            dest_vnum = getattr(dest, "vnum", None)
+            if dest_vnum:
+                exits[direction] = room_vnum_mod.pack_vnum(dest_vnum)
+            else:
+                # Stock Mudlet mappers need integers; unknown = -1.
+                exits[direction] = -1
+
+    look_name = room.look_title() if hasattr(room, "look_title") else (
+        getattr(room, "key", "") or ""
+    )
+    zone = getattr(room, "zone", None)
+    map_id = getattr(room, "map_id", None)
+    if zone:
+        area = str(zone)
+    elif map_id:
+        area = str(map_id)
+    else:
+        area = "world"
+    environment = getattr(room, "area_type", "plains") or "plains"
+
+    vnum = getattr(room, "vnum", None)
+    if vnum:
+        num = room_vnum_mod.pack_vnum(vnum)
+        human_id = room_vnum_mod.validate_vnum(vnum)
+    else:
+        num = 0
+        human_id = None
 
     payload = {
-        "num": getattr(room, "key", ""),
-        "name": getattr(room, "key", ""),
-        "area": getattr(room, "area_type", "plains") or "plains",
+        "num": num,
+        "name": look_name,
+        "area": area,
+        "environment": environment,
         "exits": exits,
     }
+    if human_id:
+        payload["id"] = human_id
     if can_see:
         desc = getattr(room, "description", None) or getattr(room, "desc", None)
         if desc:

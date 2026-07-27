@@ -1,0 +1,116 @@
+{
+    "id": "demo_town",
+    "plane": "earth",
+    "realm": "prime",
+    "autoload": true,
+    "_comment": "basegame's reference micro map -- a small human town proving the engine's room/exit/chargen loop. See docs/plans/two_repo_purity.md Phase 7. Exits south from Crossroads Trail continue into demo_overworld.json (the macro map).",
+    "city_name": "Millbrook",
+    "city_color": "dark_grey",
+    "sub_color": "slate_grey",
+    "main_colors": {
+        "street": "silver",
+        "highway": "gold",
+        "lodging": "gold",
+        "home": "teal",
+        "civic": "absinthe_green",
+        "hospital": "dark_red",
+        "sewer": "slate_grey",
+        "default": "silver"
+    },
+    "rooms": [
+        {
+            "key": "Town Square",
+            "title": "Millbrook - Town Square - Plaza",
+            "vnum": "MB00001",
+            "description": "A modest square at the heart of town, paving stones worn smooth by years of foot traffic. A notice board stands near the well, and the town's few businesses front onto it from every side.",
+            "area_type": "city",
+            "zone": "demo-town",
+            "outdoor": true,
+            "is_start": true,
+            "exits": {
+                "north": "Ranger Post",
+                "south": "Inn",
+                "east": "General Store",
+                "west": "Clinic"
+            }
+        },
+        {
+            "key": "Ranger Post",
+            "title": "Millbrook - Ranger Post - Duty Room",
+            "vnum": "MB00002",
+            "description": "A squat timber cabin bristling with maps of the surrounding wilds. A duty roster hangs by the door, and a rack of well-oiled gear waits for whoever draws the next patrol.",
+            "area_type": "city",
+            "zone": "demo-town",
+            "outdoor": false,
+            "exits": {
+                "south": "Town Square"
+            }
+        },
+        {
+            "key": "General Store",
+            "title": "Millbrook - General Store - Counter",
+            "vnum": "MB00003",
+            "description": "Shelves crowded floor to ceiling with dry goods, tools, and travel rations. The counter still bears the scars of a thousand small transactions.",
+            "area_type": "city",
+            "zone": "demo-town",
+            "outdoor": false,
+            "resources": ["vendor"],
+            "exits": {
+                "west": "Town Square"
+            }
+        },
+        {
+            "key": "Clinic",
+            "title": "Millbrook - Clinic - Ward",
+            "vnum": "MB00004",
+            "description": "A plain, well-scrubbed room lined with cots and a supply cabinet. The smell of antiseptic hangs in the air; a chalkboard tracks who's on duty this shift.",
+            "area_type": "city",
+            "zone": "demo-town",
+            "outdoor": false,
+            "hospital": true,
+            "exits": {
+                "east": "Town Square"
+            }
+        },
+        {
+            "key": "Inn",
+            "title": "Millbrook - Inn - Common Room",
+            "vnum": "MB00005",
+            "description": "A low-ceilinged common room, tables scarred by mugs and elbows, a fire banked low in the hearth. It smells like woodsmoke and somebody's stew.",
+            "area_type": "city",
+            "zone": "demo-town",
+            "outdoor": false,
+            "resources": ["vendor"],
+            "exits": {
+                "north": "Town Square",
+                "east": "Warehouse",
+                "south": "Crossroads Trail"
+            }
+        },
+        {
+            "key": "Warehouse",
+            "title": "Millbrook - Warehouse - Loading Dock",
+            "vnum": "MB00006",
+            "description": "Crates and pallets stacked in uneven rows, a loading dock open to the street. Every shipment in or out of town passes through here first.",
+            "area_type": "city",
+            "zone": "demo-town",
+            "outdoor": false,
+            "exits": {
+                "west": "Inn"
+            }
+        },
+        {
+            "key": "Crossroads Trail",
+            "title": "Millbrook - Crossroads Trail - Trailhead",
+            "vnum": "MB00007",
+            "description": "The last cobblestones give way to packed dirt here, where the town's streets thin out into the trail proper. Open country waits south of the marker post.",
+            "area_type": "city",
+            "zone": "demo-town",
+            "outdoor": true,
+            "exits": {
+                "north": "Inn",
+                "south": "Overworld Trailhead"
+            }
+        }
+    ]
+}

@@ -21,6 +21,20 @@ unchanged -- see that module's docstring for the full list of re-exports.
 """
 
 
+def _log_activity_error(where, obj):
+    """Surface a duck-typed activity-logger failure without breaking the world.
+
+    The kit / Echo transcript (supers.activity_log) is a best-effort side
+    effect attached to a body -- a broken logger must never abort a room
+    broadcast or a move. It used to be swallowed silently, which hid real
+    wiring regressions; log once with a traceback so they stay visible.
+    """
+    import traceback
+    key = getattr(obj, "key", None)
+    print(f"[world] activity {where} failed for {key!r}:", flush=True)
+    traceback.print_exc()
+
+
 class GameObject:
     """Base class for anything that exists in the world (rooms, items, people)."""
 
@@ -29,6 +43,30 @@ class GameObject:
         # 'self' is this particular object; we hang its data off it here.
         self.key = key                  # the object's name, e.g. "a rusted sword"
         self.description = description   # shown when someone looks at it
+
+
+# Monotonic stamp for GM ``where item`` (newest copy). Bumped on every
+# Item.__init__; load_world restores saved values and advances the counter
+# so post-boot spawns stay "newer" than restored rows.
+_ITEM_CREATED_SEQ = 0
+
+
+def next_item_created_seq():
+    """Allocate the next Item.created_seq (also used after restore)."""
+    global _ITEM_CREATED_SEQ
+    _ITEM_CREATED_SEQ += 1
+    return _ITEM_CREATED_SEQ
+
+
+def note_item_created_seq(seq):
+    """Ensure the global counter stays at least *seq* (after load)."""
+    global _ITEM_CREATED_SEQ
+    try:
+        n = int(seq)
+    except (TypeError, ValueError):
+        return
+    if n > _ITEM_CREATED_SEQ:
+        _ITEM_CREATED_SEQ = n
 
 
 class Item(GameObject):
@@ -85,6 +123,13 @@ class Item(GameObject):
         # bed (soft claim / hotel lease) -- None = unowned.
         self.furniture = bool(furniture)
         self.owner_key = None
+        # Celestial spirit gear: stays on the Mantle when vessel-free in
+        # Heaven / Hell (supers/ethereal_item.py). Players bless with
+        # ``mark item <gear>``.
+        self.is_ethereal = False
+        # Process-lifetime creation order for GM ``where item`` (newest).
+        # Persisted in the items.container blob; restored on load_world.
+        self.created_seq = next_item_created_seq()
 
 
 class Room(GameObject):
@@ -138,6 +183,14 @@ class Room(GameObject):
         # Validated against supers/jobs.py at Cadence boot (not at map load
         # -- maps.py stays free of SUPERS imports).
         self.jobs = []
+        # Settlement / zone shop catalogs (Grocery, Gas Station, …). Authored
+        # on hand-written rooms in content/maps/*.json and content/zones/*.json
+        # -- never on overland grid cells. Resolved at first use by
+        # supers.economy.ensure_room_vendor_stock. Not SQLite-backed (rooms
+        # rebuild every boot); finite qty resets to the JSON seed on restart.
+        # Character.vendor_stock is separate personal/under-counter stock
+        # layered on top when an on-duty keeper works here.
+        self.vendor_stock = []
         # Cadence NPCs are CONFINED to their home zone: a grouping id (e.g.
         # "wastes-town") shared by every hand-authored room of one settlement.
         # supers/cadence.py's pathfinder only ever steps between rooms sharing
@@ -148,11 +201,14 @@ class Room(GameObject):
         self.zone = None
         # Grid <-> pocket zone travel (separate from cardinal / in-out moves):
         # zone_entries maps lowercase alias -> hub Room (set on the gateway
-        # grid cell by maps._link_pockets). zone_exit_to is the grid cell to
-        # return to via the `exit` verb (stamped on the hub and every room
-        # sharing its zone). Not stored in exits{}, so `north`/`in` never
-        # accidentally walk the pocket link.
+        # grid cell by maps._link_pockets). zone_exit is the authored/runtime
+        # flag that allows the `exit` verb here (pocket mouths only -- e.g.
+        # Southern Highway / Main Street S9 for Lebanon, not house interiors).
+        # zone_exit_to is the overland grid cell `exit` returns to (stamped
+        # only on rooms with zone_exit). Not stored in exits{}, so
+        # `north`/`in` never accidentally walk the pocket link.
         self.zone_entries = {}
+        self.zone_exit = False
         self.zone_exit_to = None
         # Optional scarcity cap per resource tag, e.g. {"sleep": 2} = only two
         # NPCs can occupy the hotel's beds at once. A tag absent here (or <= 0)
@@ -174,23 +230,63 @@ class Room(GameObject):
         # as Room.wilderness. Authored in content/maps/*.json as "evil_zone";
         # default False (an ordinary room).
         self.evil_zone = False
+        # Authored leveling dungeons (content/zones/*, supers/dungeons/):
+        # players-only PvE pockets. Cadence / Echo / NPC pathing treats
+        # dungeon rooms as impassable; taxi / takedungeon refuse anyone
+        # without a live Session. Same boolean shape as evil_zone.
+        # Authored as "dungeon" in map/zone JSON; default False.
+        self.dungeon = False
+        # Block wilderness / procedural-dungeon random encounter rolls.
+        # Authored leveling dungeons stamp this True with dungeon (only the
+        # zone's fixed bestiary is seeded once -- no respawn grind). Can
+        # also be set alone in map JSON. Default False.
+        self.no_random_spawn = False
+        # One-shot seed marker for authored dungeon trash (runtime).
+        self.dungeon_seeded = False
         # Sanctuary flags (Cadence conflict ebb/flow): vampires refuse to hunt
         # or enter vampire_safe rooms (Corner Bar, Town Gym); hunters refuse
         # hunter_safe rooms (Rat's Nest Backroom). Authored in map JSON;
         # default False. Same boolean shape as evil_zone / consecrated.
         self.vampire_safe = False
         self.hunter_safe = False
+        # True sanctuary: no attack/spar start and no hostile auto-aggro
+        # (Central Plaza civic peace). Distinct from vampire_safe /
+        # hunter_safe (one-faction dens). Authored as "no_combat" in map JSON.
+        self.no_combat = False
+        # Anti-loiter hub (Central Plaza): only logged-in PCs may stand
+        # here. NPCs / Echoes / sessionless bodies are hard-blocked on
+        # cardinal walk and swept out on tick. See supers/no_loiter.py.
+        self.no_loiter = False
         # Evil ward (Men of Letters bunker, etc.): hard entry refuse for
         # Demons, possessed hosts, Vampires, and evil-aligned characters.
         # Good and neutral may shelter. See supers/wards.py + move_gate.
         self.evil_ward = False
         # Cadence D39: a townsfolk home (distinct from hotel-for-drifters).
         self.is_house = False
+        # Multi-room house link: every interior chamber of one address /
+        # apartment / homestead stamps ``is_home`` and points
+        # ``main_homeroom`` at the claim hub (usually Living). Boot
+        # ``lodging.ensure_house_home_links`` backfills from ``is_house``
+        # clusters. Porches stay threshold-only (private_home, not is_home).
+        self.is_home = False
+        self.main_homeroom = None
         # Private-home hard door (entryway / porch / apartment unit). When
         # True on an entryway, `in` into the is_house interior is gated; when
         # True on an is_house unit (apartments), the door-code step is gated.
         # Unclaimed homes stay open -- see supers.lodging.can_enter_home.
         self.private_home = False
+        # Open-door hospitality: living guests skip the friend/family gate
+        # when True (lock / unlock / buildflag unlocked). Salt lines and
+        # devil's traps still seal spirits. Default locked (False).
+        self.unlocked = False
+        # Optional authored marker that this room hosts a hunt board.
+        # Board rooms are usually discovered via missions giver JSON;
+        # this flag lets a homestead mark a hub without a catalog edit.
+        self.mission_board = False
+        # Soft owner stamp for compound homes (Bobby's Singer House,
+        # wilds homestead hubs). Used by lock/unlock ACL; claim still
+        # uses home_room_key / homestead_plots.
+        self.homestead_owner = None
         # Cadence #49: a burial plot the gravedigger fills.
         self.is_grave = False
         # Jail cell the deputy locks criminals into (mirrors is_grave).
@@ -213,10 +309,16 @@ class Room(GameObject):
         # D29 minimap: stamped only on procedural grid cells by
         # maps._build_grid so render_minimap never has to re-parse the
         # "Prefix (x, y)" key string. Hand-authored rooms leave these
-        # None -- cmd_map replies "No map here." for those.
+        # None -- town maps use layout_* or an exit-graph fallback.
         self.grid_prefix = None
         self.grid_x = None
         self.grid_y = None
+        # Area Studio / dig canvas coords (map JSON "layout": {x,y,z}).
+        # Used by the town local minimap when present; None = fall back
+        # to exit-graph placement. Not overland grid_x/y.
+        self.layout_x = None
+        self.layout_y = None
+        self.layout_z = None
         # Divine faith economy (Phase 2 item 8 / D20): consecrated ground
         # (chapels) boosts minister flock growth. Authored in map JSON as
         # "consecrated": true; default False so every older room stays
@@ -245,6 +347,13 @@ class Room(GameObject):
         self.unholy = False
         self.crossroads = False
         self.demon_deal = False
+        # Croatoan remnant / surge rooms (supers/croatoan.py). Authored in
+        # zone JSON; default clean so ordinary rooms never tick exposure.
+        self.croatoan_contaminated = False
+        self.croatoan_quarantine = False
+        self.croatoan_seal = False
+        self.croatoan_blood = 0
+        self.croatoan_panic = 0
         # Temporary unholy from a crossroads beckon ritual. Expires when
         # game_time_ticks >= this value; 0 means none. Permanent unholy
         # flags are unaffected.
@@ -260,13 +369,37 @@ class Room(GameObject):
         # without bed furniture. maps/_add_room + lodging.ensure_beds skip
         # auto-seeding beds when this is True.
         self.floor_sleep = False
+        # Stronghold / bunker bunks: sleep resource with unlimited capacity
+        # and no bed Item required (Men of Letters Quarters, barracks).
+        # Distinct from floor_sleep (camp / public-ish) -- full bed rates,
+        # never public-sleep vagrancy. Authored as "has_bunks": true.
+        self.has_bunks = False
         # Vampire nest lair (sewer floor-sleep dens). Cadence day-refuge
         # prefers these after a Vampire's claimed home. Authored as
-        # "vampire_nest"; default False.
+        # "vampire_nest"; default False. Also sets spawn_nest="vampire"
+        # when spawn_nest is unset (maps.py alias).
         self.vampire_nest = False
+        # Live spawn den type (vampire|demon|beast|ghost). Authored as
+        # "spawn_nest": "demon". Empty/None means no nest top-up.
+        self.spawn_nest = None
+        # Soul / soldier hubs (adventurer_guild, hunter_motel, angel_nest,
+        # demon_nest) -- see supers/spawn_hubs.py + hubs.json.
+        self.spawn_hub = None
         # Town Clinic / hospital room (Evil Strikes Back). Authored as
         # "hospital": true in map JSON; supers/hospital.py finds these.
         self.hospital = False
+        # Town mechanic service desk (repair / paint / mods / berth sales).
+        # Authored as "mechanic": true -- distinct from home garage storage
+        # (is_house remodeled bays) and bunker Impala berths. See
+        # supers/vehicle_kit.is_mechanic_room.
+        self.mechanic = False
+        # Last remodel template id (e.g. "kitchen", "garage") -- stamped by
+        # supers.remodel / map_store.apply_remodel and loaded from map JSON.
+        # Used to gate home cooking (kitchen) and vehicle bay heuristics.
+        self.remodel_type = None
+        # Named inbound exit label from remodel (e.g. "garage") -- adjoining
+        # rooms show Garage instead of north/south. See map_store.apply_remodel.
+        self.remodel_inbound_exit = None
         # Thin light / vision (D67): dark rooms need a carried light source
         # to see look contents. Authored as "dark": true; default False.
         self.dark = False
@@ -275,20 +408,70 @@ class Room(GameObject):
         # knows them). Authored as "hidden_directions": ["east"]; default
         # empty. Validated against exits after linking in maps.py.
         self.hidden_directions = ()
-        # Optional spoofed look title (Jinn mirage pockets). Storage key
+        # Authored ROOM NAME (map JSON "title"). Distinct from the internal
+        # graph key so many rooms can share a look name (e.g. ten "Highway"
+        # stretches). Phase 3 makes VNUM the graph id -- see
+        # docs/plans/room_vnum_identity_migration.md. None = ROOM NAME falls
+        # back to the internal key string (legacy).
+        self.title = None
+        # Hand-room mapper / system id (map JSON "vnum"), e.g. "CA00001".
+        # See engine/room_vnum.py. Grid cells stay None.
+        self.vnum = None
+        # Optional ASCII minimap / atlas glyph (map JSON "map_glyph").
+        # When set, map / map big prefer this over the area_type letter
+        # (e.g. "=" highway, "^" mountain, "C" Chicago). None = legacy
+        # AREA_TYPE_GLYPH letter. See docs/plans/xycoordmapUSguidelines.docx.
+        self.map_glyph = None
+        # Optional color layer for atlas glyphs: ocean|plains|mountains|
+        # lake|highway|city|mountain_highway. Muted topo / bright routes.
+        self.map_layer = None
+        # Optional glyph table name ("atlas") for default topo symbols.
+        self.glyph_set = None
+        # Optional spoofed ROOM NAME (Jinn mirage pockets). Internal key
         # stays unique in game.rooms; look / exit lists use look_title()
         # so the victim sees the real place name with no "fake" tell.
+        # Runtime override -- wins over authored title when set.
         self.look_key = None
         # Runtime Jinn instance id when this room is a private mirage clone.
         self.jinn_instance_id = None
+        # Zone/map official city + ROOM NAME paint meta (docs/AREA_BUILDING.md).
+        # Stamped from JSON city_name / city_color / main_colors / sub_color.
+        self.city_name = None
+        self.city_color = None
+        self.sub_color = None
+        self.main_colors = None
 
     def look_title(self):
-        """Player-facing room name for look / exit lists.
+        """ROOM NAME for look / exit lists / who / walk prose.
 
-        Returns look_key when set (mirage spoof), otherwise key. Never
-        invents dream/fake wording -- callers must not add tells either.
+        Precedence: runtime look_key (Jinn mirage) > usable authored title >
+        flag-based generic (when dig left an opaque ``unowned shopN`` /
+        ``amenityN`` key with no real title) > internal key. Never invents
+        dream/fake wording -- callers must not add tells either. Staff dig
+        / VNUM labels: ``engine.room_vnum.staff_room_label`` /
+        ``internal_room_key``.
         """
-        return self.look_key or self.key
+        if self.look_key:
+            return self.look_key
+        # Local import keeps Room construction free of circular imports
+        # (room_naming is pure helpers; world is the domain model).
+        from engine.room_naming import (
+            authored_title_is_usable,
+            generic_title_from_flags,
+            is_opaque_storage_key,
+        )
+        title = getattr(self, "title", None)
+        if authored_title_is_usable(title, getattr(self, "key", "") or ""):
+            return str(title).strip()
+        # Dig / zone keys like ``unowned amenity1`` must not leak to look,
+        # work, who, or walk -- invent a short name from resources / jobs.
+        if is_opaque_storage_key(getattr(self, "key", "") or ""):
+            generic = generic_title_from_flags(self)
+            if generic:
+                return generic
+        if title:
+            return str(title).strip()
+        return self.key
 
     def add(self, obj):
         # Put an object in this room, but guard against adding it twice.
@@ -303,6 +486,10 @@ class Room(GameObject):
             if game is not None:
                 from engine.char_index import register_character
                 register_character(game, obj)
+        else:
+            # Items / bodies: reverse pointer so Cadence move_body (and
+            # similar) never scan ~12k rooms to find where an Item sits.
+            obj.location = self
 
     def remove(self, obj):
         # Take an object out, but only if it's actually here (avoids an error).
@@ -315,6 +502,8 @@ class Room(GameObject):
             if game is not None:
                 from engine.char_index import unregister_character
                 unregister_character(game, obj)
+        elif getattr(obj, "location", None) is self:
+            obj.location = None
 
     def characters(self):
         """Return only the Characters in this room (used for broadcasting messages)."""
@@ -322,7 +511,7 @@ class Room(GameObject):
         # keeping only the items where isinstance(o, Character) is True.
         return [o for o in self.contents if isinstance(o, Character)]
 
-    def broadcast(self, message, exclude=None, blank_after=False):
+    def broadcast(self, message, exclude=None, blank_after=False, predicate=None):
         """Send a message to every player standing in this room.
 
         `exclude` skips one character or an iterable of characters —
@@ -331,6 +520,15 @@ class Room(GameObject):
         when they already received a second-person version. Sleeping
         characters (Character.asleep) are also skipped -- sleep closes the
         outside world (lodging); dream content will plug in later.
+
+        ``predicate`` (optional): callable ``fn(watcher) -> bool``. When
+        set, only watchers for whom it returns True receive the line
+        (living Reaper Mantle veil leave/arrive; others stay unfiltered).
+
+        ``message`` may be a plain string, or a callable
+        ``fn(watcher) -> str|None``. Callables build a per-watcher line
+        (viewer-relative faces for introduce / leave-arrive); returning
+        None skips that watcher.
 
         When ``blank_after`` is True, each live session that received the
         message also gets an empty line (paragraph spacing). Blanks are
@@ -354,24 +552,38 @@ class Room(GameObject):
             # prose until they wake.
             if getattr(char, "asleep", False):
                 continue
+            # Possession consciousness exile: mind is in a personal
+            # Heaven/Hell pocket -- Earth room traffic stays silent
+            # (docs/plans/personal_afterlife.md).
+            if getattr(char, "consciousness_exile", False):
+                continue
+            if predicate is not None and not predicate(char):
+                continue
+            # Per-watcher formatting for introduction / hood faces.
+            if callable(message) and not isinstance(message, (str, bytes)):
+                text = message(char)
+                if not text:
+                    continue
+            else:
+                text = message
             if char.session:
-                char.session.send(message)
+                char.session.send(text)
                 if blank_after:
                     char.session.send("")
             elif getattr(char, "snoopers", None):
                 # Sessionless NPC / offline Echo: still feed GM snoopers the
                 # room line they would have heard if they had a Session.
                 from engine import snoop
-                snoop.mirror_output(char, message)
+                snoop.mirror_output(char, text)
             # Activity logger (kit progression / Echo soak transcripts):
             # duck-typed -- engine never imports supers.activity_log.
             # Runs for sessioned and sessionless bodies alike.
             logger = getattr(char, "activity_logger", None)
             if logger is not None:
                 try:
-                    logger.seen(message)
+                    logger.seen(text)
                 except Exception:
-                    pass
+                    _log_activity_error("logger.seen", char)
 
 
 class Character(GameObject):
@@ -384,9 +596,8 @@ class Character(GameObject):
         self.session = None     # the network Session driving this character (None = NPC)
         self.inventory = []     # a list of Items this character is carrying
         # A salted hash (see auth.py), never the plaintext password. Empty
-        # string means "no password set" -- true for characters created
-        # before this feature existed; connection.py lets those reconnect
-        # unchallenged but nudges the player toward 'setpass'.
+        # string means "no password set" -- connection.py refuses public
+        # login until a head GM resets via gm setpass (pen-test H1).
         self.password_hash = ""
         # Milestone 4 (combat): who this character is currently fighting, or
         # None. Sits right alongside the other attached data -- combat.py
@@ -428,7 +639,24 @@ class Character(GameObject):
         self.combat_stance = "balanced"   # balanced | aggressive | defensive
         self.combat_intent = None         # None | "press" | "guard" | "feint"
         self.feint_exposed = False
-        self.auto_combat_style = None     # None | bite | smite | maul | devour | stake | slay
+        # Vanguard protect (group_combat_mechanics.md): standing ally you
+        # try to intercept hits for. Character or None; fight-ephemeral,
+        # never persisted. Distinct from combat_intent "guard" (self
+        # Perfect-Guard Momentum spend).
+        self.protecting = None
+        # Retaliatory aura (Phase 2b): Ascendant+ Presence cloak -- anyone
+        # who swings at you takes brief recoil. Toggle with ``radiate``.
+        # Persisted like combat_stance. Tier 2+ only (same wall as Aura
+        # Suppression). Wilderness hostiles at T2+ spawn with it on.
+        self.retaliatory_aura = False
+        # POW brutality: armed by a critical; next press spend is cheaper,
+        # then cleared (never persisted -- fight punctuation only).
+        self.pow_brutal_press_discount = False
+        # POW executioner weight: next swing harder to dodge (cleared after).
+        self.pow_executioner_weight = False
+        # VIT second wind: once-per-fight low-HP incoming cut (fight state).
+        self.vit_second_wind_used = False
+        self.auto_combat_style = None     # None | bite | smite | maul | devour | stake | crush | rend | blade
         self.auto_style_notice_tick = -999
         # Perspective rendering (section 7 item 4, D17): which pronoun the
         # prose renderer's small conjugation helper uses in third person
@@ -509,6 +737,13 @@ class Character(GameObject):
         self.asleep = False
         self.dreaming = False
         self.sleep_bed_id = None
+        # Sit / stand: pure posture flavor (bug #58), same transient
+        # treatment as resting/asleep above -- always starts standing,
+        # never persisted. Cleared on movement (see cmd_move).
+        self.sitting = False
+        # Suggestion #82: sleeping without a bed / floor_sleep camp.
+        self.public_sleep = False
+        self.public_sleep_ticks = 0
         # Section 6 (Death, Body & Spirit -- D10/D11/D12/D19 resolved v0.29,
         # see docs/SYSTEMS_DESIGN.md section 9 item 7): True while this
         # character is a discorporate spirit, controlling itself but with no
@@ -540,6 +775,34 @@ class Character(GameObject):
         # pairing never goes stale while the body exists.
         self.body = None
         self.body_room = None
+        # The six-primary stat spine (POW/VIT/FOC/FIN/RES/PRE) and Tier are
+        # generic engine content now (engine/stats.py, two_repo_purity.md)
+        # -- every game shares this same schema, the same way every game
+        # shares character.hp below. What each stat/Tier actually PRODUCES
+        # (HP formulas, combat math, Tier flavor names) stays per-game --
+        # SUPERS's own supers/stats.py re-exports these names rather than
+        # redefining them; basegame reads them directly.
+        from engine import stats as stats_module
+        self.stats = stats_module.new_stats()
+        self.tier = 0
+        # Current hit points -- generic engine vitals, not game-composed:
+        # every game needs *some* notion of "how hurt is this character",
+        # and combat/KO/recovery machinery (engine.hooks.recompute_hp,
+        # engine/systems/combat_core.py) reads/writes this same name
+        # regardless of which game is active. 0 until a game's attach step
+        # sets it to that game's own max-hp formula (SUPERS:
+        # supers.stats.max_hp; basegame: basegame.stats.max_hp) -- the
+        # FORMULA (and its tuning constants) stays per-game, only the
+        # storage slot and the stats/tier it's derived from are shared.
+        self.hp = 0
+        # Follow bonds: generic engine social state, not game-composed --
+        # cmd_move/_pull_followers (command_support.py) and break_follows
+        # (below) all read/write these unconditionally, regardless of
+        # which game is active. `following` is the one leader this
+        # character trails (or None); `followers` is who trails THIS
+        # character. Never persisted (session-only, like .snooping above).
+        self.following = None
+        self.followers = []
 
         # Game composition (AGENTS.md rule 4) is registered via engine.hooks
         # -- SUPERS calls set_character_attacher(attach_supers) at package
@@ -585,7 +848,7 @@ class Character(GameObject):
                 try:
                     logger.move(old_key, new_key)
                 except Exception:
-                    pass
+                    _log_activity_error("logger.move", self)
 
 
 def make_body(character):
@@ -617,7 +880,18 @@ def break_follows(character):
 
     Also clears opaque companion_leader_key markers (SUPERS beckon duty)
     when present -- engine stays game-agnostic; it only wipes the attr.
+
+    Staff diagnostic tails (``staff_tailing`` / ``staff_tailers``) clear
+    here too -- same session-only lifetime as follow bonds.
     """
+    from engine.command_support import stop_staff_tail
+
+    stop_staff_tail(character, silent=True)
+    for tailer in list(getattr(character, "staff_tailers", None) or []):
+        if getattr(tailer, "staff_tailing", None) is character:
+            stop_staff_tail(tailer, silent=True)
+    if hasattr(character, "staff_tailers"):
+        character.staff_tailers = []
     target = character.following
     if target is not None and character in target.followers:
         target.followers.remove(character)

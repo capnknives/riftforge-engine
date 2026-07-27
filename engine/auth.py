@@ -19,6 +19,38 @@ import secrets
 _ITERATIONS = 200_000   # PBKDF2 work factor; raise later if hardware outpaces it
 _SALT_BYTES = 16
 
+# Shared floor for chargen + setpass (mortals and staff). Staff also need
+# letter + digit + symbol -- see password_policy_error(for_gm=True).
+MIN_PASSWORD_LEN = 6
+
+
+def password_policy_error(password, *, for_gm=False):
+    """Return a short refusal string if password is too weak, else None.
+
+    Mortals: length only (lazy OK). GM / head_gm: also letter + digit +
+    symbol (non-alphanumeric). Callers pass for_gm from gm_rank.
+    """
+    if not password or len(password) < MIN_PASSWORD_LEN:
+        return f"Password must be at least {MIN_PASSWORD_LEN} characters."
+    if for_gm:
+        has_letter = any(c.isalpha() for c in password)
+        has_digit = any(c.isdigit() for c in password)
+        has_symbol = any(not c.isalnum() for c in password)
+        missing = []
+        if not has_letter:
+            missing.append("a letter")
+        if not has_digit:
+            missing.append("a digit")
+        if not has_symbol:
+            missing.append("a symbol")
+        if missing:
+            need = ", ".join(missing)
+            return (
+                f"GM passwords need {need} "
+                f"(min {MIN_PASSWORD_LEN} chars, letter + digit + symbol)."
+            )
+    return None
+
 
 def hash_password(password):
     """Turn a plaintext password into a salted hash string safe to store.

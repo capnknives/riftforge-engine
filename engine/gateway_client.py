@@ -23,7 +23,9 @@ from engine.gateway_protocol import (
     TYPE_DATA,
     encode_ctrl,
     encode_data,
+    parse_ipc_addr,
     read_frame,
+    require_loopback_ipc,
 )
 
 
@@ -40,12 +42,10 @@ def gateway_enabled() -> bool:
 
 
 def ipc_addr() -> tuple[str, int]:
-    """Host/port of the gateway IPC listener."""
-    raw = os.environ.get("RIFTFORGE_GATEWAY_IPC", "127.0.0.1:4001").strip()
-    if ":" in raw:
-        host, _, port_s = raw.rpartition(":")
-        return host or "127.0.0.1", int(port_s)
-    return "127.0.0.1", int(raw)
+    """Host/port of the gateway IPC listener (loopback required — M3)."""
+    host, port = parse_ipc_addr()
+    require_loopback_ipc(host, role="gateway_client")
+    return host, port
 
 
 class GatewaySessionWriter:
@@ -56,13 +56,26 @@ class GatewaySessionWriter:
     engine.connection.Session.
     """
 
-    def __init__(self, session_id: str, send_fn: Callable):
+    def __init__(
+        self,
+        session_id: str,
+        send_fn: Callable,
+        peer_host: Optional[str] = None,
+    ):
         self.session_id = session_id
         self._send = send_fn  # async callable(bytes) -> None
         self._closing = False
         self._closed = asyncio.Event()
         self._closed.set()  # start "open" wait_closed semantics: not closed yet
         self._closed.clear()
+        # Real public telnet peer from the gateway (CTRL open/welcome).
+        # Stored as (host, port) so gm_notify.peer_host matches direct telnet.
+        if peer_host:
+            self._peername = (str(peer_host), 0)
+        else:
+            # Older gateway / missing field -- keep the historical stub so
+            # callers still get a non-None host string.
+            self._peername = ("gateway", 0)
 
     def write(self, data: bytes) -> None:
         """Queue telnet bytes to the gateway (scheduled on the running loop)."""
@@ -95,9 +108,13 @@ class GatewaySessionWriter:
         await self._closed.wait()
 
     def get_extra_info(self, name: str, default=None):
-        """Peer address is the gateway, not the real client — report stub."""
+        """Return the real client peer when the gateway forwarded it.
+
+        Banlist + head-GM staff pings use this. Junior GM ops lines redact
+        via gm_notify.format_from(viewer=…), not by stubbing the peer here.
+        """
         if name == "peername":
-            return ("gateway", 0)
+            return self._peername
         return default
 
 
@@ -170,6 +187,20 @@ class GatewayBridge:
         self._sessions: dict[str, object] = {}  # sid -> Session
         self._readers: dict[str, GatewaySessionReader] = {}
         self._send_lock = asyncio.Lock()
+        # World heartbeat starts after welcome/reattach (not at process boot).
+        self._tick_loop_started = False
+
+    def _ensure_tick_loop(self) -> None:
+        """Start game.tick_loop once, after held clients are rebound.
+
+        server.py deliberately does not create_task(tick_loop) for the
+        gateway path -- Cadence / no_loiter must not see connected PCs as
+        sessionless Echoes during the IPC hello/welcome window.
+        """
+        if self._tick_loop_started:
+            return
+        self._tick_loop_started = True
+        asyncio.create_task(self.game.tick_loop())
 
     async def send_frame(self, frame: bytes) -> None:
         """Write one framed message to the gateway."""
@@ -192,6 +223,16 @@ class GatewayBridge:
     async def kick_client(self, session_id: str) -> None:
         """Ask the gateway to close the public TCP for this session (quit)."""
         await self.send_frame(encode_ctrl({"op": "kick", "sid": session_id}))
+
+    async def notify_planned_restart(self) -> None:
+        """Tell the gateway this IPC drop is a planned game-only reload.
+
+        Used by copyover / watcher SIGUSR1 before ``os._exit`` so WKNZ
+        Discord does not post crash/uncrash for every auto-deploy. A short
+        sleep gives the CTRL frame time to drain before the process dies.
+        """
+        await self.send_frame(encode_ctrl({"op": "planned_restart"}))
+        await asyncio.sleep(0.05)
 
     async def connect_and_run(self) -> None:
         """Connect to gateway IPC, hello/welcome, then pump frames forever."""
@@ -249,11 +290,32 @@ class GatewayBridge:
                 if not sid:
                     continue
                 name = entry.get("name")
-                await self._open_session(sid, reattach_name=name)
+                peer = entry.get("peer")
+                await self._open_session(
+                    sid, reattach_name=name, peer_host=peer
+                )
+            # Classic copyover.resume() calls this after execv; gateway
+            # reattach is the equivalent -- finish any in-flight Fix deploy.
+            from engine import deploy_notify
+            await deploy_notify.on_resume(self.game)
+            # Vault offline unfinished onboarding *after* reattach so held
+            # mid-tutorial PCs (gateway TCP never dropped) keep their body
+            # in-world and skip the vault sweep (session is live now). Routed
+            # through engine.hooks (SUPERS: heal_incomplete_tutorial_offline)
+            # -- engine/ never imports supers directly (two-repo purity).
+            from engine import hooks
+            await hooks.gateway_resume_hook(self.game)
+            # Start the world heartbeat only after held clients are
+            # reattached (or confirmed empty). Starting earlier let Cadence
+            # treat connected PCs as Echoes for one+ ticks (Cage yank).
+            self._ensure_tick_loop()
         elif op == "open":
             sid = msg.get("sid")
             if sid:
-                await self._open_session(sid, reattach_name=None)
+                peer = msg.get("peer")
+                await self._open_session(
+                    sid, reattach_name=None, peer_host=peer
+                )
         elif op == "close":
             sid = msg.get("sid")
             if sid:
@@ -262,13 +324,18 @@ class GatewayBridge:
             pass
 
     async def _open_session(
-        self, session_id: str, reattach_name: Optional[str]
+        self,
+        session_id: str,
+        reattach_name: Optional[str],
+        peer_host: Optional[str] = None,
     ) -> None:
         """Create a Session for a held client (new or reattach)."""
         if session_id in self._sessions:
             return
         reader = GatewaySessionReader(session_id)
-        writer = GatewaySessionWriter(session_id, self.send_frame)
+        writer = GatewaySessionWriter(
+            session_id, self.send_frame, peer_host=peer_host
+        )
         self._readers[session_id] = reader
         session = self.session_factory(
             reader, writer, self.game, gateway_session_id=session_id
@@ -283,6 +350,11 @@ class GatewayBridge:
             name=f"gateway-session-{session_id[:8]}",
         )
         session._gateway_task = task
+        if reattach_name:
+            # Session.run() attaches the character synchronously before its
+            # first await (play). Yield so that attach lands before welcome
+            # starts tick_loop -- otherwise Cadence can yank Cage/jail Echoes.
+            await asyncio.sleep(0)
 
     async def _run_session(self, session_id: str, session) -> None:
         """Run Session.run() (login or reattach); Echo only if client gone."""

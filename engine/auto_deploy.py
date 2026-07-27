@@ -20,6 +20,13 @@ PR numbers) never fake a second "Bug #N has been fixed" world reset.
 No manual `tools/deploy_bug_fix.py` step. Disable with AUTO_DEPLOY=0, or
 toggle live with GM `autodeploy on|off` (writes `.auto_deploy_override`).
 
+When GM turns autodeploy **back on**, a catch-up flag is written so the
+next watcher poll does a full ``git reset --hard origin/main`` (protected
+live files stashed/restored as usual). That picks up every commit missed
+while overlays were paused — not just the tip's Fix-bug file list.
+Ordinary advance-only polls stay strict (no silent re-overlay when the
+tracked SHA already matches); catch-up is only the re-enable path.
+
 State lives in .auto_deploy_state.json (gitignored) so a container restart
 does not re-deploy old commits.
 """
@@ -33,16 +40,26 @@ import subprocess
 import sys
 import time
 
+
 STATE_NAME = ".auto_deploy_state.json"
 READY_NAME = ".deploy_ready"
 # GM `autodeploy on|off` writes this so watch_and_run (parent process) sees the
 # toggle -- mutating os.environ inside server.py would not affect the watcher.
 OVERRIDE_NAME = ".auto_deploy_override"
+# Written by GM `autodeploy on` so the next poll syncs the full working tree
+# to origin/main (commits missed while the override was off).
+CATCHUP_NAME = ".auto_deploy_catchup"
 
 # Defaults; override via environment (see docker-compose.yml).
 DEFAULT_POLL_EVERY = 30
 DEFAULT_COUNTDOWN = 20
 DEFAULT_READY_TIMEOUT = 120
+# Cap hung `git fetch` / git-remote-https so a stuck HTTPS helper cannot
+# freeze watch_and_run's 1s loop (gateway + game keep running, but the
+# supervisor would otherwise stop reaping / hot-reloading / deploying).
+# Mid two-repo split: same path will poll SUPERS origin/main later --
+# timeout must exist before Phase 5 remotes.
+DEFAULT_FETCH_TIMEOUT = 60
 
 # Intentional fix subjects only -- must look like a ship, not a mention.
 # Examples that MATCH: "Fix bug #25: list commands alphabetically."
@@ -93,8 +110,48 @@ def read_override(root=None):
     return None
 
 
-def set_override(value, root=None):
+def catchup_path(root=None):
+    """Absolute path to the re-enable catch-up request flag."""
+    return os.path.join(root or _repo_root(), CATCHUP_NAME)
+
+
+def catchup_requested(root=None):
+    """True when GM `autodeploy on` asked for a full origin/main sync."""
+    return os.path.isfile(catchup_path(root))
+
+
+def request_catchup(root=None):
+    """Queue a full working-tree sync on the next successful deploy poll.
+
+    The watcher (not the game child) performs the sync — this only drops a
+    flag file the parent reads inside ``try_auto_deploy``.
+    """
+    path = catchup_path(root)
+    with open(path, "w", encoding="utf-8") as f:
+        # Timestamp helps ops logs; presence alone triggers the sync.
+        f.write(time.strftime("%Y-%m-%dT%H:%M:%S") + "\n")
+    return path
+
+
+def clear_catchup(root=None):
+    """Remove a pending catch-up flag (after sync, or when turning off)."""
+    path = catchup_path(root)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    return path
+
+
+def set_override(value, root=None, *, queue_catchup=True):
     """Write the GM override file to 'on' or 'off'. Returns the path written.
+
+    Turning **on** also queues a catch-up sync (``request_catchup``) so
+    commits that landed while overlays were paused are applied on the next
+    watcher poll. Turning **off** clears any pending catch-up flag.
+
+    Pass ``queue_catchup=False`` when restoring a prior override in tests
+    so the staging/live tree does not get a spurious catch-up flag.
 
     Raises ValueError if value is not on/off.
     """
@@ -108,6 +165,12 @@ def set_override(value, root=None):
     path = override_path(root)
     with open(path, "w", encoding="utf-8") as f:
         f.write(normalized + "\n")
+    # Re-enable → full tree catch-up; pause → cancel a pending catch-up.
+    if normalized == _OVERRIDE_ON:
+        if queue_catchup:
+            request_catchup(root)
+    else:
+        clear_catchup(root)
     return path
 
 
@@ -118,6 +181,9 @@ def clear_override(root=None):
         os.remove(path)
     except FileNotFoundError:
         pass
+    # Dropping the override is not an explicit "on" — leave catch-up alone
+    # only if env still enables; if a catch-up was queued from a prior `on`,
+    # keep it so the next enabled poll still syncs. (No clear here.)
     return path
 
 
@@ -151,10 +217,16 @@ def status_text():
         override_line = "Override file: (none -- using AUTO_DEPLOY env)"
     else:
         override_line = f"Override file: {override}"
+    catchup_line = (
+        "Catch-up queued: yes (next poll syncs working tree to origin/main)"
+        if catchup_requested()
+        else "Catch-up queued: no"
+    )
     return (
         f"Auto-deploy effective: {effective}\n"
         f"{override_line}\n"
-        f"AUTO_DEPLOY env: {'on' if env_on else 'off'}"
+        f"AUTO_DEPLOY env: {'on' if env_on else 'off'}\n"
+        f"{catchup_line}"
     )
 
 
@@ -165,26 +237,102 @@ def _countdown_seconds():
         return DEFAULT_COUNTDOWN
 
 
+def fetch_timeout_seconds():
+    """Seconds before a hung `git fetch` is killed (AUTO_DEPLOY_FETCH_TIMEOUT).
+
+    Floor at 15 so a slow but healthy pack never races the kill; default 60
+    matches DEFAULT_FETCH_TIMEOUT. Set 0 only in tests that want no cap.
+    """
+    raw = os.environ.get("AUTO_DEPLOY_FETCH_TIMEOUT", str(DEFAULT_FETCH_TIMEOUT))
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return DEFAULT_FETCH_TIMEOUT
+    if value <= 0:
+        return 0
+    return max(15, value)
+
+
+def _kill_process_tree(proc):
+    """Kill `proc` and (on Unix) its process group -- git + git-remote-https.
+
+    `subprocess.run(..., timeout=…)` only SIGKILLs the direct child; a hung
+    `git-remote-https` sibling/grandchild can linger and fill the PID
+    cgroup. We start fetches in a new session so killpg reaches the tree.
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    # Unix: process group == session when start_new_session=True.
+    if os.name != "nt" and hasattr(os, "killpg"):
+        try:
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
 def _git(*args, cwd=None):
     return subprocess.check_output(
         ["git", *args], cwd=cwd, text=True, stderr=subprocess.DEVNULL,
     ).strip()
 
 
-def _run_git(*args, cwd=None):
+def _run_git(*args, cwd=None, timeout=None):
     """Run a git subprocess; raise CalledProcessError on non-zero exit.
 
     Stdout/stderr are captured (not inherited) so a failed fetch can be
     logged with the real git reason -- DEVNULL made live outages look like
     a mysterious exit 128.
+
+    When `timeout` is a positive number of seconds, the child runs in a new
+    session (Unix) so a hung `git-remote-https` can be killpg'd. Raises
+    ``subprocess.TimeoutExpired`` after killing the tree -- callers that
+    must stay best-effort (fetch) catch it; reset --hard usually omits
+    timeout because it is local and fast.
     """
     print(f"+ git {' '.join(args)}", flush=True)
-    result = subprocess.run(
-        ["git", *args],
-        cwd=cwd,
-        check=False,
-        capture_output=True,
-        text=True,
+    popen_kwargs = {
+        "cwd": cwd,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+    # New session only when we need a killable process group (timed fetch).
+    if timeout and timeout > 0 and os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(["git", *args], **popen_kwargs)
+    try:
+        stdout, stderr = proc.communicate(
+            timeout=timeout if timeout and timeout > 0 else None
+        )
+    except subprocess.TimeoutExpired as exc:
+        _kill_process_tree(proc)
+        # Drain so the Popen does not leak pipes / zombies.
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except Exception:
+            stdout = getattr(exc, "stdout", None) or ""
+            stderr = getattr(exc, "stderr", None) or ""
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+        # Re-raise with captured output for the fetch logger.
+        raise subprocess.TimeoutExpired(
+            exc.cmd, exc.timeout, output=stdout, stderr=stderr,
+        ) from None
+
+    result = subprocess.CompletedProcess(
+        args=["git", *args],
+        returncode=proc.returncode,
+        stdout=stdout or "",
+        stderr=stderr or "",
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
@@ -251,16 +399,231 @@ def ensure_git_safe_directory(root=None):
         pass
 
 
+def _iter_protected_live_files(root):
+    """Repo-relative paths under protect lists that currently exist on disk.
+
+    Used so ``git reset --hard`` does not wipe live dig / Studio Live Edit
+    / GM catalog JSON. Same prefixes as Fix-bug overlays
+    (``AUTO_DEPLOY_PROTECT_PREFIXES`` / defaults in ``tools.apply_pr_fix``).
+    """
+    # Import here so engine boot stays light when auto_deploy is unused.
+    from tools.apply_pr_fix import (
+        is_protected_path,
+        protected_paths,
+        protected_prefixes,
+    )
+
+    found = []
+    for rel in protected_paths():
+        norm = rel.replace("\\", "/")
+        abs_path = os.path.join(root, *norm.split("/"))
+        if os.path.isfile(abs_path):
+            found.append(norm)
+    for prefix in protected_prefixes():
+        norm_prefix = prefix.replace("\\", "/")
+        if not norm_prefix:
+            continue
+        if norm_prefix.endswith("/"):
+            abs_dir = os.path.join(root, *norm_prefix.rstrip("/").split("/"))
+            if not os.path.isdir(abs_dir):
+                continue
+            for dirpath, _dirnames, filenames in os.walk(abs_dir):
+                for name in filenames:
+                    abs_file = os.path.join(dirpath, name)
+                    rel = os.path.relpath(abs_file, root).replace("\\", "/")
+                    if is_protected_path(rel):
+                        found.append(rel)
+        else:
+            abs_path = os.path.join(root, *norm_prefix.split("/"))
+            if os.path.isfile(abs_path):
+                found.append(norm_prefix)
+    # Stable unique list (walk order can vary).
+    return sorted(set(found))
+
+
+def _stash_protected_live_files(root):
+    """Copy protected live files aside before ``git reset --hard``.
+
+    Returns ``(tmpdir, rel_paths)`` or ``None`` when nothing to preserve.
+    """
+    import shutil
+    import tempfile
+
+    files = _iter_protected_live_files(root)
+    # Always log count so silent empty protect lists are visible in docker logs.
+    print(
+        f"[auto_deploy] protect stash: {len(files)} live-authored file(s)",
+        flush=True,
+    )
+    if not files:
+        return None
+    tmp = tempfile.mkdtemp(prefix="riftforge_protect_")
+    for rel in files:
+        src = os.path.join(root, *rel.split("/"))
+        dst = os.path.join(tmp, *rel.split("/"))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        try:
+            shutil.copy2(src, dst)
+        except OSError as exc:
+            print(
+                f"[auto_deploy] protect stash skipped {rel}: {exc}",
+                flush=True,
+            )
+    return tmp, files
+
+
+# Protected paths that follow origin/main even under content/maps protect.
+# When main deletes these, restore must NOT resurrect the live copy
+# (wastes purge: live kept loading Grave Plots because protect restored
+# the old wastes.json after every reset --hard).
+_MAIN_WINS_PROTECTED_PATHS = frozenset({
+    "content/maps/wastes.json",
+    "content/npcs/wastes.json",
+})
+
+
+def _restore_protected_live_files(root, stash):
+    """Write stashed protected files back after reset; remove the temp dir.
+
+    Catalog JSON (jobs / personas / items) is **additive-merged** with the
+    post-reset (origin) file on disk: new keys from ``origin/main`` land,
+    live-only GM keys and live leaf edits are kept. Other protected paths
+    (npcs, map_backups) still restore with a blind copy. Pipeline
+    ``engine/*.py`` modules are not on the default protect list -- they
+    stay at the post-reset ``origin/main`` tip.
+
+    Paths in ``_MAIN_WINS_PROTECTED_PATHS`` are never restored: if
+    ``origin/main`` deleted them, they stay deleted on live.
+    """
+    import json
+    import shutil
+
+    if not stash:
+        return
+    tmp, files = stash
+    restored = 0
+    merged = 0
+    dropped = 0
+    try:
+        from tools.apply_pr_fix import (
+            is_additive_catalog_path,
+            write_merged_catalog_json,
+        )
+
+        for rel in files:
+            src = os.path.join(tmp, *rel.split("/"))
+            if not os.path.isfile(src):
+                continue
+            dst = os.path.join(root, *rel.split("/"))
+            # Purged maps/rosters: never resurrect from the live stash when
+            # origin/main no longer has the path (wastes.json deletion).
+            if rel in _MAIN_WINS_PROTECTED_PATHS:
+                head_has = False
+                try:
+                    _run_git(
+                        "cat-file", "-e", f"HEAD:{rel}", cwd=root,
+                    )
+                    head_has = True
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    head_has = False
+                if not head_has:
+                    if os.path.isfile(dst):
+                        try:
+                            os.remove(dst)
+                        except OSError as exc:
+                            print(
+                                f"[auto_deploy] protect drop failed "
+                                f"{rel}: {exc}",
+                                flush=True,
+                            )
+                    dropped += 1
+                    print(
+                        f"[auto_deploy] protect drop (main wins): {rel}",
+                        flush=True,
+                    )
+                    continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            try:
+                if is_additive_catalog_path(rel) and os.path.isfile(dst):
+                    # dst is origin's version after reset --hard; src is live.
+                    with open(dst, encoding="utf-8") as handle:
+                        origin_data = json.load(handle)
+                    with open(src, encoding="utf-8") as handle:
+                        live_data = json.load(handle)
+                    write_merged_catalog_json(dst, origin_data, live_data)
+                    merged += 1
+                    restored += 1
+                    print(
+                        f"[auto_deploy] additive-merged protected catalog {rel}",
+                        flush=True,
+                    )
+                else:
+                    shutil.copy2(src, dst)
+                    restored += 1
+            except OSError as exc:
+                print(
+                    f"[auto_deploy] protect restore failed {rel}: {exc}",
+                    flush=True,
+                )
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                # Bad JSON on either side -- fall back to live stash bytes
+                # so we never leave a half-written catalog.
+                print(
+                    f"[auto_deploy] catalog merge failed {rel} ({exc}); "
+                    "restoring live copy",
+                    flush=True,
+                )
+                try:
+                    shutil.copy2(src, dst)
+                    restored += 1
+                except OSError as copy_exc:
+                    print(
+                        f"[auto_deploy] protect restore failed {rel}: "
+                        f"{copy_exc}",
+                        flush=True,
+                    )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    drop_bit = f", dropped {dropped} main-wins" if dropped else ""
+    print(
+        f"[auto_deploy] restored {restored} protected live-authored "
+        f"file(s) after reset --hard ({merged} catalog merge(s)"
+        f"{drop_bit})",
+        flush=True,
+    )
+
+
 def _reset_hard_to(root, sha):
     """Move the working tree to sha (feature pushes on Azure / any host).
 
     Fix-bug deploys still use the narrower overlay path. Non-fix advances
     call this so a push to main actually updates live files, then the
     mtime watcher / copyover picks up the change.
+
+    Live-authored trees under ``AUTO_DEPLOY_PROTECT_PREFIXES`` (npcs,
+    catalog JSON, ``content/map_backups/``, …) are snapped aside before
+    reset and written back afterward so GM catalog edits and staff map
+    snapshots survive silent ``origin/main`` advances. Map/zone JSON
+    itself follows ``origin/main`` (use ``gm maps backup`` first).
     """
     ensure_git_safe_directory(root)
     print(f"[auto_deploy] syncing working tree to {sha[:12]}", flush=True)
-    _run_git("reset", "--hard", sha, cwd=root)
+    stash = _stash_protected_live_files(root)
+    try:
+        _run_git("reset", "--hard", sha, cwd=root)
+    finally:
+        _restore_protected_live_files(root, stash)
+    # Live populate/dig rooms may exist only in protected map_backups after
+    # reset --hard. Additive heal merges missing keys back into zone/map
+    # JSON without overwriting git-authored rooms.
+    try:
+        from engine import hooks
+
+        heal_lines = hooks.auto_deploy_map_heal(root)
+        for line in heal_lines:
+            print(f"[auto_deploy] {line}", flush=True)
+    except Exception as exc:
+        print(f"[auto_deploy] map heal skipped: {exc}", flush=True)
 
 
 def _fetch_origin(root):
@@ -269,11 +632,26 @@ def _fetch_origin(root):
     On failure, print git's own stderr (empty object, auth, dubious ownership,
     network). Silent exit-128 skips are how a corrupted live `.git` can stall
     origin/main for hours while AUTO_DEPLOY still looks "on".
+
+    Hung HTTPS (live `git-remote-https` with no exit) used to block
+    `watch_and_run` forever because `_run_git` had no timeout -- that freezes
+    orphan reaping and further deploys while the gateway/game keep running.
+    Timed fetch + killpg returns False so the next poll can try again.
     """
     ensure_git_safe_directory(root)
+    timeout = fetch_timeout_seconds()
     try:
-        _run_git("fetch", "origin", "main", cwd=root)
+        _run_git("fetch", "origin", "main", cwd=root, timeout=timeout or None)
         return True
+    except subprocess.TimeoutExpired as exc:
+        secs = getattr(exc, "timeout", timeout) or timeout
+        print(
+            f"[auto_deploy] git fetch timed out after {secs}s "
+            "(killed hung git / git-remote-https) -- will retry next poll; "
+            "see docs/LIVE_DEPLOY.md (hung git fetch)",
+            flush=True,
+        )
+        return False
     except subprocess.CalledProcessError as exc:
         detail = getattr(exc, "_riftforge_git_detail", None) or str(exc)
         print(f"[auto_deploy] git fetch skipped: {detail}", flush=True)
@@ -336,6 +714,12 @@ def parse_deploy_metadata(subject: str) -> tuple[int | None, str]:
     match = _FIX_SUBJECT_RE.match(summary)
     if match:
         bug_id = int(match.group(1))
+        rest = summary[match.end():].lstrip()
+        if rest.startswith(":"):
+            rest = rest[1:].lstrip()
+        elif rest.startswith(("--", "—", "–")):
+            rest = rest.lstrip("-—–").lstrip()
+        summary = rest or "A bug fix has been deployed."
 
     if len(summary) > 120:
         summary = summary[:117] + "..."
@@ -496,6 +880,41 @@ def _working_tree_behind_commit(commit_sha, root):
         return True
 
 
+def _run_reenable_catchup(root, state, remote_sha):
+    """Full working-tree sync after GM ``autodeploy on`` (missed commits).
+
+    Uses the same ``reset --hard`` + protect stash path as a silent feature
+    advance — not a tip-only Fix overlay — so multi-commit gaps while the
+    toggle was off do not leave intermediate files behind. No player
+    countdown: this is catch-up, not a fresh Fix ship.
+    """
+    subject = "(unknown)"
+    try:
+        subject = _commit_subject(remote_sha, root)
+    except subprocess.CalledProcessError:
+        pass
+    print(
+        f"[auto_deploy] catch-up after re-enable: syncing working tree to "
+        f"{remote_sha[:12]} ({subject})",
+        flush=True,
+    )
+    try:
+        _reset_hard_to(root, remote_sha)
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        print(f"[auto_deploy] catch-up sync failed: {exc}", flush=True)
+        # Leave the flag so the next poll retries.
+        return False
+    state["origin_main"] = remote_sha
+    # Do not write last_deploy — catch-up is not a Fix announce.
+    _save_state(root, state)
+    clear_catchup(root)
+    print(
+        f"[auto_deploy] catch-up complete at {remote_sha[:12]}",
+        flush=True,
+    )
+    return True
+
+
 def try_auto_deploy():
     """Poll origin/main once; deploy only when the remote SHA advances.
 
@@ -505,6 +924,11 @@ def try_auto_deploy():
     Advance-only: never re-overlay because the local bind-mount drifted.
     That "catch-up" path rewrote commands.py and wiped webhook/fixbugs
     wiring. Manual recovery: tools/deploy_bug_fix.py --merged.
+
+    Exception: GM ``autodeploy on`` queues ``.auto_deploy_catchup`` so the
+    next poll does one full ``reset --hard`` to origin/main (commits missed
+    while overlays were off). That is intentional and flag-gated — not the
+    old "files differ from tracked SHA" auto path.
     """
     if not _enabled():
         return False
@@ -521,6 +945,11 @@ def try_auto_deploy():
         remote_sha = _origin_main_sha(root)
     except subprocess.CalledProcessError:
         return False
+
+    # Re-enable catch-up runs before advance-only gates so a paused host
+    # that fell behind by many commits always gets a full tree sync.
+    if catchup_requested(root):
+        return _run_reenable_catchup(root, state, remote_sha)
 
     # Never re-run the full deploy pipeline for a commit we already shipped.
     last_deploy_sha = (state.get("last_deploy") or {}).get("sha")

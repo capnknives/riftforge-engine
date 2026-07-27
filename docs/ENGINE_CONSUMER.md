@@ -33,13 +33,21 @@ Call these **before** constructing `Character`s or loading a save:
 | Loot-from-body line | `set_loot_room_line(fn)` | generic "`<actor> takes <item> from <body>.`" | `supers.scavenge.loot_room_line` |
 | Strongbox relic reward | `set_make_relic_item(fn)` | `None` | `supers.faith.make_relic_item` |
 | Spirit-sight gate | `set_can_see_spirit(fn)` | only a spirit sees itself | `supers.bootstrap._can_see_spirit` (Spirit Magic OR Attunement ≥15) |
+| Dark-room night-sight | `set_can_see_in_dark(fn)` | False (torch only) | `supers.bootstrap._can_see_in_dark` (GM form, God Mantle/twin, Monster Origin, Umbral, heatvision, hostiles) |
 | Pre-move cancel | `set_before_relocate(fn)` | `None` (nothing to cancel) | `supers.bootstrap._before_relocate` (cancels training) |
 | Post-move arrival | `set_after_arrive(fn)` | no-op | `supers.bootstrap._after_arrive` (stop work, carry body, lodging owner-enters) |
 | Room-entry encounter roll | `set_encounter_check(fn)` | no-op | `supers.world_ext.encounter_check` (wilderness/dungeon spawns + aggro) |
 | Evil Strikes Back world-meter defaults | `set_ensure_game_defaults(fn)` | no-op | `supers.balance.ensure_game_defaults` |
 | Recompute max HP | `set_recompute_hp(fn)` | no-op | `supers.bootstrap._recompute_hp` |
 | Legacy strongbox upgrade | `set_upgrade_legacy_container(fn)` | no-op, reports "not upgraded" | `supers.world_ext.upgrade_legacy_strongbox` |
+| Homeless floor-item sink | `set_orphan_item_room(fn)` | `game.start_room` | `supers.magic.orphan_item_room_for_game` (Beneath Lucifer's Cage) |
 | Map seed-item builder | `set_make_world_item(fn)` | plain flavor `Item` from `item_data` alone | `supers.items.make_world_item` |
+| Atlas map center | `set_map_center_room(fn)` | `None` | `supers.bootstrap._map_center_room` (America cell from `macro_pos`) |
+| Special directional move | `set_try_directional_move(fn)` | False (classic exits) | `supers.overland.try_overland_move` |
+| Special zone enter | `set_try_enter_zone(fn)` | False | `supers.overland.try_enter_landmark` |
+| After classic zone enter | `set_after_zone_enter(fn)` | no-op | clear overland coords + dungeon hub soft-stamp |
+| Special zone exit | `set_try_exit_zone(fn)` | False | `supers.overland.try_exit_to_overland` |
+| After HELP_TOPICS page | `set_after_help_topic(fn)` | no-op | `supers.quests.notify(…, "help_topic")` |
 
 SUPERS auto-registers attach + blob when the `supers` package is imported
 (`supers.bootstrap.register_core_hooks`). Everything else (chargen, help,
@@ -89,8 +97,10 @@ on the path.
 
 `server.py`, `commands.py`, and `maps.py` (map JSON loading; SUPERS
 catalog lookups go through the `make_world_item` hook now) remain shared,
-undecomposed root modules — Phases 4–5 will finish the split. Hooks are
-what let all of these stop **hard-coding** SUPERS imports in the meantime.
+undecomposed root modules — optional hygiene tracked as
+`arch-undecomposed-core` / [`plans/codebase_health_audit_2026-07-20.md`](plans/codebase_health_audit_2026-07-20.md)
+(two-repo remotes Phases 0–6 are already done). Hooks are what let all of
+these stop **hard-coding** SUPERS imports in the meantime.
 
 ## See also
 

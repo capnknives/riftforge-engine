@@ -10,12 +10,17 @@ Types:
   TYPE_DATA (0x01) -- 32-byte ASCII session id + raw telnet bytes
   TYPE_CTRL (0x02) -- UTF-8 JSON object
 
+Also owns IPC address helpers: the game↔gateway wire must stay on
+loopback so reattach (passwordless resume after game restart) cannot be
+spoofed from the public internet (pen-test M3).
+
 Stdlib only. Shared by engine.gateway and engine.gateway_client.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import struct
 
 TYPE_DATA = 0x01
@@ -24,8 +29,68 @@ TYPE_CTRL = 0x02
 # Fixed-width session id: uuid4.hex is exactly 32 ASCII chars.
 SID_LEN = 32
 
+# Default game↔gateway IPC (never publish this port in Docker/UFW).
+DEFAULT_IPC_ADDR = "127.0.0.1:4001"
+
 _HEADER = struct.Struct(">I")  # body length
 _TYPE = struct.Struct("B")
+
+
+def parse_ipc_addr(raw: str | None = None) -> tuple[str, int]:
+    """Parse ``host:port`` for the gateway IPC (env or explicit string)."""
+    text = (raw if raw is not None else os.environ.get(
+        "RIFTFORGE_GATEWAY_IPC", DEFAULT_IPC_ADDR
+    )).strip()
+    if not text:
+        text = DEFAULT_IPC_ADDR
+    if ":" in text:
+        host, _, port_s = text.rpartition(":")
+        return (host or "127.0.0.1"), int(port_s)
+    return "127.0.0.1", int(text)
+
+
+def is_loopback_host(host: str) -> bool:
+    """True when host is only reachable on this machine (IPv4/IPv6/localhost)."""
+    h = (host or "").strip().lower()
+    if not h:
+        return False
+    if h in ("127.0.0.1", "::1", "localhost"):
+        return True
+    # 127.0.0.0/8
+    if h.startswith("127."):
+        return True
+    return False
+
+
+def allow_nonlocal_ipc() -> bool:
+    """Escape hatch for rare lab setups (default off — do not use on live)."""
+    return os.environ.get(
+        "RIFTFORGE_GATEWAY_IPC_ALLOW_NONLOCAL", ""
+    ).strip() in ("1", "true", "True", "yes", "YES")
+
+
+def require_loopback_ipc(host: str, *, role: str = "gateway") -> None:
+    """Refuse a non-loopback IPC host unless the escape hatch is set.
+
+    Reattach skips the password prompt by design; that is only safe while
+    the IPC cannot be reached from the public network.
+    """
+    if is_loopback_host(host):
+        return
+    if allow_nonlocal_ipc():
+        print(
+            f"[{role}] WARNING: IPC host {host!r} is not loopback "
+            f"(RIFTFORGE_GATEWAY_IPC_ALLOW_NONLOCAL=1). "
+            f"Passwordless reattach is exposed if this port is reachable.",
+            flush=True,
+        )
+        return
+    raise SystemExit(
+        f"[{role}] Refusing non-loopback gateway IPC host {host!r}. "
+        f"Use 127.0.0.1 (default) so reattach cannot be spoofed from the "
+        f"internet. Override only with "
+        f"RIFTFORGE_GATEWAY_IPC_ALLOW_NONLOCAL=1 (unsafe on live)."
+    )
 
 
 def encode_data(session_id: str, payload: bytes) -> bytes:

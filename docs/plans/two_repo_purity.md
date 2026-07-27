@@ -5,11 +5,11 @@ anyone can download, and a **private SUPERS game** that depends on it.
 Authoritative short status still lives in [`HANDOFF.md`](../../HANDOFF.md);
 hook API details grow in [`../ENGINE_CONSUMER.md`](../ENGINE_CONSUMER.md).
 
-**Status:** In progress — **Phase 5 remote split OPEN**. Phase 0–4b done.
-Worktree: `D:/Claude/riftforge-phase5` on `feature/two-repo-phase5`.
-Public engine remote (locked): **`capnknives/riftforge-engine`**. Current
-monorepo becomes private SUPERS. Gateway design:
-[`connection_gateway.md`](connection_gateway.md) (shipped).
+**Status:** Phases 0–6 **done** for the remote split. Public
+[`riftforge-engine`](https://github.com/capnknives/riftforge-engine)
+(`v0.1.1` pin); private `capnknives/RiftForge` (SUPERS). Ongoing: export
+discipline when engine changes; dual-mount hack when editing both trees.
+Gateway: [`connection_gateway.md`](connection_gateway.md) (shipped).
 
 ## Locked decisions
 
@@ -40,11 +40,12 @@ monorepo becomes private SUPERS. Gateway design:
 | **2b** | `command_support.py` purity | ✅ shared move/spirit-sight helpers hookified; zero supers imports in `engine/command_support.py` |
 | **3** | Lean world + game bootstrap | ✅ MVP: lean `engine/world.py`/`engine/persistence.py`; dual installable packages declared; game entry alias added |
 | **4** | Engine-only smoke | ✅ CI job `engine-only-smoke` green with SUPERS absent (`tools/engine_smoke.py`) |
-| **5** | Remote split | 🔄 **OPEN** — public `riftforge-engine` + private SUPERS; pip tag pin; Docker dual-mount |
-| **6** | Living docs | RELEASING / UPGRADING / LIVE_DEPLOY kept current |
+| **5** | Remote split | ✅ public `riftforge-engine` + private SUPERS; pin `v0.1.1` |
+| **6** | Living docs | ✅ RELEASING / UPGRADING / LIVE_DEPLOY + CI + gateway/auto-deploy verify |
 
-Phase 5 is **open** (2026-07-17). Pre-gates green: Phase 4 engine-only
-smoke + Phase 4b gateway / soft-optional boot.
+Phases 0–6 complete (2026-07-17). Follow-on hygiene (lean `python -m engine`
+demo, monorepo engine dedup) is explicitly later — not required for the
+remote split.
 
 ## Phase 2 notes (done)
 
@@ -77,7 +78,7 @@ training-cancel/work-stop/carried-body/lodging-owner calls,
 `_can_see_spirit`'s Spirit-Magic/Attunement check, `_pull_followers`'
 hunter-safe check) reached into `supers` directly. They were exempt from
 the Phase 2 gate because they lived at the repo root, not `engine/` — see
-the monorepo layout notes — but Phase 3's lean, installable engine
+AGENTS.md's "Where things live" — but Phase 3's lean, installable engine
 package needed them hook-ified the same way `engine/verbs/basic.py`'s old
 lazy imports were in Phase 2:
 
@@ -148,7 +149,7 @@ game content split out to `supers/`:
   editable hacking loop needs regardless. A real install-and-run pass
   is Phase 5 work (the actual remote split).
 - **Not done in this MVP pass:** `server.py`/`commands.py` remain shared,
-  undecomposed root modules (see the monorepo layout notes) — Phase 4/5
+  undecomposed root modules (AGENTS.md's "Where things live") — Phase 4/5
   will need to finish deciding what, if anything, of those moves.
 
 ## Phase 4 notes (done)
@@ -167,50 +168,33 @@ Engine-only CI smoke with SUPERS **physically absent**:
   connection gateway — shipped on `main` (`07b6987`, login fix `4fc5bc6`).
   See [`connection_gateway.md`](connection_gateway.md).
 
-## Phase 5 notes (in progress)
+## Phase 5 notes (done)
 
-**Opened 2026-07-17.** Worktree `D:/Claude/riftforge-phase5`
-(`feature/two-repo-phase5`).
+**Opened / remotes cut 2026-07-17.** Merged to SUPERS `main`. Pin
+`@v0.1.1` on [`riftforge-engine`](https://github.com/capnknives/riftforge-engine).
 
 | Lock | Value |
 |------|-------|
 | Public remote | `capnknives/riftforge-engine` |
-| Private SUPERS | Current `capnknives/RiftForge` (privatize when remotes cut) |
-| Pin shape | `riftforge @ git+https://github.com/capnknives/riftforge-engine.git@vX.Y.Z` |
+| Private SUPERS | `capnknives/RiftForge` (private) |
+| Pin shape | `riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.1.1` |
 
-### Staging
+### Staging (all done)
 
-1. **Packaging proof** ✅ (same monorepo): `pip install -e .` then
-   `pip install -e ./supers` (Windows: use `riftforge>=0.1.0`, not
-   `file://..`). `tools/packaging_smoke.py` + `tools/engine_smoke.py`
-   with `supers` aside. Worktree venv: `.venv-phase5/`.
-2. **Public tree layout:** see table below.
-3. **Remotes:** create `capnknives/riftforge-engine`, privatize
-   `RiftForge`, tag `v0.1.0`, pin SUPERS, update LIVE_DEPLOY /
-   RELEASING / UPGRADING.
+1. **Packaging proof** ✅
+2. **Public tree layout** ✅ — `tools/export_public_engine.py`
+3. **Remotes** ✅ — public engine + private SUPERS + pin
 
-### Public vs SUPERS tree (layout target)
+## Phase 6 notes (done)
 
-**Public (`riftforge-engine`):**
+Living docs + ops verify (2026-07-17):
 
-- `engine/` (entire package)
-- Root packaging: `pyproject.toml` (riftforge / engine only)
-- Lean facades needed for install: `world.py`, `persistence.py`,
-  `command_support.py` (or fold into `engine` and drop facades later)
-- `maps.py` + optional **demo** maps only (no SUPERS realm JSON)
-- `tools/engine_smoke.py`, `docs/ENGINE_CONSUMER.md`,
-  `docs/RELEASING_RIFTFORGE.md`
-- Lean boot: prefer `python -m engine` demo listener; no SUPERS hooks
-
-**SUPERS-only (`RiftForge` private):**
-
-- `supers/`, `content/` (npcs, immersion, full maps, catalogs)
-- `help_topics.py`, full `smoke_test.py`, `server.py` game entry,
-  `commands.py` merge, `chargen.py`, game tools under `tools/`
-- Docker / auto-deploy / live ops; pins `riftforge-engine`
-
-**Deferred to remotes cut:** actually creating `riftforge-engine` and
-privatizing — after packaging proof is green.
+- RELEASING / UPGRADING / LIVE_DEPLOY name dual-mount + pin-bump + gateway
+  hold + auto-deploy fetch timeout.
+- Public engine CI: `engine_smoke` on `riftforge-engine`.
+- SUPERS CI: full smoke + engine-only + pin-resolve job.
+- Local Docker: `RIFTFORGE_GATEWAY=1` holds clients across game restart;
+  auto-deploy poll must not freeze the watcher (`AUTO_DEPLOY_FETCH_TIMEOUT`).
 
 ## Live Docker (must not regress)
 

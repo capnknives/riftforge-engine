@@ -15,18 +15,36 @@ def record_and_confirm(character, kind, description, history, report_dir, noun):
     """
     from engine import reports
     from engine import gm_notify
+    from engine import report_context
 
+    ctx = report_context.build(character, getattr(character.session, "game", None))
     payload = reports.record(
         kind, character.key, description, history, directory=report_dir,
+        context=ctx,
     )
-    character.session.send(f"Thanks, your {noun} was logged.")
+    entry_id = payload.get("id", "?")
+    if kind == reports.BUG:
+        character.session.send(
+            f"Thanks — bug ticket #{entry_id} is logged. "
+            "Staff will triage it; you'll hear back when it's fixed."
+        )
+    elif kind == reports.HELP:
+        character.session.send(
+            f"Thanks — help idea #{entry_id} is logged. A GM will review "
+            "it and, if it's added, write it up with 'hedit'."
+        )
+    else:
+        character.session.send(
+            f"Thanks — suggestion #{entry_id} is logged."
+        )
     # Truncate long paste bodies so the staff line stays client-wrappable.
     desc = (description or "").replace("\n", " ").strip()
     if len(desc) > 80:
         desc = desc[:77] + "..."
-    entry_id = payload.get("id", "?")
     if kind == reports.BUG:
         label = f"bug #{entry_id}"
+    elif kind == reports.HELP:
+        label = f"help idea #{entry_id}"
     else:
         label = f"suggestion #{entry_id}"
     game = getattr(character.session, "game", None)

@@ -1,6 +1,7 @@
 # Upgrading Riftforge from SUPERS
 
-**Status:** Phase 5 — SUPERS pins public **`capnknives/riftforge-engine`**.
+**Status:** Phase 6 done — SUPERS pins public **`capnknives/riftforge-engine`**
+at **`@v0.1.1`**.
 
 ## Today (during the split)
 
@@ -30,12 +31,27 @@ editable path for dual-checkout hacking.
 
 ## Local dual-checkout hacking (no tag yet)
 
-1. Clone `riftforge-engine` and private SUPERS side by side.
-2. In the SUPERS venv/container: `pip install -e ../riftforge-engine`
-3. Docker bind-mounts **both** trees; `watch_and_run` watches game +
-   optionally the engine mount.
-4. Edit either → game restart (gateway holds clients). Pin stays until
-   you cut a tag.
+1. Clone side by side, e.g. `D:\Claude\riftforge` (SUPERS) and
+   `D:\Claude\riftforge-engine` (public engine).
+2. In a venv: `pip install -e D:\Claude\riftforge-engine` then run SUPERS
+   from the private tree (or keep monorepo unpackaged bind-mount as today).
+3. **Docker dual-mount sketch** (optional while editing engine + game)::
+
+       # docker-compose override example — adjust host paths
+       services:
+         riftforge:
+           volumes:
+             - D:/Claude/riftforge:/app
+             - D:/Claude/riftforge-engine:/engine:ro
+           environment:
+             - RIFTFORGE_GATEWAY=1
+             - PYTHONPATH=/engine:/app
+
+   Today’s default remains a **single** SUPERS bind-mount (`.:/app`); the
+   engine copy inside the monorepo is what live uses until you switch to
+   the dual-mount or tagged-pin install path.
+4. Edit either tree → watcher restarts **game only**; gateway holds clients.
+5. Pin in `supers/pyproject.toml` stays at `@v0.1.1` until you cut a new tag.
 
 See [`ENGINE_CONSUMER.md`](ENGINE_CONSUMER.md) and
 [`plans/two_repo_purity.md`](plans/two_repo_purity.md).
