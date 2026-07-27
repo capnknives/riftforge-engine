@@ -96,7 +96,21 @@
             "zone": "demo-town",
             "outdoor": false,
             "exits": {
-                "west": "Inn"
+                "west": "Inn",
+                "east": "Post Office"
+            }
+        },
+        {
+            "key": "Post Office",
+            "title": "Millbrook - Post Office - Counter",
+            "vnum": "MB00008",
+            "description": "A narrow counter and a wall of cubbies. The clerk's stamp sits beside a stack of blank envelopes; letters leave town from here.",
+            "area_type": "city",
+            "zone": "demo-town",
+            "outdoor": false,
+            "resources": ["mail"],
+            "exits": {
+                "west": "Warehouse"
             }
         },
         {

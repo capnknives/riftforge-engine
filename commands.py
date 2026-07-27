@@ -45,7 +45,6 @@ from command_support import (
 )
 from engine.verbs import ENGINE_COMMANDS
 from engine.verbs.basic import _report_history, cmd_move
-from help_topics import HELP_CATEGORIES, HELP_TOPICS
 import game_select
 
 # The active game's verbs (SUPERS, basegame, or {} for a lean engine boot).
@@ -53,6 +52,22 @@ import game_select
 # RIFTFORGE_GAME=none (or leaves supers/basegame both absent) and gets
 # ENGINE_COMMANDS only.
 GAME_COMMANDS = game_select.game_commands()
+
+
+def __getattr__(name):
+    """Lazy HELP_* proxies so smoke can still ``commands.HELP_TOPICS``.
+
+    Topics are registered on ``engine.hooks`` by bootstrap / the module
+    footer below — not imported eagerly into this namespace (Phase 7
+    Stage G: ``help_topics`` may be a thin facade or empty on lean boots).
+    """
+    if name == "HELP_TOPICS":
+        from engine import hooks as _h
+        return _h.get_help_topics()
+    if name == "HELP_CATEGORIES":
+        from engine import hooks as _h
+        return _h.get_help_categories()
+    raise AttributeError(f"module 'commands' has no attribute {name!r}")
 
 
 # Idlemode wake gate: only movement or aggressive verbs reclaim presence.
@@ -467,6 +482,9 @@ def dispatch(character, raw, game):
 # did not run (lean engine / tools/engine_smoke.py). With SUPERS present,
 # bootstrap re-registers the same callables — harmless idempotent overwrite.
 from engine import hooks as _engine_hooks
+import help_topics as _help_topics_mod
 
 _engine_hooks.set_dispatch(dispatch)
-_engine_hooks.set_help(HELP_TOPICS, HELP_CATEGORIES)
+_engine_hooks.set_help(
+    _help_topics_mod.HELP_TOPICS, _help_topics_mod.HELP_CATEGORIES
+)

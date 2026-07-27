@@ -231,6 +231,27 @@ def main():
         assert name in sheet, (name, walker.session.lines)
     assert "Tier" in sheet and "HP" in sheet, walker.session.lines
 
+    # Stage 9: engine mail kit + basegame Post Office proof.
+    assert "mail" in commands_mod.COMMANDS
+    assert "mail" in topics
+    assert "Post Office" in game.rooms
+    post = game.rooms["Post Office"]
+    assert "mail" in (post.resources or ())
+    peer = placed[1]
+    peer.session = _FakeSession([])
+    walker.move_to(post)
+    walker.session = _FakeSession([])
+    dispatch(walker, f"mail send {peer.key} hello from square", game)
+    assert any("send a letter" in line.lower() for line in walker.session.lines), (
+        walker.session.lines
+    )
+    assert peer.mail_inbox and peer.mail_inbox[0]["text"] == "hello from square"
+    peer.session = _FakeSession([])
+    dispatch(peer, "mail", game)
+    assert any("hello from square" in line or "Inbox" in line for line in peer.session.lines), (
+        peer.session.lines
+    )
+
     # The tick pipeline (engine-owned since Stage 1) runs cleanly with
     # basegame's own (currently empty) handler set.
     server_mod.run_ticks(game)

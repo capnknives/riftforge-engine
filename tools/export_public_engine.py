@@ -63,7 +63,7 @@ separate private repo and depends on **tagged releases** of this package.
 ```bash
 pip install -e .
 # or pin a release from another project:
-#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.1.1
+#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.2.0
 ```
 
 ## Smoke
@@ -141,6 +141,32 @@ HELP_TOPICS = {}
 HELP_CATEGORIES = []
 '''
 
+# Public-repo CI (lives only on riftforge-engine; monorepo does not ship this).
+ENGINE_CI_YAML = """\
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  engine-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install editable engine
+        run: |
+          python -m pip install -U pip
+          python -m pip install -e .
+      - name: Engine-only smoke
+        run: python tools/engine_smoke.py
+      - name: Basegame smoke
+        run: python tools/basegame_smoke.py
+"""
+
 
 # Minimal demo map so maps.load_all_maps / engine_smoke can run without SUPERS.
 DEMO_MAP = """{
@@ -195,6 +221,12 @@ def export(dest: str) -> None:
 
     with open(os.path.join(dest, "help_topics.py"), "w", encoding="utf-8") as f:
         f.write(HELP_TOPICS_STUB)
+
+    # Public-repo CI workflow (so a wipe+sync export does not drop Actions).
+    gh_dir = os.path.join(dest, ".github", "workflows")
+    os.makedirs(gh_dir, exist_ok=True)
+    with open(os.path.join(gh_dir, "ci.yml"), "w", encoding="utf-8") as f:
+        f.write(ENGINE_CI_YAML)
 
     # Empty content/npcs so nothing accidental is assumed present.
     os.makedirs(os.path.join(dest, "content", "npcs"), exist_ok=True)

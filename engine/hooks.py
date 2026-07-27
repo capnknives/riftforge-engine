@@ -12,6 +12,17 @@ See docs/ENGINE_CONSUMER.md for the consumer-facing summary.
 # Character composition (AGENTS.md rule 4): game attaches stats/Origin/etc.
 _character_attacher = None
 
+# Room composition (Phase 7 Stage 8): game attaches its own room-flavor
+# fields (Vampire/Demon lore, Cadence lodging, town-system flags, ...) --
+# same shape as the Character attacher above.
+_room_attacher = None
+
+# Map JSON room overrides (Phase 7 Stage G): after maps._add_room stamps
+# engine-generic fields, the game may layer its authored flavor flags
+# from the same room / cell-override dict. Default no-op so lean boots
+# ignore SUPERS-only JSON keys.
+_map_room_stamper = None
+
 # Persistence: engine owns SQLite; game owns the opaque JSON blob fields.
 _blob_to = None
 _blob_from = None
@@ -407,6 +418,39 @@ def attach_character(character):
     """Run the registered attacher, or do nothing if none is set."""
     if _character_attacher is not None:
         _character_attacher(character)
+
+
+def set_room_attacher(fn):
+    """Register fn(room) called at the end of Room.__init__.
+
+    Pass None to clear (lean engine Rooms only).
+    """
+    global _room_attacher
+    _room_attacher = fn
+
+
+def attach_room(room):
+    """Run the registered room attacher, or do nothing if none is set."""
+    if _room_attacher is not None:
+        _room_attacher(room)
+
+
+def set_map_room_stamper(fn):
+    """Register fn(room, room_data, *, filename=None) for map JSON overrides.
+
+    Called from ``maps._add_room`` after engine-generic fields are stamped
+    onto the Room. ``room_data`` is the hand-room dict or grid cell
+    override (may be empty). Pass None to clear (lean engine / basegame
+    ignore SUPERS-only keys).
+    """
+    global _map_room_stamper
+    _map_room_stamper = fn
+
+
+def stamp_map_room(room, room_data, *, filename=None):
+    """Apply the registered map-JSON stamper, or do nothing if none is set."""
+    if _map_room_stamper is not None:
+        _map_room_stamper(room, room_data or {}, filename=filename)
 
 
 def set_blob_codec(to_blob, from_blob):

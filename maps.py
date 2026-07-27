@@ -1412,10 +1412,11 @@ def _load_map_files(*, include_deferred=False):
 
 
 def _room_looks_like_sewer(key, title=None):
-    """True when key/title names an underground sewer (evil_zone convention).
+    """True when key/title names an underground sewer.
 
-    Future towns get nest / nightlife playgrounds without hand-tagging every
-    tunnel cell. Explicit JSON ``evil_zone: false`` still wins at load.
+    Used here for engine-generic outdoor/dark defaults (sewers stay indoor
+    + dark). SUPERS' evil_zone sewer carve-out lives in
+    ``supers.maps_room_json`` (Stage G stamper).
     """
     blob = f"{key or ''} {title or ''}".lower()
     return "sewer" in blob
@@ -1448,31 +1449,16 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
               plane=None, realm=None, map_id=None,
               grid_prefix=None, grid_x=None, grid_y=None,
               resources=None, zone=None, resource_capacity=None,
-              consecrated=None, evil_zone=None, dungeon=None,
+              dungeon=None,
               no_random_spawn=None,
               zone_exit=None,
-              is_house=None, is_grave=None,
-              private_home=None, is_hotel_room=None,
-              is_home=None, main_homeroom=None,
-              vampire_safe=None, hunter_safe=None,
               no_combat=None,
-              no_loiter=None,
-              evil_ward=None,
-              is_cell=None, robable=None,
-              outdoor=None, floor_sleep=None, has_bunks=None,
-              vampire_nest=None, spawn_nest=None,
-              spawn_hub=None,
-              hospital=None,
-              mechanic=None,
-              devils_trap=None, salt_line=None, iron_ward=None,
-              devils_gate=None, unholy=None, crossroads=None, demon_deal=None,
-              jobs=None, vendor_stock=None, dark=None,
+              outdoor=None, dark=None,
               hidden_directions=None, title=None,
               map_glyph=None, map_layer=None, glyph_set=None,
               vnum=None, layout=None,
-              croatoan_contaminated=None, croatoan_quarantine=None,
-              croatoan_seal=None, croatoan_blood=None, croatoan_panic=None,
-              remodel_type=None, remodel_inbound_exit=None):
+              jobs=None,
+              game_fields=None):
     """Create one Room and insert it into the shared `rooms` dict.
 
     Raises loudly if `key` is already taken -- by an earlier room in this
@@ -1497,16 +1483,18 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
     Optional map_glyph / map_layer / glyph_set control atlas minimap art
     (earth_america US road-atlas style): glyph overrides the area_type
     letter; layer picks the terrain fill + bright highway/city colors;
-    glyph_set \"atlas\" switches the default topography symbols (~ . ^ o)
+    glyph_set "atlas" switches the default topography symbols (~ . ^ o)
     and turns on the filled colored-block render.
 
     Optional layout is Area Studio canvas coords
-    (``{\"x\": int, \"y\": int, \"z\": int}``). Stamped onto Room.layout_*
+    (``{"x": int, "y": int, "z": int}``). Stamped onto Room.layout_*
     for the town local minimap; omitted leaves those None (exit-graph
     fallback).
 
-    Optional remodel_type / remodel_inbound_exit come from house remodel
-    stamps (kitchen gate, garage named exits).
+    Optional ``game_fields`` is the raw hand-room / cell-override dict.
+    After engine-generic stamps below, ``engine.hooks.stamp_map_room``
+    lets the registered game (SUPERS) apply its authored flavor flags
+    (Phase 7 Stage G). Lean boots leave the hook unset.
     """
     if key in rooms:
         raise ValueError(
@@ -1625,14 +1613,6 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
                     f"room {key!r}: each jobs entry must be a non-empty string"
                 )
         room.jobs = [j.strip() for j in jobs]
-    # Settlement/zone shop catalogs (raw item refs OK -- supers.economy
-    # resolves on first use). Grid cells should leave this omitted.
-    if vendor_stock is not None:
-        if not isinstance(vendor_stock, list):
-            raise ValueError(
-                f"room {key!r}: 'vendor_stock' must be a list of ware dicts"
-            )
-        room.vendor_stock = list(vendor_stock)
     if zone is not None:
         room.zone = zone
     if resource_capacity is not None:
@@ -1643,18 +1623,6 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
                     f"must be one of {sorted(KNOWN_RESOURCE_TAGS)}"
                 )
         room.resource_capacity = dict(resource_capacity)
-    # Divine faith economy: consecrated=None (omitted) keeps Room default
-    # False; explicit true marks chapels / holy ground for minister bonus.
-    if consecrated is not None:
-        room.consecrated = bool(consecrated)
-    # D34: eviltown flag -- evil_zone=None (omitted) usually keeps Room
-    # default False. Sewer-named rooms are the convention carve-out: future
-    # towns get an underground evil playground without hand-tagging every
-    # tunnel (Lebanon sewers + nests). Explicit false still wins.
-    if evil_zone is None and _room_looks_like_sewer(key, title):
-        evil_zone = True
-    if evil_zone is not None:
-        room.evil_zone = bool(evil_zone)
     # Pocket mouth: zone_exit=None (omitted) keeps False; explicit true marks
     # a room where players may type `exit` to leave the zone (Southern
     # Highway, South Gate, dungeon Entrance). Pocket linking also stamps
@@ -1672,44 +1640,9 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
     # Explicit no_random_spawn wins (True or False) when authored.
     if no_random_spawn is not None:
         room.no_random_spawn = bool(no_random_spawn)
-    # Sanctuary flags -- omitted keeps Room defaults (False). Vampires avoid
-    # vampire_safe; hunters avoid hunter_safe (see supers/cadence.py).
-    # evil_ward hard-blocks Demons / Vampires / possessed / evil alignment
-    # (see supers/wards.py + move_gate).
-    if vampire_safe is not None:
-        room.vampire_safe = bool(vampire_safe)
-    if hunter_safe is not None:
-        room.hunter_safe = bool(hunter_safe)
     # Civic peace: no attack/spar/aggro (Central Plaza). Omitted -> False.
     if no_combat is not None:
         room.no_combat = bool(no_combat)
-    if no_loiter is not None:
-        room.no_loiter = bool(no_loiter)
-    if evil_ward is not None:
-        room.evil_ward = bool(evil_ward)
-    # Cadence D39/D49: house homes and grave plots (omitted -> Room defaults).
-    if is_house is not None:
-        room.is_house = bool(is_house)
-    if is_grave is not None:
-        room.is_grave = bool(is_grave)
-    # Private-home hard door (entryway / apartment unit). Omitted -> False.
-    if private_home is not None:
-        room.private_home = bool(private_home)
-    # Multi-room house link (boot also heals via ensure_house_home_links).
-    if is_home is not None:
-        room.is_home = bool(is_home)
-    if main_homeroom is not None:
-        # Empty string clears; otherwise store the hub room key.
-        text = str(main_homeroom).strip()
-        room.main_homeroom = text or None
-    # Rent hotel guest room (populated floors / hand JSON). Omitted -> False.
-    if is_hotel_room is not None:
-        room.is_hotel_room = bool(is_hotel_room)
-    # Jail cell + robable counters (crime / deputy loop).
-    if is_cell is not None:
-        room.is_cell = bool(is_cell)
-    if robable is not None:
-        room.robable = bool(robable)
     # Outdoor exposure: explicit JSON wins. When omitted, defaults to
     # wilderness so classic overland grids stay open-sky without tagging
     # every cell. Dual-layer America sets grid outdoor:true with
@@ -1723,68 +1656,6 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
         room.outdoor = bool(outdoor)
     else:
         room.outdoor = bool(room.wilderness)
-    # Floor-sleep / bunk / vampire-nest flags (omitted -> Room defaults False).
-    if floor_sleep is not None:
-        room.floor_sleep = bool(floor_sleep)
-    if has_bunks is not None:
-        room.has_bunks = bool(has_bunks)
-    if vampire_nest is not None:
-        room.vampire_nest = bool(vampire_nest)
-    # Live spawn den type (vampire|demon|beast|ghost). Explicit spawn_nest
-    # wins; vampire_nest True aliases to "vampire" when spawn_nest omitted.
-    if spawn_nest is not None and str(spawn_nest).strip():
-        room.spawn_nest = str(spawn_nest).strip().lower()
-    elif room.vampire_nest:
-        room.spawn_nest = "vampire"
-    # Soul / soldier hubs (Guild, Motel, Heaven/Hell barracks).
-    if spawn_hub is not None and str(spawn_hub).strip():
-        room.spawn_hub = str(spawn_hub).strip().lower()
-    # Evil Strikes Back: Town Clinic / hospital rooms.
-    if hospital is not None:
-        room.hospital = bool(hospital)
-    # Town mechanic wrench desk (omitted -> Room default False).
-    # Home remodeled garages stay storage -- do not stamp mechanic there.
-    if mechanic is not None:
-        room.mechanic = bool(mechanic)
-    # Thin D44 authored traps (omitted -> Room defaults False).
-    if devils_trap is not None:
-        room.devils_trap = bool(devils_trap)
-    if salt_line is not None:
-        room.salt_line = bool(salt_line)
-    if iron_ward is not None:
-        room.iron_ward = bool(iron_ward)
-    # D47 Devil's Gate rooms (omitted -> Room default False).
-    if devils_gate is not None:
-        room.devils_gate = bool(devils_gate)
-    # D47/D48 Demon travel whitelist (omitted -> Room defaults False).
-    if unholy is not None:
-        room.unholy = bool(unholy)
-    if crossroads is not None:
-        room.crossroads = bool(crossroads)
-    if demon_deal is not None:
-        room.demon_deal = bool(demon_deal)
-    # Croatoan remnant / surge room stamps (supers/croatoan.py).
-    if croatoan_contaminated is not None:
-        room.croatoan_contaminated = bool(croatoan_contaminated)
-    if croatoan_quarantine is not None:
-        room.croatoan_quarantine = bool(croatoan_quarantine)
-    if croatoan_seal is not None:
-        room.croatoan_seal = bool(croatoan_seal)
-    if croatoan_blood is not None:
-        try:
-            room.croatoan_blood = max(0, min(3, int(croatoan_blood)))
-        except (TypeError, ValueError):
-            room.croatoan_blood = 0
-    if croatoan_panic is not None:
-        try:
-            room.croatoan_panic = max(0, min(3, int(croatoan_panic)))
-        except (TypeError, ValueError):
-            room.croatoan_panic = 0
-    # House remodel stamps (kitchen cook gate / garage named exits).
-    if remodel_type is not None and str(remodel_type).strip():
-        room.remodel_type = str(remodel_type).strip().lower()
-    if remodel_inbound_exit is not None and str(remodel_inbound_exit).strip():
-        room.remodel_inbound_exit = str(remodel_inbound_exit).strip().lower()
     # D67 dark rooms (omitted -> Room default False). Sewers default dark.
     if dark is None and _room_looks_like_sewer(key, title):
         dark = True
@@ -1821,6 +1692,9 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
             room.layout_x = None
             room.layout_y = None
             room.layout_z = None
+    # SUPERS (or any game) authored flavor flags -- Stage G hook.
+    from engine import hooks as _hooks
+    _hooks.stamp_map_room(room, game_fields or {}, filename=filename)
     rooms[key] = room
 
 
@@ -1969,38 +1843,11 @@ def _build_grid(rooms, filename, grid, plane=None, realm=None, map_id=None):
                 resources=override.get("resources"),
                 zone=cell_zone,
                 resource_capacity=override.get("resource_capacity"),
-                consecrated=override.get("consecrated"),
-                evil_zone=override.get("evil_zone"),
                 dungeon=override.get("dungeon"),
                 no_random_spawn=override.get("no_random_spawn"),
                 zone_exit=override.get("zone_exit"),
-                is_house=override.get("is_house"),
-                is_grave=override.get("is_grave"),
-                private_home=override.get("private_home"),
-                is_hotel_room=override.get("is_hotel_room"),
-                is_home=override.get("is_home"),
-                main_homeroom=override.get("main_homeroom"),
-                vampire_safe=override.get("vampire_safe"),
-                hunter_safe=override.get("hunter_safe"),
                 no_combat=override.get("no_combat"),
-                no_loiter=override.get("no_loiter"),
-                evil_ward=override.get("evil_ward"),
-                is_cell=override.get("is_cell"),
-                robable=override.get("robable"),
                 outdoor=cell_outdoor,
-                floor_sleep=override.get("floor_sleep"),
-                has_bunks=override.get("has_bunks"),
-                vampire_nest=override.get("vampire_nest"),
-                spawn_nest=override.get("spawn_nest"),
-                hospital=override.get("hospital"),
-                mechanic=override.get("mechanic"),
-                devils_trap=override.get("devils_trap"),
-                salt_line=override.get("salt_line"),
-                iron_ward=override.get("iron_ward"),
-                devils_gate=override.get("devils_gate"),
-                unholy=override.get("unholy"),
-                crossroads=override.get("crossroads"),
-                demon_deal=override.get("demon_deal"),
                 jobs=override.get("jobs"),
                 dark=override.get("dark"),
                 hidden_directions=override.get("hidden_directions"),
@@ -2008,10 +1855,8 @@ def _build_grid(rooms, filename, grid, plane=None, realm=None, map_id=None):
                 map_glyph=override.get("map_glyph"),
                 map_layer=override.get("map_layer"),
                 glyph_set=cell_glyph_set,
+                game_fields=override,
             )
-            # Heart Furnace deep cell (Cinder Reach) -- stamp after create.
-            if override.get("furnace_deep"):
-                rooms[key].furnace_deep = True
 
 
 def _link_grid_neighbors(rooms, grid):
@@ -2323,53 +2168,18 @@ def create_rooms_from_map_data(rooms, filename, data):
             resources=room_data.get("resources"),
             zone=room_data.get("zone"),
             resource_capacity=room_data.get("resource_capacity"),
-            consecrated=room_data.get("consecrated"),
-            evil_zone=room_data.get("evil_zone"),
             dungeon=room_dungeon,
             no_random_spawn=room_no_random,
             zone_exit=room_data.get("zone_exit"),
-            is_house=room_data.get("is_house"),
-            is_grave=room_data.get("is_grave"),
-            private_home=room_data.get("private_home"),
-            is_hotel_room=room_data.get("is_hotel_room"),
-            is_home=room_data.get("is_home"),
-            main_homeroom=room_data.get("main_homeroom"),
-            vampire_safe=room_data.get("vampire_safe"),
-            hunter_safe=room_data.get("hunter_safe"),
             no_combat=room_data.get("no_combat"),
-            no_loiter=room_data.get("no_loiter"),
-            evil_ward=room_data.get("evil_ward"),
-            is_cell=room_data.get("is_cell"),
-            robable=room_data.get("robable"),
             outdoor=room_data.get("outdoor"),
-            floor_sleep=room_data.get("floor_sleep"),
-            has_bunks=room_data.get("has_bunks"),
-            vampire_nest=room_data.get("vampire_nest"),
-            spawn_nest=room_data.get("spawn_nest"),
-            spawn_hub=room_data.get("spawn_hub"),
-            hospital=room_data.get("hospital"),
-            mechanic=room_data.get("mechanic"),
-            devils_trap=room_data.get("devils_trap"),
-            salt_line=room_data.get("salt_line"),
-            iron_ward=room_data.get("iron_ward"),
-            devils_gate=room_data.get("devils_gate"),
-            unholy=room_data.get("unholy"),
-            crossroads=room_data.get("crossroads"),
-            demon_deal=room_data.get("demon_deal"),
             jobs=room_data.get("jobs"),
-            vendor_stock=room_data.get("vendor_stock"),
             dark=room_data.get("dark"),
             hidden_directions=room_data.get("hidden_directions"),
             title=room_data.get("title"),
             vnum=room_data.get("vnum"),
-            croatoan_contaminated=room_data.get("croatoan_contaminated"),
-            croatoan_quarantine=room_data.get("croatoan_quarantine"),
-            croatoan_seal=room_data.get("croatoan_seal"),
-            croatoan_blood=room_data.get("croatoan_blood"),
-            croatoan_panic=room_data.get("croatoan_panic"),
             layout=room_data.get("layout"),
-            remodel_type=room_data.get("remodel_type"),
-            remodel_inbound_exit=room_data.get("remodel_inbound_exit"),
+            game_fields=room_data,
         )
         _stamp_room_city_meta(rooms[room_data["key"]], data)
     return map_id, plane, realm, bool(grid)
@@ -2573,53 +2383,18 @@ def load_all_maps(*, include_deferred=False):
                 resources=room_data.get("resources"),
                 zone=room_data.get("zone"),
                 resource_capacity=room_data.get("resource_capacity"),
-                consecrated=room_data.get("consecrated"),
-                evil_zone=room_data.get("evil_zone"),
                 dungeon=room_dungeon,
                 no_random_spawn=room_no_random,
                 zone_exit=room_data.get("zone_exit"),
-                is_house=room_data.get("is_house"),
-                is_grave=room_data.get("is_grave"),
-                private_home=room_data.get("private_home"),
-                is_hotel_room=room_data.get("is_hotel_room"),
-                is_home=room_data.get("is_home"),
-                main_homeroom=room_data.get("main_homeroom"),
-                vampire_safe=room_data.get("vampire_safe"),
-                hunter_safe=room_data.get("hunter_safe"),
                 no_combat=room_data.get("no_combat"),
-                no_loiter=room_data.get("no_loiter"),
-                evil_ward=room_data.get("evil_ward"),
-                is_cell=room_data.get("is_cell"),
-                robable=room_data.get("robable"),
                 outdoor=room_data.get("outdoor"),
-                floor_sleep=room_data.get("floor_sleep"),
-                has_bunks=room_data.get("has_bunks"),
-                vampire_nest=room_data.get("vampire_nest"),
-                spawn_nest=room_data.get("spawn_nest"),
-                spawn_hub=room_data.get("spawn_hub"),
-                hospital=room_data.get("hospital"),
-                mechanic=room_data.get("mechanic"),
-                devils_trap=room_data.get("devils_trap"),
-                salt_line=room_data.get("salt_line"),
-                iron_ward=room_data.get("iron_ward"),
-                devils_gate=room_data.get("devils_gate"),
-                unholy=room_data.get("unholy"),
-                crossroads=room_data.get("crossroads"),
-                demon_deal=room_data.get("demon_deal"),
                 jobs=room_data.get("jobs"),
-                vendor_stock=room_data.get("vendor_stock"),
                 dark=room_data.get("dark"),
                 hidden_directions=room_data.get("hidden_directions"),
                 title=room_data.get("title"),
                 vnum=room_data.get("vnum"),
-                croatoan_contaminated=room_data.get("croatoan_contaminated"),
-                croatoan_quarantine=room_data.get("croatoan_quarantine"),
-                croatoan_seal=room_data.get("croatoan_seal"),
-                croatoan_blood=room_data.get("croatoan_blood"),
-                croatoan_panic=room_data.get("croatoan_panic"),
                 layout=room_data.get("layout"),
-                remodel_type=room_data.get("remodel_type"),
-                remodel_inbound_exit=room_data.get("remodel_inbound_exit"),
+                game_fields=room_data,
             )
             _stamp_room_city_meta(rooms[room_data["key"]], data)
         _stamp_registry_entry(registry, filename, data, plane, realm, map_id)

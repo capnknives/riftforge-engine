@@ -25,6 +25,7 @@ from engine.command_support import (
     # at runtime even though the helper lives in engine/command_support.
     _collect_character_matches,
     _display_name,
+    _maybe_append_account_tag,
     floor_item_look_lines,
     _find_character,
     _find_item,

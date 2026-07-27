@@ -11,8 +11,13 @@ COMMANDS (AGENTS.md rule 11).
 """
 
 from basegame.verbs.character import cmd_score
+from basegame.verbs.mail import cmd_mail
 
 BASEGAME_COMMANDS = {
     "score": (cmd_score, "your path, stats, Tier, and HP"),
     "sc": (cmd_score, "alias for score"),
+    "mail": (
+        cmd_mail,
+        "letters at the Post Office (see 'help mail')",
+    ),
 }

@@ -1,6 +1,6 @@
 [project]
 name = "riftforge"
-version = "0.1.0"
+version = "0.2.0"
 description = "A from-scratch MUD engine (pure Python, asyncio) powering the SUPERS game."
 requires-python = ">=3.11"
 dependencies = []  # standard library only — keep it that way

@@ -1446,6 +1446,26 @@ def cmd_tell(character, args, game):
     gmcp.push_comm(target.session, "tell", message, face)
 
 
+def _ooc_speaker_face(character, game):
+    """OOC channel speaker label (feature D).
+
+    When the speaker's Account prefers ``ooc_identity=account``, use the
+    account display name. Otherwise the character presence face. Account
+    names are allowed on OOC (feature E).
+    """
+    try:
+        from engine import accounts as accounts_mod
+        account = accounts_mod.account_for_character(game, character)
+        if (
+            account is not None
+            and account.ooc_identity == accounts_mod.OOC_IDENTITY_ACCOUNT
+        ):
+            return account.display_name or account.name
+    except Exception:
+        pass
+    return _display_name(character)
+
+
 def cmd_ooc(character, args, game):
     """Global out-of-character chat to every connected Session.
 
@@ -1484,7 +1504,8 @@ def cmd_ooc(character, args, game):
 
     message = args.strip()
     # Plain-text ((OOC)) carries meaning without color (a11y).
-    face = _display_name(character)
+    # Feature D: account pref ooc_identity may show account display name.
+    face = _ooc_speaker_face(character, game)
     plain = f"((OOC)) [{face}]: {message}"
     # Record before broadcast so the speaker's later bare `ooc` includes
     # this line even if delivery somehow skips their own Session.
@@ -2027,6 +2048,94 @@ def cmd_config(character, args, game):
         else:
             character.session.send("Usage: config tips on|off")
         return
+    if key in ("oocname", "oocidentity", "ooc_identity"):
+        # Feature D: account vs character face on OOC.
+        from engine import accounts as accounts_mod
+        account = accounts_mod.account_for_character(game, character)
+        if account is None:
+            character.session.send(
+                "Link an account first (type 'account' or create one at "
+                "login). Then: config oocname account|character"
+            )
+            return
+        if not rest:
+            character.session.send(
+                f"OOC name is {account.ooc_identity} "
+                f"(account '{account.display_name}'). "
+                "Usage: config oocname account|character"
+            )
+            return
+        choice = rest.split(None, 1)[0].lower()
+        if choice in ("account", "acct", "a"):
+            account.ooc_identity = accounts_mod.OOC_IDENTITY_ACCOUNT
+            character.session.send(
+                f"OOC will show your account name "
+                f"({account.display_name})."
+            )
+            try:
+                game.save()
+            except Exception:
+                pass
+        elif choice in ("character", "char", "c", "name"):
+            account.ooc_identity = accounts_mod.OOC_IDENTITY_CHARACTER
+            character.session.send(
+                "OOC will show your character name."
+            )
+            try:
+                game.save()
+            except Exception:
+                pass
+        else:
+            character.session.send(
+                "Usage: config oocname account|character"
+            )
+        return
+    if key in ("seeaccounts", "gmaccounts", "gm_see_accounts"):
+        # Feature F: staff-only Character(Account) labels.
+        from engine import accounts as accounts_mod
+        if not _is_gm(character):
+            character.session.send("That setting is for staff GMs.")
+            return
+        account = accounts_mod.account_for_character(game, character)
+        if account is None:
+            body = getattr(character, "gm_mode_body", None)
+            if body is not None:
+                account = accounts_mod.account_for_character(game, body)
+        if account is None:
+            character.session.send(
+                "Link a staff account first. "
+                "Usage: config seeaccounts on|off"
+            )
+            return
+        if not rest:
+            state = "on" if account.gm_see_accounts else "off"
+            character.session.send(
+                f"See-accounts is {state}. "
+                "Usage: config seeaccounts on|off "
+                "(GM form shows Character(Account))."
+            )
+            return
+        choice = rest.split(None, 1)[0].lower()
+        if choice in ("on", "yes", "true", "1"):
+            account.gm_see_accounts = True
+            character.session.send(
+                "See-accounts on -- names show as Character(Account) "
+                "while you are in GM form."
+            )
+            try:
+                game.save()
+            except Exception:
+                pass
+        elif choice in ("off", "no", "false", "0"):
+            account.gm_see_accounts = False
+            character.session.send("See-accounts off -- plain names.")
+            try:
+                game.save()
+            except Exception:
+                pass
+        else:
+            character.session.send("Usage: config seeaccounts on|off")
+        return
     if key == "channel":
         # config channel ooc <role>
         bits = rest.split(None, 1)
@@ -2074,6 +2183,7 @@ def cmd_config(character, args, game):
         "whohide": "whohide",
         "combatnumbers": "combatnumbers",
         "combatdiag": "combatdiag",
+        "fightlog": "fightlog",
         "autoidle": "autoidle",
         "idlemode": "idlemode",
         "idle": "idle",
@@ -2156,8 +2266,17 @@ def _config_status_lines(character):
         "-- config combatnumbers on|off",
         f"  combatdiag: "
         f"{'on' if getattr(character, 'combat_diag', False) else 'off'}  "
-        "-- config combatdiag on|off (GM)",
+        "-- config combatdiag on|off",
+        f"  fightlog: "
+        f"{'on' if getattr(character, 'fightlog_enabled', False) else 'off'}  "
+        "-- config fightlog on|off (cinematic replay after fights)",
         f"  channel ooc: {ch}  -- config channel ooc <role>",
+        "",
+        "Account / OOC:",
+        "  oocname: account|character  -- config oocname … "
+        "(requires a linked account)",
+        "  seeaccounts: on|off  -- config seeaccounts … "
+        "(staff GM form only)",
         "",
         "Who / idle:",
         f"  whofull: "
@@ -2177,9 +2296,238 @@ def _config_status_lines(character):
         f"  aliases: {alias_n} set  -- config alias …",
         f"  prompt: {character.prompt_format!r}  -- config prompt …",
         "",
-        "See also: help formatting | help config | help alias | help prompt",
+        "See also: help formatting | help config | help alias | "
+        "help prompt | help account",
     ]
+    # Fill live oocname / seeaccounts values when linked.
+    try:
+        from engine import accounts as accounts_mod
+        game = getattr(getattr(character, "session", None), "game", None)
+        account = accounts_mod.account_for_character(game, character)
+        if account is None:
+            body = getattr(character, "gm_mode_body", None)
+            if body is not None:
+                account = accounts_mod.account_for_character(game, body)
+        if account is not None:
+            for i, line in enumerate(lines):
+                if line.startswith("  oocname:"):
+                    lines[i] = (
+                        f"  oocname: {account.ooc_identity}  "
+                        "-- config oocname account|character"
+                    )
+                if line.startswith("  seeaccounts:"):
+                    state = "on" if account.gm_see_accounts else "off"
+                    lines[i] = (
+                        f"  seeaccounts: {state}  "
+                        "-- config seeaccounts on|off (staff)"
+                    )
+    except Exception:
+        pass
     return lines
+
+
+def cmd_account(character, args, game):
+    """Show, create, or link an engine Account for this character.
+
+    Usage::
+        account                 status (name, characters, totals, prefs)
+        account create <name>   start create+link (prompts for password)
+        account link <name>     link to existing (prompts for password)
+        account oocname …       alias of config oocname
+
+    When typed from GM form, create/link attaches the left-behind playable
+    body (not the ``gmspirit:`` actor).
+    """
+    from engine import accounts as accounts_mod
+    from engine import auth
+
+    raw = (args or "").strip()
+    # Status / already-linked checks use the playable body when in GM form.
+    link_body, body_err = accounts_mod.playable_link_target(game, character)
+    body_for_acct = link_body if link_body is not None else character
+    account = accounts_mod.account_for_character(game, body_for_acct)
+
+    if not raw:
+        if account is None:
+            character.session.send(
+                "You have no linked account. "
+                "Type 'account create <name> <password>' or "
+                "'account link <name> <password>', "
+                "or wait for the login offer next time you connect. "
+                "See 'help account'."
+            )
+            return
+        # Refresh contribution totals from logs (engine-pure).
+        try:
+            from engine import reports as reports_mod
+            bug_counts = {}
+            for entry in reports_mod.recent(
+                reports_mod.BUG, None, directory=game.report_dir
+            ):
+                if entry.get("status") != "resolved":
+                    continue
+                key = (entry.get("reporter") or "").strip()
+                if key:
+                    bug_counts[key] = bug_counts.get(key, 0) + 1
+            suggest_counts = {}
+            for entry in reports_mod.recent(
+                reports_mod.SUGGEST, None, directory=game.report_dir
+            ):
+                key = (entry.get("reporter") or "").strip()
+                if key:
+                    suggest_counts[key] = suggest_counts.get(key, 0) + 1
+            bugs = 0
+            suggests = 0
+            for key in list(account.character_keys):
+                k = (key or "").strip()
+                bugs += int(bug_counts.get(k, 0))
+                suggests += int(suggest_counts.get(k, 0))
+            account.bugs_squashed = bugs
+            account.features_suggested = suggests
+        except Exception:
+            pass
+        faces = []
+        for key in account.character_keys:
+            finder = getattr(game, "find_login_character", None)
+            body = finder(key) if callable(finder) else None
+            if body is None:
+                body = game.find_character(key)
+            if body is not None:
+                faces.append(_presence_face(body))
+            else:
+                faces.append(key)
+        lines = [
+            f"Account: {account.display_name}",
+            f"  Characters: {', '.join(faces) or '(none)'}",
+            f"  OOC name: {account.ooc_identity} "
+            f"(config oocname account|character)",
+            f"  Bugs squashed: {int(account.bugs_squashed or 0)} "
+            "(account lifetime)",
+            f"  Features suggested: "
+            f"{int(account.features_suggested or 0)} "
+            "(account lifetime)",
+        ]
+        if account.gm_rank in ("gm", "head_gm"):
+            lines.append(f"  Staff rank: {account.gm_rank}")
+            cast_n = len(accounts_mod.list_immersion_cast(game))
+            lines.append(
+                f"  Cast roster: {cast_n} immersion cast "
+                "(account login menu + gm off <name>)"
+            )
+            state = "on" if account.gm_see_accounts else "off"
+            lines.append(
+                f"  See-accounts: {state} "
+                "(config seeaccounts on|off)"
+            )
+        character.session.send("\r\n".join(lines))
+        return
+
+    parts = raw.split(None, 1)
+    sub = parts[0].lower()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if sub in ("create", "new"):
+        if account is not None:
+            character.session.send(
+                f"Already linked to '{account.display_name}'. "
+                "Ask staff if you need to change that."
+            )
+            return
+        if body_err:
+            character.session.send(body_err)
+            return
+        if not rest:
+            character.session.send("Usage: account create <name>")
+            return
+        # Synchronous-ish: reuse the async prompt via a mini loop is hard
+        # from a sync verb -- do create inline with a password on the
+        # same line OR ask them to use login offer. Prefer inline:
+        # account create Name password
+        bits = rest.split(None, 1)
+        name = bits[0]
+        if len(bits) < 2:
+            character.session.send(
+                "Usage: account create <name> <password> "
+                f"(password at least {auth.MIN_PASSWORD_LEN} characters)"
+            )
+            return
+        password = bits[1]
+        cleaned, err = accounts_mod.normalize_account_name(name)
+        if err:
+            character.session.send(err)
+            return
+        new_acct, err = accounts_mod.create_account(game, cleaned, password)
+        if err:
+            character.session.send(err)
+            return
+        link_err = accounts_mod.link_character(game, new_acct, link_body)
+        if link_err:
+            # Do not leave an orphan account with no characters.
+            accounts_mod.unregister_account(game, new_acct)
+            character.session.send(link_err)
+            return
+        accounts_mod.migrate_legacy_gm_ranks(game)
+        try:
+            game.save()
+        except Exception:
+            pass
+        character.session.send(
+            f"Account '{new_acct.display_name}' created and linked to "
+            f"{_presence_face(link_body)}. "
+            "Type 'account' to review."
+        )
+        return
+
+    if sub == "link":
+        if account is not None:
+            character.session.send(
+                f"Already linked to '{account.display_name}'."
+            )
+            return
+        if body_err:
+            character.session.send(body_err)
+            return
+        bits = rest.split(None, 1)
+        if len(bits) < 2:
+            character.session.send(
+                "Usage: account link <name> <password>"
+            )
+            return
+        cleaned, err = accounts_mod.normalize_account_name(bits[0])
+        if err:
+            character.session.send(err)
+            return
+        existing = accounts_mod.find_account(game, cleaned)
+        if existing is None:
+            character.session.send("No such account.")
+            return
+        if not accounts_mod.verify_account_password(existing, bits[1]):
+            character.session.send("Incorrect password.")
+            return
+        link_err = accounts_mod.link_character(game, existing, link_body)
+        if link_err:
+            character.session.send(link_err)
+            return
+        accounts_mod.migrate_legacy_gm_ranks(game)
+        try:
+            game.save()
+        except Exception:
+            pass
+        character.session.send(
+            f"Linked {_presence_face(link_body)} to account "
+            f"'{existing.display_name}'. "
+            "Type 'account' to review."
+        )
+        return
+
+    if sub in ("oocname", "ooc"):
+        return cmd_config(character, f"oocname {rest}".strip(), game)
+
+    character.session.send(
+        "Usage: account | account create <name> <password> | "
+        "account link <name> <password> | account oocname …  "
+        "See 'help account'."
+    )
 
 
 def cmd_alias(character, args, game):
@@ -2713,8 +3061,11 @@ def _format_help_db_entry(character, entry):
     ``syntax_block`` -- kept isolated from the narrative body in the DB --
     becomes a labeled "Syntax:" section ahead of the prose, still going
     through the one screenreader-aware formatter rather than a bespoke one.
+
+    Frame width follows ``config width`` (prefs #3) so a wide client is not
+    stuck at the classic 67-column Blood & Velvet ceiling.
     """
-    from engine import style
+    from engine import display_prefs, style
     body_lines = []
     if entry["syntax_block"]:
         body_lines.append("Syntax:")
@@ -2726,6 +3077,7 @@ def _format_help_db_entry(character, entry):
         title = f"{title} [IC]"
     return style.format_tome(
         title, body_lines,
+        width=display_prefs.sheet_width(character),
         screenreader=bool(getattr(character, "screenreader", False)),
     )
 
@@ -2746,7 +3098,7 @@ def cmd_help(character, args, game):
     bare COMMANDS one-liner, and finally a DB fuzzy "did you mean" before
     giving up and logging the miss.
     """
-    from engine import style
+    from engine import display_prefs, style
     # Local import: COMMANDS is assembled in commands.py from this very
     # package plus supers.verbs -- importing it at module level here would
     # be circular (commands.py is what imports engine.verbs in the first
@@ -2761,6 +3113,8 @@ def cmd_help(character, args, game):
     verb = verb.strip(" \t\"'`.,;:!?()[]{}")
     topics = get_help_topics()
     categories = get_help_categories()
+    # Frame budget for every help path (prefs #3) -- matches score / who.
+    help_w = display_prefs.sheet_width(character)
     if verb:
         db = getattr(game, "db", None)
         is_gm_viewer = _is_gm(character)
@@ -2808,6 +3162,7 @@ def cmd_help(character, args, game):
                         body_lines.pop(0)
             framed = style.format_tome(
                 title, body_lines, related=related,
+                width=help_w,
                 screenreader=bool(getattr(character, "screenreader", False)),
             )
             character.session.send("\r\n".join(framed))
@@ -2859,6 +3214,7 @@ def cmd_help(character, args, game):
         _, help_text = entry
         framed = style.format_tome(
             verb, [help_text], related="commands",
+            width=help_w,
             screenreader=bool(getattr(character, "screenreader", False)),
         )
         character.session.send("\r\n".join(framed))
@@ -2868,6 +3224,7 @@ def cmd_help(character, args, game):
     lines = [""]
     lines.extend(style.format_help_index(
         categories,
+        width=help_w,
         screenreader=bool(getattr(character, "screenreader", False)),
     ))
     character.session.send("\r\n".join(lines).rstrip("\n"))

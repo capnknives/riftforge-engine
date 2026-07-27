@@ -63,15 +63,53 @@ DEFAULT_FETCH_TIMEOUT = 60
 
 # Intentional fix subjects only -- must look like a ship, not a mention.
 # Examples that MATCH: "Fix bug #25: list commands alphabetically."
+#                      "Fix bugs #79-82: ethereal gear…"
+#                      "Fix bugs #57-#60: sit/stand…"
+#                      "Fix bugs #79, #80, #82: …"
 #                      "Fixes bug_reports.log #12 -- sparring echo text"
 # Examples that do NOT: "Merge origin/main: ... with bug #25."
 #                       "Enhance auto-deploy (#5)"  (PR number, not bug id)
+#                       "Fix overnight Cadence… (#63-#67)" (parenthetical only)
 _FIX_SUBJECT_RE = re.compile(
     r"^(?:fix(?:es|ed)?)\s+"
-    r"(?:bug\s*#|bug_reports\.log\s*#)"
-    r"(\d+)\b",
+    r"(?:bugs?|bug_reports\.log)\s*#"
+    r"(\d+)"
+    r"(?:\s*[-–—]\s*#?(\d+))?"
+    r"((?:\s*,\s*#?\d+)*)"
+    r"\b",
     re.IGNORECASE,
 )
+# Cap range expansion so a typo like #1-9999 cannot flood resolve.
+_MAX_BUG_ID_RANGE = 50
+
+
+def _expand_fix_subject_bug_ids(start: int, end: int | None, extras: str) -> list[int]:
+    """Build an ordered, de-duplicated bug-id list from a Fix subject match.
+
+    ``start`` is the first ``#N``. ``end`` is the optional range end
+    (``#79-82`` / ``#57-#60``). ``extras`` is the comma-tail
+    (``, #80, #82``). Ranges wider than ``_MAX_BUG_ID_RANGE`` collapse to
+    just the two endpoints so a typo cannot mark dozens of tickets.
+    """
+    ids: list[int] = []
+
+    def _add(n: int) -> None:
+        if n not in ids:
+            ids.append(n)
+
+    if end is None:
+        _add(start)
+    else:
+        lo, hi = (start, end) if start <= end else (end, start)
+        if hi - lo > _MAX_BUG_ID_RANGE:
+            _add(start)
+            _add(end)
+        else:
+            for n in range(lo, hi + 1):
+                _add(n)
+    for chunk in re.findall(r"\d+", extras or ""):
+        _add(int(chunk))
+    return ids
 
 # Values accepted in the override file / GM command (normalized to these).
 _OVERRIDE_ON = "on"
@@ -697,23 +735,29 @@ def _commit_parent_count(sha, root):
     return max(0, len(parents.split()) - 1)
 
 
-def parse_deploy_metadata(subject: str) -> tuple[int | None, str]:
-    """Extract bug # and a short summary from an intentional fix subject.
+def parse_deploy_metadata(subject: str) -> tuple[list[int], str]:
+    """Extract bug id list + short summary from an intentional fix subject.
 
-    Only subjects that START like "Fix bug #N:" / "Fixes bug_reports.log #N"
-    yield a bug_id. Mid-sentence mentions ("... changelog with bug #25") and
-    bare PR refs ("... (#5)") deliberately return bug_id=None so auto-deploy
-    does not announce a false "Bug #N has been fixed" world reset.
+    Only subjects that START like ``Fix bug #N:`` / ``Fix bugs #N-M:`` /
+    ``Fixes bug_reports.log #N`` yield ids. Mid-sentence mentions
+    (``... changelog with bug #25``) and bare PR refs (``... (#5)``)
+    deliberately return ``[]`` so auto-deploy does not announce a false
+    world reset.
+
+    Returns ``(bug_ids, summary)``. Callers that only need the primary
+    announce id use ``bug_ids[0] if bug_ids else None``.
     """
     summary = subject.strip()
     # Drop trailing "(#123)" PR reference from squash-merge subjects BEFORE
     # any id scan, so a PR number can never become a bug id.
     summary = re.sub(r"\s*\(#\d+\)\s*$", "", summary).strip()
 
-    bug_id = None
+    bug_ids: list[int] = []
     match = _FIX_SUBJECT_RE.match(summary)
     if match:
-        bug_id = int(match.group(1))
+        start = int(match.group(1))
+        end = int(match.group(2)) if match.group(2) else None
+        bug_ids = _expand_fix_subject_bug_ids(start, end, match.group(3) or "")
         rest = summary[match.end():].lstrip()
         if rest.startswith(":"):
             rest = rest[1:].lstrip()
@@ -723,7 +767,7 @@ def parse_deploy_metadata(subject: str) -> tuple[int | None, str]:
 
     if len(summary) > 120:
         summary = summary[:117] + "..."
-    return bug_id, summary or "A bug fix has been deployed."
+    return bug_ids, summary or "A bug fix has been deployed."
 
 
 def should_ship_bug_fix(subject: str, *, parent_count: int, file_count: int):
@@ -733,7 +777,7 @@ def should_ship_bug_fix(subject: str, *, parent_count: int, file_count: int):
 
     Ship only when ALL of:
       - not a merge commit (parent_count <= 1)
-      - subject parses to a real Fix bug #N id
+      - subject parses to at least one Fix bug #N id
       - the commit actually touches at least one file to overlay
     Otherwise the caller should advance origin/main silently.
     """
@@ -741,12 +785,14 @@ def should_ship_bug_fix(subject: str, *, parent_count: int, file_count: int):
         return False, "merge commit -- advance silently"
     if subject.strip().lower().startswith("merge "):
         return False, "merge subject -- advance silently"
-    bug_id, _summary = parse_deploy_metadata(subject)
-    if bug_id is None:
+    bug_ids, _summary = parse_deploy_metadata(subject)
+    if not bug_ids:
         return False, "not a Fix bug #N subject -- advance silently"
     if file_count <= 0:
         return False, "no files to overlay -- advance silently"
-    return True, f"ship bug #{bug_id}"
+    if len(bug_ids) == 1:
+        return True, f"ship bug #{bug_ids[0]}"
+    return True, f"ship bugs #{bug_ids[0]}-#{bug_ids[-1]}"
 
 
 def _advance_origin_only(root, state, remote_sha, subject, reason):
@@ -777,20 +823,23 @@ def _wait_for_ready(root, timeout_seconds):
     return False
 
 
-def _run_deploy_pipeline(root, *, commit_sha, bug_id, summary, countdown, files):
+def _run_deploy_pipeline(root, *, commit_sha, bug_ids, summary, countdown, files):
     """Announce in-game, wait, overlay this commit's files only.
 
     `files` is precomputed by the caller so empty commits never reach
     queue_deploy (announce-before-overlay was the false-positive path for
-    merge tips with no file payload).
+    merge tips with no file payload). ``bug_ids`` may list several tickets
+    for a batch Fix subject so on_resume marks every one resolved.
     """
     from engine import deploy_notify
     from tools.apply_pr_fix import overlay_files_from_ref
 
+    primary = bug_ids[0] if bug_ids else None
     signal = deploy_notify.queue_deploy(
         root,
         pr=commit_sha[:12],
-        bug_id=bug_id,
+        bug_id=primary,
+        bug_ids=bug_ids,
         summary=summary,
         countdown_seconds=countdown,
         triggered_by="engine/auto_deploy.py",
@@ -804,9 +853,14 @@ def _run_deploy_pipeline(root, *, commit_sha, bug_id, summary, countdown, files)
         )
         return True
 
+    if not bug_ids:
+        label = "fix"
+    elif len(bug_ids) == 1:
+        label = f"bug #{bug_ids[0]}"
+    else:
+        label = f"bugs #{bug_ids[0]}-#{bug_ids[-1]}"
     print(
-        f"[auto_deploy] countdown {countdown}s for "
-        f"{f'bug #{bug_id}' if bug_id else 'fix'}: {summary}",
+        f"[auto_deploy] countdown {countdown}s for {label}: {summary}",
         flush=True,
     )
     timeout = DEFAULT_READY_TIMEOUT + countdown
@@ -969,7 +1023,7 @@ def try_auto_deploy():
         return False
 
     subject = _commit_subject(remote_sha, root)
-    bug_id, summary = parse_deploy_metadata(subject)
+    bug_ids, summary = parse_deploy_metadata(subject)
     countdown = _countdown_seconds()
 
     print(
@@ -1001,7 +1055,7 @@ def try_auto_deploy():
     queued = _run_deploy_pipeline(
         root,
         commit_sha=remote_sha,
-        bug_id=bug_id,
+        bug_ids=bug_ids,
         summary=summary,
         countdown=countdown,
         files=files,
@@ -1013,7 +1067,8 @@ def try_auto_deploy():
     state["last_deploy"] = {
         "sha": remote_sha,
         "subject": subject,
-        "bug_id": bug_id,
+        "bug_id": bug_ids[0] if bug_ids else None,
+        "bug_ids": list(bug_ids),
         "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     _save_state(root, state)

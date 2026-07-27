@@ -119,7 +119,7 @@ def main():
         + "\n".join(hits)
     )
 
-    from world import Character, Item
+    from world import Character, Item, Room
     from engine import hooks
     from engine.verbs.basic import cmd_idlemode, cmd_who
 
@@ -132,6 +132,41 @@ def main():
         "POW": 5.0, "VIT": 5.0, "FOC": 5.0, "FIN": 5.0, "RES": 5.0, "PRE": 5.0,
     }, c.stats
     assert c.tier == 0
+
+    # Stage 8 two-repo purity: Room sheds its SUPERS-shaped defaults the
+    # same way Character already had (attach_room hook, engine/hooks.py).
+    # A bare engine Room must not carry any SUPERS room-flavor field...
+    r = Room("a lean room")
+    for supers_only in (
+        "croatoan_blood", "devils_gate", "vampire_nest", "city_name",
+        "hospital", "consecrated", "is_house", "vendor_stock",
+    ):
+        assert not hasattr(r, supers_only), (supers_only, r.__dict__.keys())
+    # ...but keeps every generic engine-owned Room field with its original
+    # default (engine/verbs/basic.py, engine/vision.py, engine/game_calendar.py,
+    # engine/systems/weather.py, engine/persistence.py all read these directly).
+    assert r.gravity == 1.0
+    assert r.wilderness is False
+    assert r.outdoor is False
+    assert r.area_type == "plains"
+    assert r.dark is False
+    assert r.hidden_directions == ()
+    assert r.no_combat is False
+
+    # Stage G: map-JSON stamper hook defaults to no-op (lean boot ignores
+    # SUPERS-only room keys). Registering a fake stamper must fire once.
+    seen = []
+
+    def _fake_stamp(room, room_data, *, filename=None):
+        seen.append((room.key, room_data.get("vampire_safe"), filename))
+
+    hooks.set_map_room_stamper(_fake_stamp)
+    hooks.stamp_map_room(r, {"vampire_safe": True}, filename="t.json")
+    assert seen == [("a lean room", True, "t.json")], seen
+    hooks.set_map_room_stamper(None)
+    # Cleared stamper must not raise / mutate.
+    hooks.stamp_map_room(r, {"vampire_safe": False}, filename="t2.json")
+    assert seen == [("a lean room", True, "t.json")], seen
 
     c.session = _FakeSession()
     cmd_who(c, "", _FakeGame())
@@ -246,6 +281,240 @@ def main():
     assert fired == [lean_game]
     tick_registry.clear_ticks(lean_game)
     assert lean_game._tick_handlers == []
+
+    # Stage 4 two-repo purity: the capped 0-1 meter kit is generic engine
+    # content now (engine/systems/needs.py) -- any object can carry any
+    # named meter, with zero SUPERS meter names (hunger/thirst/...) baked in.
+    from engine.systems import needs as needs_engine
+
+    class _MeterBlob:
+        pass
+
+    blob = _MeterBlob()
+    needs_engine.attach_meters(blob, ("mock_a", "mock_b"))
+    assert blob.mock_a == 0.0 and blob.mock_b == 0.0
+
+    rate = needs_engine.seek_rate(10)
+    assert rate == needs_engine.SEEK_THRESHOLD / 10
+    for _ in range(10):
+        needs_engine.advance(blob, "mock_a", rate)
+    assert abs(blob.mock_a - needs_engine.SEEK_THRESHOLD) < 1e-9
+    assert needs_engine.is_critical(blob, "mock_a") is False
+
+    blob.mock_a = 1.0
+    assert needs_engine.is_critical(blob, "mock_a") is True
+    assert needs_engine.most_urgent(blob, ("mock_a", "mock_b")) == ("mock_a", 1.0)
+    assert needs_engine.most_urgent(
+        blob, ("mock_a", "mock_b"), skip=("mock_a",),
+    ) is None
+
+    needs_engine.satisfy(blob, "mock_a")
+    assert blob.mock_a == 0.0
+    blob.mock_b = 0.5
+    level = needs_engine.sate_ambient(blob, "mock_b", 0.2)
+    assert level == 0.3 and blob.mock_b == 0.3
+
+    assert needs_engine.level_phrase(0.0) == "a little"
+    assert needs_engine.level_phrase(0.99) == "critically"
+
+    dumped = needs_engine.dump_meters(blob, ("mock_a", "mock_b"))
+    assert dumped == {"mock_a": 0.0, "mock_b": 0.3}
+    needs_engine.load_meters(blob, ("mock_a", "mock_b"), {"mock_a": 0.42})
+    assert blob.mock_a == 0.42 and blob.mock_b == 0.0
+    needs_engine.clamp_meters(blob, ("mock_a",))
+    assert blob.mock_a == 0.42
+
+    # Stage 7 two-repo purity: the weighted-outcome roll mechanism behind
+    # SUPERS' hit/dodge/block/critical reaction roll is generic engine
+    # content now (engine/systems/combat_core.py) -- the mechanism doesn't
+    # know or care what the outcome names mean.
+    from engine.systems import combat_core
+
+    # Weights sum well under the reserve -- no rescale, first bucket wins
+    # at roll=0.0, falls through to default past the last bucket.
+    weights = [("a", 0.2), ("b", 0.3)]
+    assert combat_core.roll_weighted_outcome(weights, default="z", rng=lambda: 0.0) == "a"
+    assert combat_core.roll_weighted_outcome(weights, default="z", rng=lambda: 0.25) == "b"
+    assert combat_core.roll_weighted_outcome(weights, default="z", rng=lambda: 0.9) == "z"
+
+    # Weights sum past (1 - reserve) -- proportional rescale keeps `default`
+    # guaranteed at least `reserve` share: a roll just under 1.0 still falls
+    # through to default even though raw weights summed to 1.0.
+    big_weights = [("a", 0.5), ("b", 0.5)]
+    assert combat_core.roll_weighted_outcome(
+        big_weights, default="z", reserve=0.10, rng=lambda: 0.99,
+    ) == "z"
+    assert combat_core.roll_weighted_outcome(
+        big_weights, default="z", reserve=0.10, rng=lambda: 0.0,
+    ) == "a"
+
+    # Stage 6 two-repo purity: the room-graph BFS mechanism is generic
+    # engine content now (engine/pathfind.py) -- an injected edge_ok
+    # callback decides passability; the mechanism doesn't know evil_zone,
+    # lodging, or pocket enter aliases.
+    from engine import pathfind as pathfind_engine
+
+    a = Room("a")
+    b = Room("b")
+    c = Room("c")
+    a.exits = {"north": b}
+    b.exits = {"north": c, "south": a}
+    c.exits = {"south": b}
+
+    def _edge_ok(_from_room, neighbor):
+        return neighbor is not None
+
+    assert pathfind_engine.path_directions_to(
+        a, lambda r: r is c, edge_ok=_edge_ok,
+    ) == ["north", "north"]
+    assert pathfind_engine.next_step_toward(
+        a, lambda r: r is c, edge_ok=_edge_ok,
+    ) == "north"
+    assert pathfind_engine.path_to_room(a, c, edge_ok=_edge_ok) == [
+        "north", "north",
+    ]
+    # Already at goal -> empty path / None first hop.
+    assert pathfind_engine.path_directions_to(
+        a, lambda r: r is a, edge_ok=_edge_ok,
+    ) == []
+    assert pathfind_engine.next_step_toward(
+        a, lambda r: r is a, edge_ok=_edge_ok,
+    ) is None
+    # max_nodes cap: start expands one neighbor (seen=2); limit 2 stops
+    # before reaching c two hops away.
+    assert pathfind_engine.path_directions_to(
+        a, lambda r: r is c, edge_ok=_edge_ok, max_nodes=2,
+    ) == []
+
+    # Stage 5 two-repo purity: the wallet / bank ledger is generic engine
+    # content now (engine/systems/economy.py) -- format_money, deposit /
+    # withdraw, can_afford. Vendor stock, gig work, and Cadence stipends
+    # stay in supers.
+    from engine.systems import economy as economy_engine
+
+    assert economy_engine.format_money(0) == "$0"
+    assert economy_engine.format_money(15) == "$15"
+    assert economy_engine.format_money(-3) == "-$3"
+    assert economy_engine.money_noun() == "dollars"
+    assert economy_engine.money_noun(plural=False) == "dollar"
+    assert economy_engine.money_score_label() == "Cash"
+
+    class _WalletBlob:
+        pass
+
+    purse = _WalletBlob()
+    purse.coins = 40
+    purse.bank_coins = 10
+    assert economy_engine.wallet_balance(purse) == 40
+    assert economy_engine.bank_balance(purse) == 10
+    assert economy_engine.can_afford(purse, 40) is True
+    assert economy_engine.can_afford(purse, 41) is False
+    ok, _msg = economy_engine.deposit(purse, 15)
+    assert ok and purse.coins == 25 and purse.bank_coins == 25
+    ok, _msg = economy_engine.withdraw(purse, 5)
+    assert ok and purse.coins == 30 and purse.bank_coins == 20
+    ok, _msg = economy_engine.deposit(purse, 999)
+    assert ok is False
+
+    # Stage 9 two-repo purity: text mail inbox, canned-social catalog
+    # perform, and stacked clothing wear map are generic engine content
+    # now. SUPERS keeps ship/courier, socials.json copy, and restring.
+    from engine.systems import mail as mail_engine
+    from engine.systems import social_catalog as social_engine
+    from engine.systems import wearables as wear_engine
+    from world import Item
+
+    class _MailBlob:
+        pass
+
+    alice = _MailBlob()
+    alice.key = "Alice"
+    alice.session = None
+    alice.location = Room("post")
+    alice.location.resources = ("mail",)
+    bob = _MailBlob()
+    bob.key = "Bob"
+    bob.session = None
+    bob.mail_inbox = []
+
+    class _MailGame:
+        def find_character(self, name):
+            if name.lower() == "bob":
+                return bob
+            return None
+
+        game_time_ticks = 0
+
+    ok, msg = mail_engine.send_mail(alice, "Bob", "hello there", _MailGame())
+    assert ok and bob.mail_inbox[0]["text"] == "hello there", msg
+    assert "Alice" in mail_engine.format_list(bob)[1]
+    ok, body = mail_engine.read_letter(bob, 1)
+    assert ok and "hello there" in body
+    ok, _ = mail_engine.discard_letter(bob, "1")
+    assert ok and bob.mail_inbox == []
+
+    catalog = {
+        "wave": {
+            "help": "wave [name]",
+            "solo": {
+                "self": "You wave.",
+                "others": "{actor} waves.",
+            },
+            "targeted": {
+                "self": "You wave at {target}.",
+                "target": "{actor} waves at you.",
+                "others": "{actor} waves at {target}.",
+            },
+        },
+    }
+    social_engine.validate_social_catalog(catalog)
+    assert social_engine.resolve_verb("wave", catalog) == "wave"
+
+    class _SocialRoom:
+        def __init__(self):
+            self.lines = []
+
+        def characters(self):
+            return []
+
+        def broadcast(self, text, exclude=None):
+            self.lines.append(text)
+
+    actor = Character("WaveActor")
+    actor.location = _SocialRoom()
+    ok, line = social_engine.perform(
+        actor, catalog, "wave", "", None,
+        find_in_room=lambda _n, _c: None,
+    )
+    assert ok and line == "You wave."
+    assert actor.location.lines == ["WaveActor waves."]
+
+    wearer = Character("Wearer")
+    tee = Item("a tee", "A plain tee.")
+    tee.layer = "clothing"
+    tee.slot = "body"
+    wearer.inventory = [tee]
+
+    def _is_cloth(p):
+        return getattr(p, "layer", None) == "clothing"
+
+    def _slot(p):
+        return getattr(p, "slot", None) if _is_cloth(p) else None
+
+    def _name(p, _c=None):
+        return p.key
+
+    ok, msg = wear_engine.wear_piece(
+        wearer, tee, is_clothing=_is_cloth, slot_for=_slot, display_key=_name,
+    )
+    assert ok and tee.worn is True, msg
+    assert list(wear_engine.iter_worn_clothing(wearer)) == [("body", tee)]
+    ok, msg, removed = wear_engine.remove_piece(
+        wearer, "body",
+        is_clothing=_is_cloth, slot_for=_slot, display_key=_name,
+        find_item=lambda _n, cands: cands[0] if cands else None,
+    )
+    assert ok and removed is tee and tee.worn is False, msg
 
     print("engine_smoke_ok")
     return 0

@@ -34,6 +34,7 @@ from engine.persistence import (
     load_death_beacons,
     load_author_mantle_event,
     load_ooc_history,
+    load_accounts,
     load_rumor_boards,
     load_world,
     mark_seeded,
@@ -56,6 +57,7 @@ from engine.persistence import (
     save_death_beacons,
     save_author_mantle_event,
     save_ooc_history,
+    save_accounts,
     save_rumor_boards,
     save_world,
 )

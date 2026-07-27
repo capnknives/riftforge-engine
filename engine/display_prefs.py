@@ -176,9 +176,13 @@ def apply_screenreader_mode(character, enabled):
         character.show_minimap = False
         character.map_on_move = False
         character.map_on_look = False
+        # Default fightlog on for screenreader (cinematic replay after fights).
+        character.fightlog_enabled = True
         return (
             "Screenreader mode on -- ASCII frames and minimaps "
-            "flatten to lists; combat stays tagged and brief."
+            "flatten to lists; combat stays tagged and brief. "
+            "Fightlog on -- cinematic lines buffer for 'fightlog read' "
+            "after a fight (config fightlog off to stop)."
         )
     character.screenreader = False
     return "Screenreader mode off."

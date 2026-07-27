@@ -373,6 +373,10 @@ def _display_name(obj, viewer=None):
 
     Follow/beckon party mates (engine.group) append ``(Group)`` when the
     viewer shares their follow tree -- e.g. Dean sees ``Sam(Group)``.
+
+    When a staff viewer has Account pref ``gm_see_accounts`` on and is in
+    GM form, append ``(AccountName)`` -- never shown to ordinary players
+    (feature F / E).
     """
     name = _display_name_base(obj, viewer)
     if (
@@ -389,7 +393,54 @@ def _display_name(obj, viewer=None):
                 name = f"{name}(Group)"
         except Exception:
             _log_hook_error("group suffix", getattr(obj, "key", None))
+    # Feature F: GM see-accounts toggle (staff form only).
+    if (
+        isinstance(obj, Character)
+        and viewer is not None
+        and isinstance(viewer, Character)
+    ):
+        name = _maybe_append_account_tag(name, obj, viewer)
     return name
+
+
+def _maybe_append_account_tag(name, subject, viewer):
+    """Append ``(AccountName)`` when the viewer is staff with the pref on.
+
+    Account names must never appear for ordinary players (feature E).
+    """
+    if not getattr(viewer, "gm_mode", False) and not getattr(
+        viewer, "gm_spirit", False
+    ):
+        return name
+    game = None
+    session = getattr(viewer, "session", None)
+    if session is not None:
+        game = getattr(session, "game", None)
+    if game is None:
+        return name
+    try:
+        from engine.accounts import account_for_character, find_account
+        viewer_account = account_for_character(game, viewer)
+        if viewer_account is None:
+            # Spirit may not have character.account -- check body.
+            body = getattr(viewer, "gm_mode_body", None)
+            if body is not None:
+                viewer_account = account_for_character(game, body)
+        if viewer_account is None or not viewer_account.gm_see_accounts:
+            return name
+        subject_account = account_for_character(game, subject)
+        if subject_account is None:
+            return name
+        tag = subject_account.display_name or subject_account.name
+        if not tag:
+            return name
+        suffix = f"({tag})"
+        if str(name).endswith(suffix):
+            return name
+        return f"{name}{suffix}"
+    except Exception:
+        _log_hook_error("account tag", getattr(subject, "key", None))
+        return name
 
 
 def _echo_look_bits(obj):
@@ -419,7 +470,7 @@ def _display_name_base(obj, viewer=None):
             from engine.hooks import presence_face_for
             face = presence_face_for(viewer, obj)
             if face:
-                if getattr(obj, "gm_mode", False):
+                if _staff_form_label(obj):
                     return f"{face}(GM)"
                 if obj.acts_as_echo():
                     return f"{face} ({', '.join(_echo_look_bits(obj))})"
@@ -436,7 +487,7 @@ def _display_name_base(obj, viewer=None):
             from engine.hooks import concealed_presence_name
             face = concealed_presence_name(obj)
             if face:
-                if getattr(obj, "gm_mode", False):
+                if _staff_form_label(obj):
                     return f"{face}(GM)"
                 if obj.acts_as_echo():
                     return f"{face} ({', '.join(_echo_look_bits(obj))})"
@@ -449,7 +500,7 @@ def _display_name_base(obj, viewer=None):
             _log_hook_error(
                 "concealed_presence_name", getattr(obj, "key", None)
             )
-    if isinstance(obj, Character) and getattr(obj, "gm_mode", False):
+    if isinstance(obj, Character) and _staff_form_label(obj):
         # Staff form (gmmode) -- invincible wanderer; not a spirit/Echo.
         return f"{_presence_face(obj)}(GM)"
     if isinstance(obj, Character) and obj.acts_as_echo():
@@ -462,6 +513,25 @@ def _display_name_base(obj, viewer=None):
         return _presence_face(obj)
     return obj.key
 
+
+def _staff_form_label(obj):
+    """True when presence should show ``Name(GM)`` for staff form.
+
+    Prefer ``gm_mode``, but also treat a Session-held permanent GM spirit
+    as staff form so a save hiccup cannot relabel it ``(spirit)``.
+    """
+    if obj is None:
+        return False
+    if getattr(obj, "gm_mode", False):
+        return True
+    if not getattr(obj, "gm_spirit", False):
+        return False
+    if getattr(obj, "session", None) is None:
+        return False
+    key_low = (getattr(obj, "key", None) or "").lower()
+    return key_low.startswith("gmspirit:") or bool(
+        getattr(obj, "gm_spirit_permanent", False)
+    )
 
 def _move_one(character, direction, dest, game, auto_look=True):
     """The actual single-character move: leave/arrive broadcast, encounter
@@ -902,12 +972,68 @@ def _find_character(query, characters, self_character=None):
 
 
 def _is_gm(character):
-    """Is this character any rank of GM (ordinary or head)?"""
+    """Is this character any rank of GM (ordinary or head)?
+
+    Authoritative rank lives on the linked Account when present; falls
+    back to legacy per-character ``gm_rank`` during migration. Immersion
+    cast rides keep staff identity via ``session.staff_account``.
+    """
+    game = None
+    session = getattr(character, "session", None)
+    if session is not None:
+        game = getattr(session, "game", None)
+        # Cast / alt ride: Session remembers the staff account from gm on.
+        staff_name = getattr(session, "staff_account", None)
+        if staff_name and game is not None:
+            try:
+                from engine.accounts import find_account, account_is_staff
+                acct = find_account(game, staff_name)
+                if account_is_staff(acct):
+                    return True
+            except Exception:
+                pass
+    # When session is on a GM spirit, gm_mode_body may hold the login body
+    # whose account we should check; spirit also copies gm_rank.
+    if game is not None:
+        try:
+            from engine.accounts import effective_gm_rank
+            rank = effective_gm_rank(game, character)
+            if rank in ("gm", "head_gm"):
+                return True
+            # Also check the login body when viewing from a GM spirit.
+            body = getattr(character, "gm_mode_body", None)
+            if body is not None:
+                return effective_gm_rank(game, body) in ("gm", "head_gm")
+        except Exception:
+            pass
     return character.gm_rank in ("gm", "head_gm")
 
 
 def _is_head_gm(character):
     """Is this character specifically the head GM (can promote/demote)?"""
+    game = None
+    session = getattr(character, "session", None)
+    if session is not None:
+        game = getattr(session, "game", None)
+        staff_name = getattr(session, "staff_account", None)
+        if staff_name and game is not None:
+            try:
+                from engine.accounts import find_account
+                acct = find_account(game, staff_name)
+                if acct is not None and (acct.gm_rank or "") == "head_gm":
+                    return True
+            except Exception:
+                pass
+    if game is not None:
+        try:
+            from engine.accounts import effective_gm_rank
+            if effective_gm_rank(game, character) == "head_gm":
+                return True
+            body = getattr(character, "gm_mode_body", None)
+            if body is not None:
+                return effective_gm_rank(game, body) == "head_gm"
+        except Exception:
+            pass
     return character.gm_rank == "head_gm"
 
 

@@ -1,1 +1,6 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.db
 .game_heartbeat
+_public_engine_export/

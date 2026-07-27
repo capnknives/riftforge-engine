@@ -183,14 +183,6 @@ class Room(GameObject):
         # Validated against supers/jobs.py at Cadence boot (not at map load
         # -- maps.py stays free of SUPERS imports).
         self.jobs = []
-        # Settlement / zone shop catalogs (Grocery, Gas Station, …). Authored
-        # on hand-written rooms in content/maps/*.json and content/zones/*.json
-        # -- never on overland grid cells. Resolved at first use by
-        # supers.economy.ensure_room_vendor_stock. Not SQLite-backed (rooms
-        # rebuild every boot); finite qty resets to the JSON seed on restart.
-        # Character.vendor_stock is separate personal/under-counter stock
-        # layered on top when an on-duty keeper works here.
-        self.vendor_stock = []
         # Cadence NPCs are CONFINED to their home zone: a grouping id (e.g.
         # "wastes-town") shared by every hand-authored room of one settlement.
         # supers/cadence.py's pathfinder only ever steps between rooms sharing
@@ -217,23 +209,10 @@ class Room(GameObject):
         # late arrival wait and grumble instead of bedding down. Authored in
         # content/maps/*.json as "resource_capacity"; defaults to no caps.
         self.resource_capacity = {}
-        # D34 (a D33 follow-on): flags this room as "eviltown" -- a haunt for
-        # evil NPCs (Vampires; later maybe Demons) within an otherwise normal
-        # settlement. Two things read this flag: peaceful townsfolk pathing/
-        # wandering (supers/cadence.py) treats an evil_zone room as impassable
-        # -- ordinary NPCs never path through or idle-wander into one, even
-        # though it usually shares the SAME Room.zone as the rest of the town
-        # (that's what lets it be reachable at all, e.g. down from a plaza) --
-        # and evil NPCs (supers/cadence.py's vampire hunt behavior) are the
-        # only Cadence actors exempt from that avoidance (plus allow_evil
-        # staff like the Rat's Nest bartender). A boolean flag, same shape
-        # as Room.wilderness. Authored in content/maps/*.json as "evil_zone";
-        # default False (an ordinary room).
-        self.evil_zone = False
         # Authored leveling dungeons (content/zones/*, supers/dungeons/):
         # players-only PvE pockets. Cadence / Echo / NPC pathing treats
         # dungeon rooms as impassable; taxi / takedungeon refuse anyone
-        # without a live Session. Same boolean shape as evil_zone.
+        # without a live Session. Same boolean shape as wilderness.
         # Authored as "dungeon" in map/zone JSON; default False.
         self.dungeon = False
         # Block wilderness / procedural-dungeon random encounter rolls.
@@ -243,56 +222,10 @@ class Room(GameObject):
         self.no_random_spawn = False
         # One-shot seed marker for authored dungeon trash (runtime).
         self.dungeon_seeded = False
-        # Sanctuary flags (Cadence conflict ebb/flow): vampires refuse to hunt
-        # or enter vampire_safe rooms (Corner Bar, Town Gym); hunters refuse
-        # hunter_safe rooms (Rat's Nest Backroom). Authored in map JSON;
-        # default False. Same boolean shape as evil_zone / consecrated.
-        self.vampire_safe = False
-        self.hunter_safe = False
         # True sanctuary: no attack/spar start and no hostile auto-aggro
-        # (Central Plaza civic peace). Distinct from vampire_safe /
-        # hunter_safe (one-faction dens). Authored as "no_combat" in map JSON.
+        # (Central Plaza civic peace). Distinct from the (SUPERS-attached)
+        # faction-den sanctuary flags. Authored as "no_combat" in map JSON.
         self.no_combat = False
-        # Anti-loiter hub (Central Plaza): only logged-in PCs may stand
-        # here. NPCs / Echoes / sessionless bodies are hard-blocked on
-        # cardinal walk and swept out on tick. See supers/no_loiter.py.
-        self.no_loiter = False
-        # Evil ward (Men of Letters bunker, etc.): hard entry refuse for
-        # Demons, possessed hosts, Vampires, and evil-aligned characters.
-        # Good and neutral may shelter. See supers/wards.py + move_gate.
-        self.evil_ward = False
-        # Cadence D39: a townsfolk home (distinct from hotel-for-drifters).
-        self.is_house = False
-        # Multi-room house link: every interior chamber of one address /
-        # apartment / homestead stamps ``is_home`` and points
-        # ``main_homeroom`` at the claim hub (usually Living). Boot
-        # ``lodging.ensure_house_home_links`` backfills from ``is_house``
-        # clusters. Porches stay threshold-only (private_home, not is_home).
-        self.is_home = False
-        self.main_homeroom = None
-        # Private-home hard door (entryway / porch / apartment unit). When
-        # True on an entryway, `in` into the is_house interior is gated; when
-        # True on an is_house unit (apartments), the door-code step is gated.
-        # Unclaimed homes stay open -- see supers.lodging.can_enter_home.
-        self.private_home = False
-        # Open-door hospitality: living guests skip the friend/family gate
-        # when True (lock / unlock / buildflag unlocked). Salt lines and
-        # devil's traps still seal spirits. Default locked (False).
-        self.unlocked = False
-        # Optional authored marker that this room hosts a hunt board.
-        # Board rooms are usually discovered via missions giver JSON;
-        # this flag lets a homestead mark a hub without a catalog edit.
-        self.mission_board = False
-        # Soft owner stamp for compound homes (Bobby's Singer House,
-        # wilds homestead hubs). Used by lock/unlock ACL; claim still
-        # uses home_room_key / homestead_plots.
-        self.homestead_owner = None
-        # Cadence #49: a burial plot the gravedigger fills.
-        self.is_grave = False
-        # Jail cell the deputy locks criminals into (mirrors is_grave).
-        self.is_cell = False
-        # Desperation robbery: grocery / fast-food counters tagged robable.
-        self.robable = False
         # D29/suggestion #8: which dimensional plane this room sits on
         # (e.g. "earth", "fire", "heaven"). Set from content/maps/*.json's
         # top-level "plane" when the room is grid-built; hand-authored rooms
@@ -319,87 +252,14 @@ class Room(GameObject):
         self.layout_x = None
         self.layout_y = None
         self.layout_z = None
-        # Divine faith economy (Phase 2 item 8 / D20): consecrated ground
-        # (chapels) boosts minister flock growth. Authored in map JSON as
-        # "consecrated": true; default False so every older room stays
-        # ordinary. Live-mutable the same way resources/bestiary tags are.
-        self.consecrated = False
-        # Temporary consecration from mortal pray (angel radio). Expires
-        # when game_time_ticks >= this value; 0 means no temp consecration.
-        # Permanent Room.consecrated is unaffected -- temp OR permanent
-        # counts as holy for grace drip / look helpers.
-        self.temp_consecrated_until = 0
-        # Hellcraft circle (Occultist chalk ward). Expires when
-        # game_time_ticks >= this value; 0 means no circle. Blocks Demon
-        # force-possession while active (supers/hellcraft.py).
-        self.hell_circle_until = 0
-        # Thin D44 authored traps (supers/traps.py). Map JSON may set these.
-        self.devils_trap = False
-        self.salt_line = False
-        self.iron_ward = False
-        # Devil's Gate (D47): map-authored planar hop room. Runtime rotator
-        # marks which gates are currently open; closed gates hide from look
-        # exits into them (supers/demon_travel.py).
-        self.devils_gate = False
-        # D47/D48 Demon travel whitelist (mirror of consecrated for Angels).
-        # Permanent unholy / Faustian sites Demons may dteleport to. Authored
-        # in map JSON; default False so older rooms stay ordinary.
-        self.unholy = False
-        self.crossroads = False
-        self.demon_deal = False
-        # Croatoan remnant / surge rooms (supers/croatoan.py). Authored in
-        # zone JSON; default clean so ordinary rooms never tick exposure.
-        self.croatoan_contaminated = False
-        self.croatoan_quarantine = False
-        self.croatoan_seal = False
-        self.croatoan_blood = 0
-        self.croatoan_panic = 0
-        # Temporary unholy from a crossroads beckon ritual. Expires when
-        # game_time_ticks >= this value; 0 means none. Permanent unholy
-        # flags are unaffected.
-        self.temp_unholy_until = 0
         # Open-sky exposure (Vampire daylight burn, outdoor look ambient).
         # Distinct from wilderness (spawn flag): town streets can be outdoor
         # without rolling wilderness encounters. Authored as "outdoor"; when
         # omitted, maps._add_room defaults True if wilderness else False so
         # overland grids inherit outdoor without per-cell JSON. Sewers,
-        # buildings, nests, and flats stay False (indoor / covered).
+        # buildings, nests, and flats stay False (indoor / covered). Also
+        # read by engine/systems/weather.py's generic ambient weather.
         self.outdoor = False
-        # Floor-sleep rooms (Homeless Camp, vampire nests): sleep resource
-        # without bed furniture. maps/_add_room + lodging.ensure_beds skip
-        # auto-seeding beds when this is True.
-        self.floor_sleep = False
-        # Stronghold / bunker bunks: sleep resource with unlimited capacity
-        # and no bed Item required (Men of Letters Quarters, barracks).
-        # Distinct from floor_sleep (camp / public-ish) -- full bed rates,
-        # never public-sleep vagrancy. Authored as "has_bunks": true.
-        self.has_bunks = False
-        # Vampire nest lair (sewer floor-sleep dens). Cadence day-refuge
-        # prefers these after a Vampire's claimed home. Authored as
-        # "vampire_nest"; default False. Also sets spawn_nest="vampire"
-        # when spawn_nest is unset (maps.py alias).
-        self.vampire_nest = False
-        # Live spawn den type (vampire|demon|beast|ghost). Authored as
-        # "spawn_nest": "demon". Empty/None means no nest top-up.
-        self.spawn_nest = None
-        # Soul / soldier hubs (adventurer_guild, hunter_motel, angel_nest,
-        # demon_nest) -- see supers/spawn_hubs.py + hubs.json.
-        self.spawn_hub = None
-        # Town Clinic / hospital room (Evil Strikes Back). Authored as
-        # "hospital": true in map JSON; supers/hospital.py finds these.
-        self.hospital = False
-        # Town mechanic service desk (repair / paint / mods / berth sales).
-        # Authored as "mechanic": true -- distinct from home garage storage
-        # (is_house remodeled bays) and bunker Impala berths. See
-        # supers/vehicle_kit.is_mechanic_room.
-        self.mechanic = False
-        # Last remodel template id (e.g. "kitchen", "garage") -- stamped by
-        # supers.remodel / map_store.apply_remodel and loaded from map JSON.
-        # Used to gate home cooking (kitchen) and vehicle bay heuristics.
-        self.remodel_type = None
-        # Named inbound exit label from remodel (e.g. "garage") -- adjoining
-        # rooms show Garage instead of north/south. See map_store.apply_remodel.
-        self.remodel_inbound_exit = None
         # Thin light / vision (D67): dark rooms need a carried light source
         # to see look contents. Authored as "dark": true; default False.
         self.dark = False
@@ -432,14 +292,16 @@ class Room(GameObject):
         # so the victim sees the real place name with no "fake" tell.
         # Runtime override -- wins over authored title when set.
         self.look_key = None
-        # Runtime Jinn instance id when this room is a private mirage clone.
-        self.jinn_instance_id = None
-        # Zone/map official city + ROOM NAME paint meta (docs/AREA_BUILDING.md).
-        # Stamped from JSON city_name / city_color / main_colors / sub_color.
-        self.city_name = None
-        self.city_color = None
-        self.sub_color = None
-        self.main_colors = None
+
+        # Game composition (mirrors Character.__init__'s attach_character
+        # call below): SUPERS registers set_room_attacher(attach_supers_room)
+        # at package import / server boot (supers/room_attach.py) to add its
+        # own room-flavor fields (Vampire/Demon lore, Cadence lodging,
+        # town-system flags, ...). With no attacher registered this is a
+        # no-op, so a bare engine Room stays lean (two-repo purity gate:
+        # docs/plans/two_repo_purity.md Phase 7 Stage 8).
+        from engine.hooks import attach_room
+        attach_room(self)
 
     def look_title(self):
         """ROOM NAME for look / exit lists / who / walk prose.
@@ -599,6 +461,10 @@ class Character(GameObject):
         # string means "no password set" -- connection.py refuses public
         # login until a head GM resets via gm setpass (pen-test H1).
         self.password_hash = ""
+        # Linked engine Account name (normalized), or "" when unlinked.
+        # Characters keep their own password_hash; accounts have a separate
+        # credential. See engine/accounts.py.
+        self.account = ""
         # Milestone 4 (combat): who this character is currently fighting, or
         # None. Sits right alongside the other attached data -- combat.py
         # reads/clears it every tick; nothing here is Origin/Discipline-

@@ -13,7 +13,7 @@ separate private repo and depends on **tagged releases** of this package.
 ```bash
 pip install -e .
 # or pin a release from another project:
-#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.1.1
+#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.2.0
 ```
 
 ## Smoke

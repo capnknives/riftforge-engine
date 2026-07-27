@@ -38,3 +38,5 @@ def attach_basegame(character):
     # game's attach step runs) so a Character built outside chargen (smoke,
     # NPCs) is never left at hp=0.
     character.hp = stats_module.max_hp(character)
+    # Text mail inbox (engine/systems/mail.py) -- same shape SUPERS uses.
+    character.mail_inbox = []

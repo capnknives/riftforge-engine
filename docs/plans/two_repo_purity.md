@@ -7,9 +7,18 @@ hook API details grow in [`../ENGINE_CONSUMER.md`](../ENGINE_CONSUMER.md).
 
 **Status:** Phases 0–6 **done** for the remote split. Public
 [`riftforge-engine`](https://github.com/capnknives/riftforge-engine)
-(`v0.1.1` pin); private `capnknives/RiftForge` (SUPERS). Ongoing: export
-discipline when engine changes; dual-mount hack when editing both trees.
-Gateway: [`connection_gateway.md`](connection_gateway.md) (shipped).
+(`v0.2.0` pin); private `capnknives/RiftForge` (SUPERS). **Phase 7**
+(engine framework extraction + `basegame/` + Stage G root glue) is
+**complete** — Stages **1–9**, A1/A2, Plan B, Stage G, and the public
+`v0.2.0` tag. Ongoing: export discipline when engine changes; dual-mount
+hack when editing both trees. Gateway:
+[`connection_gateway.md`](connection_gateway.md) (shipped).
+Parked T3 hygiene rows (`persistence-api` / `lean-demo` / `dirty-saves`)
+stay in [`refactor_plan.md`](refactor_plan.md) until explicitly unparked.
+
+**Naming:** two-repo **Phase 7** (this file) is **not** combat
+“Phase 7” template-blend weaving — that stays parked under combat prose
+plans.
 
 ## Locked decisions
 
@@ -40,7 +49,7 @@ Gateway: [`connection_gateway.md`](connection_gateway.md) (shipped).
 | **2b** | `command_support.py` purity | ✅ shared move/spirit-sight helpers hookified; zero supers imports in `engine/command_support.py` |
 | **3** | Lean world + game bootstrap | ✅ MVP: lean `engine/world.py`/`engine/persistence.py`; dual installable packages declared; game entry alias added |
 | **4** | Engine-only smoke | ✅ CI job `engine-only-smoke` green with SUPERS absent (`tools/engine_smoke.py`) |
-| **5** | Remote split | ✅ public `riftforge-engine` + private SUPERS; pin `v0.1.1` |
+| **5** | Remote split | ✅ public `riftforge-engine` + private SUPERS; pin `v0.2.0` |
 | **6** | Living docs | ✅ RELEASING / UPGRADING / LIVE_DEPLOY + CI + gateway/auto-deploy verify |
 
 Phases 0–6 complete (2026-07-17). Follow-on hygiene (lean `python -m engine`
@@ -171,13 +180,13 @@ Engine-only CI smoke with SUPERS **physically absent**:
 ## Phase 5 notes (done)
 
 **Opened / remotes cut 2026-07-17.** Merged to SUPERS `main`. Pin
-`@v0.1.1` on [`riftforge-engine`](https://github.com/capnknives/riftforge-engine).
+`@v0.2.0` on [`riftforge-engine`](https://github.com/capnknives/riftforge-engine).
 
 | Lock | Value |
 |------|-------|
 | Public remote | `capnknives/riftforge-engine` |
 | Private SUPERS | `capnknives/RiftForge` (private) |
-| Pin shape | `riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.1.1` |
+| Pin shape | `riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.2.0` |
 
 ### Staging (all done)
 
@@ -207,10 +216,213 @@ Living docs + ops verify (2026-07-17):
 4. Gateway process is long-lived; auto-deploy still overlays the game tree
    only — never put game logic in `engine/gateway.py`.
 
+## Phase 7 — engine extraction + basegame
+
+Follow-on after the remote split (Phases 0–6). Goal: grow reusable
+frameworks under `engine/` / `engine/systems/`, prove them with
+`basegame/`, keep SUPERS lore and catalogs private. **Hygiene track** —
+does not invent product #1 (`remaining_project_schedule.md` + newest
+HANDOFF “Next up” still win). Unpark a stage explicitly (“start Stage N”).
+
+Archive of the A1/A2/Plan B design note:
+[`../archive/phase7_a1_a2_plan_b_complete.md`](../archive/phase7_a1_a2_plan_b_complete.md).
+
+### Phase 7 status
+
+| Stage / piece | Status | PR / note |
+|---------------|--------|-----------|
+| **1** — `content_store` / `content_validate` / `tick_registry` → `engine/` | ✅ Done | [#782](https://github.com/capnknives/RiftForge/pull/782) |
+| **2** — `basegame/` + `game_select.py` | ✅ Done | [#793](https://github.com/capnknives/RiftForge/pull/793) |
+| **3** — generic `engine/systems/weather.py` (SUPERS weather stays) | ✅ Done | [#798](https://github.com/capnknives/RiftForge/pull/798) |
+| **A1 + A2** — `engine/stats.py` + basegame shared spine + `score` | ✅ Done | [#837](https://github.com/capnknives/RiftForge/pull/837) |
+| **Plan B** — `attach_supers` → 14 `_attach_*` helpers | ✅ Done | [#842](https://github.com/capnknives/RiftForge/pull/842) |
+| Public export includes `basegame` in `PUBLIC_PATHS` | ✅ Done | with #837 |
+| New public tag / friend push to `riftforge-engine` | ✅ Done | **`v0.2.0`** — Phase 7 frameworks + basegame; SUPERS pin bumped |
+| **4** — needs/meter kit + effort → `engine/systems/` | ✅ Done | [#844](https://github.com/capnknives/RiftForge/pull/844) |
+| **5** — economy coin/vendor primitives | ✅ Done | [#856](https://github.com/capnknives/RiftForge/pull/856) |
+| **6** — pathfind BFS → `engine/` | ✅ Done | [#855](https://github.com/capnknives/RiftForge/pull/855) |
+| **7** — `engine/systems/combat_core` (brief only) | ✅ Done | [#848](https://github.com/capnknives/RiftForge/pull/848) |
+| **8** — lean Character debt (`t3-lean-room-flags`) | ✅ Done | [#849](https://github.com/capnknives/RiftForge/pull/849) |
+| **9** — mail / socials / clothing + basegame proof | ✅ Done | [#864](https://github.com/capnknives/RiftForge/pull/864) |
+| **G** — root `server.py` / `maps.py` / chargen/help | ✅ Done | Maps stamper [#865](https://github.com/capnknives/RiftForge/pull/865); boot seed / chargen / help [#867](https://github.com/capnknives/RiftForge/pull/867) |
+
+### Boundary rule (locked)
+
+**Promote into `engine/` (or `engine/systems/`) when the module is a
+reusable framework** another game could opt into — even if SUPERS-tuned
+defaults exist today.
+
+| Layer | Owns |
+|-------|------|
+| **`engine/` / `engine/systems/`** | Primitives + frameworks: meters, coin/vendor APIs, pathfind BFS, battle-brief build/apply, content store, tick registry, shared spine, generic ambient weather, lean Character surface |
+| **`basegame/`** | Proof consumer: adopts engine frameworks; ships minimal verbs/help/maps; no SUPERS lore |
+| **`supers/`** | Catalogs, Origin/Path/Cadence fiction, combat prose/lexicon, CONUS weather/daylight/storm, Tier flavor names, fuel economies, town AI |
+
+**Confirm before promoting (edge cases):** public remote visibility (new
+tags / friend access), anything that would force SUPERS lore into the
+public tree, or peels that break live Docker / gateway. Default when
+unsure: **ask**, then peel with supers re-export facades (Stage 1 pattern).
+
+**Stay in supers (explicit):** Cadence town AI, hospital/clinic fiction,
+crime, alignment/incap kill methods, combat prose/narrate/lexicon, full
+`training.py` Track-B, SUPERS `weather`/`daylight`/`storm_watch`, Origin
+fuel chassis.
+
+### Done notes (Stages 1–9, A1/A2, Plan B)
+
+- **Stage 1:** moved JSON catalog helpers + ordered tick registration into
+  `engine/`; supers keeps re-export facades. Lean boot gets an empty tick
+  pipeline.
+- **Stage 2:** `RIFTFORGE_GAME=basegame` via `game_select.py`; mutual
+  exclusion vs supers; `tools/basegame_smoke.py` proves a second game.
+- **Stage 3 (revised):** do **not** move SUPERS CONUS weather — ship new
+  generic ambient weather under `engine/systems/weather.py` and wire
+  basegame; SUPERS weather/daylight/storm stay private.
+- **A1:** six primaries + Tier math in `engine/stats.py`;
+  `Character.stats` / `tier` set in `engine/world.py`; `supers/stats.py`
+  re-exports; engine-smoke asserts the generic defaults.
+- **A2 (bundled with A1 in #837):** basegame drops its 4-stat spine,
+  adopts the shared six, ships `score` / `sc` + help.
+- **Plan B:** pure code-motion split of `attach_supers()` into fourteen
+  named `_attach_*` helpers (508 field defaults unchanged).
+- **Stage 4:** name-agnostic capped 0–1 meter kit (`seek_rate`, attach/ensure/
+  dump/load/clamp, `advance`, `satisfy`, `sate_ambient`, `is_critical`,
+  `most_urgent`/`most_critical`, `level_phrase`) in `engine/systems/needs.py`;
+  `supers/needs.py` keeps the eleven-meter set + all fiction (Vampire fuel
+  mirroring, Celestial skips, pack duty, homesickness tiers, ...) via a thin
+  facade — every public function keeps its exact name/signature, so none of
+  the ~70 existing call sites changed. `supers/effort.py`'s meter clamp
+  routes through the same kit. No `basegame/` hunger/thirst wiring yet
+  (deferred as optional/later, per the original stage scope). `needs_timing`
+  output confirmed byte-identical pre/post refactor.
+- **Stage 5:** auditing `supers/economy.py` (~1,140 lines) the same way
+  Stage 4 / Stage 7 audited needs / combat found that only the wallet
+  ledger is genuinely reusable framework — `format_money`,
+  `money_noun` / `money_score_label`, `wallet_balance` /
+  `bank_balance`, `can_afford`, `deposit`, and `withdraw` now live in
+  `engine/systems/economy.py` (optional dynamic `coins` /
+  `bank_coins` via getattr; Character attach + persist stay in supers).
+  The stage blurb's "flat currency, vendor stock, buy/sell" undersells
+  the coupling: vendor catalogs, `buy` / `sell` / `fence_to_vendor`,
+  gig work (`start_work` / `stop_work` / `tick_work`), stipends,
+  thrift / `can_afford_resource`, and `needs.NEED_RESOURCE` mapping are
+  all SUPERS content and stay in `supers/economy.py` as an unchanged
+  re-export facade for the ledger helpers. Room `vendor_stock` already
+  lives on `supers/room_attach.py` (Stage 8) — no change there. Engine
+  readers already used defensive `getattr(character, "coins", 0)`
+  (mission strongbox reward in `engine/verbs/basic.py`); nothing else
+  under `engine/` needed rewiring. No `basegame/` cash wiring yet
+  (deferred like Stage 4 / Stage 7).
+- **Stage 7:** researching `supers/combat.py`'s `build_brief` (~977 lines)
+  and `apply_brief` (~35 lines) found almost all of both are genuinely
+  SUPERS content, same boundary-rule call as A1 (`accuracy()`/`evasion()`/
+  etc. stayed in `supers/stats.py`) — `gap_offense_mult`/
+  `outcome_mult_for_gap` (SUPERS' tuned tier-gap curve) and `apply_brief`
+  (Integrity absorption, hex-breaking, GMCP push, no clean generic slice)
+  were deliberately left untouched, not overlooked. The one genuinely
+  generic, non-trivial mechanism found: `_roll_reaction`'s rescale-and-roll
+  step (weighted outcomes with a guaranteed floor share for the default),
+  now `roll_weighted_outcome()` in `engine/systems/combat_core.py`.
+  `_roll_reaction` (its one caller, inside `build_brief`) delegates just
+  that tail; every accuracy/evasion/crit/block chance formula feeding the
+  weights is untouched. Verified bit-for-bit RNG-identical against the old
+  inline roll across 200k+ random trials (a first pass using Python's
+  `sum()` builtin surfaced a genuine floating-point divergence at rare
+  threshold boundaries — fixed by summing with a plain accumulation loop
+  instead). No `basegame/` combat exists yet, so no consumer wiring in this
+  PR either.
+- **Stage 8:** audited `Character.__init__` field-by-field first —
+  every SUPERS-flavored-looking field (`regimen`, `spirit`/`spirit_state`/
+  `spirit_tether`, `gm_rank`, `body`/`body_room`, `password_hash`,
+  `snooping`/`snoopers`, `idle_mode`, ...) turned out to be read/written
+  directly by real `engine/` code (`command_support.py`, `connection.py`,
+  `persistence.py`, `snoop.py`) — Character was already lean, nothing
+  moved. The debt was entirely on `Room`: ~46 fields (Vampire/hunter
+  hunt-AI, Demon travel + Hellcraft wards, Croatoan, Divine consecration,
+  Cadence lodging/homestead, town-system flags, Jinn mirage ids, city
+  paint metadata) had zero `engine/` reader and moved to new
+  `supers/room_attach.py`, wired through new `set_room_attacher`/
+  `attach_room` hooks (`engine/hooks.py`, mirroring the Character
+  attacher exactly). `plane`/`realm` and `outdoor` were deliberately kept
+  generic (`engine/systems/weather.py` reads `outdoor` directly; `plane`
+  would have needed a second `maps.py` fix for no clear boundary-rule
+  win). One real compatibility bug found and fixed: `maps.py`'s
+  `_add_room` had a bare `room.vampire_nest` self-read (deciding
+  `spawn_nest` when JSON omits it) that would `AttributeError` for any
+  game without a room attacher — now `getattr(room, "vampire_nest", False)`.
+  `basegame/` needed no changes (never touched any of the 46 fields).
+- **Stage 6:** auditing `supers/pathfind.py` (~673 lines) the same way
+  Stage 7 audited `build_brief` found that only the deque BFS mechanism
+  is genuinely reusable framework — `path_directions_to` /
+  `next_step_toward` / `path_to_room` now live in `engine/pathfind.py`
+  with an injected `edge_ok(from_room, neighbor)` callback so the
+  engine never imports SUPERS passability. `supers/pathfind.py` keeps
+  public signatures unchanged (thin wrappers that pass `passable` as
+  `edge_ok`) plus everything that is Cadence/lore: `passable` itself
+  (evil_zone / vampire_safe / hunter_safe / evil_ward / lodging ACL /
+  no_loiter), `avoid_evil_for`, the immersion `step` walk (gait/vessel
+  prose, escort, followers, cast barks), and pocket/homeward lore
+  (`next_hop_homeward`, `_homeward_allow`, wilderness gateways,
+  preferred enter aliases). One purity fix in the same peel: the
+  module-level `from supers import economy` moved inside `step()` so
+  the BFS core path stays free of that dependency. No `basegame/`
+  pathfind wiring yet (deferred like Stage 4 / Stage 7).
+- **Stage 9:** auditing mail / socials / clothing the same way Stages
+  5/7 audited economy / combat found three small frameworks, not three
+  large subsystems. **Mail:** text inbox + send/read/discard /
+  `is_mail_room` / login notify → `engine/systems/mail.py`;
+  `supers/mail.py` keeps `ship_item` (Curio / rare_dealer) as a
+  re-export facade. **Socials:** catalog validate / resolve / perform /
+  format_list → `engine/systems/social_catalog.py` (injected
+  `find_in_room`); SUPERS keeps `socials.json` + `make_social_commands`
+  (free-form `emote` was already engine). **Clothing:** stacked wear
+  map + wear/remove/rebind → `engine/systems/wearables.py` (injected
+  `is_clothing` / `slot_for` / `display_key`); SUPERS keeps catalog
+  stamp, restring, outfits, look lines. **basegame proof:** Post Office
+  room + `mail` verb + help (score pattern); canned socials and wear
+  deferred like Stage 4/7.
+
+### Remaining stages (detail)
+
+**Phase 7 complete.** Stage G (maps stamper #865 + boot seed / chargen /
+help #867) and public **`riftforge-engine` `@v0.2.0`** are shipped.
+Root `server.py` / `maps.py` remain glue shells by design.
+
+**Later (not scheduled):** parked T3 rows in
+[`refactor_plan.md`](refactor_plan.md) (`t3-persistence-api`,
+`t3-lean-demo`, `t3-dirty-saves`) — unpark only with an explicit ask.
+Further public tags when engine APIs change.
+
+### Delegation (who leads what)
+
+| Agent | Best for |
+|-------|----------|
+| **Grok** | Stage **9** + **G** lead (**done**) — boundary audit, API shape, `basegame/` wiring, SoT fidelity |
+| **Composer** | Easy leftovers **at the end** only: Stage-1-style facades, call-site re-exports, smoke asserts, status-table / CHANGELOG polish — once Grok has locked the API |
+| **Sonnet** | API/shape forks historically (`needs` Stage 4, `combat_core` Stage 7, lean Character Stage 8); edge-case go/no-go — all Sonnet-led stages done |
+
+Stages **4** / **7** / **8** → Sonnet lead (**done**). Stages **5** /
+**6** → Composer peels (**done**). Stage **9** + **G** → Grok lead
+(**done**). Public **`v0.2.0`** tag → Grok (**done**).
+
+### Peel recipe (every remaining stage)
+
+1. Linked worktree + feature branch from `origin/main` (not staging).
+2. Move framework into `engine/` or `engine/systems/`; supers re-export
+   facade (Stage 1 pattern).
+3. Zero `from supers` / `import supers` under `engine/`.
+4. Targeted smoke (+ `basegame_smoke` / `engine_smoke` when the surface
+   is shared). Crash-surface → local Docker gate before live-bound PR.
+5. CHANGELOG.d fragment; PR; maintainer merges.
+
 ## Related docs
 
 - [`../ENGINE_CONSUMER.md`](../ENGINE_CONSUMER.md) — how a game registers hooks
 - [`../RELEASING_RIFTFORGE.md`](../RELEASING_RIFTFORGE.md) — cutting public tags
 - [`../UPGRADING_RIFTFORGE.md`](../UPGRADING_RIFTFORGE.md) — bumping the pin in SUPERS
 - [`../LIVE_DEPLOY.md`](../LIVE_DEPLOY.md) — watch/copyover/auto-deploy after the split
+- [`refactor_plan.md`](refactor_plan.md) — hygiene T2/T3 pointer (Phase 7 SoT is this file)
+- [`tools/export_public_engine.py`](../../tools/export_public_engine.py) — `PUBLIC_PATHS` (includes `basegame`)
+- [`tools/basegame_smoke.py`](../../tools/basegame_smoke.py) / [`tools/engine_smoke.py`](../../tools/engine_smoke.py)
 - Archive: `docs/archive/HANDOFF_HISTORY.md` (“Engine/SUPERS folder split”)
+- Archive: [`../archive/phase7_a1_a2_plan_b_complete.md`](../archive/phase7_a1_a2_plan_b_complete.md)

@@ -14,8 +14,9 @@ def character_to_blob(character):
     """character -> JSON-safe dict (engine.persistence writes this verbatim)."""
     return {
         "bg_path": character.bg_path,
-        "bg_stats": dict(character.bg_stats),
+        "bg_stats": dict(getattr(character, "bg_stats", {}) or character.stats),
         "hp": character.hp,
+        "mail_inbox": list(getattr(character, "mail_inbox", None) or []),
     }
 
 
@@ -29,7 +30,19 @@ def apply_character_blob(character, data):
     character.bg_path = data.get("bg_path", character.bg_path)
     saved_stats = data.get("bg_stats")
     if isinstance(saved_stats, dict):
-        character.bg_stats.update(
-            {k: v for k, v in saved_stats.items() if k in stats_module.STAT_NAMES}
-        )
+        # Prefer bg_stats bag when present; else shared engine spine.
+        bag = getattr(character, "bg_stats", None)
+        if isinstance(bag, dict):
+            bag.update(
+                {k: v for k, v in saved_stats.items() if k in stats_module.STAT_NAMES}
+            )
+        else:
+            character.stats.update(
+                {k: v for k, v in saved_stats.items() if k in stats_module.STAT_NAMES}
+            )
     character.hp = data.get("hp", stats_module.max_hp(character))
+    saved_mail = data.get("mail_inbox")
+    if isinstance(saved_mail, list):
+        character.mail_inbox = list(saved_mail)
+    elif not hasattr(character, "mail_inbox"):
+        character.mail_inbox = []

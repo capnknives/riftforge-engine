@@ -111,16 +111,17 @@ def register_default_ticks(game):
 
 
 def seed_content(game):
-    """Idempotent basegame world backfill, called once at Game boot.
+    """Idempotent game-package world backfill, called once at Game boot.
 
-    SUPERS seeding is unchanged and stays inline as
-    ``server.Game._seed_supers_content`` (too much SUPERS-specific backfill
-    logic -- homesteads, gathering, Cadence, immersion cast, ... -- to
-    route through here yet); this hook exists so basegame gets an
-    equivalent boot-time seed point without server.py needing to know
-    basegame's internals.
+    SUPERS: ``supers.boot_seed.seed_content`` (Cadence, immersion, heals,
+    ``register_default_ticks``). Basegame: ``basegame.seed.seed_content``
+    plus tick registration. Lean engine (``none``): no-op.
     """
     name = _resolve()
-    if name == "basegame":
+    if name == "supers":
+        from supers.boot_seed import seed_content as fn
+        fn(game)
+    elif name == "basegame":
         from basegame.seed import seed_content as fn
         fn(game)
+        register_default_ticks(game)

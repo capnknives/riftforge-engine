@@ -33,15 +33,11 @@ from engine.tick_registry import run_ticks, run_ticks_async
 import game_select
 
 # _HAS_SUPERS specifically means "SUPERS is the active game" -- it still
-# gates every SUPERS-only boot backfill below (homesteads, gathering,
-# personal realms, Cadence gm-spirit purge, ...) exactly as before, since
-# none of those have a basegame equivalent yet. make_training_dummy is a
-# SUPERS-content helper (world.py), not something basegame provides.
+# gates every SUPERS-only meta load below (plane souls, hue courts, …)
+# exactly as before, since none of those have a basegame equivalent yet.
+# Boot seed (Cadence / immersion / heals) routes through
+# game_select.seed_content → supers.boot_seed (Phase 7 Stage G).
 _HAS_SUPERS = game_select.game_name() == "supers"
-make_training_dummy = None
-if _HAS_SUPERS:
-    from world import make_training_dummy as _make_training_dummy
-    make_training_dummy = _make_training_dummy
 
 register_all_hooks = game_select.register_all_hooks
 register_default_ticks = game_select.register_default_ticks
@@ -100,6 +96,9 @@ class Game:
         # chat (still a short ring — not a forever log). Refilled after db
         # connect below.
         self.ooc_history = deque(maxlen=20)
+        # Engine-level Accounts (above Characters). Filled by
+        # persistence.load_accounts after the world load; empty until then.
+        self.accounts = {}
         # Where bug_reports.log / suggestions.log / help_misses.log live.
         # Same directory as the save file so Docker's host volume keeps
         # reports across rebuilds (reports.py / commands.py).
@@ -225,14 +224,19 @@ class Game:
             persistence.mark_seeded(self.db)
             self.save()
 
-        if _HAS_SUPERS:
-            self._seed_supers_content()
-        elif game_select.game_name() == "basegame":
-            game_select.seed_content(self)
-            register_default_ticks(self)
-        else:
-            # Lean engine: rumor boards already loaded in _load_persisted_meta.
-            pass
+        # Engine accounts: load after characters so back-pointers reconcile.
+        persistence.load_accounts(self.db, self)
+        try:
+            from engine import accounts as accounts_mod
+            accounts_mod.reconcile_accounts(self)
+            accounts_mod.migrate_legacy_gm_ranks(self)
+        except Exception:
+            print("[server] account reconcile/migrate failed:", flush=True)
+            traceback.print_exc()
+
+        # Game-package boot seed (SUPERS Cadence/heals, or basegame stub).
+        # Lean engine ("none"): no-op — meta already loaded above.
+        game_select.seed_content(self)
 
     def _load_persisted_meta(self):
         """Load Game meta counters from SQLite before any boot save().
@@ -357,223 +361,6 @@ class Game:
         else:
             self.pit_drop_tuning = raw_pit_drops or {}
 
-    def _seed_supers_content(self):
-        """Idempotent SUPERS backfills (dummy, Cadence, immersion, ticks).
-
-        Only called when the supers package imported successfully at boot.
-        """
-        # Milestone 5b: backfill the training dummy idempotently, NOT as
-        # first-boot seed content -- a database seeded before this feature
-        # existed (e.g. the real riftforge.db) already took the "if not
-        # seeded" branch above and would otherwise never get one. Checking
-        # "does it already exist" instead of "is this a fresh database"
-        # handles both a brand-new world AND an old save the same way.
-        dummy = self.find_character("a training dummy")
-        if not dummy:
-            dummy = make_training_dummy()
-            # Gym floor -- Plaza is no_loiter (NPCs / dummies cannot stand there).
-            from supers import starter_town as starter_town_mod
-            gym = self.rooms.get(starter_town_mod.GYM_KEY) or self.start_room
-            dummy.move_to(gym)
-            self.save()
-        elif not dummy.spar_only:
-            # Self-healing (same spirit as persistence.py's float-drift
-            # round() fix): a dummy saved before Milestone F added
-            # spar_only loads with the field defaulted to False, which
-            # would silently let a real lethal 'attack' through against
-            # it instead of redirecting to sparring. Patch it back once.
-            dummy.spar_only = True
-            self.save()
-
-        # Head GM is never auto-granted from a hard-coded name (pen-test C2).
-        # Promote via an existing head GM, or seed gm_rank in the DB / a
-        # one-shot ops script — Game.__init__ must not mint staff ranks.
-        # Once a character already holds head_gm, boot ensures T4 God-level
-        # staff powers without rewriting their play Path (Reaper ferry OK).
-        from supers import creation as creation_mod
-        if creation_mod.ensure_all_head_gm_mantles(self):
-            self.save()
-
-        # Cadence town simulation (docs/SYSTEMS_DESIGN.md D33 slice): place
-        # every rostered town NPC (content/npcs/*.json) not already in the
-        # world. Same idempotent-backfill shape as the training dummy above,
-        # for the same reason -- this must also backfill an existing save
-        # that predates (or just hasn't yet authored) a given townsperson.
-        from supers import cadence
-        from supers import lodging
-        from supers import npc_appearance as npc_appearance_mod
-        npc_appearance_mod.heal_all_npc_appearances(self, catalogs_only=True)
-        cadence.ensure_town_npcs(self)
-        # Immersion GM cast (Buffy / Constantine / …): git-tracked JSON
-        # under content/immersion/ -- create-or-update on every boot so
-        # live/local DBs no longer need per-character seed scripts.
-        from supers import immersion as immersion_mod
-        immersion_mod.ensure_all(self)
-        npc_appearance_mod.heal_all_npc_appearances(self, live_only=True)
-        # You are what you drive: Cadence/immersion random rides + live
-        # owned vehicle interiors (idempotent).
-        from supers import vehicle_kit as vehicle_kit_mod
-        vehicle_kit_mod.ensure_all_owned_vehicles(self)
-        # Cabin self-park soft-lock: parked_room must never be Inside …
-        # (ensure used to stamp curb from a body restored into its cabin).
-        from supers import vehicles as vehicles_mod
-        vehicles_mod.heal_cabin_self_parks(self)
-        vehicles_mod.heal_invalid_indoor_parks(self)
-        # Older saves kept interior room_key but not in_vehicle -- relink
-        # so leave/drive work (Dean stuck in Sam's Suburban, etc.).
-        vehicles_mod.heal_vehicle_board_state(self)
-        # Strip Cadence cars wrongly stamped onto living husks (live
-        # husk:Crowley Toyota + who title leak). After ensure so we
-        # clear persisted kits that ensure would otherwise rehydrate.
-        vehicle_kit_mod.heal_living_husk_vehicles(self)
-        # Lebanon starter transplant: yank bodies off wastes-town / old
-        # bunker road onto Lebanon Square / America (35,11).
-        from supers import starter_town as starter_town_mod
-        starter_town_mod.heal_lebanon_transplant(self)
-        # Purge resurrected Neighborhood*House* template interiors (and
-        # rewrite lebanon.json / map backup) so live protect cannot keep
-        # bringing them back.
-        starter_town_mod.heal_lebanon_orphan_template_houses(self)
-        # Civic look titles (Lebanon Pawn Shop, Town Clinic, …) -- keep
-        # storage keys stable while look_title never leaks unowned shopN.
-        starter_town_mod.heal_lebanon_civic_titles(self)
-        # Sheriff dig typos → office + Cell A/B; seat Deputy Vale at desk.
-        starter_town_mod.heal_sheriff_office(self)
-        starter_town_mod.heal_sewer_evil_zones(self)
-        # Lawrence house lots: numbered street exits (415 → porch). Old
-        # cardinal dig left only the last porch reachable from the curb.
-        from supers import lawrence_town as lawrence_town_mod
-        lawrence_town_mod.heal_lawrence_lot_exits(self)
-        # Legal name + CNUM backfill (legacy bodies get given_name from key).
-        from engine import char_identity as char_identity_mod
-        char_identity_mod.heal_all_character_identities(self)
-        # Dual-layer America overland: migrate legacy cell occupancy to
-        # macro/micro virtual presence (never deletes characters).
-        from supers import overland as overland_mod
-        overland_mod.heal_dual_layer_positions(self)
-        # Yank Cadence bodies stranded far on the America foot grid
-        # (Faith/Buffy/Riot soft-lock after Lebanon adoption).
-        overland_mod.heal_stranded_overland_cadence(self)
-        # Immersion catalog re-stamps Chuck mortal_conceal=true every boot.
-        # If an Author mantle event was mid-flight, quietly re-reveal /
-        # respawn the Unmade shade so copyover does not erase lore.
-        from supers import author_event as author_event_mod
-        author_event_mod.restore_after_boot(self)
-        # Clear vessel_host_key / possessed_by that point at missing bodies
-        # (despawned husk, pre-rename save, etc.) so spirits are not stuck.
-        from supers import vessel as vessel_mod
-        vessel_mod.heal_dangling_possession(self)
-        from supers import personal_realm as personal_realm_mod
-        personal_realm_mod.heal_personal_realm_invariants(self)
-        # Repair Mantle + living-husk desync (dual-corporeal after an
-        # older Item-only spirit body relink) -- Castiel walking while
-        # Jimmy is also vacant/corporeal.
-        vessel_mod.heal_living_husk_invariants(self)
-        # Migrate legacy soft gm fold (body still in room) into hard vault.
-        from supers import fold_vault as fold_vault_mod
-        fold_vault_mod.heal_soft_folded_to_vault(self)
-        # Permanent pets: clear dangling bonds / park ownerless strays.
-        from supers import pet as pet_mod
-        pet_mod.heal_pet_invariants(self)
-        # Awakened Nature homezone tutorial mentors (Marrow/Seraphiel/
-        # Ashmouth/Gorge/Emberwake): same idempotent-backfill shape as
-        # immersion cast -- seed once, skip if already present.
-        from supers import tutorial as tutorial_mod
-        tutorial_mod.ensure_mentors(self)
-        # Copyover boot: vault unfinished homezone lessons before classic
-        # execv reattach. Gateway mode defers this until after welcome
-        # reattach (gateway_client) so held TCP clients are not vaulted
-        # while still connected -- session is never persisted, so every
-        # body looks offline at Game.__init__.
-        from engine.gateway_client import gateway_enabled
-
-        if not gateway_enabled():
-            tutorial_mod.heal_incomplete_tutorial_offline(self)
-        # Plane Temper (and other authored) drill motes -- ephemeral hostiles
-        # vanish across restart; re-seed any active opener's spawns.
-        from supers import quests as quests_mod
-        quests_mod.ensure_active_quest_spawns(self)
-        # Mission givers (Bobby, …): validate portal rooms + stamp
-        # mission_giver onto rostered NPCs after Cadence seeds them.
-        from supers import missions as missions_mod
-        missions_mod.ensure_givers(self)
-        # Mid-delve copyover/restart: ephemeral stronghold/procedural rooms
-        # die; persistence stubs trap hunters until we evacuate to the board.
-        missions_mod.heal_all_orphaned_ephemeral_locations(self)
-        from supers.purgatory_dungeon import floor as pit_floor_mod
-        pit_floor_mod.heal_orphaned_pit_rooms(self)
-        # Singer House: vampire_safe + salt/iron/devil's-trap wards.
-        from supers import singer_house as singer_house_mod
-        singer_house_mod.ensure_singer_house_wards(self)
-        # Lodging: free tap / TV / wash on houses, apartments, hotels
-        # (and homestead chambers), then bed furniture + roster owners.
-        lodging.ensure_home_basics(self)
-        lodging.ensure_house_home_links(self)
-        lodging.ensure_living_room_media(self)
-        lodging.ensure_beds(self)
-        lodging.assign_roster_bed_owners(self)
-        # Street-home shell: number → porch → living → branches (titles +
-        # outdoor flags). Memory-only; populate fixshell persists JSON.
-        from supers import populate as populate_mod
-        populate_mod.heal_street_home_shell_live(self)
-        # Retroactive home_zone / home_room_key heal for players + Echoes
-        # created before path stamps (Vagan/Velan wilderness stuck case).
-        cadence.heal_all_home_anchors(self)
-        # Lifetime playtime: backfill total_playtime_ticks from the newbie
-        # active-play clock when the lifetime counter under-counts.
-        from supers import connection_log as connection_log_mod
-        connection_log_mod.heal_all_playtime(self)
-        # Bug reporters: lifetime Bugs squashed tally from resolved tickets
-        # in bug_reports.log (retroactive + idempotent on every boot).
-        from supers import bug_reporter_credit as bug_reporter_credit_mod
-        bug_reporter_credit_mod.heal_all_bugs_squashed(self)
-        # Home grocery stock: backfill refrigerator furniture on is_house
-        # rooms (long-lived DBs / maps that predate fridge seed_items).
-        from supers import grocery as grocery_mod
-        grocery_mod.ensure_fridges(self)
-        # Wayfinding furniture signs (Lawrence junctions + future towns).
-        from supers import wayfinding as wayfinding_mod
-        wayfinding_mod.ensure_wayfinding_signs(self)
-        # Buffy/Angel easter egg: mutual lovers + Angel's mausoleum home
-        # when both characters exist (idempotent; no-op otherwise).
-        # Faith: mutual friends with Buffy and Angel when she exists.
-        # (ensure_all already runs bond helpers; keep these for older
-        # call-order safety if ensure_all is ever skipped.)
-        from supers import relationships as relationships_mod
-        relationships_mod.ensure_buffy_angel_bond(self)
-        relationships_mod.ensure_faith_bonds(self)
-        relationships_mod.ensure_illyria_bonds(self)
-        relationships_mod.ensure_winchester_bonds(self)
-        relationships_mod.ensure_constantine_bonds(self)
-        relationships_mod.ensure_benny_bonds(self)
-        # Cadence #50: Vampire townsfolk-kill counter for hunter escalation.
-        self.vampire_townsfolk_kills = 0
-        # Evil Strikes Back: ensure Game fields exist; meta already loaded in
-        # ``_load_persisted_meta`` before any early boot save().
-        from supers import balance as balance_module
-        balance_module.ensure_game_defaults(self)
-        # Celestial Prince / Grigori hue seats -- re-apply from meta JSON
-        # (already loaded as raw dict) then reconcile occupants.
-        from supers import celestial_court as celestial_court_mod
-        celestial_court_mod.load_hue_courts_into_game(
-            self, persistence.load_hue_courts(self.db)
-        )
-        celestial_court_mod.reconcile_courts(self)
-        # Refresh death beacons / rumor boards / lifetime after Cadence seed
-        # (idempotent; keeps copyover-safe rebuild paths consistent).
-        self.death_beacons = persistence.load_death_beacons(self.db)
-        self.rumor_boards = persistence.load_rumor_boards(self.db)
-        from supers import world_stats as world_stats_mod
-        self.lifetime_stats = world_stats_mod.normalize_loaded(
-            persistence.load_lifetime_stats(self.db)
-        )
-        from supers import pet as pet_mod
-        self.pet_adoption = pet_mod.normalize_adoption_stock(
-            persistence.load_pet_adoption(self.db)
-        )
-        pet_mod.ensure_adoption_stock(self)
-        self.save()
-        register_default_ticks(self)
 
     def find_character(self, name):
         """Find a character anywhere in the world by name (case-insensitive).
@@ -737,6 +524,7 @@ class Game:
         persistence.save_death_beacons(self.db, self)
         persistence.save_author_mantle_event(self.db, self)
         persistence.save_ooc_history(self.db, self)
+        persistence.save_accounts(self.db, self)
         persistence.save_rumor_boards(self.db, self)
         persistence.save_lifetime_stats(self.db, self)
         persistence.save_pet_adoption(self.db, self)

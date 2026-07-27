@@ -18,3 +18,5 @@ jobs:
           python -m pip install -e .
       - name: Engine-only smoke
         run: python tools/engine_smoke.py
+      - name: Basegame smoke
+        run: python tools/basegame_smoke.py

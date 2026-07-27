@@ -63,3 +63,11 @@ def register_all_hooks():
     hooks.set_help(help_topics.HELP_TOPICS, help_topics.HELP_CATEGORIES)
     hooks.set_dispatch(commands.dispatch)
     hooks.set_weather_look_clause(weather_module.look_clause)
+
+    # Login notify for waiting letters (engine mail kit).
+    from engine.systems import mail as mail_mod
+
+    def _after_session_attach(character, game):
+        mail_mod.notify_inbox(character, game)
+
+    hooks.set_after_session_attach(_after_session_attach)

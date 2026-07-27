@@ -207,6 +207,8 @@ class Session:
         self.writer = writer
         self.game = game
         self.character = None     # set once they pick a name and log in
+        # Staff account name while this Session rides GM form / cast / alts.
+        self.staff_account = None
         self.alive = True         # flips to False on quit/disconnect; ends the loop
         # Gateway IPC: fixed session id + optional bridge for bound/kick CTRL.
         # None when speaking telnet directly (RIFTFORGE_GATEWAY=0).
@@ -556,6 +558,7 @@ class Session:
         for line in style.format_login_banner():
             self.send(line)
         self.send("By what name are you known?")
+        self.send("(Or type 'account' to log into an account.)")
         # Staff `gm users` can see this socket as flags=login until promote.
         self._register_connecting("login")
 
@@ -564,6 +567,8 @@ class Session:
         # session without a password to prove takeover, or success (break).
         # takeover is True when we kicked another live Session for this name.
         takeover = False
+        # When True, password already verified via account login (feature C).
+        account_login_ok = False
         while True:
             raw_name = await self.read_line()
             if raw_name is None:
@@ -575,6 +580,50 @@ class Session:
                 mssp.reply_text_probe(self)
                 self.close()
                 return
+            # Feature C: keyword ``account`` → account name/pass → pick char.
+            from engine import account_login as account_login_mod
+            if account_login_mod.is_account_login_keyword(raw_name):
+                picked = await account_login_mod.login_via_account(self)
+                if picked is None:
+                    return  # disconnected mid-account login
+                if picked is False:
+                    continue  # back to name prompt (already re-prompted)
+                # Account auth covers owned characters -- skip char password.
+                existing = picked
+                given_name = (
+                    getattr(picked, "given_name", None)
+                    or getattr(picked, "key", "")
+                    or ""
+                )
+                from engine import char_identity as identity_mod
+                surname = identity_mod.character_surname(picked)
+                account_login_ok = True
+                unique_short_ok = True
+                # Live seat / gmspirit takeover (same as direct login).
+                live_holder = (
+                    existing if existing.session is not None else None
+                )
+                if live_holder is None:
+                    sk = getattr(existing, "gm_spirit_key", None)
+                    if not sk and getattr(existing, "gm_staff_form", False):
+                        from engine.command_support import (
+                            strip_ephemeral_storage_prefix,
+                        )
+                        sk = (
+                            "gmspirit:"
+                            + strip_ephemeral_storage_prefix(existing.key)
+                        )
+                    if sk:
+                        spirit = self.game.find_character(sk)
+                        if (
+                            spirit is not None
+                            and getattr(spirit, "session", None) is not None
+                        ):
+                            live_holder = spirit
+                if live_holder is not None:
+                    self._take_over_session(live_holder)
+                    takeover = True
+                break
             # Strip client window tags (P1/P4…) then require letters-only
             # (bug_reports.log #28). Digits used to pass isalnum() and baked
             # session tags into Character.key forever.
@@ -982,6 +1031,14 @@ class Session:
                 )
             except Exception:
                 pass
+        # Feature B: unlinked playable body → create / link / skip offer.
+        if self.character is not None:
+            from engine import account_login as account_login_mod
+            linked_ok = await account_login_mod.offer_account_link(
+                self, self.character
+            )
+            if not linked_ok:
+                return
         # Gateway: remember who is on this held socket for the next game boot.
         if self.character is not None:
             self._notify_gateway_bound(self.character.key)
@@ -1211,11 +1268,15 @@ class Session:
             return
 
         if cmd == "preview":
+            from engine import display_prefs
             body_lines = list(state["body"])
             if state["syntax"]:
                 body_lines = [f"Syntax: {s}" for s in state["syntax"]] + [""] + body_lines
+            # Same width pref as live help -- staff preview must match what
+            # players with config width N will see after /save.
             framed = style.format_tome(
                 state["keyword"], body_lines,
+                width=display_prefs.sheet_width(self.character),
                 screenreader=bool(getattr(self.character, "screenreader", False)),
             )
             self.send("\r\n".join(framed))
@@ -1309,9 +1370,9 @@ class Session:
             from engine import hooks
             hooks.on_session_disconnect(self.character, self.game)
             # Drop GM staff spirit on logout: body is already a Cadence Echo.
-            # Destroy the ephemeral spirit but KEEP gm_away + gm_staff_form
-            # so reconnect / copyover can restore `gm on` (no second playable
-            # body). Inlined (no supers import -- engine stays game-agnostic).
+            # Permanent account spirits (feature G) are parked in place;
+            # ephemeral leftovers are despawned. KEEP gm_away + gm_staff_form
+            # so reconnect / copyover can restore `gm on`.
             if getattr(self.character, "gm_mode", False) or getattr(
                 self.character, "gm_spirit", False
             ):
@@ -1326,7 +1387,7 @@ class Session:
                     # Intent survives quit -- body stays true-invis Echo.
                     body.gm_away = True
                     body.gm_staff_form = True
-                    body.gm_spirit_key = None
+                    body.gm_spirit_key = getattr(self.character, "key", None)
                     # Remember watch-room so reconnect restores there
                     # (not over wherever Cadence walked the Echo).
                     watch = getattr(self.character, "location", None)
@@ -1336,22 +1397,49 @@ class Session:
                     from engine.command_support import _presence_face
                     disconnect_name = _presence_face(body)
                     leaving = body
-                # Despawn the spirit Character (Room.remove unregisters).
                 spirit = self.character
-                spirit.gm_mode = False
-                spirit.gm_spirit = False
-                spirit.gm_mode_body = None
-                spirit.gm_body_key = None
-                spirit_room = getattr(spirit, "location", None)
-                if spirit_room is not None and spirit in getattr(
-                    spirit_room, "contents", []
-                ):
-                    spirit_room.remove(spirit)
-                # Body is already session-less -- leave it as Echo. No
-                # "goes still" broadcast (body already looks like an Echo).
-                spirit.session = None
-                self.character = None
-                break_follows(spirit)
+                permanent = bool(
+                    getattr(spirit, "gm_spirit_permanent", False)
+                )
+                if not permanent:
+                    # Engine-pure account ownership check (no supers import).
+                    try:
+                        from engine.accounts import ensure_accounts_dict
+                        low = (spirit.key or "").lower()
+                        for acct in ensure_accounts_dict(self.game).values():
+                            if acct.gm_rank not in ("gm", "head_gm"):
+                                continue
+                            want = (
+                                acct.gm_spirit_key
+                                or f"gmspirit:{acct.name}"
+                            )
+                            if want.lower() == low:
+                                permanent = True
+                                break
+                    except Exception:
+                        permanent = False
+                if permanent:
+                    # Park: stay in room, sessionless, true-invis.
+                    spirit.gm_mode = False
+                    spirit.gm_spirit = True
+                    spirit.gm_spirit_permanent = True
+                    spirit.session = None
+                    self.character = None
+                    break_follows(spirit)
+                else:
+                    # Legacy ephemeral leftover -- despawn.
+                    spirit.gm_mode = False
+                    spirit.gm_spirit = False
+                    spirit.gm_mode_body = None
+                    spirit.gm_body_key = None
+                    spirit_room = getattr(spirit, "location", None)
+                    if spirit_room is not None and spirit in getattr(
+                        spirit_room, "contents", []
+                    ):
+                        spirit_room.remove(spirit)
+                    spirit.session = None
+                    self.character = None
+                    break_follows(spirit)
             else:
                 self.character.session = None    # the character is now an Echo
                 break_follows(self.character)

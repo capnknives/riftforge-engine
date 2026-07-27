@@ -35,8 +35,19 @@ Shows your Path, your six primary stats (the same POW/VIT/FOC/FIN/RES/PRE
 spine every game on the engine shares), your Tier, and your HP. `sc` is a
 shorthand alias.
 """,
+    "mail": """RiftForge reference town -- mail
+
+How you play:
+  1. Walk to the Post Office (east from the Warehouse).
+  2. Type bare mail to list your inbox.
+  3. mail send <name> <text> to leave a letter for someone in the world.
+  4. mail read <n> / mail discard <n|all> to manage letters.
+
+Letters queue on the recipient even when they are offline. Login tells
+you if mail is waiting. This reference build does not ship packages.
+""",
 }
 
 HELP_CATEGORIES = [
-    ("Basegame", ["basegame", "paths", "score"]),
+    ("Basegame", ["basegame", "paths", "score", "mail"]),
 ]

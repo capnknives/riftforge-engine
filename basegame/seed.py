@@ -1,6 +1,6 @@
 """seed.py -- idempotent basegame world backfill, run once at Game boot.
 
-Mirrors server.Game._seed_supers_content's role but scoped to what
+Mirrors supers.boot_seed.seed_content's role but scoped to what
 basegame actually needs, called from game_select.seed_content (see
 server.py's Game.__init__). The skeleton reference town ships entirely as
 static map JSON (basegame/content/), so there is nothing to backfill yet --

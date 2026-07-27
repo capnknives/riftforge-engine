@@ -10,7 +10,8 @@ asyncio task which:
   2. Counts down (players stay connected -- copyover preserves sockets).
   3. Writes `.deploy_ready` so the host script can `gh pr checkout` the fix.
   4. After copyover resumes, on_resume() announces the fix is live and marks
-     the bug resolved in bug_reports.log when a bug_id was provided.
+     each bug in bug_ids (or the legacy single bug_id) resolved in
+     bug_reports.log — which credits reporters via the after-mark hook.
 
 Networking stays out of this module (file hand-off only, same spirit as
 reports.py). The actual git pull runs on the host; engine/watch_and_run.py
@@ -118,13 +119,40 @@ def _seed_completed_from_auto_deploy(directory):
         _mark_completed(directory, sha)
 
 
-def queue_deploy(directory, *, pr, bug_id=None, summary="", countdown_seconds=30,
-                 triggered_by="unknown", commit_sha=None):
+def _normalize_bug_ids(bug_id=None, bug_ids=None):
+    """Return a de-duplicated list of int bug ids from queue_deploy args.
+
+    ``bug_ids`` (batch Fix subjects) wins when provided; ``bug_id`` is folded
+    in for callers that still pass a single primary. Empty / None → [].
+    """
+    ids = []
+    if bug_ids:
+        for raw in bug_ids:
+            try:
+                n = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if n not in ids:
+                ids.append(n)
+    if bug_id is not None:
+        try:
+            n = int(bug_id)
+        except (TypeError, ValueError):
+            n = None
+        if n is not None and n not in ids:
+            # Primary announce id goes first when it was not already listed.
+            ids.insert(0, n)
+    return ids
+
+
+def queue_deploy(directory, *, pr, bug_id=None, bug_ids=None, summary="",
+                 countdown_seconds=30, triggered_by="unknown", commit_sha=None):
     """Write a new deploy signal -- tick() will pick it up on the next heartbeat.
 
-    pr is stored for logging only (the host script already knows it). bug_id
-    and summary drive the in-game announcements; when bug_id is set, on_resume()
-    marks that bug resolved after copyover.
+    pr is stored for logging only (the host script already knows it). bug_id /
+    bug_ids and summary drive the in-game announcements; when any bug id is
+    set, on_resume() marks each bug resolved after copyover (so batch Fix
+    subjects credit every reporter).
 
     commit_sha= (when known) is used as a stable deploy_key so auto_deploy does
     not re-announce the same squash-merge on every poll when local files drift.
@@ -149,9 +177,12 @@ def queue_deploy(directory, *, pr, bug_id=None, summary="", countdown_seconds=30
         ):
             return existing
 
+    ids = _normalize_bug_ids(bug_id=bug_id, bug_ids=bug_ids)
     payload = {
         "pr": str(pr),
-        "bug_id": bug_id,
+        # Primary id kept for older signal readers / announce chrome.
+        "bug_id": ids[0] if ids else None,
+        "bug_ids": ids,
         "summary": summary.strip() or "A reported bug has been fixed.",
         "countdown_seconds": max(0, int(countdown_seconds)),
         "triggered_by": triggered_by,
@@ -218,11 +249,18 @@ def _log_task_exception(task):
 async def _run_countdown(game, signal):
     """Broadcast the fix announcement, count down, then release the host."""
     directory = game.report_dir
-    bug_id = signal.get("bug_id")
+    bug_ids = _normalize_bug_ids(
+        bug_id=signal.get("bug_id"), bug_ids=signal.get("bug_ids"),
+    )
     summary = signal.get("summary") or "A reported bug has been fixed."
     total = int(signal.get("countdown_seconds", 30))
 
-    bug_ref = f"Bug #{bug_id}" if bug_id else "A tear in the script"
+    if not bug_ids:
+        bug_ref = "A tear in the script"
+    elif len(bug_ids) == 1:
+        bug_ref = f"Bug #{bug_ids[0]}"
+    else:
+        bug_ref = f"Bugs #{bug_ids[0]}–#{bug_ids[-1]}"
     game.broadcast_all(
         f"*** {bug_ref} has been mended: {summary} ***\r\n"
         f"*** The Veil will reseal in {total} seconds. Stay put -- "
@@ -262,19 +300,26 @@ async def on_resume(game):
     if not signal or signal.get("phase") != "awaiting_copyover":
         return
 
-    bug_id = signal.get("bug_id")
+    bug_ids = _normalize_bug_ids(
+        bug_id=signal.get("bug_id"), bug_ids=signal.get("bug_ids"),
+    )
     summary = signal.get("summary") or "A reported bug has been fixed."
 
-    if bug_id is not None:
-        game.broadcast_all(
-            f"*** The Veil holds. Bug #{bug_id} fix is live: {summary} ***"
-        )
-    else:
+    if not bug_ids:
         game.broadcast_all(
             f"*** The Veil holds. The mend is live: {summary} ***"
         )
+    elif len(bug_ids) == 1:
+        game.broadcast_all(
+            f"*** The Veil holds. Bug #{bug_ids[0]} fix is live: {summary} ***"
+        )
+    else:
+        game.broadcast_all(
+            f"*** The Veil holds. Bugs #{bug_ids[0]}–#{bug_ids[-1]} "
+            f"fix is live: {summary} ***"
+        )
 
-    if bug_id is not None:
+    for bug_id in bug_ids:
         try:
             reports.mark(
                 reports.BUG, int(bug_id), "resolved", directory=directory,

@@ -21,6 +21,7 @@ those flavor sites now go through `engine.hooks` instead, which SUPERS
 wires up at boot without this package ever needing to know SUPERS exists.
 """
 from .basic import (
+    cmd_account,
     cmd_alias,
     cmd_brief,
     cmd_bug,
@@ -120,6 +121,7 @@ ENGINE_COMMANDS = {
     "color":     (cmd_color,     "ANSI color on|off; bare toggles (see 'help formatting')"),
     "brief":     (cmd_brief,     "skip room prose after moves; bare toggles (see 'help formatting')"),
     "config":    (cmd_config,    "prefs hub: color, brief, screenreader, combattags, prompt, …"),
+    "account":   (cmd_account,   "show/create/link your account (see 'help account')"),
     "alias":     (cmd_alias,     "list, set, or clear your command shortcuts"),
     "prompt":    (cmd_prompt,    "show or set your vitals prompt after each command"),
     "date":      (cmd_date,      "full calendar date, season, and moon (see 'help calendar')"),

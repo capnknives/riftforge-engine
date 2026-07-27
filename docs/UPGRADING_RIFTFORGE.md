@@ -1,7 +1,7 @@
 # Upgrading Riftforge from SUPERS
 
-**Status:** Phase 6 done — SUPERS pins public **`capnknives/riftforge-engine`**
-at **`@v0.1.1`**.
+**Status:** Phase 6 remotes **done**; Phase 7 peels **done**. SUPERS pins
+public **`capnknives/riftforge-engine`** at **`@v0.2.0`**.
 
 ## Today (during the split)
 
@@ -16,15 +16,15 @@ editable path for dual-checkout hacking.
 
 ## Tagged ship (clean)
 
-1. Public `riftforge-engine`: land change, engine smoke, tag `vX.Y.Z`
-   ([`RELEASING_RIFTFORGE.md`](RELEASING_RIFTFORGE.md)).
+1. Public `riftforge-engine`: land change, engine + basegame smoke, tag
+   `vX.Y.Z` ([`RELEASING_RIFTFORGE.md`](RELEASING_RIFTFORGE.md)).
 2. Private SUPERS (`capnknives/RiftForge`): set in `supers/pyproject.toml`::
 
        dependencies = [
-           "riftforge @ git+https://github.com/capnknives/riftforge-engine.git@vX.Y.Z",
+           "riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.2.0",
        ]
 
-3. Run SUPERS `smoke_test.py`.
+3. Run SUPERS targeted smoke (or full `smoke_test.py` when approved).
 4. Merge to SUPERS `main` → live auto-deploy overlays → install new pin →
    game restart behind gateway ([`LIVE_DEPLOY.md`](LIVE_DEPLOY.md)).
 5. Rollback: revert the pin commit on SUPERS.
@@ -51,7 +51,8 @@ editable path for dual-checkout hacking.
    engine copy inside the monorepo is what live uses until you switch to
    the dual-mount or tagged-pin install path.
 4. Edit either tree → watcher restarts **game only**; gateway holds clients.
-5. Pin in `supers/pyproject.toml` stays at `@v0.1.1` until you cut a new tag.
+5. Pin in `supers/pyproject.toml` stays at the published tag until you cut
+   a new one.
 
 See [`ENGINE_CONSUMER.md`](ENGINE_CONSUMER.md) and
 [`plans/two_repo_purity.md`](plans/two_repo_purity.md).

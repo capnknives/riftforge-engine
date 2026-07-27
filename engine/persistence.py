@@ -187,6 +187,15 @@ CREATE TABLE IF NOT EXISTS help_aliases (
     alias           TEXT PRIMARY KEY,
     primary_keyword TEXT NOT NULL REFERENCES helpfiles(primary_keyword)
 );
+-- Engine-level player accounts (above Characters). name is the normalized
+-- login key; password_hash is account-auth (characters keep their own);
+-- data is a JSON blob of character_keys / gm_rank / prefs / totals.
+CREATE TABLE IF NOT EXISTS accounts (
+    name           TEXT PRIMARY KEY,
+    display_name   TEXT NOT NULL,
+    password_hash  TEXT NOT NULL DEFAULT '',
+    data           TEXT NOT NULL DEFAULT '{}'
+);
 -- External-content FTS5 index (keyword + body only -- aliases already get
 -- exact-match coverage via help_aliases, see help_db.get_entry). Kept in
 -- sync by the three triggers below rather than the app re-indexing itself.
@@ -301,6 +310,13 @@ _MIGRATIONS = [
     # only runs one statement at a time, so this is a callable migration
     # like #5, not a single SQL string.
     (9, "_migrate_add_help_tables"),
+    # Engine-level accounts (login identity above Characters).
+    (10, """CREATE TABLE IF NOT EXISTS accounts (
+    name           TEXT PRIMARY KEY,
+    display_name   TEXT NOT NULL,
+    password_hash  TEXT NOT NULL DEFAULT '',
+    data           TEXT NOT NULL DEFAULT '{}'
+)"""),
 ]
 
 
@@ -825,6 +841,70 @@ def save_ooc_history(conn, game):
         )
 
 
+def save_accounts(conn, game):
+    """Write every Account on ``game.accounts`` into the accounts table.
+
+    Full wipe-and-rewrite (same snapshot style as characters) so deleted
+    accounts do not linger. Called from ``Game.save`` beside the world
+    snapshot.
+    """
+    from engine.accounts import Account, ensure_accounts_dict
+
+    accounts = ensure_accounts_dict(game)
+    with conn:
+        conn.execute("DELETE FROM accounts")
+        for account in accounts.values():
+            if not isinstance(account, Account):
+                continue
+            name = (account.name or "").strip()
+            if not name:
+                continue
+            display = (account.display_name or name).strip() or name
+            blob = json.dumps(account.to_blob())
+            conn.execute(
+                "INSERT INTO accounts "
+                "(name, display_name, password_hash, data) "
+                "VALUES (?, ?, ?, ?)",
+                (name, display, account.password_hash or "", blob),
+            )
+
+
+def load_accounts(conn, game):
+    """Rebuild ``game.accounts`` from the accounts table.
+
+    Safe on pre-feature DBs (empty table / missing table → empty dict).
+    Called once at boot after ``load_world`` so character back-pointers
+    can be reconciled against live Echoes.
+    """
+    from engine.accounts import Account, account_lookup_key, ensure_accounts_dict
+
+    accounts = ensure_accounts_dict(game)
+    accounts.clear()
+    try:
+        rows = conn.execute(
+            "SELECT name, display_name, password_hash, data FROM accounts"
+        )
+    except sqlite3.OperationalError:
+        # Migration not yet applied / very old DB -- leave empty.
+        return accounts
+    for name, display_name, password_hash, data in rows:
+        cleaned = (name or "").strip()
+        if not cleaned:
+            continue
+        account = Account(
+            cleaned,
+            password_hash=password_hash or "",
+            display_name=(display_name or cleaned).strip() or cleaned,
+        )
+        try:
+            blob = json.loads(data) if data else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            blob = {}
+        account.apply_blob(blob)
+        accounts[account_lookup_key(account.name)] = account
+    return accounts
+
+
 def load_rumor_boards(conn):
     """Load player rumor boards from meta (D63). Returns {room_key: [posts]}.
 
@@ -1144,13 +1224,37 @@ def save_world(conn, game):
             # Guild / Motel / plane hub spawns -- reboot clears them.
             if getattr(obj, "transient_soul", False):
                 continue
-            # Ephemeral GM staff spirits (gm on) -- never persist. Intent
-            # lives on the login body as gm_staff_form in the blob.
+            # Ephemeral leftover GM staff spirits -- never persist. Permanent
+            # account-owned spirits (feature G) DO persist so gm on/off can
+            # reattach without minting a new Character each time.
             key_low = (getattr(obj, "key", None) or "").lower()
+            if key_low.startswith("gmspirit:"):
+                permanent = bool(getattr(obj, "gm_spirit_permanent", False))
+                if not permanent:
+                    try:
+                        from engine.accounts import ensure_accounts_dict
+                        for acct in ensure_accounts_dict(game).values():
+                            if acct.gm_rank not in ("gm", "head_gm"):
+                                continue
+                            want = (
+                                acct.gm_spirit_key
+                                or f"gmspirit:{acct.name}"
+                            )
+                            if want.lower() == key_low:
+                                permanent = True
+                                break
+                    except Exception:
+                        permanent = False
+                if not permanent:
+                    continue
+                # Do NOT mutate the live Character here. Clearing gm_mode on
+                # the in-memory spirit mid-session made active staff form
+                # look like ``Wits (spirit)`` after any autosave / account
+                # save, and broke ``gm account`` / other form-gated verbs.
+                # Load already parks permanent spirits with gm_mode=False.
             if (
-                getattr(obj, "gm_spirit", False)
-                or getattr(obj, "gm_mode", False)
-                or key_low.startswith("gmspirit:")
+                getattr(obj, "gm_mode", False)
+                and not key_low.startswith("gmspirit:")
             ):
                 continue
             if (
@@ -1270,9 +1374,33 @@ def load_world(conn, game):
     for name, description, room_key, blob in conn.execute(
         "SELECT name, description, room_key, stats FROM characters"
     ):
-        # Older saves may still have zombie gmspirit: rows; never rebuild them.
+        # Permanent account GM spirits load; orphan ephemeral leftovers skip.
         if (name or "").lower().startswith("gmspirit:"):
-            continue
+            keep = False
+            try:
+                blob_peek = json.loads(blob) if blob else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                blob_peek = {}
+            if blob_peek.get("gm_spirit_permanent"):
+                keep = True
+            if not keep:
+                try:
+                    from engine.accounts import ensure_accounts_dict
+                    low = (name or "").lower()
+                    for acct in ensure_accounts_dict(game).values():
+                        if acct.gm_rank not in ("gm", "head_gm"):
+                            continue
+                        want = (
+                            acct.gm_spirit_key
+                            or f"gmspirit:{acct.name}"
+                        )
+                        if want.lower() == low:
+                            keep = True
+                            break
+                except Exception:
+                    keep = False
+            if not keep:
+                continue
         char = Character(name, description)
         saved = json.loads(blob)
         # Restore every SUPERS field (stat spine, Origin/Path/Disciplines,
