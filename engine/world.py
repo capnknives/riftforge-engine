@@ -607,6 +607,10 @@ class Character(GameObject):
         # treatment as resting/asleep above -- always starts standing,
         # never persisted. Cleared on movement (see cmd_move).
         self.sitting = False
+        # Awake recline on a bed/couch (distinct from asleep / sleep_bed_id).
+        self.lying = False
+        # id(furniture Item) while sitting or lying awake; transient.
+        self.posture_furniture_id = None
         # Suggestion #82: sleeping without a bed / floor_sleep camp.
         self.public_sleep = False
         self.public_sleep_ticks = 0

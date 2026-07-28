@@ -61,10 +61,17 @@ class Account:
         self.gm_spirit_key = None
         # Contribution tallies (recomputed from report logs on heal).
         self.bugs_squashed = 0
+        # Resolved suggestions shipped from player ideas (log is source of truth).
         self.features_suggested = 0
         # Prefs: which face OOC uses; whether GM form appends (Account).
         self.ooc_identity = OOC_IDENTITY_CHARACTER
         self.gm_see_accounts = False
+        # Staff "wizard invisibility": when True (default), this account's
+        # GM form (`gm on`) is visible only to other GM-form staff. Toggle
+        # off (`wizinvis off`) to let ALL characters see the form as
+        # ``Accountname(GM)`` -- a deliberate staff reveal. Parked spirits
+        # (`gm off`) are always invisible regardless of this flag.
+        self.wizinvis = True
 
     def to_blob(self):
         """JSON-serializable extras for the accounts.data column."""
@@ -80,6 +87,7 @@ class Account:
                 else OOC_IDENTITY_CHARACTER
             ),
             "gm_see_accounts": bool(self.gm_see_accounts),
+            "wizinvis": bool(self.wizinvis),
         }
 
     def apply_blob(self, data):
@@ -111,6 +119,8 @@ class Account:
             ooc if ooc in OOC_IDENTITY_CHOICES else OOC_IDENTITY_CHARACTER
         )
         self.gm_see_accounts = bool(data.get("gm_see_accounts", False))
+        # Missing key = default staff-invisible (old saves keep prior behavior).
+        self.wizinvis = bool(data.get("wizinvis", True))
 
 
 def normalize_account_name(raw):

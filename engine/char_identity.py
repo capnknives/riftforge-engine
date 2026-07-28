@@ -122,6 +122,97 @@ def legal_public_name(char, *, force_surname=False) -> str:
     return f"{given} {sur}"
 
 
+def humanize_storage_key(raw_key) -> str:
+    """Best-effort public label when only a storage key string is known.
+
+    Inserts spaces at lower→Upper boundaries so mashed legacy keys like
+    ``ZackMarkson`` read as ``Zack Markson``. Does not invent surnames for
+    single-token keys (``Crowley`` stays ``Crowley``). Ephemeral prefixes
+    are stripped first. Prefer ``legal_public_name`` / ``reporter_display_name``
+    when a live body is available.
+    """
+    from engine.command_support import strip_ephemeral_storage_prefix
+
+    peeled = strip_ephemeral_storage_prefix(str(raw_key or "").strip())
+    if not peeled or peeled == "?":
+        return peeled or "?"
+    # Drop trailing digits from allocate_storage_key suffixes (ZackMarkson2).
+    base = re.sub(r"\d+$", "", peeled) or peeled
+    # ``ZackMarkson`` → ``Zack Markson``; leave already-spaced faces alone.
+    spaced = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", base)
+    return spaced if spaced else "?"
+
+
+def split_mashed_key_identity(raw_key):
+    """Split a GivenSurname storage mash into ``(given, surname)`` or None.
+
+    Only when there is exactly one lower→Upper boundary (``ZackMarkson`` →
+    Zack + Markson). Multi-hump keys (``MaryAnneSmith``) and single-token
+    keys (``Crowley``, ``McDonald``) return None so we do not invent a
+    wrong surname. Trailing numeric suffixes from ``allocate_storage_key``
+    are stripped first (``ZackMarkson2`` → Zack + Markson).
+    """
+    from engine.command_support import strip_ephemeral_storage_prefix
+
+    peeled = strip_ephemeral_storage_prefix(str(raw_key or "").strip())
+    if not peeled or peeled == "?":
+        return None
+    base = re.sub(r"\d+$", "", peeled) or peeled
+    spaced = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", base).strip()
+    parts = [p for p in spaced.split() if p]
+    if len(parts) != 2:
+        return None
+    given, sur = parts[0], parts[1]
+    if not given.isalpha() or not sur.isalpha():
+        return None
+    if len(given) < 1 or len(sur) < SURNAME_MIN:
+        return None
+    return given[0].upper() + given[1:], sur[0].upper() + sur[1:]
+
+
+def staff_face(char) -> str:
+    """Staff / promote / freeze toast label for a live Character body.
+
+    Always force-surname so mashed storage keys never appear in GM
+    confirmation lines (``Zack Markson is now a GM``, not ``ZackMarkson``).
+    """
+    if char is None:
+        return "?"
+    try:
+        return legal_public_name(char, force_surname=True)
+    except Exception:
+        return humanize_storage_key(getattr(char, "key", None))
+
+
+def reporter_display_name(game, reporter_key) -> str:
+    """Staff-facing reporter label for bug/suggest/help lists.
+
+    Reports store the immutable ``Character.key`` for stability. Display
+    looks up the live/Echo body and shows ``legal_public_name`` so mashed
+    keys like ``ZackMarkson`` read as ``Zack Markson``. Missing bodies
+    fall back to a humanized key string (CamelCase split).
+    """
+    raw = str(reporter_key or "").strip()
+    if not raw:
+        return "?"
+    char = None
+    if game is not None:
+        find = getattr(game, "find_character", None)
+        if callable(find):
+            char = find(raw)
+        if char is None:
+            roster = getattr(game, "characters", None) or []
+            for body in roster:
+                if getattr(body, "key", None) == raw:
+                    char = body
+                    break
+    if char is not None:
+        try:
+            return legal_public_name(char, force_surname=True)
+        except Exception:
+            pass
+    return humanize_storage_key(raw)
+
 def identity_match_needles(char) -> list[str]:
     """Lowercase strings that should match this character in targeting."""
     needles = []
@@ -366,9 +457,41 @@ def allocate_storage_key(game, given_name: str, surname: str) -> str:
 
 
 def stamp_new_identity(char, game, given_name: str, surname: str) -> None:
-    """Set given/surname/visibility/CNUM on a brand-new Character."""
-    char.given_name = given_name
-    char.surname = surname
+    """Set given/surname/visibility/CNUM on a brand-new Character.
+
+    Always stores the two legal-name fields separately. ``Character.key``
+    may be a GivenSurname mash when the bare first name was taken -- that
+    mash must never be copied into ``given_name``.
+    """
+    given = (given_name or "").strip()
+    sur = (surname or "").strip()
+    if not given:
+        raise ValueError("given_name required for stamp_new_identity")
+    # Refuse to stamp a SingleWord mash as the given name when a surname
+    # was provided (would recreate the ZackMarkson display bug on save).
+    if sur:
+        parts = split_mashed_key_identity(given)
+        if parts is not None and parts[1].lower() == sur.lower():
+            given = parts[0]
+        elif (
+            given.lower().endswith(sur.lower())
+            and len(given) > len(sur)
+            and " " not in given
+        ):
+            # given is ZackMarkson with surname Markson (no camel if all one case)
+            peeled = given[: -len(sur)]
+            if peeled and given.lower() == (peeled + sur).lower():
+                key_face = _strip_prefix(getattr(char, "key", None) or "")
+                if given.lower() == key_face.lower() or split_mashed_key_identity(
+                    given
+                ):
+                    given = (
+                        peeled[0].upper() + peeled[1:]
+                        if len(peeled) > 1
+                        else peeled.upper()
+                    )
+    char.given_name = given
+    char.surname = sur
     char.surname_visible = True
     char.public_name_order = PUBLIC_NAME_ORDER_GIVEN_FIRST
     taken = collect_taken_cnums(getattr(game, "characters", None) or [])
@@ -380,42 +503,73 @@ def stamp_new_identity(char, game, given_name: str, surname: str) -> None:
             taken.add(validate_cnum(existing))
         except ValueError:
             pass
-    char.cnum = allocate_cnum(given_name, taken=taken)
+    char.cnum = allocate_cnum(given, taken=taken)
 
 
 def heal_mashed_given_surname(char) -> bool:
-    """Split legacy ``GivenSurname`` storage keys into given + surname.
+    """Split legacy ``GivenSurname`` mash out of ``given_name``.
 
-    Older bodies kept ``Character.key`` like ``ZackMarkson`` while
-    ``namechange`` only stamped ``surname`` -- ``legal_public_name``
-    then read as one word. Idempotent boot / desk repair.
+    Covers:
+      1. ``given_name=ZackMarkson`` + ``surname=Markson`` (desk / heal peel)
+      2. ``given_name=ZackMarkson`` (or empty) + empty surname when the
+         storage key is a one-hump mash -- invent surname from the key so
+         saves never keep a SingleWord legal name for duplicate-first-name
+         bodies.
+
+    Idempotent boot / desk / pre-save repair. Does not rename ``Character.key``.
     """
     if char is None:
         return False
+    key_face = _strip_prefix(getattr(char, "key", None) or "")
+    given = character_given_name(char)
+    sur = character_surname(char)
+    changed = False
+
+    # Case 2 first when surname is missing: split the key (or mashed given).
+    if not sur:
+        split_src = None
+        if given and given.lower() == key_face.lower():
+            split_src = key_face or given
+        elif not given or not str(getattr(char, "given_name", None) or "").strip():
+            split_src = key_face
+        elif split_mashed_key_identity(given) is not None and given.lower() == (
+            "".join(ch for ch in given if ch.isalpha()).lower()
+        ):
+            # given itself is a CamelCase mash with no surname on file.
+            split_src = given
+        if split_src:
+            parts = split_mashed_key_identity(split_src)
+            if parts is not None:
+                char.given_name, char.surname = parts
+                return True
+
     given = character_given_name(char)
     sur = character_surname(char)
     if not given or not sur:
-        return False
+        return changed
     mash = "".join(ch for ch in (given + sur) if ch.isalpha())
     if not mash:
-        return False
+        return changed
     if given.lower() != mash.lower() and given.lower() != sur.lower():
-        key_face = _strip_prefix(getattr(char, "key", None) or "")
         if given.lower() != key_face.lower():
-            return False
+            return changed
     if len(given) <= len(sur) or not given.lower().endswith(sur.lower()):
-        return False
+        return changed
     peeled = given[: -len(sur)]
     if not peeled:
-        return False
-    char.given_name = peeled[0].upper() + peeled[1:] if len(peeled) > 1 else peeled.upper()
+        return changed
+    char.given_name = (
+        peeled[0].upper() + peeled[1:] if len(peeled) > 1 else peeled.upper()
+    )
     return True
 
 
 def ensure_character_identity(char, game=None) -> bool:
     """Backfill given_name / surname / CNUM on a loaded body. Returns changed.
 
-    Legacy: given_name ← stripped key face, surname empty, allocate CNUM.
+    Legacy empty given: prefer splitting a GivenSurname storage mash into
+    two fields; only fall back to the whole key face when it is a single
+    token (true one-name bodies). Never leave ``given_name=ZackMarkson``.
     """
     if char is None:
         return False
@@ -423,7 +577,11 @@ def ensure_character_identity(char, game=None) -> bool:
     given = getattr(char, "given_name", None)
     if not isinstance(given, str) or not given.strip():
         face = _strip_prefix(getattr(char, "key", None) or "")
-        char.given_name = face if face and face != "?" else "Unknown"
+        parts = split_mashed_key_identity(face) if face and face != "?" else None
+        if parts is not None:
+            char.given_name, char.surname = parts
+        else:
+            char.given_name = face if face and face != "?" else "Unknown"
         changed = True
     if not hasattr(char, "surname") or char.surname is None:
         char.surname = ""

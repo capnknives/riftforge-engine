@@ -34,7 +34,7 @@ PATH_ORDER = ("detective", "medic", "laborer", "ranger")
 async def run(session, character):
     """Walk a brand-new character through path choice + stat point-buy."""
     session.send("")
-    session.send("Welcome to the RiftForge reference town.")
+    session.send("Welcome to Notbigville, Kansas.")
     session.send(
         "Every resident here starts as an ordinary human -- what sets you "
         "apart is the work you do."
@@ -48,6 +48,9 @@ async def run(session, character):
     if not await _prompt_stats(session, character):
         return False
     character.hp = stats_module.max_hp(character)
+
+    if not await _prompt_stellar(session, character):
+        return False
 
     session.send("")
     session.send(f"You are a {PATHS[path].split(' -- ')[0]}.")
@@ -119,6 +122,25 @@ async def _prompt_stats(session, character):
             remaining -= amount
             break
     return True
+
+
+async def _prompt_stellar(session, character):
+    """Optional Stellar demo path (yellow-sun flight)."""
+    while True:
+        session.send("")
+        session.send("Stellar origin (yellow-sun flight demo)? 1=yes  0=no:")
+        raw = await session.read_line()
+        if raw is None:
+            return False
+        choice = raw.strip()
+        if choice in ("0", "no", "n"):
+            character.bg_stellar = False
+            return True
+        if choice in ("1", "yes", "y"):
+            character.bg_stellar = True
+            character.solar_charge = 1.0
+            return True
+        session.send("Enter 1 for yes or 0 for no.")
 
 
 def _send_sheet(session, character):

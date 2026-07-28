@@ -13,8 +13,9 @@ hook API details grow in [`../ENGINE_CONSUMER.md`](../ENGINE_CONSUMER.md).
 `v0.2.0` tag. Ongoing: export discipline when engine changes; dual-mount
 hack when editing both trees. Gateway:
 [`connection_gateway.md`](connection_gateway.md) (shipped).
-Parked T3 hygiene rows (`persistence-api` / `lean-demo` / `dirty-saves`)
-stay in [`refactor_plan.md`](refactor_plan.md) until explicitly unparked.
+T3 hygiene peels (`persistence-api` / `lean-demo` / dirty-saves **bench**)
+are done in [`refactor_plan.md`](refactor_plan.md); full incremental
+dirty-saves stay parked until measured GO.
 
 **Naming:** two-repo **Phase 7** (this file) is **not** combat
 “Phase 7” template-blend weaving — that stays parked under combat prose
@@ -238,6 +239,7 @@ Archive of the A1/A2/Plan B design note:
 | **Plan B** — `attach_supers` → 14 `_attach_*` helpers | ✅ Done | [#842](https://github.com/capnknives/RiftForge/pull/842) |
 | Public export includes `basegame` in `PUBLIC_PATHS` | ✅ Done | with #837 |
 | New public tag / friend push to `riftforge-engine` | ✅ Done | **`v0.2.0`** — Phase 7 frameworks + basegame; SUPERS pin bumped |
+| **Notbigville weather/travel demo** | ✅ Done | CONUS `regional_weather` + overland + storm chase + globe/aerial → `engine/systems/`; basegame Notbigville; public **`v0.3.0`**; SUPERS pin `@v0.3.0`. Facades kept. See § next purity pass. |
 | **4** — needs/meter kit + effort → `engine/systems/` | ✅ Done | [#844](https://github.com/capnknives/RiftForge/pull/844) |
 | **5** — economy coin/vendor primitives | ✅ Done | [#856](https://github.com/capnknives/RiftForge/pull/856) |
 | **6** — pathfind BFS → `engine/` | ✅ Done | [#855](https://github.com/capnknives/RiftForge/pull/855) |
@@ -254,9 +256,9 @@ defaults exist today.
 
 | Layer | Owns |
 |-------|------|
-| **`engine/` / `engine/systems/`** | Primitives + frameworks: meters, coin/vendor APIs, pathfind BFS, battle-brief build/apply, content store, tick registry, shared spine, generic ambient weather, lean Character surface |
+| **`engine/` / `engine/systems/`** | Primitives + frameworks: meters, coin/vendor APIs, pathfind BFS, battle-brief build/apply, content store, tick registry, shared spine, generic ambient weather **and** CONUS `regional_weather` / overland / storm chase / globe+aerial (Notbigville / `v0.3.0`), lean Character surface |
 | **`basegame/`** | Proof consumer: adopts engine frameworks; ships minimal verbs/help/maps; no SUPERS lore |
-| **`supers/`** | Catalogs, Origin/Path/Cadence fiction, combat prose/lexicon, CONUS weather/daylight/storm, Tier flavor names, fuel economies, town AI |
+| **`supers/`** | Catalogs, Origin/Path/Cadence fiction, combat prose/lexicon, daylight + clinic/radio/elemental **hooks** into regional weather, Tier flavor names, fuel economies, town AI; thin facades for peeled frameworks |
 
 **Confirm before promoting (edge cases):** public remote visibility (new
 tags / friend access), anything that would force SUPERS lore into the
@@ -265,8 +267,9 @@ unsure: **ask**, then peel with supers re-export facades (Stage 1 pattern).
 
 **Stay in supers (explicit):** Cadence town AI, hospital/clinic fiction,
 crime, alignment/incap kill methods, combat prose/narrate/lexicon, full
-`training.py` Track-B, SUPERS `weather`/`daylight`/`storm_watch`, Origin
-fuel chassis.
+`training.py` Track-B, `daylight`, Origin fuel chassis. CONUS weather /
+storm chase / America overland / globe flight now live under
+`engine/systems/` with supers re-export facades (`v0.3.0`).
 
 ### Done notes (Stages 1–9, A1/A2, Plan B)
 
@@ -385,13 +388,33 @@ fuel chassis.
 ### Remaining stages (detail)
 
 **Phase 7 complete.** Stage G (maps stamper #865 + boot seed / chargen /
-help #867) and public **`riftforge-engine` `@v0.2.0`** are shipped.
-Root `server.py` / `maps.py` remain glue shells by design.
+help #867) and public **`riftforge-engine` `@v0.2.0`** shipped; Notbigville
+weather/travel demo + **`@v0.3.0`** shipped after. Root `server.py` /
+`maps.py` remain glue shells by design.
 
-**Later (not scheduled):** parked T3 rows in
-[`refactor_plan.md`](refactor_plan.md) (`t3-persistence-api`,
-`t3-lean-demo`, `t3-dirty-saves`) — unpark only with an explicit ask.
+**Later (not scheduled):** full dirty-tracked saves only after
+`tools/persist_save_bench.py` (or live lag) shows GO + explicit unpark.
 Further public tags when engine APIs change.
+
+### Next purity pass (post-v0.3.0) — parked until explicit unpark
+
+Hygiene follow-on after the Notbigville peel. **Do not** treat as free
+backlog or invent #1 (`AGENTS.md` rules 15 / 17). Unpark with an
+explicit “start overland purity” (or similar) ask.
+
+| Item | Why it exists | Suggested fix when unparked |
+|------|---------------|-----------------------------|
+| Lazy optional ``importlib`` loads of ``supers.*`` inside `engine/systems/overland.py` | Foot travel works without them; vehicles / dungeons / Lebanon starter / solar / planar influence still resolve via `_try_game_module` when SUPERS is installed | Replace with `engine.hooks` registrations (Stage-1 / vehicle-enter pattern); then assert no ``supers`` strings under `engine/` even via importlib |
+| Dual weather modules | `engine/systems/weather.py` = tiny ambient kit (Stage 3); `regional_weather.py` = CONUS + tornadoes | Keep both; optionally strengthen module docs / README — **do not** merge or delete ambient without asking |
+| SUPERS re-export facades | `supers/weather.py`, `overland.py`, `storm_watch.py`, `globe.py`, `stellar_globe_flight.py` | **Keep** until a dedicated call-site rewrite is worth the churn |
+| Climate-contrast pockets | Plan wanted Seattle/Miami; hubs must exist at atlas link time | Add stub zones + pocket rows when someone wants climate demo contrast |
+| `engine_smoke` vs monorepo | Smoke fails if `supers/` is present by design | Run purity/engine smoke in the public export tree or with `supers` renamed aside |
+
+**Done for v0.3.0 (boot gate, not full purity):**
+- `from supers` / `import supers` lines removed from `engine/` (scanner-clean).
+- `_do_transition` uses `hooks.encounter_check` (not root `world.encounter_check`).
+- Hellhound sight via `hooks.set_can_see_hellhound`.
+- Overland still optionally loads SUPERS modules by qualname for vehicle/Cadence paths.
 
 ### Delegation (who leads what)
 

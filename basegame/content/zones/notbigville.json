@@ -1,0 +1,128 @@
+{
+    "id": "notbigville",
+    "plane": "earth",
+    "realm": "prime",
+    "autoload": true,
+    "_comment": "Notbigville KS demo town for public basegame. Atlas pocket at (35,10) on earth_america.json. Hub NB00001 Main Street.",
+    "city_name": "Notbigville",
+    "city_color": "dark_grey",
+    "sub_color": "slate_grey",
+    "main_colors": {
+        "street": "silver",
+        "highway": "gold",
+        "lodging": "gold",
+        "civic": "absinthe_green",
+        "hospital": "dark_red",
+        "default": "silver"
+    },
+    "rooms": [
+        {
+            "key": "NB00001",
+            "title": "Notbigville - Main Street - Plaza",
+            "vnum": "NB00001",
+            "description": "A modest Kansas square where two highways meet under a wide prairie sky. A storm-shelter sign rattles on the community board; grain elevators glint west of town.",
+            "area_type": "city",
+            "zone": "notbigville",
+            "outdoor": true,
+            "is_start": true,
+            "exits": {
+                "north": "NB00008",
+                "south": "NB00007",
+                "east": "NB00002",
+                "west": "NB00005"
+            }
+        },
+        {
+            "key": "NB00002",
+            "title": "Notbigville - Storm Watch Office - Desk",
+            "vnum": "NB00002",
+            "description": "Radar screens wash the room in green light. A chase board lists active storm cells; folding chairs face a wall of regional climate charts.",
+            "area_type": "city",
+            "zone": "notbigville",
+            "outdoor": false,
+            "jobs": ["tornado_hunter"],
+            "exits": {
+                "west": "NB00001",
+                "east": "NB00004"
+            }
+        },
+        {
+            "key": "NB00003",
+            "title": "Notbigville - Community Shelter - Cellar",
+            "vnum": "NB00003",
+            "description": "Concrete steps lead down to a reinforced cellar stocked with cots, water, and a hand-crank radio. The door is heavy enough to trust when the sirens sound.",
+            "area_type": "city",
+            "zone": "notbigville",
+            "outdoor": false,
+            "shelter": true,
+            "exits": {
+                "up": "NB00004"
+            }
+        },
+        {
+            "key": "NB00004",
+            "title": "Notbigville - General Store - Counter",
+            "vnum": "NB00004",
+            "description": "Shelves of dry goods and storm supplies. The proprietor keeps a tornado siren cheat-sheet taped beside the register.",
+            "area_type": "city",
+            "zone": "notbigville",
+            "outdoor": false,
+            "resources": ["vendor"],
+            "exits": {
+                "west": "NB00002",
+                "down": "NB00003",
+                "east": "NB00006"
+            }
+        },
+        {
+            "key": "NB00005",
+            "title": "Notbigville - Clinic - Ward",
+            "vnum": "NB00005",
+            "description": "A plain ward with cots and antiseptic smell. Storm-injury triage notes are pinned beside the supply cabinet.",
+            "area_type": "city",
+            "zone": "notbigville",
+            "outdoor": false,
+            "hospital": true,
+            "exits": {
+                "east": "NB00001"
+            }
+        },
+        {
+            "key": "NB00006",
+            "title": "Notbigville - Post Office - Counter",
+            "vnum": "NB00006",
+            "description": "Cubbyholes and a clerk's stamp. Letters still leave town when the sky is clear.",
+            "area_type": "city",
+            "zone": "notbigville",
+            "outdoor": false,
+            "resources": ["mail"],
+            "exits": {
+                "west": "NB00004"
+            }
+        },
+        {
+            "key": "NB00007",
+            "title": "Notbigville - Highway Shoulder - Mile Marker",
+            "vnum": "NB00007",
+            "description": "Packed shoulder where US-281 meets the county road. Open prairie rolls away in every direction; the town square lies north.",
+            "area_type": "city",
+            "zone": "notbigville",
+            "outdoor": true,
+            "exits": {
+                "north": "NB00001"
+            }
+        },
+        {
+            "key": "NB00008",
+            "title": "Notbigville - Observatory Knoll - Lookout",
+            "vnum": "NB00008",
+            "description": "A grassy rise with a shuttered observatory dome. The horizon is nothing but sky -- useful for watching weather roll in.",
+            "area_type": "city",
+            "zone": "notbigville",
+            "outdoor": true,
+            "exits": {
+                "south": "NB00001"
+            }
+        }
+    ]
+}

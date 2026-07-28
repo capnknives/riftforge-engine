@@ -53,27 +53,9 @@ def record_and_confirm(character, kind, description, history, report_dir, noun):
         )
     else:
         character.session.send(
-            f"Thanks — suggestion #{entry_id} is logged."
+            f"Thanks — suggestion #{entry_id} is logged. "
+            "Staff will triage it; you'll hear back when it's shipped."
         )
-        # Refresh account features_suggested from the suggestions log
-        # (engine-pure -- no supers import for two-repo purity).
-        if account is not None and game is not None:
-            try:
-                suggest_counts = {}
-                for entry in reports.recent(
-                    reports.SUGGEST, None, directory=game.report_dir
-                ):
-                    key = (entry.get("reporter") or "").strip()
-                    if key:
-                        suggest_counts[key] = suggest_counts.get(key, 0) + 1
-                total = 0
-                for key in list(account.character_keys):
-                    total += int(
-                        suggest_counts.get((key or "").strip(), 0)
-                    )
-                account.features_suggested = total
-            except Exception:
-                pass
     # Truncate long paste bodies so the staff line stays client-wrappable.
     desc = (description or "").replace("\n", " ").strip()
     if len(desc) > 80:
@@ -85,9 +67,13 @@ def record_and_confirm(character, kind, description, history, report_dir, noun):
     else:
         label = f"suggestion #{entry_id}"
     if game is not None:
-        who = character.key
+        # Storage key stays in the JSONL reporter field; staff pings show
+        # the legal public name (Zack Markson, not ZackMarkson).
+        from engine.char_identity import legal_public_name
+
+        who = legal_public_name(character, force_surname=True)
         if account_name:
-            who = f"{character.key}({account_name})"
+            who = f"{who}({account_name})"
         gm_notify.ping_gms(
             game,
             f"{who} filed {label}: {desc}",

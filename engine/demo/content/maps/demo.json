@@ -1,0 +1,12 @@
+{
+  "id": "demo",
+  "name": "Demo Realm",
+  "rooms": [
+    {
+      "key": "Demo Start",
+      "description": "A bare engine demo room.",
+      "exits": {},
+      "is_start": true
+    }
+  ]
+}

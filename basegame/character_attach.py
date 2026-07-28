@@ -40,3 +40,16 @@ def attach_basegame(character):
     character.hp = stats_module.max_hp(character)
     # Text mail inbox (engine/systems/mail.py) -- same shape SUPERS uses.
     character.mail_inbox = []
+    character.coins = 0
+    character.job = None
+    character.on_duty = False
+    character.chase_id = None
+    character.chase_brief = None
+    character.chase_flags = {}
+    character.bg_stellar = False
+    character.solar_charge = 1.0
+    character.stellar_flight_tier = "ground"
+    character.stellar_globe_lon = None
+    character.stellar_globe_lat = None
+    character.stellar_flight_macro = None
+    character.orbit_return_room = None

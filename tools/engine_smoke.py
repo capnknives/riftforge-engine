@@ -211,12 +211,22 @@ def main():
     except ImportError:
         pass
 
-    # Extra vs purity subprocess: maps load without a game registered.
+    # Extra vs purity subprocess: lean maps (T3 lean-demo) — one room, not
+    # the full monorepo content/maps tree. Configure before load_all_maps.
+    os.environ["RIFTFORGE_GAME"] = "none"
+    import game_select as game_select_mod
+    game_select_mod._reset_for_tests()
+    assert game_select_mod.game_name() == "none"
     import maps
     rooms, start_room, seed_items = maps.load_all_maps()
     assert isinstance(rooms, dict) and rooms, "maps.load_all_maps should build rooms"
     assert start_room is not None, "at least one map should mark is_start"
     assert isinstance(seed_items, list)
+    assert len(rooms) == 1, (
+        f"lean demo should be one room, got {len(rooms)} "
+        f"(maps_dir={maps.get_maps_dir()!r})"
+    )
+    assert start_room.key == "Demo Start", start_room.key
 
     # Phase 4b: soft-optional commands + server with SUPERS absent.
     import commands as commands_mod
@@ -228,9 +238,11 @@ def main():
 
     import server as server_mod
     assert server_mod._HAS_SUPERS is False
-    # Lean Game: maps + persistence, no Cadence seed.
+    # Lean Game: maps + persistence, no Cadence seed; still one-room demo.
     lean_game = server_mod.Game(db_path=":memory:")
     assert lean_game.start_room is not None
+    assert lean_game.start_room.key == "Demo Start", lean_game.start_room.key
+    assert len(lean_game.rooms) == 1, len(lean_game.rooms)
     assert lean_game.find_character("a training dummy") is None
 
     # Stage 1 two-repo purity: the tick pipeline is generic engine

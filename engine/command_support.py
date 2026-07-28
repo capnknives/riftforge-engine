@@ -108,12 +108,23 @@ def _can_see_gm_away(viewer, body):
     return False
 
 
+def _can_see_hellhound(viewer, hound):
+    """Deal-pursuit hellhound invis pierce (Celestial / glasses / engage).
+
+    Game registers ``hooks.set_can_see_hellhound``; bare engine defaults
+    to False (no Deal hellhounds).
+    """
+    from engine import hooks
+    return bool(hooks.can_see_hellhound(viewer, hound))
+
+
 def _is_presence_hidden(viewer, other):
     """True when ``other`` should be omitted from viewer's look / targeting.
 
     Combines death-spirit invisibility (section 6), the living Reaper
-    Mantle veil, true-invis staff Echoes left behind by ``gm on``, and
-    rare ``gm fold`` shelved Echoes so call sites do not drift apart.
+    Mantle veil, Deal hellhound true-invis, true-invis staff Echoes left
+    behind by ``gm on``, and rare ``gm fold`` shelved Echoes so call
+    sites do not drift apart.
     """
     if other is None or viewer is None:
         return False
@@ -129,6 +140,14 @@ def _is_presence_hidden(viewer, other):
         return True
     if not _can_perceive_reaper(viewer, other):
         return True
+    # Deal hellhounds: invisible unless Celestial / glasses.
+    # Check both the generic ``invisible`` flag and the Deal-specific stamp.
+    if (
+        getattr(other, "invisible", False)
+        or getattr(other, "hellhound_invisible", False)
+    ):
+        if not _can_see_hellhound(viewer, other):
+            return True
     return False
 
 
@@ -137,7 +156,8 @@ def _presence_hears(actor):
 
     Returns True when the watcher may hear leave/arrive / Cadence narrate
     lines naming ``actor``. Hidden presence (veiled Reaper, gm_away Echo,
-    folded Echo, unseen spirit) is silent to ordinary watchers.
+    folded Echo, unseen spirit, invisible hellhound) is silent to
+    ordinary watchers.
     """
     def _hears(watcher):
         return not _is_presence_hidden(watcher, actor)
@@ -179,9 +199,19 @@ def is_staff_stealth_presence(obj):
     """
     if not isinstance(obj, Character):
         return False
+    if getattr(obj, "gm_spirit", False):
+        # A staffer who toggled `wizinvis off` is a deliberate reveal: the
+        # active form should broadcast leave/arrive/idle like any visible
+        # character. Parked spirits and the default (wizinvis on) stay silent.
+        active = (
+            getattr(obj, "session", None) is not None
+            or getattr(obj, "gm_mode", False)
+        )
+        if active and not getattr(obj, "wizinvis", True):
+            return False
+        return True
     return bool(
-        getattr(obj, "gm_spirit", False)
-        or getattr(obj, "gm_away", False)
+        getattr(obj, "gm_away", False)
         or is_folded(obj)
     )
 
@@ -465,6 +495,13 @@ def _echo_look_bits(obj):
 
 def _display_name_base(obj, viewer=None):
     """Core presence label without the follow-group ``(Group)`` suffix."""
+    # Staff form (gm on / GM spirit) always reads as the account face plus
+    # ``(GM)``, viewer-independent. The introduce/name-learning system (which
+    # masks a stranger as "a person") must never apply to a deliberately
+    # revealed GM -- players who can see a `wizinvis off` form, and other
+    # staff, all see ``Accountname(GM)``, not a masked description.
+    if isinstance(obj, Character) and _staff_form_label(obj):
+        return f"{_presence_face(obj)}(GM)"
     if isinstance(obj, Character) and viewer is not None:
         try:
             from engine.hooks import presence_face_for
@@ -517,21 +554,21 @@ def _display_name_base(obj, viewer=None):
 def _staff_form_label(obj):
     """True when presence should show ``Name(GM)`` for staff form.
 
-    Prefer ``gm_mode``, but also treat a Session-held permanent GM spirit
-    as staff form so a save hiccup cannot relabel it ``(spirit)``.
+    Any GM staff spirit is labeled staff form -- active *or* parked. A
+    parked (sessionless) permanent spirit is normally hidden from look
+    entirely (see ``_can_see_spirit``), but on the rare occasion it does
+    reach a label path it must read ``Accountname(GM)``, never the mortal
+    ``(echo)`` / ``(spirit)`` tag (that made a staffer's own spirit look
+    like a real logged-out character).
     """
     if obj is None:
         return False
     if getattr(obj, "gm_mode", False):
         return True
-    if not getattr(obj, "gm_spirit", False):
-        return False
-    if getattr(obj, "session", None) is None:
-        return False
+    if getattr(obj, "gm_spirit", False):
+        return True
     key_low = (getattr(obj, "key", None) or "").lower()
-    return key_low.startswith("gmspirit:") or bool(
-        getattr(obj, "gm_spirit_permanent", False)
-    )
+    return key_low.startswith("gmspirit:")
 
 def _move_one(character, direction, dest, game, auto_look=True):
     """The actual single-character move: leave/arrive broadcast, encounter

@@ -27,6 +27,12 @@ _map_room_stamper = None
 _blob_to = None
 _blob_from = None
 
+# Game-owned Game meta (T3 persistence-api): moral/Tide, Cadence overrides,
+# tuning tables, rumor boards, … — loaded/saved around the engine-generic
+# world snapshot. Default no-op so lean boots keep __init__ defaults.
+_game_meta_loader = None
+_game_meta_saver = None
+
 # Optional post-password new-character flow (appearance, Background, ...).
 _chargen = None
 
@@ -126,6 +132,8 @@ _make_relic_item = None
 # After a locked container is forced open (cmd_open). Games use this for
 # mission strongbox objective flags, etc. fn(character, item) -> None.
 _after_open_container = None
+_before_open_container = None
+_after_growth_banked = None
 
 # --- Phase 2b hooks -------------------------------------------------------
 # command_support.py (repo root) used to reach into `supers` directly for a
@@ -138,6 +146,10 @@ _after_open_container = None
 # that (Spirit Magic, Attunement) is game-specific and needs the hook.
 # fn(viewer, spirit) -> bool.
 _can_see_spirit = None
+
+# Deal hellhound invis pierce. Default False (no Deal kit in bare engine).
+# fn(viewer, hound) -> bool.
+_can_see_hellhound = None
 
 # Dark-room sight gate (D67): can `character` see in a dark room without
 # a carried light? Engine default is False (torch required). SUPERS
@@ -190,6 +202,7 @@ _concealed_presence_name = None
 # Viewer-relative room / look / leave face.
 # fn(viewer, subject) -> str | None. None / missing -> fall back to key path.
 _presence_face_for = None
+_room_presence_line = None
 # Echo room-look tag bits (``['echo']`` quiet vs full idle/regimen). SUPERS
 # registers so ``echo look quiet|full`` works without engine importing game.
 _echo_look_bits = None
@@ -482,6 +495,31 @@ def apply_character_blob(character, data):
     if _blob_from is not None:
         return _blob_from(character, data or {})
     return None
+
+
+def set_game_meta_codec(load_fn, save_fn):
+    """Register Game meta load/save (SUPERS Tide, Cadence, tuning, …).
+
+    load_fn(game, conn) -> None — mutate game from SQLite meta rows.
+    save_fn(game, conn) -> None — write game fields into meta.
+
+    Pass None, None to clear (lean engine / basegame keep defaults).
+    """
+    global _game_meta_loader, _game_meta_saver
+    _game_meta_loader = load_fn
+    _game_meta_saver = save_fn
+
+
+def load_game_meta(game, conn):
+    """Run the registered meta loader, or no-op if none is set."""
+    if _game_meta_loader is not None:
+        _game_meta_loader(game, conn)
+
+
+def save_game_meta(game, conn):
+    """Run the registered meta saver, or no-op if none is set."""
+    if _game_meta_saver is not None:
+        _game_meta_saver(game, conn)
 
 
 def set_chargen(async_fn):
@@ -977,6 +1015,38 @@ def after_open_container(character, item):
         _after_open_container(character, item)
 
 
+def set_before_open_container(fn):
+    """Register fn(character, item, holder, game) -> bool before cmd_open pays.
+
+    Return True when the handler consumed the open (e.g. pit mimic reveal).
+    Pass None to restore the no-op default.
+    """
+    global _before_open_container
+    _before_open_container = fn
+
+
+def before_open_container(character, item, holder, game):
+    """Run the registered pre-open hook; True means cmd_open should stop."""
+    if _before_open_container is not None:
+        return bool(_before_open_container(character, item, holder, game))
+    return False
+
+
+def set_after_growth_banked(fn):
+    """Register fn(character, amount, source) after growth is banked.
+
+    ``source`` is a short label (e.g. ``lockbox``). Pass None for no-op.
+    """
+    global _after_growth_banked
+    _after_growth_banked = fn
+
+
+def after_growth_banked(character, amount, source="unknown"):
+    """Notify the game that banked growth was applied."""
+    if _after_growth_banked is not None:
+        _after_growth_banked(character, amount, source)
+
+
 # After a character acquires an Item into inventory (get / open / loot).
 # Games may auto-stow reagents into a gear bag. fn(character, item) ->
 # optional player message str, or None.
@@ -1019,6 +1089,26 @@ def can_see_spirit(viewer, spirit):
         return True
     if _can_see_spirit is not None:
         return _can_see_spirit(viewer, spirit)
+    return False
+
+
+def set_can_see_hellhound(fn):
+    """Register fn(viewer, hound) -> bool for Deal hellhound invis pierce.
+
+    Pass None to restore the default: nobody pierces hellhound invis.
+    """
+    global _can_see_hellhound
+    _can_see_hellhound = fn
+
+
+def can_see_hellhound(viewer, hound=None):
+    """Can `viewer` see a Deal hellhound (or other hellhound_invisible)?
+
+    Default (no game installed): False. SUPERS registers Celestial /
+    glasses / engage checks from ``supers.hellhounds``.
+    """
+    if _can_see_hellhound is not None:
+        return bool(_can_see_hellhound(viewer, hound))
     return False
 
 
@@ -1232,6 +1322,26 @@ def presence_face_for(viewer, subject):
     if _presence_face_for is not None:
         return _presence_face_for(viewer, subject)
     return None
+
+
+def set_room_presence_line(fn):
+    """Register fn(face_label, character, room, game) -> str for look souls.
+
+    SUPERS uses this for positional state (``is standing here``, ``[KO] …
+    is unconscious here``). Pass None to restore the lean engine default.
+    """
+    global _room_presence_line
+    _room_presence_line = fn
+
+
+def room_presence_line(face_label, character, room, game=None):
+    """Full room-presence line for one Character, or a bare label fallback."""
+    if _room_presence_line is not None:
+        return _room_presence_line(face_label, character, room, game)
+    label = (face_label or "?").strip()
+    if getattr(character, "asleep", False):
+        return f"{label} is sleeping here"
+    return f"{label} is standing here"
 
 
 def set_echo_look_bits(fn):
@@ -1656,6 +1766,91 @@ def weather_look_vision(
             after_move=after_move,
         )
     return None
+
+
+# Optional regional-weather game hooks (SUPERS registers; basegame uses defaults).
+_weather_is_elemental_realm = None
+_weather_room_plane = None
+_weather_clinic_admit = None
+_weather_radio_bulletin = None
+
+
+def set_weather_is_elemental_realm(fn):
+    """Register fn(room) -> bool for non-CONUS Reach-style planes."""
+    global _weather_is_elemental_realm
+    _weather_is_elemental_realm = fn
+
+
+def weather_is_elemental_realm(room):
+    """True when CONUS weather should not run for this room."""
+    if _weather_is_elemental_realm is not None:
+        return bool(_weather_is_elemental_realm(room))
+    return False
+
+
+def set_weather_room_plane(fn):
+    """Register fn(room) -> plane id string (earth, fire, …)."""
+    global _weather_room_plane
+    _weather_room_plane = fn
+
+
+def weather_room_plane(room):
+    """Return the room's plane id for weather flavor routing."""
+    if _weather_room_plane is not None:
+        return _weather_room_plane(room)
+    if room is None:
+        return None
+    return getattr(room, "plane", None) or "earth"
+
+
+def set_weather_clinic_admit(fn):
+    """Register fn(game, character, reason=…) -> bool after tornado drop."""
+    global _weather_clinic_admit
+    _weather_clinic_admit = fn
+
+
+def weather_clinic_admit(game, character, reason="injury"):
+    """Admit an injured character to a clinic; return True if handled."""
+    if _weather_clinic_admit is not None:
+        return bool(_weather_clinic_admit(game, character, reason=reason))
+    if game is None or character is None:
+        return False
+    rooms = getattr(game, "rooms", None) or {}
+    for room in rooms.values():
+        if getattr(room, "hospital", False):
+            character.move_to(room)
+            character.hp = max(1, int(getattr(character, "hp", 0) or 0))
+            character.hospitalized = True
+            return True
+    return False
+
+
+def set_weather_radio_bulletin(fn):
+    """Register fn(game, line) for scheduled WX radio interrupts."""
+    global _weather_radio_bulletin
+    _weather_radio_bulletin = fn
+
+
+def weather_radio_bulletin(game, line):
+    """Optional in-game radio bulletin hook; no-op when unset."""
+    if _weather_radio_bulletin is not None:
+        _weather_radio_bulletin(game, line)
+
+
+_storm_chase_is_on_duty = None
+
+
+def set_storm_chase_is_on_duty(fn):
+    """Register fn(character, game) -> bool for desk duty gate."""
+    global _storm_chase_is_on_duty
+    _storm_chase_is_on_duty = fn
+
+
+def storm_chase_is_on_duty(character, game=None):
+    """True when character may run on-duty storm desk verbs."""
+    if _storm_chase_is_on_duty is not None:
+        return bool(_storm_chase_is_on_duty(character, game=game))
+    return bool(getattr(character, "on_duty", False))
 
 
 def set_is_consciousness_exile(fn):

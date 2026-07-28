@@ -23,9 +23,11 @@ toggle live with GM `autodeploy on|off` (writes `.auto_deploy_override`).
 When GM turns autodeploy **back on**, a catch-up flag is written so the
 next watcher poll does a full ``git reset --hard origin/main`` (protected
 live files stashed/restored as usual). That picks up every commit missed
-while overlays were paused — not just the tip's Fix-bug file list.
-Ordinary advance-only polls stay strict (no silent re-overlay when the
-tracked SHA already matches); catch-up is only the re-enable path.
+while overlays were paused — not just the tip's Fix-bug file list. Any
+``Fix bug #N`` commits in that gap are also queued for in-game resolve
+(reporter credit, no Veil countdown — code is already on disk). Ordinary
+advance-only polls stay strict (no silent re-overlay when the tracked SHA
+already matches); catch-up is only the re-enable path.
 
 State lives in .auto_deploy_state.json (gitignored) so a container restart
 does not re-deploy old commits.
@@ -33,6 +35,7 @@ does not re-deploy old commits.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import re
@@ -73,6 +76,19 @@ DEFAULT_FETCH_TIMEOUT = 60
 _FIX_SUBJECT_RE = re.compile(
     r"^(?:fix(?:es|ed)?)\s+"
     r"(?:bugs?|bug_reports\.log)\s*#"
+    r"(\d+)"
+    r"(?:\s*[-–—]\s*#?(\d+))?"
+    r"((?:\s*,\s*#?\d+)*)"
+    r"\b",
+    re.IGNORECASE,
+)
+# Ship suggestion subjects mirror Fix bug subjects:
+#   "Ship suggestion #92: pit auto-look"
+#   "Ship suggestions #92-#96: packet"
+#   "Shipped ideas #92, #94: …"
+_SHIP_SUGGESTION_SUBJECT_RE = re.compile(
+    r"^(?:ship(?:ped)?)\s+"
+    r"(?:suggestions?|ideas?|suggestions\.log)\s*#"
     r"(\d+)"
     r"(?:\s*[-–—]\s*#?(\d+))?"
     r"((?:\s*,\s*#?\d+)*)"
@@ -655,8 +671,11 @@ def _reset_hard_to(root, sha):
     # reset --hard. Additive heal merges missing keys back into zone/map
     # JSON without overwriting git-authored rooms.
     try:
-        from engine import hooks
+        import engine.hooks as hooks
 
+        # Same stale-module trap as deploy_notify: reload so map heal APIs
+        # match disk after reset --hard under a long-lived watcher.
+        importlib.reload(hooks)
         heal_lines = hooks.auto_deploy_map_heal(root)
         for line in heal_lines:
             print(f"[auto_deploy] {line}", flush=True)
@@ -735,39 +754,59 @@ def _commit_parent_count(sha, root):
     return max(0, len(parents.split()) - 1)
 
 
-def parse_deploy_metadata(subject: str) -> tuple[list[int], str]:
-    """Extract bug id list + short summary from an intentional fix subject.
+def _parse_subject_ticket_tail(summary: str, match) -> str:
+    """Return the human summary after a Fix/Ship subject prefix match."""
+    rest = summary[match.end():].lstrip()
+    if rest.startswith(":"):
+        rest = rest[1:].lstrip()
+    elif rest.startswith(("--", "—", "–")):
+        rest = rest.lstrip("-—–").lstrip()
+    return rest
 
-    Only subjects that START like ``Fix bug #N:`` / ``Fix bugs #N-M:`` /
-    ``Fixes bug_reports.log #N`` yield ids. Mid-sentence mentions
-    (``... changelog with bug #25``) and bare PR refs (``... (#5)``)
-    deliberately return ``[]`` so auto-deploy does not announce a false
-    world reset.
 
-    Returns ``(bug_ids, summary)``. Callers that only need the primary
-    announce id use ``bug_ids[0] if bug_ids else None``.
+def parse_deploy_metadata(subject: str) -> tuple[list[int], list[int], str]:
+    """Extract bug/suggestion ids + short summary from a deploy subject.
+
+    Only subjects that START like ``Fix bug #N:`` / ``Ship suggestion #N:``
+    yield ids. Mid-sentence mentions and bare PR refs deliberately return
+    empty id lists so auto-deploy does not announce a false world reset.
+
+    Returns ``(bug_ids, suggestion_ids, summary)``.
     """
     summary = subject.strip()
     # Drop trailing "(#123)" PR reference from squash-merge subjects BEFORE
-    # any id scan, so a PR number can never become a bug id.
+    # any id scan, so a PR number can never become a ticket id.
     summary = re.sub(r"\s*\(#\d+\)\s*$", "", summary).strip()
 
     bug_ids: list[int] = []
+    suggestion_ids: list[int] = []
     match = _FIX_SUBJECT_RE.match(summary)
     if match:
         start = int(match.group(1))
         end = int(match.group(2)) if match.group(2) else None
         bug_ids = _expand_fix_subject_bug_ids(start, end, match.group(3) or "")
-        rest = summary[match.end():].lstrip()
-        if rest.startswith(":"):
-            rest = rest[1:].lstrip()
-        elif rest.startswith(("--", "—", "–")):
-            rest = rest.lstrip("-—–").lstrip()
+        rest = _parse_subject_ticket_tail(summary, match)
         summary = rest or "A bug fix has been deployed."
+    else:
+        match = _SHIP_SUGGESTION_SUBJECT_RE.match(summary)
+        if match:
+            start = int(match.group(1))
+            end = int(match.group(2)) if match.group(2) else None
+            suggestion_ids = _expand_fix_subject_bug_ids(
+                start, end, match.group(3) or "",
+            )
+            rest = _parse_subject_ticket_tail(summary, match)
+            summary = rest or "A player suggestion has been shipped."
 
     if len(summary) > 120:
         summary = summary[:117] + "..."
-    return bug_ids, summary or "A bug fix has been deployed."
+    if bug_ids:
+        default = "A bug fix has been deployed."
+    elif suggestion_ids:
+        default = "A player suggestion has been shipped."
+    else:
+        default = "A bug fix has been deployed."
+    return bug_ids, suggestion_ids, summary or default
 
 
 def should_ship_bug_fix(subject: str, *, parent_count: int, file_count: int):
@@ -785,14 +824,20 @@ def should_ship_bug_fix(subject: str, *, parent_count: int, file_count: int):
         return False, "merge commit -- advance silently"
     if subject.strip().lower().startswith("merge "):
         return False, "merge subject -- advance silently"
-    bug_ids, _summary = parse_deploy_metadata(subject)
-    if not bug_ids:
-        return False, "not a Fix bug #N subject -- advance silently"
+    bug_ids, suggestion_ids, _summary = parse_deploy_metadata(subject)
+    if not bug_ids and not suggestion_ids:
+        return False, "not a Fix/Ship ticket subject -- advance silently"
     if file_count <= 0:
         return False, "no files to overlay -- advance silently"
-    if len(bug_ids) == 1:
-        return True, f"ship bug #{bug_ids[0]}"
-    return True, f"ship bugs #{bug_ids[0]}-#{bug_ids[-1]}"
+    if bug_ids:
+        if len(bug_ids) == 1:
+            return True, f"ship bug #{bug_ids[0]}"
+        return True, f"ship bugs #{bug_ids[0]}-#{bug_ids[-1]}"
+    if len(suggestion_ids) == 1:
+        return True, f"ship suggestion #{suggestion_ids[0]}"
+    return True, (
+        f"ship suggestions #{suggestion_ids[0]}-#{suggestion_ids[-1]}"
+    )
 
 
 def _advance_origin_only(root, state, remote_sha, subject, reason):
@@ -823,23 +868,30 @@ def _wait_for_ready(root, timeout_seconds):
     return False
 
 
-def _run_deploy_pipeline(root, *, commit_sha, bug_ids, summary, countdown, files):
+def _run_deploy_pipeline(
+    root, *, commit_sha, bug_ids, suggestion_ids, summary, countdown, files,
+):
     """Announce in-game, wait, overlay this commit's files only.
 
     `files` is precomputed by the caller so empty commits never reach
     queue_deploy (announce-before-overlay was the false-positive path for
-    merge tips with no file payload). ``bug_ids`` may list several tickets
-    for a batch Fix subject so on_resume marks every one resolved.
+    merge tips with no file payload). ``bug_ids`` / ``suggestion_ids`` may
+    list several tickets for a batch subject so on_resume marks every one
+    resolved.
     """
-    from engine import deploy_notify
     from tools.apply_pr_fix import overlay_files_from_ref
 
-    primary = bug_ids[0] if bug_ids else None
+    deploy_notify = _fresh_deploy_notify()
+
+    primary_bug = bug_ids[0] if bug_ids else None
+    primary_suggest = suggestion_ids[0] if suggestion_ids else None
     signal = deploy_notify.queue_deploy(
         root,
         pr=commit_sha[:12],
-        bug_id=primary,
+        bug_id=primary_bug,
         bug_ids=bug_ids,
+        suggestion_id=primary_suggest,
+        suggestion_ids=suggestion_ids,
         summary=summary,
         countdown_seconds=countdown,
         triggered_by="engine/auto_deploy.py",
@@ -853,12 +905,7 @@ def _run_deploy_pipeline(root, *, commit_sha, bug_ids, summary, countdown, files
         )
         return True
 
-    if not bug_ids:
-        label = "fix"
-    elif len(bug_ids) == 1:
-        label = f"bug #{bug_ids[0]}"
-    else:
-        label = f"bugs #{bug_ids[0]}-#{bug_ids[-1]}"
+    label = deploy_notify.describe_ticket_ref(bug_ids, suggestion_ids)
     print(
         f"[auto_deploy] countdown {countdown}s for {label}: {summary}",
         flush=True,
@@ -934,14 +981,154 @@ def _working_tree_behind_commit(commit_sha, root):
         return True
 
 
+def _commits_between(from_sha, to_sha, root):
+    """Return commit SHAs from ``from_sha`` exclusive through ``to_sha`` inclusive.
+
+    When ``from_sha`` is empty, only ``to_sha`` is considered (first sync).
+    """
+    if not to_sha:
+        return []
+    if not from_sha:
+        return [to_sha]
+    if from_sha == to_sha:
+        return []
+    out = _git("rev-list", "--reverse", f"{from_sha}..{to_sha}", cwd=root)
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def collect_missed_fix_commits(root, from_sha, to_sha):
+    """List Fix-bug commits in ``from_sha..to_sha`` not yet announced.
+
+    Each entry is ``{"sha", "bug_ids", "summary"}``. Pure git + parser
+    helpers — easy to smoke-test with a real repo history.
+    """
+    from tools.apply_pr_fix import files_in_commit
+
+    fixes = []
+    for sha in _commits_between(from_sha, to_sha, root):
+        try:
+            subject = _commit_subject(sha, root)
+            parent_count = _commit_parent_count(sha, root)
+        except subprocess.CalledProcessError:
+            continue
+        files = files_in_commit(sha, cwd=root)
+        ship, _reason = should_ship_bug_fix(
+            subject, parent_count=parent_count, file_count=len(files),
+        )
+        if not ship:
+            continue
+        bug_ids, suggestion_ids, summary = parse_deploy_metadata(subject)
+        if not bug_ids and not suggestion_ids:
+            continue
+        fixes.append({
+            "sha": sha,
+            "bug_ids": list(bug_ids),
+            "suggestion_ids": list(suggestion_ids),
+            "summary": summary,
+        })
+    return fixes
+
+
+def _catchup_from_sha(state):
+    """Oldest tracked tip to scan for missed Fix commits during catch-up."""
+    return (
+        state.get("origin_main")
+        or (state.get("last_deploy") or {}).get("sha")
+        or ""
+    )
+
+
+def _fresh_deploy_notify():
+    """Reload ``engine.deploy_notify`` from disk before calling it.
+
+    ``watch_and_run`` reloads this module every poll, but an older watcher
+    that only reloads ``auto_deploy`` can still hold a stale
+    ``deploy_notify`` in memory. Reloading here keeps ``queue_deploy`` /
+    ``queue_catchup_resolves`` signatures aligned with the bind-mount even
+    when ``watch_and_run.reload_auto_deploy`` itself has not been updated
+    yet (chicken-and-egg after a Fix that only patches this file).
+    """
+    import engine.deploy_notify as deploy_notify
+
+    return importlib.reload(deploy_notify)
+
+
+def _apply_catchup_fix_resolves(root, state, missed_fixes):
+    """Queue in-game resolve for Fix commits already on disk after catch-up."""
+    deploy_notify = _fresh_deploy_notify()
+
+    deploy_notify.queue_catchup_resolves(root, missed_fixes)
+    for fix in missed_fixes:
+        deploy_notify.mark_deploy_completed(root, fix["sha"])
+
+    latest = missed_fixes[-1]
+    try:
+        subject = _commit_subject(latest["sha"], root)
+    except subprocess.CalledProcessError:
+        subject = "(catch-up fix)"
+    state["last_deploy"] = {
+        "sha": latest["sha"],
+        "subject": subject,
+        "bug_id": latest["bug_ids"][0] if latest.get("bug_ids") else None,
+        "bug_ids": list(latest.get("bug_ids") or []),
+        "suggestion_id": (
+            latest["suggestion_ids"][0]
+            if latest.get("suggestion_ids")
+            else None
+        ),
+        "suggestion_ids": list(latest.get("suggestion_ids") or []),
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+    all_bug_ids = []
+    all_suggest_ids = []
+    for fix in missed_fixes:
+        for bug_id in fix.get("bug_ids") or []:
+            if bug_id not in all_bug_ids:
+                all_bug_ids.append(bug_id)
+        for suggestion_id in fix.get("suggestion_ids") or []:
+            if suggestion_id not in all_suggest_ids:
+                all_suggest_ids.append(suggestion_id)
+    label = deploy_notify.describe_ticket_ref(all_bug_ids, all_suggest_ids)
+    print(
+        f"[auto_deploy] catch-up queued resolve for {label} "
+        f"({len(missed_fixes)} Fix commit(s))",
+        flush=True,
+    )
+
+
+def record_catchup_last_deploy(root, fix, *, subject=None):
+    """Persist ``last_deploy`` after in-game catch-up resolve (copyover)."""
+    state = _load_state(root)
+    if subject is None:
+        try:
+            subject = _commit_subject(fix["sha"], root)
+        except subprocess.CalledProcessError:
+            subject = "(catch-up fix)"
+    state["last_deploy"] = {
+        "sha": fix["sha"],
+        "subject": subject,
+        "bug_id": fix["bug_ids"][0] if fix.get("bug_ids") else None,
+        "bug_ids": list(fix.get("bug_ids") or []),
+        "suggestion_id": (
+            fix["suggestion_ids"][0] if fix.get("suggestion_ids") else None
+        ),
+        "suggestion_ids": list(fix.get("suggestion_ids") or []),
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    _save_state(root, state)
+
+
 def _run_reenable_catchup(root, state, remote_sha):
     """Full working-tree sync after GM ``autodeploy on`` (missed commits).
 
     Uses the same ``reset --hard`` + protect stash path as a silent feature
     advance — not a tip-only Fix overlay — so multi-commit gaps while the
-    toggle was off do not leave intermediate files behind. No player
-    countdown: this is catch-up, not a fresh Fix ship.
+    toggle was off do not leave intermediate files behind. Missed ``Fix bug
+    #N`` subjects in that range are handed to deploy_notify for resolve +
+    reporter credit (no Veil countdown — the tree is already current).
     """
+    from_sha = _catchup_from_sha(state)
     subject = "(unknown)"
     try:
         subject = _commit_subject(remote_sha, root)
@@ -953,13 +1140,42 @@ def _run_reenable_catchup(root, state, remote_sha):
         flush=True,
     )
     try:
-        _reset_hard_to(root, remote_sha)
-    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        print(f"[auto_deploy] catch-up sync failed: {exc}", flush=True)
-        # Leave the flag so the next poll retries.
-        return False
+        head_sha = _git("rev-parse", "HEAD", cwd=root).strip()
+    except subprocess.CalledProcessError:
+        head_sha = ""
+    # Already at tip: skip reset --hard. Re-running it still rewrites
+    # protected restore mtimes and copyovers the game for no code change.
+    if head_sha == remote_sha:
+        print(
+            f"[auto_deploy] catch-up tree already at {remote_sha[:12]} "
+            "(skipping reset --hard)",
+            flush=True,
+        )
+    else:
+        try:
+            _reset_hard_to(root, remote_sha)
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            print(f"[auto_deploy] catch-up sync failed: {exc}", flush=True)
+            # Leave the flag so the next poll retries.
+            return False
+
+    # Tree is at tip. Always clear the catch-up flag + advance tracked SHA
+    # even if resolve queueing fails -- otherwise every poll re-runs
+    # reset --hard + protect restore, which rewrites mtimes and copyover-
+    # loops the game forever under a stale deploy_notify (AttributeError
+    # on queue_catchup_resolves / unexpected kwarg bug_ids).
+    missed_fixes = collect_missed_fix_commits(root, from_sha, remote_sha)
+    if missed_fixes:
+        try:
+            _apply_catchup_fix_resolves(root, state, missed_fixes)
+        except Exception as exc:
+            print(
+                f"[auto_deploy] catch-up resolve queue failed "
+                f"(tree already synced; clearing catch-up flag): {exc}",
+                flush=True,
+            )
+
     state["origin_main"] = remote_sha
-    # Do not write last_deploy — catch-up is not a Fix announce.
     _save_state(root, state)
     clear_catchup(root)
     print(
@@ -1023,7 +1239,7 @@ def try_auto_deploy():
         return False
 
     subject = _commit_subject(remote_sha, root)
-    bug_ids, summary = parse_deploy_metadata(subject)
+    bug_ids, suggestion_ids, summary = parse_deploy_metadata(subject)
     countdown = _countdown_seconds()
 
     print(
@@ -1056,6 +1272,7 @@ def try_auto_deploy():
         root,
         commit_sha=remote_sha,
         bug_ids=bug_ids,
+        suggestion_ids=suggestion_ids,
         summary=summary,
         countdown=countdown,
         files=files,
@@ -1069,6 +1286,8 @@ def try_auto_deploy():
         "subject": subject,
         "bug_id": bug_ids[0] if bug_ids else None,
         "bug_ids": list(bug_ids),
+        "suggestion_id": suggestion_ids[0] if suggestion_ids else None,
+        "suggestion_ids": list(suggestion_ids),
         "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     _save_state(root, state)

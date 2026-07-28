@@ -58,12 +58,17 @@ def _resolve():
         _GAME_NAME = "basegame"
     elif choice == "none":
         _GAME_NAME = "none"
+        # Lean demo: one-room map, not the full monorepo content/maps tree.
+        from engine.lean_boot import configure_lean_maps
+        configure_lean_maps()
     else:  # auto
         try:
             import supers  # noqa: F401
             _GAME_NAME = "supers"
         except ImportError:
             _GAME_NAME = "none"
+            from engine.lean_boot import configure_lean_maps
+            configure_lean_maps()
 
     return _GAME_NAME
 

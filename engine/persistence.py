@@ -725,6 +725,16 @@ def _load_meta_dict(conn, key):
     return data
 
 
+def load_meta_json(conn, key):
+    """Public opaque-KV read: JSON dict at ``meta[key]`` (missing = {}).
+
+    T3 persistence-api: games should prefer this (or named wrappers) over
+    inventing new SQL. SUPERS Game meta orchestration lives in
+    ``supers.persist_meta`` via ``engine.hooks.set_game_meta_codec``.
+    """
+    return _load_meta_dict(conn, key)
+
+
 def _save_meta_dict(conn, key, game, attr):
     """Persist ``game.<attr>`` (a dict) into ``meta[key]``.
 
@@ -734,10 +744,17 @@ def _save_meta_dict(conn, key, game, attr):
     blob = getattr(game, attr, None)
     if not isinstance(blob, dict):
         blob = {}
+    save_meta_json(conn, key, blob)
+
+
+def save_meta_json(conn, key, value):
+    """Public opaque-KV write: store ``value`` (dict) at ``meta[key]``."""
+    if not isinstance(value, dict):
+        value = {}
     with conn:
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-            (key, json.dumps(blob)),
+            (key, json.dumps(value)),
         )
 
 
@@ -1125,6 +1142,57 @@ def _loot_from_json(loot):
     return out
 
 
+def _restore_pit_mimic_fields(item, state):
+    """Reattach Purgatory pit mimic stamps from a container blob."""
+    if state.get("pit_mimic"):
+        item.pit_mimic = True
+    if state.get("pit_mimic_tier") is not None:
+        try:
+            item.pit_mimic_tier = int(state["pit_mimic_tier"])
+        except (TypeError, ValueError):
+            pass
+    if state.get("pit_mimic_floor") is not None:
+        try:
+            item.pit_mimic_floor = int(state["pit_mimic_floor"])
+        except (TypeError, ValueError):
+            pass
+    if state.get("pit_run_tag"):
+        item.pit_run_tag = str(state["pit_run_tag"])
+
+
+def _restore_on_use_fields(item, state):
+    """Reattach consumable ``on_use`` / pit potion stamps from a blob.
+
+    Pit sustain potions (and any future on_use Items) keep their effect
+    dict across restart. Older saves omitted these keys -- SUPERS boot
+    heal (``heal_loaded_pit_potion`` via enrich) rebuilds them by key.
+    """
+    on_use = state.get("on_use")
+    if isinstance(on_use, dict) and on_use:
+        item.on_use = dict(on_use)
+    if state.get("purgatory_pit_loot"):
+        item.purgatory_pit_loot = True
+    if state.get("pit_potion_id"):
+        item.pit_potion_id = str(state["pit_potion_id"]).strip()
+
+
+def _restore_herb_fields(item, state):
+    """Reattach herb joint / loaded pipe stamps from a save blob."""
+    if state.get("herb_id"):
+        item.herb_id = str(state["herb_id"]).strip()
+    if state.get("is_joint"):
+        item.is_joint = True
+    if state.get("is_pipe"):
+        item.is_pipe = True
+    if state.get("pipe_herb_id"):
+        item.pipe_herb_id = str(state["pipe_herb_id"]).strip()
+    if state.get("pipe_puffs") is not None:
+        try:
+            item.pipe_puffs = int(state["pipe_puffs"])
+        except (TypeError, ValueError):
+            pass
+
+
 def _item_container_blob(item):
     """JSON for the items.container column: an Item's locked/loot state (a
     dungeon lockbox's whole reward, world.make_lockbox), same reasoning as
@@ -1186,6 +1254,53 @@ def _item_container_blob(item):
         "is_phone": bool(getattr(item, "is_phone", False)),
         "is_payphone": bool(getattr(item, "is_payphone", False)),
         "is_ethereal": bool(getattr(item, "is_ethereal", False)),
+        # Colt / charged weapons -- survive logout with chamber count.
+        "ammo_charges": (
+            int(item.ammo_charges)
+            if getattr(item, "ammo_charges", None) is not None
+            else None
+        ),
+        "max_ammo": (
+            int(item.max_ammo)
+            if getattr(item, "max_ammo", None) is not None
+            else None
+        ),
+        "weapon_voice": getattr(item, "weapon_voice", None),
+        "artifact_lexicon": getattr(item, "artifact_lexicon", None),
+        # Purgatory pit mimic strongboxes (pose as lockboxes until opened).
+        "pit_mimic": bool(getattr(item, "pit_mimic", False)),
+        "pit_mimic_tier": (
+            int(item.pit_mimic_tier)
+            if getattr(item, "pit_mimic_tier", None) is not None
+            else None
+        ),
+        "pit_mimic_floor": (
+            int(item.pit_mimic_floor)
+            if getattr(item, "pit_mimic_floor", None) is not None
+            else None
+        ),
+        "pit_run_tag": getattr(item, "pit_run_tag", None),
+        # Consumable on_use (Purgatory pit sustain potions, etc.).
+        "on_use": (
+            dict(item.on_use)
+            if isinstance(getattr(item, "on_use", None), dict)
+            and item.on_use
+            else None
+        ),
+        "purgatory_pit_loot": bool(
+            getattr(item, "purgatory_pit_loot", False)
+        ),
+        "pit_potion_id": getattr(item, "pit_potion_id", None),
+        # Herb joints / loaded pipes (supers/herbs.py).
+        "herb_id": getattr(item, "herb_id", None),
+        "is_joint": bool(getattr(item, "is_joint", False)),
+        "is_pipe": bool(getattr(item, "is_pipe", False)),
+        "pipe_herb_id": getattr(item, "pipe_herb_id", None),
+        "pipe_puffs": (
+            int(item.pipe_puffs)
+            if getattr(item, "pipe_puffs", None) is not None
+            else None
+        ),
     })
 
 
@@ -1527,6 +1642,24 @@ def load_world(conn, game):
             item.furniture = True
         if state.get("is_ethereal"):
             item.is_ethereal = True
+        # Colt / charged weapon ammo (absent on older saves → enrich later).
+        if state.get("ammo_charges") is not None:
+            try:
+                item.ammo_charges = int(state["ammo_charges"])
+            except (TypeError, ValueError):
+                pass
+        if state.get("max_ammo") is not None:
+            try:
+                item.max_ammo = int(state["max_ammo"])
+            except (TypeError, ValueError):
+                pass
+        if state.get("weapon_voice"):
+            item.weapon_voice = str(state["weapon_voice"]).strip().lower()
+        if state.get("artifact_lexicon"):
+            item.artifact_lexicon = str(state["artifact_lexicon"]).strip()
+        _restore_pit_mimic_fields(item, state)
+        _restore_on_use_fields(item, state)
+        _restore_herb_fields(item, state)
         # bug_reports.log #21: strongboxes saved before the lockbox pass (or
         # with the default '{}' container blob) reload as flavor-only Items;
         # promote them here so `open strongbox` still pays out after a
@@ -1540,6 +1673,9 @@ def load_world(conn, game):
             sink = game.rooms.get(holder_key) or orphan_item_room(game)
             if sink is not None:
                 sink.add(item)
+            # Catalog gear + pit potion on_use heal (same as inventory).
+            from engine import hooks
+            hooks.enrich_loaded_item(item)
         elif holder_type == "gear":
             # Job kit bag -- not surface inventory (supers/gear_bag).
             owner = game.find_character(holder_key)
@@ -1735,6 +1871,8 @@ def item_from_saved_container(key, description, container):
         item.furniture = True
     if state.get("is_ethereal"):
         item.is_ethereal = True
+    _restore_pit_mimic_fields(item, state)
+    _restore_on_use_fields(item, state)
     upgrade_legacy_container(item)
     return item
 

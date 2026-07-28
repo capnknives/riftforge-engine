@@ -1,0 +1,3613 @@
+{
+  "id": "earth_america",
+  "plane": "earth",
+  "realm": "prime",
+  "autoload": true,
+  "_comment": "Demo America atlas for basegame Notbigville. Full 78x18 grid; pockets: Notbigville KS, Seattle, Miami for climate contrast.",
+  "pockets": [
+    {
+      "kind": "settlement",
+      "at": [
+        35,
+        10
+      ],
+      "hub_room": "NB00001",
+      "enter_as": [
+        "notbigville",
+        "kansas",
+        "notbigville kansas",
+        "heartland"
+      ],
+      "visible_as": "Notbigville, Kansas"
+    }
+  ],
+  "grid": {
+    "key_prefix": "America Overland",
+    "width": 78,
+    "height": 18,
+    "wrap": false,
+    "virtual_overland": true,
+    "outdoor": true,
+    "wilderness": false,
+    "gravity": 1.0,
+    "area_type": "ocean",
+    "glyph_set": "atlas",
+    "bestiary_categories": [
+      "earth-dweller"
+    ],
+    "default_description": "Open ocean under a wide sky at ({x}, {y}). The continent sits somewhere inland; the atlas edge is hard -- you cannot drive or walk past the rim.",
+    "cell_overrides": {
+      "5,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (5, 11). Distant highway hum."
+      },
+      "5,12": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (5, 12). Good country to lose a tail -- or a body."
+      },
+      "5,13": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (5, 13). Good country to lose a tail -- or a body."
+      },
+      "5,14": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (5, 14). Good country to lose a tail -- or a body."
+      },
+      "6,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (6, 10). Distant highway hum."
+      },
+      "6,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (6, 11). Distant highway hum."
+      },
+      "6,12": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (6, 12). Good country to lose a tail -- or a body."
+      },
+      "6,13": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (6, 13). Good country to lose a tail -- or a body."
+      },
+      "6,14": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (6, 14). Good country to lose a tail -- or a body."
+      },
+      "6,15": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (6, 15). Good country to lose a tail -- or a body."
+      },
+      "7,10": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (7, 10). The interstates skirt the worst of the passes."
+      },
+      "7,11": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (7, 11). The interstates skirt the worst of the passes."
+      },
+      "7,12": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-5 cuts the continent. Mile marker faded at (7, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "7,13": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-5 cuts the continent. Mile marker faded at (7, 13). Drive the cardinals; cities wait at the hubs."
+      },
+      "7,14": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-5 cuts the continent. Mile marker faded at (7, 14). Drive the cardinals; cities wait at the hubs."
+      },
+      "7,15": {
+        "area_type": "city",
+        "title": "Seattle Approach",
+        "description": "Evergreen ridges and gray water. Type enter seattle for the charter strip. Coordinates (7, 15).",
+        "wilderness": false,
+        "map_glyph": "S",
+        "map_layer": "city"
+      },
+      "8,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (8, 9). Distant highway hum."
+      },
+      "8,10": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-5 cuts the continent. Mile marker faded at (8, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "8,11": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-5 cuts the continent. Mile marker faded at (8, 11). Drive the cardinals; cities wait at the hubs."
+      },
+      "8,12": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (8, 12). The interstates skirt the worst of the passes."
+      },
+      "8,13": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (8, 13). The interstates skirt the worst of the passes."
+      },
+      "8,14": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (8, 14). The interstates skirt the worst of the passes."
+      },
+      "8,15": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (8, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "9,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (9, 8). Distant highway hum."
+      },
+      "9,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "\\",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-5 cuts the continent. Mile marker faded at (9, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "9,10": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (9, 10). The interstates skirt the worst of the passes."
+      },
+      "9,11": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (9, 11). The interstates skirt the worst of the passes."
+      },
+      "9,12": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (9, 12). The interstates skirt the worst of the passes."
+      },
+      "9,13": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (9, 13). The interstates skirt the worst of the passes."
+      },
+      "9,14": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (9, 14). The interstates skirt the worst of the passes."
+      },
+      "9,15": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (9, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "10,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (10, 7). Distant highway hum."
+      },
+      "10,8": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-5 cuts the continent. Mile marker faded at (10, 8). Drive the cardinals; cities wait at the hubs."
+      },
+      "10,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (10, 9). Distant highway hum."
+      },
+      "10,10": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (10, 10). The interstates skirt the worst of the passes."
+      },
+      "10,11": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (10, 11). The interstates skirt the worst of the passes."
+      },
+      "10,12": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (10, 12). The interstates skirt the worst of the passes."
+      },
+      "10,13": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (10, 13). The interstates skirt the worst of the passes."
+      },
+      "10,14": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (10, 14). The interstates skirt the worst of the passes."
+      },
+      "10,15": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (10, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "11,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (11, 7). Distant highway hum."
+      },
+      "11,8": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-5 cuts the continent. Mile marker faded at (11, 8). Drive the cardinals; cities wait at the hubs."
+      },
+      "11,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (11, 9). Distant highway hum."
+      },
+      "11,10": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (11, 10). The interstates skirt the worst of the passes."
+      },
+      "11,11": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (11, 11). The interstates skirt the worst of the passes."
+      },
+      "11,12": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (11, 12). The interstates skirt the worst of the passes."
+      },
+      "11,13": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (11, 13). The interstates skirt the worst of the passes."
+      },
+      "11,14": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (11, 14). The interstates skirt the worst of the passes."
+      },
+      "11,15": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (11, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "12,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (12, 6). Distant highway hum."
+      },
+      "12,7": {
+        "area_type": "city",
+        "title": "Los Angeles Approach",
+        "description": "Smog and palm haze under a hard west-coast sun. Freeways braid below. Type enter la to drop onto the airport strip. Coordinates (12, 7).",
+        "wilderness": false,
+        "map_glyph": "L",
+        "map_layer": "city"
+      },
+      "12,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (12, 8). Distant highway hum."
+      },
+      "12,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (12, 9). Distant highway hum."
+      },
+      "12,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (12, 10). Distant highway hum."
+      },
+      "12,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (12, 11). Distant highway hum."
+      },
+      "12,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (12, 12). Distant highway hum."
+      },
+      "12,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (12, 13). Distant highway hum."
+      },
+      "12,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (12, 14). Distant highway hum."
+      },
+      "12,15": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (12, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "13,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (13, 6). Distant highway hum."
+      },
+      "13,7": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (13, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "13,8": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-15 cuts the continent. Mile marker faded at (13, 8). Drive the cardinals; cities wait at the hubs."
+      },
+      "13,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (13, 9). Distant highway hum."
+      },
+      "13,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (13, 10). Distant highway hum."
+      },
+      "13,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (13, 11). Distant highway hum."
+      },
+      "13,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (13, 12). Distant highway hum."
+      },
+      "13,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (13, 13). Distant highway hum."
+      },
+      "13,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (13, 14). Distant highway hum."
+      },
+      "13,15": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (13, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "14,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (14, 6). Distant highway hum."
+      },
+      "14,7": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (14, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "14,8": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-15 cuts the continent. Mile marker faded at (14, 8). Drive the cardinals; cities wait at the hubs."
+      },
+      "14,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (14, 9). Distant highway hum."
+      },
+      "14,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (14, 10). Distant highway hum."
+      },
+      "14,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (14, 11). Distant highway hum."
+      },
+      "14,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (14, 12). Distant highway hum."
+      },
+      "14,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (14, 13). Distant highway hum."
+      },
+      "14,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (14, 14). Distant highway hum."
+      },
+      "14,15": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (14, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "15,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (15, 6). Distant highway hum."
+      },
+      "15,7": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (15, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "15,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (15, 8). Distant highway hum."
+      },
+      "15,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-15 cuts the continent. Mile marker faded at (15, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "15,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (15, 10). Distant highway hum."
+      },
+      "15,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (15, 11). Distant highway hum."
+      },
+      "15,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (15, 12). Distant highway hum."
+      },
+      "15,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (15, 13). Distant highway hum."
+      },
+      "15,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (15, 14). Distant highway hum."
+      },
+      "15,15": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (15, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "16,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (16, 6). Distant highway hum."
+      },
+      "16,7": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (16, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "16,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (16, 8). Distant highway hum."
+      },
+      "16,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-15 cuts the continent. Mile marker faded at (16, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "16,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (16, 10). Distant highway hum."
+      },
+      "16,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (16, 11). Distant highway hum."
+      },
+      "16,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (16, 12). Distant highway hum."
+      },
+      "16,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (16, 13). Distant highway hum."
+      },
+      "16,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (16, 14). Distant highway hum."
+      },
+      "16,15": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (16, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "17,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (17, 6). Distant highway hum."
+      },
+      "17,7": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (17, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "17,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (17, 8). Distant highway hum."
+      },
+      "17,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (17, 9). Distant highway hum."
+      },
+      "17,10": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "/",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-15 cuts the continent. Mile marker faded at (17, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "17,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (17, 11). Distant highway hum."
+      },
+      "17,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (17, 12). Distant highway hum."
+      },
+      "17,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (17, 13). Distant highway hum."
+      },
+      "17,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (17, 14). Distant highway hum."
+      },
+      "17,15": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (17, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "18,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (18, 6). Distant highway hum."
+      },
+      "18,7": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (18, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "18,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (18, 8). Distant highway hum."
+      },
+      "18,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (18, 9). Distant highway hum."
+      },
+      "18,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (18, 10). Distant highway hum."
+      },
+      "18,11": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-15 cuts the continent. Mile marker faded at (18, 11). Drive the cardinals; cities wait at the hubs."
+      },
+      "18,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (18, 12). Distant highway hum."
+      },
+      "18,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (18, 13). Distant highway hum."
+      },
+      "18,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (18, 14). Distant highway hum."
+      },
+      "18,15": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (18, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "19,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (19, 6). Distant highway hum."
+      },
+      "19,7": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (19, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "19,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (19, 8). Distant highway hum."
+      },
+      "19,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (19, 9). Distant highway hum."
+      },
+      "19,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (19, 10). Distant highway hum."
+      },
+      "19,11": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-15 cuts the continent. Mile marker faded at (19, 11). Drive the cardinals; cities wait at the hubs."
+      },
+      "19,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (19, 12). Distant highway hum."
+      },
+      "19,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (19, 13). Distant highway hum."
+      },
+      "19,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (19, 14). Distant highway hum."
+      },
+      "19,15": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (19, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "20,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (20, 6). Distant highway hum."
+      },
+      "20,7": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (20, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "20,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (20, 8). Distant highway hum."
+      },
+      "20,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (20, 9). Distant highway hum."
+      },
+      "20,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (20, 10). Distant highway hum."
+      },
+      "20,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (20, 11). Distant highway hum."
+      },
+      "20,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "/",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-15 cuts the continent. Mile marker faded at (20, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "20,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (20, 13). Distant highway hum."
+      },
+      "20,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (20, 14). Distant highway hum."
+      },
+      "20,15": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (20, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "21,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (21, 6). Distant highway hum."
+      },
+      "21,7": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (21, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "21,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (21, 8). Distant highway hum."
+      },
+      "21,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (21, 9). Distant highway hum."
+      },
+      "21,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (21, 10). Distant highway hum."
+      },
+      "21,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (21, 11). Distant highway hum."
+      },
+      "21,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (21, 12). Distant highway hum."
+      },
+      "21,13": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-15 cuts the continent. Mile marker faded at (21, 13). Drive the cardinals; cities wait at the hubs."
+      },
+      "21,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (21, 14). Distant highway hum."
+      },
+      "21,15": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (21, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "22,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (22, 6). Distant highway hum."
+      },
+      "22,7": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (22, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "22,8": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (22, 8). The interstates skirt the worst of the passes."
+      },
+      "22,9": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (22, 9). The interstates skirt the worst of the passes."
+      },
+      "22,10": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (22, 10). The interstates skirt the worst of the passes."
+      },
+      "22,11": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (22, 11). The interstates skirt the worst of the passes."
+      },
+      "22,12": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (22, 12). The interstates skirt the worst of the passes."
+      },
+      "22,13": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-15 cuts the continent. Mile marker faded at (22, 13). Drive the cardinals; cities wait at the hubs."
+      },
+      "22,14": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (22, 14). The interstates skirt the worst of the passes."
+      },
+      "22,15": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (22, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "23,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (23, 6). Distant highway hum."
+      },
+      "23,7": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (23, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "23,8": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (23, 8). The interstates skirt the worst of the passes."
+      },
+      "23,9": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (23, 9). The interstates skirt the worst of the passes."
+      },
+      "23,10": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (23, 10). The interstates skirt the worst of the passes."
+      },
+      "23,11": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (23, 11). The interstates skirt the worst of the passes."
+      },
+      "23,12": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (23, 12). The interstates skirt the worst of the passes."
+      },
+      "23,13": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (23, 13). The interstates skirt the worst of the passes."
+      },
+      "23,14": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-15, I-90 cuts the continent. Mile marker faded at (23, 14). Drive the cardinals; cities wait at the hubs."
+      },
+      "23,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (23, 15). Distant highway hum."
+      },
+      "24,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (24, 6). Distant highway hum."
+      },
+      "24,7": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (24, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "24,8": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (24, 8). The interstates skirt the worst of the passes."
+      },
+      "24,9": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (24, 9). The interstates skirt the worst of the passes."
+      },
+      "24,10": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (24, 10). The interstates skirt the worst of the passes."
+      },
+      "24,11": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (24, 11). The interstates skirt the worst of the passes."
+      },
+      "24,12": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (24, 12). The interstates skirt the worst of the passes."
+      },
+      "24,13": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (24, 13). The interstates skirt the worst of the passes."
+      },
+      "24,14": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-15, I-90 cuts the continent. Mile marker faded at (24, 14). Drive the cardinals; cities wait at the hubs."
+      },
+      "24,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (24, 15). Distant highway hum."
+      },
+      "25,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (25, 6). Distant highway hum."
+      },
+      "25,7": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (25, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "25,8": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (25, 8). The interstates skirt the worst of the passes."
+      },
+      "25,9": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (25, 9). The interstates skirt the worst of the passes."
+      },
+      "25,10": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (25, 10). The interstates skirt the worst of the passes."
+      },
+      "25,11": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (25, 11). The interstates skirt the worst of the passes."
+      },
+      "25,12": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (25, 12). The interstates skirt the worst of the passes."
+      },
+      "25,13": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (25, 13). The interstates skirt the worst of the passes."
+      },
+      "25,14": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-15, I-90 cuts the continent. Mile marker faded at (25, 14). Drive the cardinals; cities wait at the hubs."
+      },
+      "25,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (25, 15). Distant highway hum."
+      },
+      "26,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (26, 5). Distant highway hum."
+      },
+      "26,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (26, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "26,7": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (26, 7). The interstates skirt the worst of the passes."
+      },
+      "26,8": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (26, 8). The interstates skirt the worst of the passes."
+      },
+      "26,9": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (26, 9). The interstates skirt the worst of the passes."
+      },
+      "26,10": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (26, 10). The interstates skirt the worst of the passes."
+      },
+      "26,11": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (26, 11). The interstates skirt the worst of the passes."
+      },
+      "26,12": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (26, 12). The interstates skirt the worst of the passes."
+      },
+      "26,13": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (26, 13). The interstates skirt the worst of the passes."
+      },
+      "26,14": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-15, I-90 cuts the continent. Mile marker faded at (26, 14). Drive the cardinals; cities wait at the hubs."
+      },
+      "26,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (26, 15). Distant highway hum."
+      },
+      "27,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (27, 5). Distant highway hum."
+      },
+      "27,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (27, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "27,7": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (27, 7). The interstates skirt the worst of the passes."
+      },
+      "27,8": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (27, 8). The interstates skirt the worst of the passes."
+      },
+      "27,9": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (27, 9). The interstates skirt the worst of the passes."
+      },
+      "27,10": {
+        "area_type": "mountains",
+        "title": "Ridge Approach",
+        "description": "Cold Front Range wind above Manning. Type enter ridge for the mountain dirt strip; exit returns here. Coordinates (27, 10)."
+      },
+      "27,11": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (27, 11). The interstates skirt the worst of the passes."
+      },
+      "27,12": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-25 cuts the continent. Mile marker faded at (27, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "27,13": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-25 cuts the continent. Mile marker faded at (27, 13). Drive the cardinals; cities wait at the hubs."
+      },
+      "27,14": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "+",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-15, I-25, I-90 cuts the continent. Mile marker faded at (27, 14). Drive the cardinals; cities wait at the hubs."
+      },
+      "27,15": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-25 cuts the continent. Mile marker faded at (27, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "28,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (28, 5). Distant highway hum."
+      },
+      "28,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (28, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "28,7": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (28, 7). The interstates skirt the worst of the passes."
+      },
+      "28,8": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (28, 8). The interstates skirt the worst of the passes."
+      },
+      "28,9": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-25 cuts the continent. Mile marker faded at (28, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "28,10": {
+        "area_type": "city",
+        "title": "Denver Approach",
+        "description": "High plains meet the Front Range. Type enter denver for the mountain-edge strip. Coordinates (28, 10).",
+        "wilderness": false,
+        "map_glyph": "D",
+        "map_layer": "city"
+      },
+      "28,11": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-25 cuts the continent. Mile marker faded at (28, 11). Drive the cardinals; cities wait at the hubs."
+      },
+      "28,12": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (28, 12). The interstates skirt the worst of the passes."
+      },
+      "28,13": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (28, 13). The interstates skirt the worst of the passes."
+      },
+      "28,14": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-15, I-90 cuts the continent. Mile marker faded at (28, 14). Drive the cardinals; cities wait at the hubs."
+      },
+      "28,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (28, 15). Distant highway hum."
+      },
+      "29,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (29, 5). Distant highway hum."
+      },
+      "29,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (29, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "29,7": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-25 cuts the continent. Mile marker faded at (29, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "29,8": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-25 cuts the continent. Mile marker faded at (29, 8). Drive the cardinals; cities wait at the hubs."
+      },
+      "29,9": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (29, 9). The interstates skirt the worst of the passes."
+      },
+      "29,10": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (29, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "29,11": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (29, 11). The interstates skirt the worst of the passes."
+      },
+      "29,12": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (29, 12). The interstates skirt the worst of the passes."
+      },
+      "29,13": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (29, 13). The interstates skirt the worst of the passes."
+      },
+      "29,14": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (29, 14). Drive the cardinals; cities wait at the hubs."
+      },
+      "29,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (29, 15). Distant highway hum."
+      },
+      "30,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (30, 5). Distant highway hum."
+      },
+      "30,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "+",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10, I-25 cuts the continent. Mile marker faded at (30, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "30,7": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (30, 7). The interstates skirt the worst of the passes."
+      },
+      "30,8": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (30, 8). The interstates skirt the worst of the passes."
+      },
+      "30,9": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (30, 9). The interstates skirt the worst of the passes."
+      },
+      "30,10": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (30, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "30,11": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (30, 11). The interstates skirt the worst of the passes."
+      },
+      "30,12": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (30, 12). The interstates skirt the worst of the passes."
+      },
+      "30,13": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (30, 13). The interstates skirt the worst of the passes."
+      },
+      "30,14": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (30, 14). Drive the cardinals; cities wait at the hubs."
+      },
+      "30,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (30, 15). Distant highway hum."
+      },
+      "31,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (31, 5). Distant highway hum."
+      },
+      "31,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (31, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "31,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (31, 7). Distant highway hum."
+      },
+      "31,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (31, 8). Distant highway hum."
+      },
+      "31,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (31, 9). Distant highway hum."
+      },
+      "31,10": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (31, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "31,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (31, 11). Distant highway hum."
+      },
+      "31,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (31, 12). Distant highway hum."
+      },
+      "31,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (31, 13). Distant highway hum."
+      },
+      "31,14": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (31, 14). Drive the cardinals; cities wait at the hubs."
+      },
+      "31,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (31, 15). Distant highway hum."
+      },
+      "32,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (32, 5). Distant highway hum."
+      },
+      "32,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (32, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "32,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (32, 7). Distant highway hum."
+      },
+      "32,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (32, 8). Distant highway hum."
+      },
+      "32,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (32, 9). Distant highway hum."
+      },
+      "32,10": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (32, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "32,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (32, 11). Distant highway hum."
+      },
+      "32,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (32, 12). Distant highway hum."
+      },
+      "32,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (32, 13). Distant highway hum."
+      },
+      "32,14": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (32, 14). Drive the cardinals; cities wait at the hubs."
+      },
+      "32,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (32, 15). Distant highway hum."
+      },
+      "33,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (33, 4). Distant highway hum."
+      },
+      "33,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (33, 5). Distant highway hum."
+      },
+      "33,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (33, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "33,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (33, 7). Distant highway hum."
+      },
+      "33,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (33, 8). Distant highway hum."
+      },
+      "33,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (33, 9). Distant highway hum."
+      },
+      "33,10": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (33, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "33,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (33, 11). Distant highway hum."
+      },
+      "33,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (33, 12). Distant highway hum."
+      },
+      "33,13": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (33, 13). Drive the cardinals; cities wait at the hubs."
+      },
+      "33,14": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-35 cuts the continent. Mile marker faded at (33, 14). Drive the cardinals; cities wait at the hubs."
+      },
+      "33,15": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-35 cuts the continent. Mile marker faded at (33, 15). Drive the cardinals; cities wait at the hubs."
+      },
+      "34,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (34, 4). Distant highway hum."
+      },
+      "34,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (34, 5). Distant highway hum."
+      },
+      "34,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (34, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "34,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (34, 7). Distant highway hum."
+      },
+      "34,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (34, 8). Distant highway hum."
+      },
+      "34,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (34, 9). Distant highway hum."
+      },
+      "34,10": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (34, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "34,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (34, 11). Distant highway hum."
+      },
+      "34,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-35 cuts the continent. Mile marker faded at (34, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "34,13": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "+",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-35, I-90 cuts the continent. Mile marker faded at (34, 13). Drive the cardinals; cities wait at the hubs."
+      },
+      "34,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (34, 14). Distant highway hum."
+      },
+      "34,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (34, 15). Distant highway hum."
+      },
+      "35,3": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (35, 3). Distant highway hum."
+      },
+      "35,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (35, 4). Distant highway hum."
+      },
+      "35,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (35, 5). Distant highway hum."
+      },
+      "35,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (35, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "35,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (35, 7). Distant highway hum."
+      },
+      "35,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (35, 8). Distant highway hum."
+      },
+      "35,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (35, 9). Distant highway hum."
+      },
+      "35,10": {
+        "area_type": "city",
+        "title": "Lebanon Approach",
+        "description": "Kansas-flat horizon, grain elevators, and a faded Lebanon mile-marker. Hunter country -- geographic center of the contiguous US. Type enter lebanon to step onto the southern highway into town. Coordinates (35, 10).",
+        "wilderness": false,
+        "map_glyph": "*",
+        "map_layer": "city"
+      },
+      "35,11": {
+        "area_type": "plains",
+        "title": "Bunker Access Road",
+        "description": "A gravel spur just north of Lebanon, Kansas. A Men of Letters seal is weathered into a concrete lintel half-sunk in the berm. Type enter bunker to go in; south is the Lebanon approach. From town, Main Street north reaches the same Gatehouse via the access spur. Coordinates (35, 11).",
+        "wilderness": false,
+        "map_glyph": "B",
+        "map_layer": "city"
+      },
+      "35,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (35, 12). Distant highway hum."
+      },
+      "35,13": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (35, 13). Drive the cardinals; cities wait at the hubs."
+      },
+      "35,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (35, 14). Distant highway hum."
+      },
+      "35,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (35, 15). Distant highway hum."
+      },
+      "36,3": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (36, 3). Distant highway hum."
+      },
+      "36,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (36, 4). Distant highway hum."
+      },
+      "36,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (36, 5). Distant highway hum."
+      },
+      "36,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (36, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "36,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (36, 7). Distant highway hum."
+      },
+      "36,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (36, 8). Distant highway hum."
+      },
+      "36,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "\\",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-35 cuts the continent. Mile marker faded at (36, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "36,10": {
+        "area_type": "plains",
+        "title": "Outskirts Approach",
+        "description": "Monument road just east of Lebanon -- leyline hum under the trees. Type enter outskirts for the charter strip; exit returns here. Coordinates (36, 10).",
+        "map_glyph": "=",
+        "map_layer": "highway"
+      },
+      "36,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (36, 11). Distant highway hum."
+      },
+      "36,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (36, 12). Distant highway hum."
+      },
+      "36,13": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (36, 13). Drive the cardinals; cities wait at the hubs."
+      },
+      "36,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (36, 14). Distant highway hum."
+      },
+      "36,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (36, 15). Distant highway hum."
+      },
+      "37,3": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (37, 3). Distant highway hum."
+      },
+      "37,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (37, 4). Distant highway hum."
+      },
+      "37,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (37, 5). Distant highway hum."
+      },
+      "37,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (37, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "37,7": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-35 cuts the continent. Mile marker faded at (37, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "37,8": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-35 cuts the continent. Mile marker faded at (37, 8). Drive the cardinals; cities wait at the hubs."
+      },
+      "37,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (37, 9). Distant highway hum."
+      },
+      "37,10": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (37, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "37,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (37, 11). Distant highway hum."
+      },
+      "37,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (37, 12). Distant highway hum."
+      },
+      "37,13": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (37, 13). Drive the cardinals; cities wait at the hubs."
+      },
+      "37,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (37, 14). Distant highway hum."
+      },
+      "37,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (37, 15). Distant highway hum."
+      },
+      "38,3": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (38, 3). Distant highway hum."
+      },
+      "38,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (38, 4). Distant highway hum."
+      },
+      "38,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (38, 5). Distant highway hum."
+      },
+      "38,6": {
+        "area_type": "city",
+        "title": "Dallas Approach",
+        "description": "Hot flatland and highway glare. Type enter dallas for the metro strip. Coordinates (38, 6).",
+        "wilderness": false,
+        "map_glyph": "X",
+        "map_layer": "city"
+      },
+      "38,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (38, 7). Distant highway hum."
+      },
+      "38,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (38, 8). Distant highway hum."
+      },
+      "38,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (38, 9). Distant highway hum."
+      },
+      "38,10": {
+        "area_type": "city",
+        "title": "Lawrence Approach",
+        "description": "College-town brick and a faint bruise in the eastern sky toward Stull. Hunter country after the near-Apocalypse. Type enter lawrence for the southern Massachusetts Street highway into town. Coordinates (38, 10).",
+        "wilderness": false,
+        "map_glyph": "W",
+        "map_layer": "city"
+      },
+      "38,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (38, 11). Distant highway hum."
+      },
+      "38,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (38, 12). Distant highway hum."
+      },
+      "38,13": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (38, 13). Drive the cardinals; cities wait at the hubs."
+      },
+      "38,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (38, 14). Distant highway hum."
+      },
+      "38,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (38, 15). Distant highway hum."
+      },
+      "39,3": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (39, 3). Distant highway hum."
+      },
+      "39,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (39, 4). Distant highway hum."
+      },
+      "39,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (39, 5). Distant highway hum."
+      },
+      "39,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (39, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "39,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (39, 7). Distant highway hum."
+      },
+      "39,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (39, 8). Distant highway hum."
+      },
+      "39,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (39, 9). Distant highway hum."
+      },
+      "39,10": {
+        "area_type": "plains",
+        "title": "Stull Approach",
+        "description": "Bruised sky near Stull and Clinton Lake, just outside Lawrence. Type enter stull for the charter strip, or walk west from Lawrence's Stull Gate Road into town; exit returns here. Coordinates (39, 10).",
+        "map_glyph": "=",
+        "map_layer": "highway"
+      },
+      "39,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (39, 11). Distant highway hum."
+      },
+      "39,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (39, 12). Distant highway hum."
+      },
+      "39,13": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (39, 13). Drive the cardinals; cities wait at the hubs."
+      },
+      "39,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (39, 14). Distant highway hum."
+      },
+      "39,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (39, 15). Distant highway hum."
+      },
+      "40,3": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (40, 3). Distant highway hum."
+      },
+      "40,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (40, 4). Distant highway hum."
+      },
+      "40,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (40, 5). Distant highway hum."
+      },
+      "40,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (40, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "40,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (40, 7). Distant highway hum."
+      },
+      "40,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (40, 8). Distant highway hum."
+      },
+      "40,9": {
+        "area_type": "plains",
+        "title": "Carthage Approach",
+        "description": "Mass-grave earth stains the wind outside Carthage. Type enter reaper for the dirt strip; exit returns here. Coordinates (40, 9).",
+        "map_glyph": "=",
+        "map_layer": "highway"
+      },
+      "40,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (40, 10). Distant highway hum."
+      },
+      "40,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (40, 11). Distant highway hum."
+      },
+      "40,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (40, 12). Distant highway hum."
+      },
+      "40,13": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (40, 13). Drive the cardinals; cities wait at the hubs."
+      },
+      "40,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (40, 14). Distant highway hum."
+      },
+      "40,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (40, 15). Distant highway hum."
+      },
+      "41,3": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (41, 3). Distant highway hum."
+      },
+      "41,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (41, 4). Distant highway hum."
+      },
+      "41,5": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (41, 5). Drive the cardinals; cities wait at the hubs."
+      },
+      "41,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (41, 6). Distant highway hum."
+      },
+      "41,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (41, 7). Distant highway hum."
+      },
+      "41,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (41, 8). Distant highway hum."
+      },
+      "41,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (41, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "41,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (41, 10). Distant highway hum."
+      },
+      "41,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (41, 11). Distant highway hum."
+      },
+      "41,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (41, 12). Distant highway hum."
+      },
+      "41,13": {
+        "area_type": "plains",
+        "title": "Parish Approach",
+        "description": "Smoke hangs over Pastor Jim's church outside Blue Earth. Type enter parish for the dirt strip; exit returns here. Coordinates (41, 13).",
+        "map_glyph": "=",
+        "map_layer": "highway"
+      },
+      "41,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (41, 14). Distant highway hum."
+      },
+      "41,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (41, 15). Distant highway hum."
+      },
+      "42,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (42, 4). Distant highway hum."
+      },
+      "42,5": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (42, 5). Drive the cardinals; cities wait at the hubs."
+      },
+      "42,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (42, 6). Distant highway hum."
+      },
+      "42,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (42, 7). Distant highway hum."
+      },
+      "42,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (42, 8). Distant highway hum."
+      },
+      "42,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (42, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "42,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (42, 10). Distant highway hum."
+      },
+      "42,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (42, 11). Distant highway hum."
+      },
+      "42,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (42, 12). Distant highway hum."
+      },
+      "42,13": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (42, 13). Drive the cardinals; cities wait at the hubs."
+      },
+      "42,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (42, 14). Distant highway hum."
+      },
+      "42,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (42, 15). Distant highway hum."
+      },
+      "43,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (43, 4). Distant highway hum."
+      },
+      "43,5": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (43, 5). Drive the cardinals; cities wait at the hubs."
+      },
+      "43,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (43, 7). Distant highway hum."
+      },
+      "43,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (43, 8). Distant highway hum."
+      },
+      "43,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (43, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "43,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (43, 10). Distant highway hum."
+      },
+      "43,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (43, 11). Distant highway hum."
+      },
+      "43,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (43, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "43,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (43, 13). Distant highway hum."
+      },
+      "43,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (43, 14). Distant highway hum."
+      },
+      "43,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (43, 15). Distant highway hum."
+      },
+      "44,5": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (44, 5). Drive the cardinals; cities wait at the hubs."
+      },
+      "44,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (44, 7). Distant highway hum."
+      },
+      "44,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (44, 8). Distant highway hum."
+      },
+      "44,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (44, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "44,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (44, 10). Distant highway hum."
+      },
+      "44,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (44, 11). Distant highway hum."
+      },
+      "44,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (44, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "44,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (44, 13). Distant highway hum."
+      },
+      "44,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (44, 14). Distant highway hum."
+      },
+      "44,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (44, 15). Distant highway hum."
+      },
+      "45,5": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (45, 5). Drive the cardinals; cities wait at the hubs."
+      },
+      "45,7": {
+        "area_type": "plains",
+        "title": "Lloyd's Approach",
+        "description": "Twin dirt roads cross beyond the weeds outside Greenwood. Type enter lloyds for the dusty strip; exit returns here. Coordinates (45, 7)."
+      },
+      "45,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (45, 8). Distant highway hum."
+      },
+      "45,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (45, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "45,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (45, 10). Distant highway hum."
+      },
+      "45,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (45, 11). Distant highway hum."
+      },
+      "45,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (45, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "45,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (45, 13). Distant highway hum."
+      },
+      "45,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (45, 14). Distant highway hum."
+      },
+      "45,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (45, 15). Distant highway hum."
+      },
+      "46,5": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (46, 5). Drive the cardinals; cities wait at the hubs."
+      },
+      "46,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (46, 7). Distant highway hum."
+      },
+      "46,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (46, 8). Distant highway hum."
+      },
+      "46,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (46, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "46,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (46, 10). Distant highway hum."
+      },
+      "46,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (46, 11). Distant highway hum."
+      },
+      "46,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (46, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "46,13": {
+        "area_type": "lake",
+        "description": "Freshwater glare -- Great Lakes country at (46, 13)."
+      },
+      "46,14": {
+        "area_type": "lake",
+        "description": "Freshwater glare -- Great Lakes country at (46, 14)."
+      },
+      "46,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (46, 15). Distant highway hum."
+      },
+      "47,5": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (47, 5). Drive the cardinals; cities wait at the hubs."
+      },
+      "47,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (47, 7). Distant highway hum."
+      },
+      "47,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (47, 8). Distant highway hum."
+      },
+      "47,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (47, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "47,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (47, 10). Distant highway hum."
+      },
+      "47,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (47, 11). Distant highway hum."
+      },
+      "47,12": {
+        "area_type": "plains",
+        "title": "Asylum Approach",
+        "description": "A rain-rotted drive and rusted gates mark Roosevelt Asylum outside Rockford. Type enter asylum to step onto the dirt strip; exit returns here. Coordinates (47, 12).",
+        "map_glyph": "=",
+        "map_layer": "highway"
+      },
+      "47,13": {
+        "area_type": "lake",
+        "description": "Freshwater glare -- Great Lakes country at (47, 13)."
+      },
+      "47,14": {
+        "area_type": "lake",
+        "description": "Freshwater glare -- Great Lakes country at (47, 14)."
+      },
+      "47,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (47, 15). Distant highway hum."
+      },
+      "48,5": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (48, 5). Drive the cardinals; cities wait at the hubs."
+      },
+      "48,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (48, 7). Distant highway hum."
+      },
+      "48,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (48, 8). Distant highway hum."
+      },
+      "48,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (48, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "48,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (48, 10). Distant highway hum."
+      },
+      "48,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (48, 11). Distant highway hum."
+      },
+      "48,12": {
+        "area_type": "city",
+        "title": "Chicago Approach",
+        "description": "Lake wind cuts the skyline haze. Type enter chicago for the lakeshore strip. Coordinates (48, 12).",
+        "wilderness": false,
+        "map_glyph": "C",
+        "map_layer": "city"
+      },
+      "48,13": {
+        "area_type": "lake",
+        "description": "Freshwater glare -- Great Lakes country at (48, 13)."
+      },
+      "48,14": {
+        "area_type": "lake",
+        "description": "Freshwater glare -- Great Lakes country at (48, 14)."
+      },
+      "48,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (48, 15). Distant highway hum."
+      },
+      "49,5": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (49, 5). Drive the cardinals; cities wait at the hubs."
+      },
+      "49,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (49, 6). Distant highway hum."
+      },
+      "49,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (49, 7). Distant highway hum."
+      },
+      "49,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (49, 8). Distant highway hum."
+      },
+      "49,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (49, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "49,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (49, 10). Distant highway hum."
+      },
+      "49,11": {
+        "area_type": "plains",
+        "title": "Mafia Pier Approach",
+        "description": "Freight pier fog just off Chicago's lakeshore. Type enter mafia for the underground drop; exit returns here. Coordinates (49, 11)."
+      },
+      "49,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (49, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "49,13": {
+        "area_type": "lake",
+        "description": "Freshwater glare -- Great Lakes country at (49, 13)."
+      },
+      "49,14": {
+        "area_type": "lake",
+        "description": "Freshwater glare -- Great Lakes country at (49, 14)."
+      },
+      "49,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (49, 15). Distant highway hum."
+      },
+      "50,5": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (50, 5). Drive the cardinals; cities wait at the hubs."
+      },
+      "50,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (50, 6). Distant highway hum."
+      },
+      "50,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (50, 7). Distant highway hum."
+      },
+      "50,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (50, 8). Distant highway hum."
+      },
+      "50,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (50, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "50,10": {
+        "area_type": "plains",
+        "title": "Orchard Approach",
+        "description": "Corn country and a painted orchard sign outside Burkitsville. Type enter orchard for the gravel strip; exit returns here. Coordinates (50, 10)."
+      },
+      "50,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (50, 11). Distant highway hum."
+      },
+      "50,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (50, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "50,13": {
+        "area_type": "lake",
+        "description": "Freshwater glare -- Great Lakes country at (50, 13)."
+      },
+      "50,14": {
+        "area_type": "lake",
+        "description": "Freshwater glare -- Great Lakes country at (50, 14)."
+      },
+      "50,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (50, 15). Distant highway hum."
+      },
+      "51,5": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (51, 5). Drive the cardinals; cities wait at the hubs."
+      },
+      "51,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (51, 6). Distant highway hum."
+      },
+      "51,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (51, 7). Distant highway hum."
+      },
+      "51,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (51, 8). Distant highway hum."
+      },
+      "51,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (51, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "51,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (51, 10). Distant highway hum."
+      },
+      "51,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (51, 11). Distant highway hum."
+      },
+      "51,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (51, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "51,13": {
+        "area_type": "lake",
+        "description": "Freshwater glare -- Great Lakes country at (51, 13)."
+      },
+      "51,14": {
+        "area_type": "lake",
+        "description": "Freshwater glare -- Great Lakes country at (51, 14)."
+      },
+      "51,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (51, 15). Distant highway hum."
+      },
+      "52,5": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (52, 5). Drive the cardinals; cities wait at the hubs."
+      },
+      "52,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (52, 6). Distant highway hum."
+      },
+      "52,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (52, 7). Distant highway hum."
+      },
+      "52,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (52, 8). Distant highway hum."
+      },
+      "52,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (52, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "52,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (52, 10). Distant highway hum."
+      },
+      "52,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (52, 11). Distant highway hum."
+      },
+      "52,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (52, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "52,13": {
+        "area_type": "lake",
+        "description": "Freshwater glare -- Great Lakes country at (52, 13)."
+      },
+      "52,14": {
+        "area_type": "lake",
+        "description": "Freshwater glare -- Great Lakes country at (52, 14)."
+      },
+      "52,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (52, 15). Distant highway hum."
+      },
+      "53,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (53, 4). Distant highway hum."
+      },
+      "53,5": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (53, 5). Drive the cardinals; cities wait at the hubs."
+      },
+      "53,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (53, 6). Distant highway hum."
+      },
+      "53,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (53, 7). Distant highway hum."
+      },
+      "53,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (53, 8). Distant highway hum."
+      },
+      "53,9": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (53, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "53,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (53, 10). Distant highway hum."
+      },
+      "53,11": {
+        "area_type": "plains",
+        "title": "Mirror Approach",
+        "description": "Glass glitter in the gutters of Toledo's antique district. Type enter mirror for the charter strip; exit returns here. Coordinates (53, 11)."
+      },
+      "53,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (53, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "53,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (53, 13). Distant highway hum."
+      },
+      "53,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (53, 14). Distant highway hum."
+      },
+      "53,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (53, 15). Distant highway hum."
+      },
+      "54,3": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (54, 3). Distant highway hum."
+      },
+      "54,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (54, 4). Distant highway hum."
+      },
+      "54,5": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (54, 5). Drive the cardinals; cities wait at the hubs."
+      },
+      "54,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (54, 6). Distant highway hum."
+      },
+      "54,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (54, 7). Distant highway hum."
+      },
+      "54,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (54, 8). Distant highway hum."
+      },
+      "54,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (54, 9). Distant highway hum."
+      },
+      "54,10": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (54, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "54,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (54, 11). Distant highway hum."
+      },
+      "54,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (54, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "54,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (54, 13). Distant highway hum."
+      },
+      "54,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (54, 14). Distant highway hum."
+      },
+      "54,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (54, 15). Distant highway hum."
+      },
+      "55,2": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (55, 2). Distant highway hum."
+      },
+      "55,3": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (55, 3). Distant highway hum."
+      },
+      "55,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (55, 4). Distant highway hum."
+      },
+      "55,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (55, 5). Distant highway hum."
+      },
+      "55,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (55, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "55,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (55, 7). Distant highway hum."
+      },
+      "55,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (55, 8). Distant highway hum."
+      },
+      "55,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (55, 9). Distant highway hum."
+      },
+      "55,10": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (55, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "55,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (55, 11). Distant highway hum."
+      },
+      "55,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (55, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "55,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (55, 13). Distant highway hum."
+      },
+      "55,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (55, 14). Distant highway hum."
+      },
+      "55,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (55, 15). Distant highway hum."
+      },
+      "56,1": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (56, 1). Distant highway hum."
+      },
+      "56,2": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (56, 2). Distant highway hum."
+      },
+      "56,3": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (56, 3). Distant highway hum."
+      },
+      "56,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (56, 4). Distant highway hum."
+      },
+      "56,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (56, 5). Distant highway hum."
+      },
+      "56,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (56, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "56,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (56, 7). Distant highway hum."
+      },
+      "56,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (56, 8). Distant highway hum."
+      },
+      "56,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (56, 9). Distant highway hum."
+      },
+      "56,10": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (56, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "56,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (56, 11). Distant highway hum."
+      },
+      "56,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (56, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "56,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (56, 13). Distant highway hum."
+      },
+      "56,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (56, 14). Distant highway hum."
+      },
+      "56,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (56, 15). Distant highway hum."
+      },
+      "57,1": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (57, 1). Distant highway hum."
+      },
+      "57,2": {
+        "area_type": "city",
+        "title": "Miami Approach",
+        "description": "Warm salt air and flat coastal light. Type enter miami for the peninsula strip. Coordinates (57, 2).",
+        "wilderness": false,
+        "map_glyph": "M",
+        "map_layer": "city"
+      },
+      "57,3": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (57, 3). Distant highway hum."
+      },
+      "57,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (57, 4). Distant highway hum."
+      },
+      "57,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (57, 5). Distant highway hum."
+      },
+      "57,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (57, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "57,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (57, 7). Distant highway hum."
+      },
+      "57,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (57, 8). Distant highway hum."
+      },
+      "57,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (57, 9). Distant highway hum."
+      },
+      "57,10": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (57, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "57,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (57, 11). Distant highway hum."
+      },
+      "57,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (57, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "57,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (57, 13). Distant highway hum."
+      },
+      "57,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (57, 14). Distant highway hum."
+      },
+      "57,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (57, 15). Distant highway hum."
+      },
+      "58,1": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (58, 1). Distant highway hum."
+      },
+      "58,2": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (58, 2). Distant highway hum."
+      },
+      "58,3": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-95 cuts the continent. Mile marker faded at (58, 3). Drive the cardinals; cities wait at the hubs."
+      },
+      "58,4": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "|",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-95 cuts the continent. Mile marker faded at (58, 4). Drive the cardinals; cities wait at the hubs."
+      },
+      "58,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (58, 5). Distant highway hum."
+      },
+      "58,6": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (58, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "58,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (58, 7). Distant highway hum."
+      },
+      "58,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (58, 8). Distant highway hum."
+      },
+      "58,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (58, 9). Distant highway hum."
+      },
+      "58,10": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (58, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "58,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (58, 11). Distant highway hum."
+      },
+      "58,12": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (58, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "58,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (58, 13). Distant highway hum."
+      },
+      "58,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (58, 14). Distant highway hum."
+      },
+      "58,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (58, 15). Distant highway hum."
+      },
+      "59,2": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (59, 2). Distant highway hum."
+      },
+      "59,3": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (59, 3). Distant highway hum."
+      },
+      "59,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (59, 4). Distant highway hum."
+      },
+      "59,5": {
+        "area_type": "forest",
+        "title": "Highway",
+        "map_glyph": "/",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-95 cuts the continent. Mile marker faded at (59, 5). Drive the cardinals; cities wait at the hubs."
+      },
+      "59,6": {
+        "area_type": "forest",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (59, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "59,7": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (59, 7). Good country to lose a tail -- or a body."
+      },
+      "59,8": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (59, 8). The interstates skirt the worst of the passes."
+      },
+      "59,9": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (59, 9). The interstates skirt the worst of the passes."
+      },
+      "59,10": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (59, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "59,11": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (59, 11). The interstates skirt the worst of the passes."
+      },
+      "59,12": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (59, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "59,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (59, 13). Distant highway hum."
+      },
+      "59,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (59, 14). Distant highway hum."
+      },
+      "60,3": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (60, 3). Distant highway hum."
+      },
+      "60,4": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (60, 4). Distant highway hum."
+      },
+      "60,5": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (60, 5). Good country to lose a tail -- or a body."
+      },
+      "60,6": {
+        "area_type": "forest",
+        "title": "Highway",
+        "map_glyph": "/",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-95 cuts the continent. Mile marker faded at (60, 6). Drive the cardinals; cities wait at the hubs."
+      },
+      "60,7": {
+        "area_type": "forest",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (60, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "60,8": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (60, 8). The interstates skirt the worst of the passes."
+      },
+      "60,9": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (60, 9). The interstates skirt the worst of the passes."
+      },
+      "60,10": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (60, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "60,11": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (60, 11). The interstates skirt the worst of the passes."
+      },
+      "60,12": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (60, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "60,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (60, 13). Distant highway hum."
+      },
+      "60,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (60, 14). Distant highway hum."
+      },
+      "61,5": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (61, 5). Good country to lose a tail -- or a body."
+      },
+      "61,6": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (61, 6). Good country to lose a tail -- or a body."
+      },
+      "61,7": {
+        "area_type": "forest",
+        "title": "Highway",
+        "map_glyph": "+",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-10, I-95 cuts the continent. Mile marker faded at (61, 7). Drive the cardinals; cities wait at the hubs."
+      },
+      "61,8": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (61, 8). The interstates skirt the worst of the passes."
+      },
+      "61,9": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (61, 9). The interstates skirt the worst of the passes."
+      },
+      "61,10": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-70 cuts the continent. Mile marker faded at (61, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "61,11": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-90 cuts the continent. Mile marker faded at (61, 11). Drive the cardinals; cities wait at the hubs."
+      },
+      "61,12": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (61, 12). The interstates skirt the worst of the passes."
+      },
+      "61,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (61, 13). Distant highway hum."
+      },
+      "62,5": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (62, 5). Good country to lose a tail -- or a body."
+      },
+      "62,6": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (62, 6). Good country to lose a tail -- or a body."
+      },
+      "62,7": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (62, 7). Good country to lose a tail -- or a body."
+      },
+      "62,8": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "+",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-10, I-95 cuts the continent. Mile marker faded at (62, 8). Drive the cardinals; cities wait at the hubs."
+      },
+      "62,9": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (62, 9). The interstates skirt the worst of the passes."
+      },
+      "62,10": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (62, 10). The interstates skirt the worst of the passes."
+      },
+      "62,11": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-70, I-90 cuts the continent. Mile marker faded at (62, 11). Drive the cardinals; cities wait at the hubs."
+      },
+      "62,12": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (62, 12). The interstates skirt the worst of the passes."
+      },
+      "62,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (62, 13). Distant highway hum."
+      },
+      "62,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (62, 15). Distant highway hum."
+      },
+      "63,5": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (63, 5). Good country to lose a tail -- or a body."
+      },
+      "63,6": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (63, 6). Good country to lose a tail -- or a body."
+      },
+      "63,7": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (63, 7). Good country to lose a tail -- or a body."
+      },
+      "63,8": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-10 cuts the continent. Mile marker faded at (63, 8). Drive the cardinals; cities wait at the hubs."
+      },
+      "63,9": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "/",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-95 cuts the continent. Mile marker faded at (63, 9). Drive the cardinals; cities wait at the hubs."
+      },
+      "63,10": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (63, 10). The interstates skirt the worst of the passes."
+      },
+      "63,11": {
+        "area_type": "mountains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "mountain_highway",
+        "description": "Asphalt ribbon of I-70, I-90 cuts the continent. Mile marker faded at (63, 11). Drive the cardinals; cities wait at the hubs."
+      },
+      "63,12": {
+        "area_type": "mountains",
+        "description": "High rock and thin air at (63, 12). The interstates skirt the worst of the passes."
+      },
+      "63,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (63, 13). Distant highway hum."
+      },
+      "63,14": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (63, 14). Distant highway hum."
+      },
+      "63,15": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (63, 15). Distant highway hum."
+      },
+      "64,5": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (64, 5). Good country to lose a tail -- or a body."
+      },
+      "64,6": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (64, 6). Good country to lose a tail -- or a body."
+      },
+      "64,7": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (64, 7). Good country to lose a tail -- or a body."
+      },
+      "64,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (64, 8). Distant highway hum."
+      },
+      "64,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (64, 9). Distant highway hum."
+      },
+      "64,10": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "/",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-95 cuts the continent. Mile marker faded at (64, 10). Drive the cardinals; cities wait at the hubs."
+      },
+      "64,11": {
+        "area_type": "plains",
+        "title": "Highway",
+        "map_glyph": "=",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-70, I-90 cuts the continent. Mile marker faded at (64, 11). Drive the cardinals; cities wait at the hubs."
+      },
+      "64,12": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (64, 12). Good country to lose a tail -- or a body."
+      },
+      "64,13": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (64, 13). Good country to lose a tail -- or a body."
+      },
+      "64,14": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (64, 14). Good country to lose a tail -- or a body."
+      },
+      "64,15": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (64, 15). Good country to lose a tail -- or a body."
+      },
+      "65,5": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (65, 5). Good country to lose a tail -- or a body."
+      },
+      "65,6": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (65, 6). Good country to lose a tail -- or a body."
+      },
+      "65,7": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (65, 7). Good country to lose a tail -- or a body."
+      },
+      "65,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (65, 8). Distant highway hum."
+      },
+      "65,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (65, 9). Distant highway hum."
+      },
+      "65,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (65, 10). Distant highway hum."
+      },
+      "65,11": {
+        "area_type": "city",
+        "title": "New York Approach",
+        "description": "Atlantic haze and stacked approaches. Type enter nyc for the east-coast strip. Coordinates (65, 11).",
+        "wilderness": false,
+        "map_glyph": "N",
+        "map_layer": "city"
+      },
+      "65,12": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (65, 12). Good country to lose a tail -- or a body."
+      },
+      "65,13": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (65, 13). Good country to lose a tail -- or a body."
+      },
+      "65,14": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (65, 14). Good country to lose a tail -- or a body."
+      },
+      "65,15": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (65, 15). Good country to lose a tail -- or a body."
+      },
+      "66,5": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (66, 5). Distant highway hum."
+      },
+      "66,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (66, 6). Distant highway hum."
+      },
+      "66,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (66, 7). Distant highway hum."
+      },
+      "66,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (66, 8). Distant highway hum."
+      },
+      "66,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (66, 9). Distant highway hum."
+      },
+      "66,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (66, 10). Distant highway hum."
+      },
+      "66,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (66, 11). Distant highway hum."
+      },
+      "66,12": {
+        "area_type": "forest",
+        "title": "Highway",
+        "map_glyph": "/",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-95 cuts the continent. Mile marker faded at (66, 12). Drive the cardinals; cities wait at the hubs."
+      },
+      "66,13": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (66, 13). Good country to lose a tail -- or a body."
+      },
+      "66,14": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (66, 14). Good country to lose a tail -- or a body."
+      },
+      "66,15": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (66, 15). Good country to lose a tail -- or a body."
+      },
+      "67,6": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (67, 6). Distant highway hum."
+      },
+      "67,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (67, 7). Distant highway hum."
+      },
+      "67,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (67, 8). Distant highway hum."
+      },
+      "67,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (67, 9). Distant highway hum."
+      },
+      "67,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (67, 10). Distant highway hum."
+      },
+      "67,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (67, 11). Distant highway hum."
+      },
+      "67,12": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (67, 12). Good country to lose a tail -- or a body."
+      },
+      "67,13": {
+        "area_type": "forest",
+        "title": "Highway",
+        "map_glyph": "/",
+        "map_layer": "highway",
+        "description": "Asphalt ribbon of I-95 cuts the continent. Mile marker faded at (67, 13). Drive the cardinals; cities wait at the hubs."
+      },
+      "67,14": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (67, 14). Good country to lose a tail -- or a body."
+      },
+      "67,15": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (67, 15). Good country to lose a tail -- or a body."
+      },
+      "68,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (68, 7). Distant highway hum."
+      },
+      "68,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (68, 8). Distant highway hum."
+      },
+      "68,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (68, 9). Distant highway hum."
+      },
+      "68,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (68, 10). Distant highway hum."
+      },
+      "68,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (68, 11). Distant highway hum."
+      },
+      "68,12": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (68, 12). Good country to lose a tail -- or a body."
+      },
+      "68,13": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (68, 13). Good country to lose a tail -- or a body."
+      },
+      "68,14": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (68, 14). Good country to lose a tail -- or a body."
+      },
+      "68,15": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (68, 15). Good country to lose a tail -- or a body."
+      },
+      "69,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (69, 7). Distant highway hum."
+      },
+      "69,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (69, 8). Distant highway hum."
+      },
+      "69,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (69, 9). Distant highway hum."
+      },
+      "69,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (69, 10). Distant highway hum."
+      },
+      "69,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (69, 11). Distant highway hum."
+      },
+      "69,12": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (69, 12). Good country to lose a tail -- or a body."
+      },
+      "69,13": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (69, 13). Good country to lose a tail -- or a body."
+      },
+      "69,14": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (69, 14). Good country to lose a tail -- or a body."
+      },
+      "69,15": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (69, 15). Good country to lose a tail -- or a body."
+      },
+      "70,7": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (70, 7). Distant highway hum."
+      },
+      "70,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (70, 8). Distant highway hum."
+      },
+      "70,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (70, 9). Distant highway hum."
+      },
+      "70,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (70, 10). Distant highway hum."
+      },
+      "70,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (70, 11). Distant highway hum."
+      },
+      "70,12": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (70, 12). Good country to lose a tail -- or a body."
+      },
+      "70,13": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (70, 13). Good country to lose a tail -- or a body."
+      },
+      "70,14": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (70, 14). Good country to lose a tail -- or a body."
+      },
+      "70,15": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (70, 15). Good country to lose a tail -- or a body."
+      },
+      "71,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (71, 8). Distant highway hum."
+      },
+      "71,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (71, 9). Distant highway hum."
+      },
+      "71,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (71, 10). Distant highway hum."
+      },
+      "71,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (71, 11). Distant highway hum."
+      },
+      "71,12": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (71, 12). Good country to lose a tail -- or a body."
+      },
+      "71,13": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (71, 13). Good country to lose a tail -- or a body."
+      },
+      "71,14": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (71, 14). Good country to lose a tail -- or a body."
+      },
+      "72,8": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (72, 8). Distant highway hum."
+      },
+      "72,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (72, 9). Distant highway hum."
+      },
+      "72,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (72, 10). Distant highway hum."
+      },
+      "72,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (72, 11). Distant highway hum."
+      },
+      "72,12": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (72, 12). Good country to lose a tail -- or a body."
+      },
+      "72,13": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (72, 13). Good country to lose a tail -- or a body."
+      },
+      "72,14": {
+        "area_type": "forest",
+        "description": "Deep timber crowds the shoulder at (72, 14). Good country to lose a tail -- or a body."
+      },
+      "73,9": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (73, 9). Distant highway hum."
+      },
+      "73,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (73, 10). Distant highway hum."
+      },
+      "73,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (73, 11). Distant highway hum."
+      },
+      "73,12": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (73, 12). Distant highway hum."
+      },
+      "73,13": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (73, 13). Distant highway hum."
+      },
+      "74,10": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (74, 10). Distant highway hum."
+      },
+      "74,11": {
+        "area_type": "plains",
+        "description": "Open American ground -- fields, scrub, and fence lines at (74, 11). Distant highway hum."
+      }
+    }
+  },
+  "rooms": [
+    {
+      "key": "SP00003",
+      "title": "Seattle Strip",
+      "description": "A short charter strip and idle-rentals lot for Seattle. Future flights and car trips will stage here. Type exit to return to the America overland grid.",
+      "area_type": "city",
+      "zone": "america-seattle",
+      "outdoor": true,
+      "wilderness": false,
+      "exits": {},
+      "vnum": "SP00003",
+      "legacy_key": "Seattle Strip"
+    },
+    {
+      "key": "LP00001",
+      "title": "Los Angeles Strip",
+      "description": "A short charter strip and idle-rentals lot for Los Angeles. Future flights and car trips will stage here. Type exit to return to the America overland grid.",
+      "area_type": "city",
+      "zone": "america-la",
+      "outdoor": true,
+      "wilderness": false,
+      "exits": {},
+      "vnum": "LP00001",
+      "legacy_key": "Los Angeles Strip"
+    },
+    {
+      "key": "DP00002",
+      "title": "Denver Strip",
+      "description": "A short charter strip and idle-rentals lot for Denver. Future flights and car trips will stage here. Type exit to return to the America overland grid.",
+      "area_type": "city",
+      "zone": "america-denver",
+      "outdoor": true,
+      "wilderness": false,
+      "exits": {},
+      "vnum": "DP00002",
+      "legacy_key": "Denver Strip"
+    },
+    {
+      "key": "DP00001",
+      "title": "Dallas Strip",
+      "description": "A short charter strip and idle-rentals lot for Dallas. Future flights and car trips will stage here. Type exit to return to the America overland grid.",
+      "area_type": "city",
+      "zone": "america-dallas",
+      "outdoor": true,
+      "wilderness": false,
+      "exits": {},
+      "vnum": "DP00001",
+      "legacy_key": "Dallas Strip"
+    },
+    {
+      "key": "CP00002",
+      "title": "Chicago Strip",
+      "description": "A short charter strip and idle-rentals lot for Chicago. Future flights and car trips will stage here. Type exit to return to the America overland grid.",
+      "area_type": "city",
+      "zone": "america-chicago",
+      "outdoor": true,
+      "wilderness": false,
+      "exits": {},
+      "vnum": "CP00002",
+      "legacy_key": "Chicago Strip"
+    },
+    {
+      "key": "NP00001",
+      "title": "New York Strip",
+      "description": "A short charter strip and idle-rentals lot for New York. Future flights and car trips will stage here. Type exit to return to the America overland grid.",
+      "area_type": "city",
+      "zone": "america-nyc",
+      "outdoor": true,
+      "wilderness": false,
+      "exits": {},
+      "vnum": "NP00001",
+      "legacy_key": "New York Strip"
+    },
+    {
+      "key": "MP00001",
+      "title": "Miami Strip",
+      "description": "A short charter strip and idle-rentals lot for Miami. Future flights and car trips will stage here. Type exit to return to the America overland grid.",
+      "area_type": "city",
+      "zone": "america-miami",
+      "outdoor": true,
+      "wilderness": false,
+      "exits": {},
+      "vnum": "MP00001",
+      "legacy_key": "America Hub Miami"
+    }
+  ]
+}

@@ -117,7 +117,7 @@ def _copyover_boot_grace_seconds():
 
 
 def reload_auto_deploy():
-    """Reload apply_pr_fix + auto_deploy so disk patches take effect.
+    """Reload apply_pr_fix + deploy_notify + hooks + auto_deploy from disk.
 
     The watcher is long-lived (often PID 1). A one-shot ``from engine.auto_deploy
     import try_auto_deploy`` at boot keeps the pre-patch function forever after
@@ -125,12 +125,22 @@ def reload_auto_deploy():
     disk while feature syncs still wiped Studio / dig JSON.
 
     Reloads ``tools.apply_pr_fix`` first (protect lists), then
+    ``engine.deploy_notify`` and ``engine.hooks`` (batch ``bug_ids`` /
+    ``queue_catchup_resolves`` / map heal must match disk), then
     ``engine.auto_deploy``. Call on every deploy poll.
+
+    Without reloading ``deploy_notify``, a tip-only ``auto_deploy`` reload
+    can call ``queue_deploy(..., bug_ids=...)`` against a stale module and
+    error-loop every poll (reset --hard + protect restore → copyover churn).
     """
     import engine.auto_deploy as auto_deploy
+    import engine.deploy_notify as deploy_notify
+    import engine.hooks as hooks
     import tools.apply_pr_fix as apply_pr_fix
 
     importlib.reload(apply_pr_fix)
+    importlib.reload(deploy_notify)
+    importlib.reload(hooks)
     mod = importlib.reload(auto_deploy)
     return mod
 

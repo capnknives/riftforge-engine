@@ -1,0 +1,2672 @@
+{
+  "_comment": "Derived CONUS climate summary inspired by NOAA/NCEI 1991-2020 climate normals. Not a station archive. Generated 2026-07-21 for RiftForge weather_climatology V1.",
+  "version": 1,
+  "source": "NOAA/NCEI 1991-2020 climate normals (derived summary)",
+  "temp_unit": "F",
+  "regions": {
+    "pacific_nw": {
+      "id": "pacific_nw",
+      "display_name": "Pacific Northwest",
+      "months": [
+        {
+          "month": 1,
+          "tmax_f": 46,
+          "tmin_f": 35,
+          "precip_chance": 0.55,
+          "snow_chance": 0.15,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 2,
+            "cloudy": 4,
+            "fog": 2,
+            "rain": 4,
+            "storm": 1,
+            "snow": 1
+          }
+        },
+        {
+          "month": 2,
+          "tmax_f": 50,
+          "tmin_f": 36,
+          "precip_chance": 0.5,
+          "snow_chance": 0.05,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 2,
+            "cloudy": 4,
+            "fog": 2,
+            "rain": 4,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 3,
+          "tmax_f": 54,
+          "tmin_f": 38,
+          "precip_chance": 0.45,
+          "snow_chance": 0.02,
+          "storm_chance": 0.08,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 2,
+            "rain": 4,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 4,
+          "tmax_f": 59,
+          "tmin_f": 41,
+          "precip_chance": 0.4,
+          "snow_chance": 0,
+          "storm_chance": 0.1,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 4,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 5,
+          "tmax_f": 65,
+          "tmin_f": 46,
+          "precip_chance": 0.3,
+          "snow_chance": 0,
+          "storm_chance": 0.12,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 3,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 6,
+          "tmax_f": 70,
+          "tmin_f": 51,
+          "precip_chance": 0.25,
+          "snow_chance": 0,
+          "storm_chance": 0.1,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 2,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 7,
+          "tmax_f": 76,
+          "tmin_f": 55,
+          "precip_chance": 0.15,
+          "snow_chance": 0,
+          "storm_chance": 0.08,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 6,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 8,
+          "tmax_f": 76,
+          "tmin_f": 55,
+          "precip_chance": 0.15,
+          "snow_chance": 0,
+          "storm_chance": 0.08,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 6,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 9,
+          "tmax_f": 71,
+          "tmin_f": 51,
+          "precip_chance": 0.25,
+          "snow_chance": 0,
+          "storm_chance": 0.08,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 2,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 10,
+          "tmax_f": 60,
+          "tmin_f": 44,
+          "precip_chance": 0.4,
+          "snow_chance": 0.02,
+          "storm_chance": 0.06,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 2,
+            "rain": 4,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 11,
+          "tmax_f": 51,
+          "tmin_f": 39,
+          "precip_chance": 0.55,
+          "snow_chance": 0.08,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 2,
+            "cloudy": 4,
+            "fog": 2,
+            "rain": 4,
+            "storm": 1,
+            "snow": 1
+          }
+        },
+        {
+          "month": 12,
+          "tmax_f": 45,
+          "tmin_f": 35,
+          "precip_chance": 0.6,
+          "snow_chance": 0.15,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 2,
+            "cloudy": 4,
+            "fog": 2,
+            "rain": 4,
+            "storm": 1,
+            "snow": 1
+          }
+        }
+      ]
+    },
+    "california": {
+      "id": "california",
+      "display_name": "California",
+      "months": [
+        {
+          "month": 1,
+          "tmax_f": 68,
+          "tmin_f": 48,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.02,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 2,
+            "storm": 0,
+            "snow": 0
+          }
+        },
+        {
+          "month": 2,
+          "tmax_f": 70,
+          "tmin_f": 50,
+          "precip_chance": 0.3,
+          "snow_chance": 0,
+          "storm_chance": 0.02,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 2,
+            "storm": 0,
+            "snow": 0
+          }
+        },
+        {
+          "month": 3,
+          "tmax_f": 72,
+          "tmin_f": 52,
+          "precip_chance": 0.25,
+          "snow_chance": 0,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 2,
+            "storm": 0,
+            "snow": 0
+          }
+        },
+        {
+          "month": 4,
+          "tmax_f": 75,
+          "tmin_f": 54,
+          "precip_chance": 0.15,
+          "snow_chance": 0,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 6,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 1,
+            "storm": 0,
+            "snow": 0
+          }
+        },
+        {
+          "month": 5,
+          "tmax_f": 78,
+          "tmin_f": 57,
+          "precip_chance": 0.08,
+          "snow_chance": 0,
+          "storm_chance": 0.08,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 7,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 0,
+            "snow": 0
+          }
+        },
+        {
+          "month": 6,
+          "tmax_f": 82,
+          "tmin_f": 60,
+          "precip_chance": 0.02,
+          "snow_chance": 0,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 8,
+            "cloudy": 1,
+            "fog": 0,
+            "rain": 0,
+            "storm": 0,
+            "snow": 0
+          }
+        },
+        {
+          "month": 7,
+          "tmax_f": 86,
+          "tmin_f": 64,
+          "precip_chance": 0.01,
+          "snow_chance": 0,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 8,
+            "cloudy": 1,
+            "fog": 0,
+            "rain": 0,
+            "storm": 0,
+            "snow": 0
+          }
+        },
+        {
+          "month": 8,
+          "tmax_f": 86,
+          "tmin_f": 64,
+          "precip_chance": 0.01,
+          "snow_chance": 0,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 8,
+            "cloudy": 1,
+            "fog": 0,
+            "rain": 0,
+            "storm": 0,
+            "snow": 0
+          }
+        },
+        {
+          "month": 9,
+          "tmax_f": 84,
+          "tmin_f": 62,
+          "precip_chance": 0.05,
+          "snow_chance": 0,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 7,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 0,
+            "snow": 0
+          }
+        },
+        {
+          "month": 10,
+          "tmax_f": 78,
+          "tmin_f": 58,
+          "precip_chance": 0.1,
+          "snow_chance": 0,
+          "storm_chance": 0.03,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 6,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 1,
+            "storm": 0,
+            "snow": 0
+          }
+        },
+        {
+          "month": 11,
+          "tmax_f": 72,
+          "tmin_f": 52,
+          "precip_chance": 0.2,
+          "snow_chance": 0,
+          "storm_chance": 0.02,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 2,
+            "storm": 0,
+            "snow": 0
+          }
+        },
+        {
+          "month": 12,
+          "tmax_f": 67,
+          "tmin_f": 47,
+          "precip_chance": 0.3,
+          "snow_chance": 0,
+          "storm_chance": 0.02,
+          "tornado_chance": 0,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 2,
+            "storm": 0,
+            "snow": 0
+          }
+        }
+      ]
+    },
+    "southwest_desert": {
+      "id": "southwest_desert",
+      "display_name": "Southwest desert",
+      "months": [
+        {
+          "month": 1,
+          "tmax_f": 60,
+          "tmin_f": 35,
+          "precip_chance": 0.15,
+          "snow_chance": 0,
+          "storm_chance": 0.02,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 6,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 0,
+            "snow": 0
+          }
+        },
+        {
+          "month": 2,
+          "tmax_f": 65,
+          "tmin_f": 38,
+          "precip_chance": 0.15,
+          "snow_chance": 0,
+          "storm_chance": 0.03,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 6,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 0,
+            "snow": 0
+          }
+        },
+        {
+          "month": 3,
+          "tmax_f": 72,
+          "tmin_f": 44,
+          "precip_chance": 0.12,
+          "snow_chance": 0,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 6,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 0,
+            "snow": 0
+          }
+        },
+        {
+          "month": 4,
+          "tmax_f": 80,
+          "tmin_f": 50,
+          "precip_chance": 0.08,
+          "snow_chance": 0,
+          "storm_chance": 0.08,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 6,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 5,
+          "tmax_f": 90,
+          "tmin_f": 58,
+          "precip_chance": 0.05,
+          "snow_chance": 0,
+          "storm_chance": 0.1,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 6,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 6,
+          "tmax_f": 100,
+          "tmin_f": 68,
+          "precip_chance": 0.08,
+          "snow_chance": 0,
+          "storm_chance": 0.15,
+          "tornado_chance": 0.02,
+          "wind_band": [
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 7,
+          "tmax_f": 104,
+          "tmin_f": 75,
+          "precip_chance": 0.2,
+          "snow_chance": 0,
+          "storm_chance": 0.25,
+          "tornado_chance": 0.03,
+          "wind_band": [
+            "moderate",
+            "gusty",
+            "strong"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 2,
+            "storm": 3,
+            "snow": 0
+          }
+        },
+        {
+          "month": 8,
+          "tmax_f": 102,
+          "tmin_f": 74,
+          "precip_chance": 0.2,
+          "snow_chance": 0,
+          "storm_chance": 0.25,
+          "tornado_chance": 0.03,
+          "wind_band": [
+            "moderate",
+            "gusty",
+            "strong"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 2,
+            "storm": 3,
+            "snow": 0
+          }
+        },
+        {
+          "month": 9,
+          "tmax_f": 95,
+          "tmin_f": 66,
+          "precip_chance": 0.15,
+          "snow_chance": 0,
+          "storm_chance": 0.15,
+          "tornado_chance": 0.02,
+          "wind_band": [
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 10,
+          "tmax_f": 84,
+          "tmin_f": 54,
+          "precip_chance": 0.1,
+          "snow_chance": 0,
+          "storm_chance": 0.08,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 6,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 11,
+          "tmax_f": 70,
+          "tmin_f": 42,
+          "precip_chance": 0.12,
+          "snow_chance": 0,
+          "storm_chance": 0.03,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 6,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 0,
+            "snow": 0
+          }
+        },
+        {
+          "month": 12,
+          "tmax_f": 60,
+          "tmin_f": 34,
+          "precip_chance": 0.15,
+          "snow_chance": 0,
+          "storm_chance": 0.02,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 6,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 0,
+            "snow": 0
+          }
+        }
+      ]
+    },
+    "rockies": {
+      "id": "rockies",
+      "display_name": "Rockies",
+      "months": [
+        {
+          "month": 1,
+          "tmax_f": 42,
+          "tmin_f": 18,
+          "precip_chance": 0.25,
+          "snow_chance": 0.4,
+          "storm_chance": 0.02,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 1,
+            "storm": 0,
+            "snow": 4
+          }
+        },
+        {
+          "month": 2,
+          "tmax_f": 45,
+          "tmin_f": 20,
+          "precip_chance": 0.25,
+          "snow_chance": 0.35,
+          "storm_chance": 0.03,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 1,
+            "storm": 0,
+            "snow": 4
+          }
+        },
+        {
+          "month": 3,
+          "tmax_f": 52,
+          "tmin_f": 26,
+          "precip_chance": 0.3,
+          "snow_chance": 0.25,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 2,
+            "storm": 1,
+            "snow": 3
+          }
+        },
+        {
+          "month": 4,
+          "tmax_f": 60,
+          "tmin_f": 34,
+          "precip_chance": 0.35,
+          "snow_chance": 0.1,
+          "storm_chance": 0.1,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 3,
+            "storm": 1,
+            "snow": 1
+          }
+        },
+        {
+          "month": 5,
+          "tmax_f": 70,
+          "tmin_f": 42,
+          "precip_chance": 0.4,
+          "snow_chance": 0.02,
+          "storm_chance": 0.15,
+          "tornado_chance": 0.02,
+          "wind_band": [
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 3,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 6,
+          "tmax_f": 80,
+          "tmin_f": 50,
+          "precip_chance": 0.3,
+          "snow_chance": 0,
+          "storm_chance": 0.2,
+          "tornado_chance": 0.02,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 2,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 7,
+          "tmax_f": 88,
+          "tmin_f": 56,
+          "precip_chance": 0.25,
+          "snow_chance": 0,
+          "storm_chance": 0.25,
+          "tornado_chance": 0.02,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 2,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 8,
+          "tmax_f": 86,
+          "tmin_f": 54,
+          "precip_chance": 0.25,
+          "snow_chance": 0,
+          "storm_chance": 0.2,
+          "tornado_chance": 0.02,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 2,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 9,
+          "tmax_f": 78,
+          "tmin_f": 46,
+          "precip_chance": 0.25,
+          "snow_chance": 0.02,
+          "storm_chance": 0.1,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 2,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 10,
+          "tmax_f": 64,
+          "tmin_f": 34,
+          "precip_chance": 0.25,
+          "snow_chance": 0.1,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 2,
+            "storm": 1,
+            "snow": 2
+          }
+        },
+        {
+          "month": 11,
+          "tmax_f": 50,
+          "tmin_f": 24,
+          "precip_chance": 0.25,
+          "snow_chance": 0.3,
+          "storm_chance": 0.03,
+          "tornado_chance": 0,
+          "wind_band": [
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 1,
+            "storm": 0,
+            "snow": 4
+          }
+        },
+        {
+          "month": 12,
+          "tmax_f": 42,
+          "tmin_f": 16,
+          "precip_chance": 0.25,
+          "snow_chance": 0.4,
+          "storm_chance": 0.02,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 1,
+            "storm": 0,
+            "snow": 4
+          }
+        }
+      ]
+    },
+    "great_plains": {
+      "id": "great_plains",
+      "display_name": "Great Plains / Midwest",
+      "months": [
+        {
+          "month": 1,
+          "tmax_f": 38,
+          "tmin_f": 18,
+          "precip_chance": 0.2,
+          "snow_chance": 0.35,
+          "storm_chance": 0.05,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "moderate",
+            "gusty",
+            "strong"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 1,
+            "storm": 1,
+            "snow": 4
+          }
+        },
+        {
+          "month": 2,
+          "tmax_f": 44,
+          "tmin_f": 22,
+          "precip_chance": 0.25,
+          "snow_chance": 0.3,
+          "storm_chance": 0.08,
+          "tornado_chance": 0.02,
+          "wind_band": [
+            "moderate",
+            "gusty",
+            "strong"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 2,
+            "storm": 1,
+            "snow": 3
+          }
+        },
+        {
+          "month": 3,
+          "tmax_f": 55,
+          "tmin_f": 32,
+          "precip_chance": 0.35,
+          "snow_chance": 0.15,
+          "storm_chance": 0.2,
+          "tornado_chance": 0.08,
+          "wind_band": [
+            "moderate",
+            "gusty",
+            "strong"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 3,
+            "snow": 1
+          }
+        },
+        {
+          "month": 4,
+          "tmax_f": 66,
+          "tmin_f": 42,
+          "precip_chance": 0.4,
+          "snow_chance": 0.02,
+          "storm_chance": 0.3,
+          "tornado_chance": 0.15,
+          "wind_band": [
+            "moderate",
+            "gusty",
+            "strong"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 4,
+            "snow": 0
+          }
+        },
+        {
+          "month": 5,
+          "tmax_f": 76,
+          "tmin_f": 52,
+          "precip_chance": 0.45,
+          "snow_chance": 0,
+          "storm_chance": 0.35,
+          "tornado_chance": 0.18,
+          "wind_band": [
+            "moderate",
+            "gusty",
+            "strong"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 3,
+            "storm": 4,
+            "snow": 0
+          }
+        },
+        {
+          "month": 6,
+          "tmax_f": 86,
+          "tmin_f": 62,
+          "precip_chance": 0.4,
+          "snow_chance": 0,
+          "storm_chance": 0.35,
+          "tornado_chance": 0.15,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 2,
+            "storm": 3,
+            "snow": 0
+          }
+        },
+        {
+          "month": 7,
+          "tmax_f": 90,
+          "tmin_f": 66,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.3,
+          "tornado_chance": 0.08,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 2,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 8,
+          "tmax_f": 88,
+          "tmin_f": 64,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.25,
+          "tornado_chance": 0.05,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 2,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 9,
+          "tmax_f": 80,
+          "tmin_f": 55,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.2,
+          "tornado_chance": 0.05,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 10,
+          "tmax_f": 68,
+          "tmin_f": 42,
+          "precip_chance": 0.3,
+          "snow_chance": 0.05,
+          "storm_chance": 0.15,
+          "tornado_chance": 0.03,
+          "wind_band": [
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 3,
+            "storm": 2,
+            "snow": 1
+          }
+        },
+        {
+          "month": 11,
+          "tmax_f": 52,
+          "tmin_f": 30,
+          "precip_chance": 0.25,
+          "snow_chance": 0.2,
+          "storm_chance": 0.08,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 2,
+            "storm": 1,
+            "snow": 3
+          }
+        },
+        {
+          "month": 12,
+          "tmax_f": 40,
+          "tmin_f": 20,
+          "precip_chance": 0.2,
+          "snow_chance": 0.35,
+          "storm_chance": 0.05,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "moderate",
+            "gusty",
+            "strong"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 1,
+            "storm": 1,
+            "snow": 4
+          }
+        }
+      ]
+    },
+    "great_lakes": {
+      "id": "great_lakes",
+      "display_name": "Great Lakes",
+      "months": [
+        {
+          "month": 1,
+          "tmax_f": 32,
+          "tmin_f": 18,
+          "precip_chance": 0.3,
+          "snow_chance": 0.45,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 2,
+            "cloudy": 3,
+            "fog": 2,
+            "rain": 1,
+            "storm": 1,
+            "snow": 5
+          }
+        },
+        {
+          "month": 2,
+          "tmax_f": 36,
+          "tmin_f": 20,
+          "precip_chance": 0.3,
+          "snow_chance": 0.4,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 2,
+            "cloudy": 3,
+            "fog": 2,
+            "rain": 2,
+            "storm": 1,
+            "snow": 4
+          }
+        },
+        {
+          "month": 3,
+          "tmax_f": 46,
+          "tmin_f": 28,
+          "precip_chance": 0.35,
+          "snow_chance": 0.2,
+          "storm_chance": 0.12,
+          "tornado_chance": 0.02,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 2,
+            "rain": 3,
+            "storm": 2,
+            "snow": 2
+          }
+        },
+        {
+          "month": 4,
+          "tmax_f": 58,
+          "tmin_f": 38,
+          "precip_chance": 0.4,
+          "snow_chance": 0.05,
+          "storm_chance": 0.2,
+          "tornado_chance": 0.05,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 4,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 5,
+          "tmax_f": 70,
+          "tmin_f": 48,
+          "precip_chance": 0.4,
+          "snow_chance": 0,
+          "storm_chance": 0.25,
+          "tornado_chance": 0.08,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 3,
+            "storm": 3,
+            "snow": 0
+          }
+        },
+        {
+          "month": 6,
+          "tmax_f": 80,
+          "tmin_f": 58,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.25,
+          "tornado_chance": 0.06,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 7,
+          "tmax_f": 84,
+          "tmin_f": 64,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.3,
+          "tornado_chance": 0.05,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 8,
+          "tmax_f": 82,
+          "tmin_f": 62,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.25,
+          "tornado_chance": 0.03,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 9,
+          "tmax_f": 75,
+          "tmin_f": 54,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.15,
+          "tornado_chance": 0.02,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 3,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 10,
+          "tmax_f": 62,
+          "tmin_f": 42,
+          "precip_chance": 0.35,
+          "snow_chance": 0.05,
+          "storm_chance": 0.1,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 2,
+            "rain": 3,
+            "storm": 1,
+            "snow": 1
+          }
+        },
+        {
+          "month": 11,
+          "tmax_f": 48,
+          "tmin_f": 32,
+          "precip_chance": 0.35,
+          "snow_chance": 0.25,
+          "storm_chance": 0.08,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 2,
+            "cloudy": 3,
+            "fog": 2,
+            "rain": 2,
+            "storm": 1,
+            "snow": 4
+          }
+        },
+        {
+          "month": 12,
+          "tmax_f": 36,
+          "tmin_f": 22,
+          "precip_chance": 0.35,
+          "snow_chance": 0.45,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 2,
+            "cloudy": 3,
+            "fog": 2,
+            "rain": 1,
+            "storm": 1,
+            "snow": 5
+          }
+        }
+      ]
+    },
+    "northeast": {
+      "id": "northeast",
+      "display_name": "Northeast",
+      "months": [
+        {
+          "month": 1,
+          "tmax_f": 38,
+          "tmin_f": 24,
+          "precip_chance": 0.35,
+          "snow_chance": 0.3,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 2,
+            "rain": 2,
+            "storm": 1,
+            "snow": 3
+          }
+        },
+        {
+          "month": 2,
+          "tmax_f": 40,
+          "tmin_f": 26,
+          "precip_chance": 0.35,
+          "snow_chance": 0.25,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 2,
+            "rain": 2,
+            "storm": 1,
+            "snow": 3
+          }
+        },
+        {
+          "month": 3,
+          "tmax_f": 49,
+          "tmin_f": 33,
+          "precip_chance": 0.4,
+          "snow_chance": 0.1,
+          "storm_chance": 0.12,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 2,
+            "rain": 3,
+            "storm": 2,
+            "snow": 1
+          }
+        },
+        {
+          "month": 4,
+          "tmax_f": 60,
+          "tmin_f": 42,
+          "precip_chance": 0.4,
+          "snow_chance": 0.02,
+          "storm_chance": 0.18,
+          "tornado_chance": 0.03,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 4,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 5,
+          "tmax_f": 70,
+          "tmin_f": 52,
+          "precip_chance": 0.4,
+          "snow_chance": 0,
+          "storm_chance": 0.22,
+          "tornado_chance": 0.05,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 3,
+            "storm": 3,
+            "snow": 0
+          }
+        },
+        {
+          "month": 6,
+          "tmax_f": 79,
+          "tmin_f": 61,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.22,
+          "tornado_chance": 0.04,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 7,
+          "tmax_f": 84,
+          "tmin_f": 66,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.25,
+          "tornado_chance": 0.03,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 8,
+          "tmax_f": 82,
+          "tmin_f": 65,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.2,
+          "tornado_chance": 0.02,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 9,
+          "tmax_f": 75,
+          "tmin_f": 57,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.15,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 3,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 10,
+          "tmax_f": 64,
+          "tmin_f": 46,
+          "precip_chance": 0.35,
+          "snow_chance": 0.02,
+          "storm_chance": 0.12,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 2,
+            "rain": 3,
+            "storm": 1,
+            "snow": 1
+          }
+        },
+        {
+          "month": 11,
+          "tmax_f": 52,
+          "tmin_f": 36,
+          "precip_chance": 0.4,
+          "snow_chance": 0.1,
+          "storm_chance": 0.08,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 2,
+            "rain": 3,
+            "storm": 1,
+            "snow": 2
+          }
+        },
+        {
+          "month": 12,
+          "tmax_f": 42,
+          "tmin_f": 28,
+          "precip_chance": 0.35,
+          "snow_chance": 0.25,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 2,
+            "rain": 2,
+            "storm": 1,
+            "snow": 3
+          }
+        }
+      ]
+    },
+    "southeast": {
+      "id": "southeast",
+      "display_name": "Southeast",
+      "months": [
+        {
+          "month": 1,
+          "tmax_f": 55,
+          "tmin_f": 36,
+          "precip_chance": 0.4,
+          "snow_chance": 0.02,
+          "storm_chance": 0.1,
+          "tornado_chance": 0.02,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 3,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 2,
+          "tmax_f": 58,
+          "tmin_f": 38,
+          "precip_chance": 0.4,
+          "snow_chance": 0.01,
+          "storm_chance": 0.12,
+          "tornado_chance": 0.03,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 3,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 3,
+          "tmax_f": 66,
+          "tmin_f": 44,
+          "precip_chance": 0.45,
+          "snow_chance": 0,
+          "storm_chance": 0.2,
+          "tornado_chance": 0.08,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 3,
+            "storm": 3,
+            "snow": 0
+          }
+        },
+        {
+          "month": 4,
+          "tmax_f": 74,
+          "tmin_f": 52,
+          "precip_chance": 0.4,
+          "snow_chance": 0,
+          "storm_chance": 0.28,
+          "tornado_chance": 0.12,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 4,
+            "snow": 0
+          }
+        },
+        {
+          "month": 5,
+          "tmax_f": 82,
+          "tmin_f": 60,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.3,
+          "tornado_chance": 0.12,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 4,
+            "snow": 0
+          }
+        },
+        {
+          "month": 6,
+          "tmax_f": 88,
+          "tmin_f": 68,
+          "precip_chance": 0.4,
+          "snow_chance": 0,
+          "storm_chance": 0.35,
+          "tornado_chance": 0.08,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 4,
+            "snow": 0
+          }
+        },
+        {
+          "month": 7,
+          "tmax_f": 90,
+          "tmin_f": 70,
+          "precip_chance": 0.45,
+          "snow_chance": 0,
+          "storm_chance": 0.4,
+          "tornado_chance": 0.05,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 4,
+            "snow": 0
+          }
+        },
+        {
+          "month": 8,
+          "tmax_f": 89,
+          "tmin_f": 70,
+          "precip_chance": 0.4,
+          "snow_chance": 0,
+          "storm_chance": 0.35,
+          "tornado_chance": 0.04,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 4,
+            "snow": 0
+          }
+        },
+        {
+          "month": 9,
+          "tmax_f": 84,
+          "tmin_f": 64,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.25,
+          "tornado_chance": 0.05,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 3,
+            "snow": 0
+          }
+        },
+        {
+          "month": 10,
+          "tmax_f": 74,
+          "tmin_f": 52,
+          "precip_chance": 0.3,
+          "snow_chance": 0,
+          "storm_chance": 0.15,
+          "tornado_chance": 0.03,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 3,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 11,
+          "tmax_f": 64,
+          "tmin_f": 42,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.12,
+          "tornado_chance": 0.02,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 3,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 12,
+          "tmax_f": 56,
+          "tmin_f": 36,
+          "precip_chance": 0.4,
+          "snow_chance": 0.02,
+          "storm_chance": 0.08,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 3,
+            "fog": 1,
+            "rain": 3,
+            "storm": 1,
+            "snow": 0
+          }
+        }
+      ]
+    },
+    "gulf_coast": {
+      "id": "gulf_coast",
+      "display_name": "Gulf Coast",
+      "months": [
+        {
+          "month": 1,
+          "tmax_f": 72,
+          "tmin_f": 55,
+          "precip_chance": 0.3,
+          "snow_chance": 0,
+          "storm_chance": 0.08,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 2,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 2,
+          "tmax_f": 74,
+          "tmin_f": 56,
+          "precip_chance": 0.3,
+          "snow_chance": 0,
+          "storm_chance": 0.1,
+          "tornado_chance": 0.02,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 2,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 3,
+          "tmax_f": 78,
+          "tmin_f": 60,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.15,
+          "tornado_chance": 0.04,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 4,
+          "tmax_f": 82,
+          "tmin_f": 64,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.2,
+          "tornado_chance": 0.05,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 5,
+          "tmax_f": 86,
+          "tmin_f": 70,
+          "precip_chance": 0.4,
+          "snow_chance": 0,
+          "storm_chance": 0.3,
+          "tornado_chance": 0.06,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 3,
+            "snow": 0
+          }
+        },
+        {
+          "month": 6,
+          "tmax_f": 90,
+          "tmin_f": 75,
+          "precip_chance": 0.5,
+          "snow_chance": 0,
+          "storm_chance": 0.4,
+          "tornado_chance": 0.05,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 4,
+            "snow": 0
+          }
+        },
+        {
+          "month": 7,
+          "tmax_f": 91,
+          "tmin_f": 76,
+          "precip_chance": 0.55,
+          "snow_chance": 0,
+          "storm_chance": 0.45,
+          "tornado_chance": 0.03,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 2,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 4,
+            "snow": 0
+          }
+        },
+        {
+          "month": 8,
+          "tmax_f": 91,
+          "tmin_f": 76,
+          "precip_chance": 0.55,
+          "snow_chance": 0,
+          "storm_chance": 0.4,
+          "tornado_chance": 0.03,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 2,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 4,
+            "snow": 0
+          }
+        },
+        {
+          "month": 9,
+          "tmax_f": 88,
+          "tmin_f": 74,
+          "precip_chance": 0.45,
+          "snow_chance": 0,
+          "storm_chance": 0.3,
+          "tornado_chance": 0.04,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 3,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 3,
+            "snow": 0
+          }
+        },
+        {
+          "month": 10,
+          "tmax_f": 84,
+          "tmin_f": 68,
+          "precip_chance": 0.35,
+          "snow_chance": 0,
+          "storm_chance": 0.18,
+          "tornado_chance": 0.03,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 3,
+            "storm": 2,
+            "snow": 0
+          }
+        },
+        {
+          "month": 11,
+          "tmax_f": 78,
+          "tmin_f": 62,
+          "precip_chance": 0.3,
+          "snow_chance": 0,
+          "storm_chance": 0.12,
+          "tornado_chance": 0.02,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 4,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 2,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 12,
+          "tmax_f": 74,
+          "tmin_f": 58,
+          "precip_chance": 0.3,
+          "snow_chance": 0,
+          "storm_chance": 0.08,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "calm",
+            "light"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 2,
+            "storm": 1,
+            "snow": 0
+          }
+        }
+      ]
+    },
+    "interior_west": {
+      "id": "interior_west",
+      "display_name": "Interior West / Basin",
+      "months": [
+        {
+          "month": 1,
+          "tmax_f": 40,
+          "tmin_f": 20,
+          "precip_chance": 0.2,
+          "snow_chance": 0.25,
+          "storm_chance": 0.02,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 1,
+            "storm": 0,
+            "snow": 2
+          }
+        },
+        {
+          "month": 2,
+          "tmax_f": 46,
+          "tmin_f": 24,
+          "precip_chance": 0.2,
+          "snow_chance": 0.2,
+          "storm_chance": 0.03,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 1,
+            "storm": 0,
+            "snow": 2
+          }
+        },
+        {
+          "month": 3,
+          "tmax_f": 55,
+          "tmin_f": 30,
+          "precip_chance": 0.2,
+          "snow_chance": 0.1,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 1,
+            "storm": 1,
+            "snow": 1
+          }
+        },
+        {
+          "month": 4,
+          "tmax_f": 64,
+          "tmin_f": 36,
+          "precip_chance": 0.2,
+          "snow_chance": 0.02,
+          "storm_chance": 0.08,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 2,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 5,
+          "tmax_f": 74,
+          "tmin_f": 44,
+          "precip_chance": 0.15,
+          "snow_chance": 0,
+          "storm_chance": 0.1,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 6,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 6,
+          "tmax_f": 86,
+          "tmin_f": 52,
+          "precip_chance": 0.1,
+          "snow_chance": 0,
+          "storm_chance": 0.12,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 7,
+            "cloudy": 1,
+            "fog": 0,
+            "rain": 1,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 7,
+          "tmax_f": 94,
+          "tmin_f": 58,
+          "precip_chance": 0.1,
+          "snow_chance": 0,
+          "storm_chance": 0.15,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 7,
+            "cloudy": 1,
+            "fog": 0,
+            "rain": 1,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 8,
+          "tmax_f": 92,
+          "tmin_f": 56,
+          "precip_chance": 0.1,
+          "snow_chance": 0,
+          "storm_chance": 0.12,
+          "tornado_chance": 0.01,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 7,
+            "cloudy": 1,
+            "fog": 0,
+            "rain": 1,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 9,
+          "tmax_f": 82,
+          "tmin_f": 48,
+          "precip_chance": 0.1,
+          "snow_chance": 0,
+          "storm_chance": 0.08,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate"
+          ],
+          "condition_weights": {
+            "clear": 6,
+            "cloudy": 2,
+            "fog": 0,
+            "rain": 1,
+            "storm": 1,
+            "snow": 0
+          }
+        },
+        {
+          "month": 10,
+          "tmax_f": 68,
+          "tmin_f": 36,
+          "precip_chance": 0.15,
+          "snow_chance": 0.05,
+          "storm_chance": 0.05,
+          "tornado_chance": 0,
+          "wind_band": [
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 1,
+            "storm": 1,
+            "snow": 1
+          }
+        },
+        {
+          "month": 11,
+          "tmax_f": 52,
+          "tmin_f": 26,
+          "precip_chance": 0.2,
+          "snow_chance": 0.15,
+          "storm_chance": 0.03,
+          "tornado_chance": 0,
+          "wind_band": [
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 1,
+            "storm": 0,
+            "snow": 2
+          }
+        },
+        {
+          "month": 12,
+          "tmax_f": 40,
+          "tmin_f": 18,
+          "precip_chance": 0.2,
+          "snow_chance": 0.25,
+          "storm_chance": 0.02,
+          "tornado_chance": 0,
+          "wind_band": [
+            "light",
+            "moderate",
+            "gusty"
+          ],
+          "condition_weights": {
+            "clear": 5,
+            "cloudy": 2,
+            "fog": 1,
+            "rain": 1,
+            "storm": 0,
+            "snow": 2
+          }
+        }
+      ]
+    }
+  },
+  "atlas_overrides": [
+    {
+      "x": 35,
+      "y": 10,
+      "region": "great_plains"
+    },
+    {
+      "x": 36,
+      "y": 10,
+      "region": "great_plains"
+    },
+    {
+      "x": 57,
+      "y": 2,
+      "region": "gulf_coast"
+    },
+    {
+      "x": 8,
+      "y": 2,
+      "region": "pacific_nw"
+    },
+    {
+      "x": 6,
+      "y": 8,
+      "region": "california"
+    },
+    {
+      "x": 24,
+      "y": 7,
+      "region": "rockies"
+    },
+    {
+      "x": 32,
+      "y": 12,
+      "region": "great_plains"
+    },
+    {
+      "x": 42,
+      "y": 5,
+      "region": "great_lakes"
+    },
+    {
+      "x": 58,
+      "y": 4,
+      "region": "northeast"
+    }
+  ],
+  "glyph_default": {
+    "~": null,
+    "o": null,
+    ".": "great_plains",
+    "^": "rockies",
+    "#": "great_plains",
+    "=": "great_plains",
+    "+": "great_plains"
+  }
+}

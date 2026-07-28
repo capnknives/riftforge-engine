@@ -147,9 +147,16 @@ def start(snooper, target):
         # ``unowned amenity7`` (those stay dig/goto-only).
         from engine import room_vnum as room_vnum_mod
         where = f" ({room_vnum_mod.staff_room_label(loc)})"
-    kind = "NPC" if getattr(target, "is_npc", False) else (
-        "Echo" if getattr(target, "session", None) is None else "player"
-    )
+    # A staff GM spirit reads as [GM] whether piloted or parked -- never
+    # [Echo] (a parked, sessionless spirit is not a mortal logout body).
+    if getattr(target, "gm_spirit", False):
+        kind = "GM"
+    elif getattr(target, "is_npc", False):
+        kind = "NPC"
+    elif getattr(target, "session", None) is None:
+        kind = "Echo"
+    else:
+        kind = "player"
     from command_support import _public_label
     return True, (
         f"You are now snooping {_public_label(target)} [{kind}]{where}. "

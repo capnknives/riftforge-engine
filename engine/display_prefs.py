@@ -344,6 +344,7 @@ def _prompt_vitals(character, game=None):
     hp = 100
     max_hp = 100
     energy = getattr(character, "energy", 0)
+    energy_max = ""
     stamina = int(getattr(character, "stamina", 0) or 0)
     max_stamina = stamina
     fuel_str = ""
@@ -373,6 +374,11 @@ def _prompt_vitals(character, game=None):
             pass
         if "energy" in vitals:
             energy = vitals["energy"]
+        if "energymax" in vitals:
+            energy_max = str(vitals["energymax"])
+        elif "energy_raw" in vitals:
+            # Percent mode without energymax still has raw ceiling in payload.
+            energy_max = ""
         if "stamina" in vitals:
             try:
                 stamina = int(float(vitals["stamina"]))
@@ -401,6 +407,7 @@ def _prompt_vitals(character, game=None):
         "hp": hp,
         "max_hp": max_hp,
         "energy": energy,
+        "energy_max": energy_max,
         "stamina": stamina,
         "max_stamina": max_stamina,
         "has_fuel": has_fuel,
@@ -430,7 +437,11 @@ def _expand_segment(code, v):
     if code == "Hp":
         return f"<dark_red>[{v['hp']}/{v['max_hp']}hp]"
     if code == "En":
-        return _seg("<dark_grey> ", f"<gold>[{v['energy']}en]")
+        if v.get("energy_max"):
+            inner = f"[{v['energy']}/{v['energy_max']}en]"
+        else:
+            inner = f"[{v['energy']}en]"
+        return _seg("<dark_grey> ", f"<gold>{inner}")
     if code == "St":
         return _seg(
             "<dark_grey> ",
@@ -476,9 +487,9 @@ def format_prompt(character, game=None):
     ``[field]`` that **omits itself** when the resource does not apply::
 
       %Hp  [72/100hp]
-      %En  [40en]
+      %En  [100/100en]   (Focus capacity at Tier; raw ceiling with combatnumbers)
       %St  [28/30st]
-      %Mn  [12/50mn]   (mages only)
+      %Mn  [88/100mn]   (mages only; percent of pool by default)
       %Fu  [80fuel]    (fuel Origins only)
       %Ex  [n,e,s,w]
       %Gr  [Sam, Dean] (only when grouped)

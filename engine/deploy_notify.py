@@ -13,6 +13,11 @@ asyncio task which:
      each bug in bug_ids (or the legacy single bug_id) resolved in
      bug_reports.log — which credits reporters via the after-mark hook.
 
+GM ``autodeploy on`` catch-up (engine/auto_deploy.py) writes
+``.catchup_bug_resolve.json`` instead: copyover ``on_resume()`` (and the
+game tick) marks every missed Fix ticket resolved without a Veil countdown
+because the working tree was already synced via ``git reset --hard``.
+
 Networking stays out of this module (file hand-off only, same spirit as
 reports.py). The actual git pull runs on the host; engine/watch_and_run.py
 detects the changed .py files and SIGUSR1's a copyover automatically.
@@ -27,6 +32,7 @@ from engine import reports
 # Transient hand-off files (gitignored). Live beside riftforge.db / report_dir.
 SIGNAL_PATH = ".deploy_signal.json"
 READY_PATH = ".deploy_ready"
+CATCHUP_RESOLVE_PATH = ".catchup_bug_resolve.json"
 
 # Seconds at which to repeat the countdown warning (plus the initial announce).
 _COUNTDOWN_WARN_AT = (15, 10, 5, 3, 2, 1)
@@ -47,6 +53,11 @@ def signal_path(directory="."):
 def ready_path(directory="."):
     """Absolute path to the deploy-ready marker under report_dir."""
     return os.path.join(directory, READY_PATH)
+
+
+def catchup_resolve_path(directory="."):
+    """Absolute path to the autodeploy catch-up bug-resolve hand-off file."""
+    return os.path.join(directory, CATCHUP_RESOLVE_PATH)
 
 
 def _read_signal(directory):
@@ -106,6 +117,11 @@ def _mark_completed(directory, deploy_key):
         f.write("\n")
 
 
+def mark_deploy_completed(directory, deploy_key):
+    """Public wrapper — auto_deploy catch-up marks Fix SHAs without countdown."""
+    _mark_completed(directory, deploy_key)
+
+
 def _seed_completed_from_auto_deploy(directory):
     """If auto_deploy already shipped a commit, treat it as announced once."""
     path = os.path.join(directory, ".auto_deploy_state.json")
@@ -145,7 +161,51 @@ def _normalize_bug_ids(bug_id=None, bug_ids=None):
     return ids
 
 
-def queue_deploy(directory, *, pr, bug_id=None, bug_ids=None, summary="",
+def _normalize_suggestion_ids(suggestion_id=None, suggestion_ids=None):
+    """Return a de-duplicated list of int suggestion ids from queue_deploy."""
+    ids = []
+    if suggestion_ids:
+        for raw in suggestion_ids:
+            try:
+                n = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if n not in ids:
+                ids.append(n)
+    if suggestion_id is not None:
+        try:
+            n = int(suggestion_id)
+        except (TypeError, ValueError):
+            n = None
+        if n is not None and n not in ids:
+            ids.insert(0, n)
+    return ids
+
+
+def describe_ticket_ref(bug_ids=None, suggestion_ids=None):
+    """Short in-game label for one or more bug/suggestion ticket ids."""
+    bug_ids = list(bug_ids or [])
+    suggestion_ids = list(suggestion_ids or [])
+    parts = []
+    if bug_ids:
+        if len(bug_ids) == 1:
+            parts.append(f"Bug #{bug_ids[0]}")
+        else:
+            parts.append(f"Bugs #{bug_ids[0]}–#{bug_ids[-1]}")
+    if suggestion_ids:
+        if len(suggestion_ids) == 1:
+            parts.append(f"Suggestion #{suggestion_ids[0]}")
+        else:
+            parts.append(
+                f"Suggestions #{suggestion_ids[0]}–#{suggestion_ids[-1]}"
+            )
+    if not parts:
+        return "A tear in the script"
+    return " and ".join(parts)
+
+
+def queue_deploy(directory, *, pr, bug_id=None, bug_ids=None,
+                 suggestion_id=None, suggestion_ids=None, summary="",
                  countdown_seconds=30, triggered_by="unknown", commit_sha=None):
     """Write a new deploy signal -- tick() will pick it up on the next heartbeat.
 
@@ -178,12 +238,24 @@ def queue_deploy(directory, *, pr, bug_id=None, bug_ids=None, summary="",
             return existing
 
     ids = _normalize_bug_ids(bug_id=bug_id, bug_ids=bug_ids)
+    suggest_ids = _normalize_suggestion_ids(
+        suggestion_id=suggestion_id, suggestion_ids=suggestion_ids,
+    )
+    if not summary.strip():
+        if ids and suggest_ids:
+            summary = "Reported bugs and suggestions have been shipped."
+        elif suggest_ids:
+            summary = "A player suggestion has been shipped."
+        else:
+            summary = "A reported bug has been fixed."
     payload = {
         "pr": str(pr),
-        # Primary id kept for older signal readers / announce chrome.
+        # Primary ids kept for older signal readers / announce chrome.
         "bug_id": ids[0] if ids else None,
         "bug_ids": ids,
-        "summary": summary.strip() or "A reported bug has been fixed.",
+        "suggestion_id": suggest_ids[0] if suggest_ids else None,
+        "suggestion_ids": suggest_ids,
+        "summary": summary.strip(),
         "countdown_seconds": max(0, int(countdown_seconds)),
         "triggered_by": triggered_by,
         "phase": "pending",
@@ -199,15 +271,223 @@ def queue_deploy(directory, *, pr, bug_id=None, bug_ids=None, summary="",
     return payload
 
 
+def queue_catchup_resolves(directory, missed_fixes):
+    """Hand off missed Fix commits for the game tick to mark resolved.
+
+    ``missed_fixes`` is a list of dicts with ``sha``, ``bug_ids``, and
+    ``summary`` (from auto_deploy.collect_missed_fix_commits). No Veil
+    countdown — code is already on disk after catch-up ``reset --hard``.
+    """
+    if not missed_fixes:
+        return
+    payload = {
+        "phase": "pending",
+        "fixes": [
+            {
+                "commit_sha": fix["sha"],
+                "bug_ids": list(fix.get("bug_ids") or []),
+                "suggestion_ids": list(fix.get("suggestion_ids") or []),
+                "summary": (fix.get("summary") or "").strip()
+                or "A reported bug has been fixed.",
+            }
+            for fix in missed_fixes
+        ],
+    }
+    path = catchup_resolve_path(directory)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+    print(
+        f"[deploy_notify] queued catch-up resolve for "
+        f"{len(missed_fixes)} Fix commit(s)",
+        flush=True,
+    )
+
+
+def _apply_catchup_fixes(game, fixes):
+    """Mark bugs/suggestions resolved for missed ship commits (no countdown)."""
+    directory = game.report_dir
+    all_bug_ids = []
+    all_suggestion_ids = []
+    for fix in fixes:
+        for bug_id in _normalize_bug_ids(bug_ids=fix.get("bug_ids")):
+            if bug_id not in all_bug_ids:
+                all_bug_ids.append(bug_id)
+        for suggestion_id in _normalize_suggestion_ids(
+            suggestion_ids=fix.get("suggestion_ids"),
+        ):
+            if suggestion_id not in all_suggestion_ids:
+                all_suggestion_ids.append(suggestion_id)
+
+    if all_bug_ids or all_suggestion_ids:
+        last_summary = (fixes[-1].get("summary") or "").strip()
+        if not last_summary:
+            if all_bug_ids and all_suggestion_ids:
+                last_summary = "Reported bugs and suggestions have been shipped."
+            elif all_suggestion_ids:
+                last_summary = "Player suggestions have been shipped."
+            else:
+                last_summary = "Reported bugs have been fixed."
+        ref = describe_ticket_ref(all_bug_ids, all_suggestion_ids)
+        game.broadcast_all(
+            f"*** The Veil holds. {ref} is live (catch-up): "
+            f"{last_summary} ***"
+        )
+
+    for fix in fixes:
+        commit_sha = fix.get("commit_sha") or fix.get("sha") or ""
+        for bug_id in _normalize_bug_ids(bug_ids=fix.get("bug_ids")):
+            try:
+                reports.mark(
+                    reports.BUG, int(bug_id), "resolved", directory=directory,
+                    game=game,
+                )
+                print(
+                    f"[deploy_notify] catch-up marked bug #{bug_id} resolved",
+                    flush=True,
+                )
+            except (ValueError, IndexError) as exc:
+                print(
+                    f"[deploy_notify] catch-up could not mark bug "
+                    f"#{bug_id} resolved: {exc}",
+                    flush=True,
+                )
+        for suggestion_id in _normalize_suggestion_ids(
+            suggestion_ids=fix.get("suggestion_ids"),
+        ):
+            try:
+                reports.mark(
+                    reports.SUGGEST, int(suggestion_id), "resolved",
+                    directory=directory, game=game,
+                )
+                print(
+                    f"[deploy_notify] catch-up marked suggestion "
+                    f"#{suggestion_id} resolved",
+                    flush=True,
+                )
+            except (ValueError, IndexError) as exc:
+                print(
+                    f"[deploy_notify] catch-up could not mark suggestion "
+                    f"#{suggestion_id} resolved: {exc}",
+                    flush=True,
+                )
+        if commit_sha:
+            _mark_completed(directory, commit_sha)
+    return bool(all_bug_ids or all_suggestion_ids)
+
+
+def _process_catchup_resolves(game):
+    """Mark bugs resolved after autodeploy catch-up (no countdown)."""
+    directory = game.report_dir
+    path = catchup_resolve_path(directory)
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, ValueError, json.JSONDecodeError):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return False
+
+    if payload.get("phase") != "pending":
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return False
+
+    fixes = payload.get("fixes") or []
+    applied = _apply_catchup_fixes(game, fixes)
+
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    if applied:
+        from engine import auto_deploy
+        latest = fixes[-1]
+        auto_deploy.record_catchup_last_deploy(
+            directory,
+            {
+                "sha": latest.get("commit_sha") or latest.get("sha"),
+                "bug_ids": latest.get("bug_ids") or [],
+            },
+        )
+        print("[deploy_notify] catch-up bug resolve complete", flush=True)
+    return applied
+
+
+def _reconcile_missed_fix_resolves_from_auto_deploy_state(game):
+    """On copyover, resolve Fix commits between last_deploy and origin_main.
+
+    Covers catch-up that synced code before the resolve hand-off shipped, or
+  any gap where ``last_deploy`` lags ``origin_main`` with Fix subjects still
+    open in ``bug_reports.log``.
+    """
+    directory = game.report_dir
+    state_path = os.path.join(directory, ".auto_deploy_state.json")
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+
+    last_sha = (state.get("last_deploy") or {}).get("sha") or ""
+    origin_sha = state.get("origin_main") or ""
+    if not last_sha or not origin_sha or last_sha == origin_sha:
+        return False
+
+    from engine import auto_deploy
+
+    missed = auto_deploy.collect_missed_fix_commits(
+        directory, last_sha, origin_sha,
+    )
+    if not missed:
+        return False
+
+    completed = _load_completed_keys(directory)
+    pending = [fix for fix in missed if fix["sha"] not in completed]
+    if not pending:
+        return False
+
+    # Normalize keys for _apply_catchup_fixes (file hand-off uses commit_sha).
+    fixes = [
+        {
+            "commit_sha": fix["sha"],
+            "bug_ids": list(fix.get("bug_ids") or []),
+            "suggestion_ids": list(fix.get("suggestion_ids") or []),
+            "summary": fix.get("summary") or "",
+        }
+        for fix in pending
+    ]
+    applied = _apply_catchup_fixes(game, fixes)
+    if not applied:
+        return False
+
+    auto_deploy.record_catchup_last_deploy(directory, pending[-1])
+    print(
+        f"[deploy_notify] copyover reconciled {len(pending)} missed Fix "
+        f"commit(s) from auto_deploy state",
+        flush=True,
+    )
+    return True
+
+
 def tick(game):
     """Called from Game.on_tick() -- start a countdown when a signal appears.
 
     Synchronous on purpose: only schedules asyncio.create_task, never blocks
-    the tick loop on sleep().
+    the tick loop on sleep(). Catch-up resolves run first (fast, no sleep).
     """
     global _deploy_task, _started_mtime
 
     directory = game.report_dir
+    if _process_catchup_resolves(game):
+        return
+
     path = signal_path(directory)
     if not os.path.isfile(path):
         _started_mtime = None
@@ -252,22 +532,25 @@ async def _run_countdown(game, signal):
     bug_ids = _normalize_bug_ids(
         bug_id=signal.get("bug_id"), bug_ids=signal.get("bug_ids"),
     )
+    suggestion_ids = _normalize_suggestion_ids(
+        suggestion_id=signal.get("suggestion_id"),
+        suggestion_ids=signal.get("suggestion_ids"),
+    )
     summary = signal.get("summary") or "A reported bug has been fixed."
     total = int(signal.get("countdown_seconds", 30))
 
-    if not bug_ids:
-        bug_ref = "A tear in the script"
-    elif len(bug_ids) == 1:
-        bug_ref = f"Bug #{bug_ids[0]}"
+    ticket_ref = describe_ticket_ref(bug_ids, suggestion_ids)
+    if bug_ids and not suggestion_ids:
+        verb = "has been mended"
     else:
-        bug_ref = f"Bugs #{bug_ids[0]}–#{bug_ids[-1]}"
+        verb = "has been shipped"
     game.broadcast_all(
-        f"*** {bug_ref} has been mended: {summary} ***\r\n"
+        f"*** {ticket_ref} {verb}: {summary} ***\r\n"
         f"*** The Veil will reseal in {total} seconds. Stay put -- "
         f"you will remain. ***"
     )
     print(
-        f"[deploy_notify] countdown started for {bug_ref} "
+        f"[deploy_notify] countdown started for {ticket_ref} "
         f"(PR {signal.get('pr', '?')}, {total}s)",
         flush=True,
     )
@@ -294,8 +577,13 @@ async def _run_countdown(game, signal):
 
 
 async def on_resume(game):
-    """After copyover, announce the fix is live and tidy up hand-off files."""
+    """After copyover, finish deploy hand-offs and reconcile missed Fix bugs."""
     directory = game.report_dir
+
+    # Catch-up file (watcher) or last_deploy lag (retro after early catch-up).
+    _process_catchup_resolves(game)
+    _reconcile_missed_fix_resolves_from_auto_deploy_state(game)
+
     signal = _read_signal(directory)
     if not signal or signal.get("phase") != "awaiting_copyover":
         return
@@ -303,20 +591,20 @@ async def on_resume(game):
     bug_ids = _normalize_bug_ids(
         bug_id=signal.get("bug_id"), bug_ids=signal.get("bug_ids"),
     )
+    suggestion_ids = _normalize_suggestion_ids(
+        suggestion_id=signal.get("suggestion_id"),
+        suggestion_ids=signal.get("suggestion_ids"),
+    )
     summary = signal.get("summary") or "A reported bug has been fixed."
 
-    if not bug_ids:
+    ticket_ref = describe_ticket_ref(bug_ids, suggestion_ids)
+    if ticket_ref != "A tear in the script":
         game.broadcast_all(
-            f"*** The Veil holds. The mend is live: {summary} ***"
-        )
-    elif len(bug_ids) == 1:
-        game.broadcast_all(
-            f"*** The Veil holds. Bug #{bug_ids[0]} fix is live: {summary} ***"
+            f"*** The Veil holds. {ticket_ref} is live: {summary} ***"
         )
     else:
         game.broadcast_all(
-            f"*** The Veil holds. Bugs #{bug_ids[0]}–#{bug_ids[-1]} "
-            f"fix is live: {summary} ***"
+            f"*** The Veil holds. The mend is live: {summary} ***"
         )
 
     for bug_id in bug_ids:
@@ -329,6 +617,23 @@ async def on_resume(game):
         except (ValueError, IndexError) as exc:
             print(
                 f"[deploy_notify] could not mark bug #{bug_id} resolved: {exc}",
+                flush=True,
+            )
+
+    for suggestion_id in suggestion_ids:
+        try:
+            reports.mark(
+                reports.SUGGEST, int(suggestion_id), "resolved",
+                directory=directory, game=game,
+            )
+            print(
+                f"[deploy_notify] marked suggestion #{suggestion_id} resolved",
+                flush=True,
+            )
+        except (ValueError, IndexError) as exc:
+            print(
+                f"[deploy_notify] could not mark suggestion "
+                f"#{suggestion_id} resolved: {exc}",
                 flush=True,
             )
 

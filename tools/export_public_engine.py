@@ -35,6 +35,7 @@ PUBLIC_PATHS = (
     "basegame",
     "tools/engine_smoke.py",
     "tools/basegame_smoke.py",
+    "tools/demo_weather_smoke.py",
     "tools/packaging_smoke.py",
     "tools/export_public_engine.py",
     "docs/ENGINE_CONSUMER.md",
@@ -169,19 +170,7 @@ jobs:
 
 
 # Minimal demo map so maps.load_all_maps / engine_smoke can run without SUPERS.
-DEMO_MAP = """{
-  "id": "demo",
-  "name": "Demo Realm",
-  "rooms": [
-    {
-      "key": "Demo Start",
-      "description": "A bare engine demo room.",
-      "exits": {},
-      "is_start": true
-    }
-  ]
-}
-"""
+# Canonical source: engine/demo/content/maps/demo.json (copied at export).
 
 
 def _repo_root() -> str:
@@ -216,8 +205,13 @@ def export(dest: str) -> None:
 
     maps_dir = os.path.join(dest, "content", "maps")
     os.makedirs(maps_dir, exist_ok=True)
-    with open(os.path.join(maps_dir, "demo.json"), "w", encoding="utf-8") as f:
-        f.write(DEMO_MAP)
+    demo_src = os.path.join(
+        root, "engine", "demo", "content", "maps", "demo.json"
+    )
+    if os.path.isfile(demo_src):
+        shutil.copy2(demo_src, os.path.join(maps_dir, "demo.json"))
+    else:
+        print(f"warn: missing lean demo map {demo_src}", file=sys.stderr)
 
     with open(os.path.join(dest, "help_topics.py"), "w", encoding="utf-8") as f:
         f.write(HELP_TOPICS_STUB)
@@ -234,6 +228,12 @@ def export(dest: str) -> None:
     # Always overwrite — never ship the private monorepo README body.
     with open(os.path.join(dest, "README.md"), "w", encoding="utf-8") as f:
         f.write(PUBLIC_README)
+
+    with open(os.path.join(dest, ".gitignore"), "w", encoding="utf-8") as f:
+        f.write(
+            "__pycache__/\n*.pyc\n.pytest_cache/\n*.db\n"
+            ".game_heartbeat\n_public_engine_export/\n"
+        )
 
     # Public tree must not ship a supers package or AI instruction files.
     assert not os.path.exists(os.path.join(dest, "supers"))

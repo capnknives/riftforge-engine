@@ -24,6 +24,9 @@ class RoomMap(dict):
     Procedural dungeons, strongholds, and smoke tests all do
     ``game.rooms[key] = room``; without this stamp, Room.add would not
     know which Game owns the character roster.
+
+    Phase 3: ``get`` also resolves legacy dig keys via
+    ``game.room_aliases`` (VNUM identity keys are the primary dict keys).
     """
 
     def __init__(self, game):
@@ -35,6 +38,42 @@ class RoomMap(dict):
         """Insert ``room`` and point ``room.game`` at the owning Game."""
         room.game = self._game
         super().__setitem__(key, room)
+
+    def _resolve_alias(self, key):
+        """Return Room for identity key or Phase 3 legacy alias, else None."""
+        hit = dict.get(self, key)
+        if hit is not None:
+            return hit
+        if key is None:
+            return None
+        aliases = getattr(self._game, "room_aliases", None) or {}
+        mapped = aliases.get(key)
+        if mapped is not None:
+            return dict.get(self, mapped)
+        return None
+
+    def __getitem__(self, key):
+        """Identity key first, then Phase 3 legacy dig-key aliases.
+
+        Call sites still write ``rooms[\"lebanon:…\"]`` after VNUM rekey;
+        ``in`` / ``get`` already aliased -- subscript must match or boot
+        heals crash (``KeyError`` after a true ``in`` check).
+        """
+        hit = self._resolve_alias(key)
+        if hit is not None:
+            return hit
+        raise KeyError(key)
+
+    def get(self, key, default=None):
+        """Identity key first, then Phase 3 legacy dig-key aliases."""
+        hit = self._resolve_alias(key)
+        if hit is not None:
+            return hit
+        return default
+
+    def __contains__(self, key):
+        """True when identity key or legacy alias resolves."""
+        return self._resolve_alias(key) is not None
 
     def update(self, other=(), **kwargs):
         """Stamp every room, including bulk ``update`` from build_world."""

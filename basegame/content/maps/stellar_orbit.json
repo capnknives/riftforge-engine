@@ -1,0 +1,36 @@
+{
+  "id": "stellar_orbit",
+  "plane": "stellar",
+  "rooms": [
+    {
+      "key": "LM00002",
+      "description": "A rib of pale metal hangs above the world. The yellow sun is a hard white disc without air to soften it; Charge pours in faster than any street bask. The ground curves away below. Type 'descend' to fall back to your last open-sky footing.",
+      "wilderness": false,
+      "area_type": "ruins",
+      "zone": "stellar-orbit",
+      "outdoor": true,
+      "gravity": 0.2,
+      "exits": {
+        "east": "SE00003"
+      },
+      "vnum": "LM00002",
+      "title": "Low Orbit Platform",
+      "legacy_key": "Low Orbit Platform"
+    },
+    {
+      "key": "SE00003",
+      "description": "Heat without sound. The corona washes this ledge in radiation that would kill anything without a Solar Charge battery. West returns to the Low Orbit Platform; there is no further ascent -- this is the premium soak, not a dungeon.",
+      "wilderness": false,
+      "area_type": "ruins",
+      "zone": "stellar-orbit",
+      "outdoor": true,
+      "gravity": 0.1,
+      "exits": {
+        "west": "LM00002"
+      },
+      "vnum": "SE00003",
+      "title": "Stellar Corona Edge",
+      "legacy_key": "Stellar Corona Edge"
+    }
+  ]
+}

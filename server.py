@@ -78,10 +78,14 @@ class Game:
         self.characters = set()
         self.rooms = RoomMap(self)
         self.rooms.update(raw_rooms)
+        # Phase 3 dual-read: legacy dig / JSON keys → VNUM identity.
+        import maps as maps_module
+        self.room_aliases = dict(
+            getattr(maps_module, "LAST_ROOM_ALIASES", None) or {}
+        )
         # Map catalog metadata from maps.LAST_MAP_REGISTRY (realm/plane/
         # pocket hubs per map id) -- copied after load so tooling/GM verbs
         # can inspect without re-reading JSON.
-        import maps as maps_module
         self.map_registry = dict(maps_module.LAST_MAP_REGISTRY)
         self.sessions = []                # every connected Session (starts empty)
         # Mid-login / mid-chargen sockets that are NOT on `sessions` yet.
@@ -241,126 +245,13 @@ class Game:
     def _load_persisted_meta(self):
         """Load Game meta counters from SQLite before any boot save().
 
-        ``Game.save()`` always writes plane soul banks, moral state,
-        lifetime_stats, death beacons, hue courts, and rumor boards. Boot
-        used to set those fields to empty defaults, then call ``save()``
-        while backfilling the training dummy / head GM -- which wrote
-        zeros over live Heaven/Hell tallies (and could wipe Tide /
-        gmworld lifetime too). Load first; defaults above only apply when
-        meta keys are missing (fresh world).
+        Engine-generic clock fields are loaded in ``__init__`` above.
+        SUPERS-shaped Tide / Cadence / tuning / rumor / OOC meta rides
+        ``engine.hooks.load_game_meta`` (``supers.persist_meta``). Lean
+        boots leave the hook unset and keep the ``__init__`` defaults.
         """
-        moral = persistence.load_moral_state(self.db)
-        self.moral_balance = moral["moral_balance"]
-        self.eclipse_until_tick = moral["eclipse_until_tick"]
-        self.moral_event_cooldown_until = moral[
-            "moral_event_cooldown_until"
-        ]
-        self.moral_maxed_side = moral.get("moral_maxed_side")
-        self.moral_maxed_since_tick = moral.get(
-            "moral_maxed_since_tick", 0
-        )
-        self.moral_last_casualty_tick = moral.get(
-            "moral_last_casualty_tick", 0
-        )
-        self.moral_scout_cooldown_until = moral.get(
-            "moral_scout_cooldown_until", 0
-        )
-        self.holy_war_active = bool(moral.get("holy_war_active", False))
-        plane_souls = persistence.load_plane_soul_counts(self.db)
-        self.heaven_soul_count = plane_souls["heaven_soul_count"]
-        self.hell_soul_count = plane_souls["hell_soul_count"]
-        self.next_phone_seq = plane_souls.get("next_phone_seq", 1000) or 1000
-        self.hue_courts = persistence.load_hue_courts(self.db)
-        self.death_beacons = persistence.load_death_beacons(self.db)
-        # Chuck Author mantle-resume event (phase survives copyover).
-        self.author_mantle_event = persistence.load_author_mantle_event(
-            self.db
-        )
-        # Recent OOC lines (bare `ooc` replay) — survive copyover / restart.
-        for _ooc_line in persistence.load_ooc_history(self.db):
-            self.ooc_history.append(_ooc_line)
-        self.rumor_boards = persistence.load_rumor_boards(self.db)
-        raw_lifetime = persistence.load_lifetime_stats(self.db)
-        if _HAS_SUPERS:
-            from supers import world_stats as world_stats_mod
-            self.lifetime_stats = world_stats_mod.normalize_loaded(
-                raw_lifetime
-            )
-        else:
-            self.lifetime_stats = raw_lifetime or {}
-        raw_pet_adoption = persistence.load_pet_adoption(self.db)
-        if _HAS_SUPERS:
-            from supers import pet as pet_mod
-            self.pet_adoption = pet_mod.normalize_adoption_stock(
-                raw_pet_adoption
-            )
-            pet_mod.ensure_adoption_stock(self)
-        else:
-            self.pet_adoption = raw_pet_adoption or {}
-        raw_chances = persistence.load_cadence_chances(self.db)
-        if _HAS_SUPERS:
-            from supers import cadence_chances as chances_mod
-            self.cadence_chances = chances_mod.normalize_loaded(raw_chances)
-        else:
-            self.cadence_chances = raw_chances or {}
-        raw_scale = persistence.load_cadence_scale(self.db)
-        if _HAS_SUPERS:
-            from supers import cadence_scale as scale_mod
-            self.cadence_scale = scale_mod.normalize_loaded(raw_scale)
-        else:
-            self.cadence_scale = raw_scale or {}
-        raw_wfs = persistence.load_winchester_failsafe(self.db)
-        if _HAS_SUPERS:
-            from supers import winchester_failsafe as wfs_mod
-            self.winchester_failsafe = raw_wfs or {}
-            wfs_mod.ensure_game_state(self)
-            wfs_mod.restore_active_job_stamps(self)
-        else:
-            self.winchester_failsafe = raw_wfs or {}
-        raw_cairport = persistence.load_cadence_airport(self.db)
-        if _HAS_SUPERS:
-            from supers import cadence_airport as cairport_mod
-            self.cadence_airport = raw_cairport or {}
-            cairport_mod.ensure_game_state(self)
-        else:
-            self.cadence_airport = raw_cairport or {}
-        raw_incap = persistence.load_incap_tuning(self.db)
-        if _HAS_SUPERS:
-            from supers import incap_tuning as incap_tuning_mod
-            self.incap_tuning = incap_tuning_mod.normalize_loaded(raw_incap)
-        else:
-            self.incap_tuning = raw_incap or {}
-        raw_outgoing = persistence.load_outgoing_damage_tuning(self.db)
-        if _HAS_SUPERS:
-            from supers import outgoing_damage_tuning as outgoing_mod
-            self.outgoing_damage_tuning = outgoing_mod.normalize_loaded(
-                raw_outgoing
-            )
-        else:
-            self.outgoing_damage_tuning = raw_outgoing or {}
-        raw_bodydecay = persistence.load_corpse_decay_tuning(self.db)
-        if _HAS_SUPERS:
-            from supers import corpse_decay_tuning as bodydecay_mod
-            self.corpse_decay_tuning = bodydecay_mod.normalize_loaded(
-                raw_bodydecay
-            )
-        else:
-            self.corpse_decay_tuning = raw_bodydecay or {}
-        raw_hellexile = persistence.load_hell_exile_tuning(self.db)
-        if _HAS_SUPERS:
-            from supers import hell_exile_tuning as hellexile_mod
-            self.hell_exile_tuning = hellexile_mod.normalize_loaded(
-                raw_hellexile
-            )
-        else:
-            self.hell_exile_tuning = raw_hellexile or {}
-        raw_pit_drops = persistence.load_pit_drop_tuning(self.db)
-        if _HAS_SUPERS:
-            from supers.purgatory_dungeon import drop_tuning as pit_drops_mod
-            self.pit_drop_tuning = pit_drops_mod.normalize_loaded(raw_pit_drops)
-        else:
-            self.pit_drop_tuning = raw_pit_drops or {}
-
+        from engine import hooks as hooks_mod
+        hooks_mod.load_game_meta(self, self.db)
 
     def find_character(self, name):
         """Find a character anywhere in the world by name (case-insensitive).
@@ -399,9 +290,29 @@ class Game:
         if not needle:
             return None
 
-        # With an ordinal, collect all substring matches and pick.
+        def _parked_gm_spirit(obj):
+            """True for an off-grid, sessionless staff GM spirit.
+
+            A staffer who is not in GM form leaves their permanent spirit
+            parked in the vault beneath Lucifer's Cage (see
+            ``supers.verbs.gm.presence._park_gm_spirit``). Per design, a
+            parked GM is *not in the game*: it must not surface from
+            name / face / given-name lookups (``summon``, ``snoop``,
+            ``where``, ``goto`` by name). Exact full-key lookups
+            (``gmspirit:Zhayl``) still resolve below so ``gm on`` can
+            reattach without minting a new Character.
+            """
+            return (
+                getattr(obj, "gm_spirit", False)
+                and getattr(obj, "session", None) is None
+                and not getattr(obj, "gm_mode", False)
+            )
+
+        # With an ordinal, collect all substring matches and pick. Parked
+        # staff spirits are filtered out (not part of the live world).
         if ordinal is not None:
-            matches = _collect_character_matches(rest, list(self.characters))
+            pool = [o for o in self.characters if not _parked_gm_spirit(o)]
+            matches = _collect_character_matches(rest, pool)
             return pick_ordinal(matches, ordinal)
 
         # Two-pass exact: never let an ephemeral prefix steal a bare key.
@@ -412,6 +323,10 @@ class Game:
             key = (getattr(obj, "key", None) or "").lower()
             if key == needle:
                 return obj
+            # Skip parked staff spirits for every fuzzy (non exact-key)
+            # match so a bare ``zhayl`` never grabs the off-grid ghost.
+            if _parked_gm_spirit(obj):
+                continue
             if ephemeral_hit is None and ":" in key:
                 prefix, _, rest_key = key.partition(":")
                 if prefix in ("husk", "gmspirit") and rest_key == needle:
@@ -507,36 +422,16 @@ class Game:
 
     def save(self):
         """Snapshot the whole world to the database (see persistence.py)."""
+        from engine import hooks as hooks_mod
+
         persistence.save_world(self.db, self)
         persistence.save_game_time(self.db, self.game_time_ticks)
         persistence.save_calendar_epoch_day(
             self.db, getattr(self, "calendar_epoch_day", 0)
         )
-        persistence.save_moral_state(self.db, self)
-        persistence.save_plane_soul_counts(self.db, self)
-        # Normalize hue courts before engine-pure meta write.
-        try:
-            from supers import celestial_court as celestial_court_mod
-            self.hue_courts = celestial_court_mod.serialize_hue_courts(self)
-        except ImportError:
-            pass
-        persistence.save_hue_courts(self.db, self)
-        persistence.save_death_beacons(self.db, self)
-        persistence.save_author_mantle_event(self.db, self)
-        persistence.save_ooc_history(self.db, self)
         persistence.save_accounts(self.db, self)
-        persistence.save_rumor_boards(self.db, self)
-        persistence.save_lifetime_stats(self.db, self)
-        persistence.save_pet_adoption(self.db, self)
-        persistence.save_cadence_chances(self.db, self)
-        persistence.save_cadence_scale(self.db, self)
-        persistence.save_winchester_failsafe(self.db, self)
-        persistence.save_cadence_airport(self.db, self)
-        persistence.save_incap_tuning(self.db, self)
-        persistence.save_outgoing_damage_tuning(self.db, self)
-        persistence.save_corpse_decay_tuning(self.db, self)
-        persistence.save_hell_exile_tuning(self.db, self)
-        persistence.save_pit_drop_tuning(self.db, self)
+        # SUPERS Tide / Cadence / tuning / rumor / OOC (no-op when lean).
+        hooks_mod.save_game_meta(self, self.db)
         # D41 wilds homestead + gather nodes (same save pulse as the world).
         if _HAS_SUPERS:
             try:

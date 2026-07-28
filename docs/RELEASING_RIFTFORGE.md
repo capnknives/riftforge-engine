@@ -30,7 +30,9 @@ combat_core, mail/socials/wearables, Stage G hooks).
 
 - No `supers` imports under the `engine` package
 - No `content/npcs`, Origins catalogs, or SUPERS help pages
-- Demo map only under `content/maps/` (export tool writes `demo.json`)
+- Demo map: export writes `content/maps/demo.json` from canonical
+  `engine/demo/content/maps/demo.json`; monorepo lean boot uses
+  `python -m engine` / `RIFTFORGE_GAME=none` (`engine.lean_boot`)
 - `tools/engine_smoke.py` / `tools/basegame_smoke.py` pass
 
 See [`plans/two_repo_purity.md`](plans/two_repo_purity.md).

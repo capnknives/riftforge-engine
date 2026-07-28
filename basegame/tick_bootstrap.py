@@ -7,11 +7,11 @@ basegame stages register onto.
 """
 
 from engine.tick_registry import clear_ticks, register_tick
-from engine.systems import weather as weather_module
+from engine.systems import regional_weather as weather_module
 
 
 def register_default_ticks(game):
     """Wire every basegame tick handler onto `game` (idempotent clear+fill)."""
     clear_ticks(game)
-    register_tick(game, weather_module.tick, order=80, name="weather")
+    register_tick(game, weather_module.tick_all, order=80, name="weather")
     # needs/economy/combat land in later stages.

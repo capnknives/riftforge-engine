@@ -162,6 +162,8 @@ KNOWN_RESOURCE_TAGS = frozenset({
     "lab", "patrol",
     # Tornado / severe-weather cellar (weather_climatology shelter table).
     "storm_shelter",
+    # Wild herb pick patches (Earth tagged cells; plane maps auto-seed).
+    "herb_node",
 })
 
 # Controlled plane vocabulary (map JSON top-level "plane"). Realm is the
@@ -196,6 +198,8 @@ POCKET_KINDS = frozenset({"settlement", "dungeon", "landmark"})
 # Filled by the most recent load_all_maps() call -- Game may copy this onto
 # game.map_registry. Keys are map file "id" strings.
 LAST_MAP_REGISTRY = {}
+# Legacy dig / JSON key → VNUM after Phase 3 rekey (load_all_maps).
+LAST_ROOM_ALIASES = {}
 
 # Map/zone files present on disk with ``"autoload": false`` (skipped at boot).
 # Refreshed by load_all_maps() / catalog_map_files(). Keys are map ids.
@@ -1458,6 +1462,7 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
               map_glyph=None, map_layer=None, glyph_set=None,
               vnum=None, layout=None,
               jobs=None,
+              legacy_key=None,
               game_fields=None):
     """Create one Room and insert it into the shared `rooms` dict.
 
@@ -1529,6 +1534,9 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
                     f"already used by {other.key!r}"
                 )
         room.vnum = normalized
+    # Phase 3 dual-read: former dig / JSON key before VNUM identity.
+    if legacy_key is not None and str(legacy_key).strip():
+        room.legacy_key = str(legacy_key).strip()
     # Atlas minimap overrides (optional).
     if map_glyph is not None:
         g = str(map_glyph).strip()
@@ -1930,12 +1938,43 @@ def _link_grid_portals(rooms, filename, grid):
     for portal in grid.get("portals", []):
         key = f"{prefix} ({portal['x']}, {portal['y']})"
         to_room = portal["to_room"]
-        if to_room not in rooms:
+        dest = _resolve_loaded_room(rooms, to_room)
+        if dest is None:
             raise ValueError(
                 f"{filename}: portal from {key!r} points at unknown room "
                 f"{to_room!r}"
             )
-        rooms[key].exits[portal["direction"]] = rooms[to_room]
+        rooms[key].exits[portal["direction"]] = dest
+
+
+def _resolve_loaded_room(rooms, token):
+    """Resolve an exit/portal target during map load (legacy key or VNUM).
+
+    Pass 1 inserts rooms under their JSON ``key`` (legacy dig string or
+    Phase 3 VNUM). Exit targets may mix both until content is rewritten.
+    """
+    if not token:
+        return None
+    text = str(token).strip()
+    hit = rooms.get(text)
+    if hit is not None:
+        return hit
+    from engine import room_vnum as room_vnum_mod
+    try:
+        want = room_vnum_mod.validate_vnum(text)
+    except ValueError:
+        want = text.upper()
+    for room in rooms.values():
+        got = getattr(room, "vnum", None)
+        if not got:
+            continue
+        try:
+            if room_vnum_mod.validate_vnum(got) == want:
+                return room
+        except ValueError:
+            if str(got).strip().upper() == want:
+                return room
+    return None
 
 
 def _link_room_exits(rooms, filename, room_data):
@@ -1947,12 +1986,13 @@ def _link_room_exits(rooms, filename, room_data):
     """
     room = rooms[room_data["key"]]
     for direction, to_room in room_data.get("exits", {}).items():
-        if to_room not in rooms:
+        dest = _resolve_loaded_room(rooms, to_room)
+        if dest is None:
             raise ValueError(
                 f"{filename}: {room_data['key']!r}'s {direction!r} exit "
                 f"points at unknown room {to_room!r}"
             )
-        room.exits[direction] = rooms[to_room]
+        room.exits[direction] = dest
     # D66: every hidden direction must actually be an exit (fail loud).
     for direction in getattr(room, "hidden_directions", ()) or ():
         if direction not in room.exits:
@@ -2179,6 +2219,7 @@ def create_rooms_from_map_data(rooms, filename, data):
             title=room_data.get("title"),
             vnum=room_data.get("vnum"),
             layout=room_data.get("layout"),
+            legacy_key=room_data.get("legacy_key"),
             game_fields=room_data,
         )
         _stamp_room_city_meta(rooms[room_data["key"]], data)
@@ -2325,7 +2366,7 @@ def load_all_maps(*, include_deferred=False):
     Area Studio) pass True so exits that point at hot-loadable rooms are
     checked instead of falsely reporting "unknown room".
     """
-    global LAST_MAP_REGISTRY, _LANDMARKS_BY_PREFIX
+    global LAST_MAP_REGISTRY, _LANDMARKS_BY_PREFIX, LAST_ROOM_ALIASES
     map_files = _load_map_files(include_deferred=include_deferred)
 
     # Fresh registry each load so copyover / re-import never duplicates.
@@ -2394,6 +2435,7 @@ def load_all_maps(*, include_deferred=False):
                 title=room_data.get("title"),
                 vnum=room_data.get("vnum"),
                 layout=room_data.get("layout"),
+                legacy_key=room_data.get("legacy_key"),
                 game_fields=room_data,
             )
             _stamp_room_city_meta(rooms[room_data["key"]], data)
@@ -2433,4 +2475,12 @@ def load_all_maps(*, include_deferred=False):
         )
 
     LAST_MAP_REGISTRY = registry
+    # Phase 3: hand rooms keyed by VNUM; legacy dig keys → aliases.
+    from engine import room_vnum as room_vnum_mod
+    rooms, LAST_ROOM_ALIASES = room_vnum_mod.rekey_hand_rooms_to_vnum(rooms)
+    # Re-point start_room if its key changed (same object, new .key).
+    if start_room is not None:
+        start_id = room_vnum_mod.internal_room_key(start_room)
+        if start_id and start_id in rooms:
+            start_room = rooms[start_id]
     return rooms, start_room, seed_items

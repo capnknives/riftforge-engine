@@ -303,16 +303,423 @@ def describe_actor_room(actor, *, staff: bool = False) -> str:
 
 
 def internal_room_key(room) -> str:
-    """Graph / persistence id for a room (Phase 1 = ``room.key``).
+    """Graph / persistence id for a room.
 
-    Phase 3 flips this to return the VNUM string and rekeys
-    ``game.rooms``. Call sites that *store* exit targets or ``home_room``
-    should go through this helper so the flip is localized. Never show
-    this string to players; staff dig tips may show it until Phase 3.
+    Phase 3: hand rooms with a VNUM use the VNUM string; grid cells and
+    unstamped rooms keep ``room.key``. Call sites that *store* exit
+    targets or ``home_room`` should go through this helper. Never show
+    this string to players as the address -- use :func:`staff_room_label`.
     """
     if room is None:
         return ""
+    # Hand rooms: VNUM is identity when stamped.
+    if is_hand_room(room):
+        raw = getattr(room, "vnum", None)
+        if raw is not None and str(raw).strip():
+            try:
+                return validate_vnum(raw)
+            except ValueError:
+                return str(raw).strip()
     return getattr(room, "key", "") or ""
+
+
+def ensure_title_before_rekey(room) -> None:
+    """Stamp authored ``title`` from the pre-rekey ROOM NAME if missing.
+
+    After Phase 3, ``room.key`` becomes the VNUM -- look_title must not
+    fall through to ``CA00001``. Opaque dig keys get a flag-based generic
+    stamped into title before the key flips.
+    """
+    if room is None:
+        return
+    from engine.room_naming import (
+        authored_title_is_usable,
+        bare_key,
+        generic_title_from_flags,
+        is_opaque_storage_key,
+    )
+    title = getattr(room, "title", None)
+    key = getattr(room, "key", "") or ""
+    if authored_title_is_usable(title, key):
+        return
+    if is_opaque_storage_key(key):
+        generic = generic_title_from_flags(room)
+        if generic:
+            room.title = generic
+        return
+    face = bare_key(key) if key else ""
+    if face:
+        room.title = face
+
+
+def rekey_hand_rooms_to_vnum(rooms: dict) -> tuple[dict, dict]:
+    """Rebuild a rooms dict so hand rooms are keyed by VNUM.
+
+    Returns ``(new_rooms, aliases)`` where ``aliases`` maps every former
+    storage key (and bare unscoped forms) to the VNUM identity key.
+    Grid cells stay under their coordinate keys. Rooms without a vnum
+    stay under their existing key (ephemeral / unstamped).
+
+    Live ``room.exits`` already hold Room object refs -- only the dict
+    keys and ``room.key`` change. Call after exits are linked.
+    """
+    if not isinstance(rooms, dict):
+        return {}, {}
+    new_rooms = {}
+    aliases = {}
+    for old_key, room in list(rooms.items()):
+        if room is None:
+            continue
+        if not is_hand_room(room):
+            new_rooms[old_key] = room
+            continue
+        raw = getattr(room, "vnum", None)
+        if not raw or not str(raw).strip():
+            new_rooms[old_key] = room
+            continue
+        try:
+            vnum = validate_vnum(raw)
+        except ValueError:
+            new_rooms[old_key] = room
+            continue
+        ensure_title_before_rekey(room)
+        # Remember the dig / JSON key for dual-read boot heal.
+        leg = getattr(room, "legacy_key", None)
+        if not leg:
+            room.legacy_key = old_key
+            leg = old_key
+        room.key = vnum
+        room.vnum = vnum
+        if vnum in new_rooms and new_rooms[vnum] is not room:
+            raise ValueError(
+                f"Phase 3 rekey: duplicate VNUM {vnum!r} "
+                f"({getattr(new_rooms[vnum], 'legacy_key', None)!r} vs "
+                f"{old_key!r})"
+            )
+        new_rooms[vnum] = room
+        aliases[old_key] = vnum
+        if leg and str(leg) != old_key:
+            aliases[str(leg)] = vnum
+        # Also alias bare unscoped form of qualified keys.
+        for candidate in (old_key, leg):
+            if not candidate:
+                continue
+            bare = bare_key_name(str(candidate))
+            if bare and bare != str(candidate) and bare not in aliases:
+                aliases[bare] = vnum
+    return new_rooms, aliases
+
+
+def lookup_room(game, key):
+    """Find a Room by VNUM identity key or legacy storage key.
+
+    Prefers ``game.rooms`` (Phase 3 identity), then ``game.room_aliases``.
+    """
+    if game is None or not key:
+        return None
+    text = str(key).strip()
+    if not text:
+        return None
+    rooms = getattr(game, "rooms", None)
+    if isinstance(rooms, dict):
+        hit = rooms.get(text)
+        if hit is not None:
+            return hit
+    aliases = getattr(game, "room_aliases", None) or {}
+    mapped = aliases.get(text)
+    if mapped and isinstance(rooms, dict):
+        hit = rooms.get(mapped)
+        if hit is not None:
+            return hit
+    # Case-insensitive alias / key scan (legacy tips).
+    lowered = text.lower()
+    for aka, vnum in aliases.items():
+        if str(aka).lower() == lowered and isinstance(rooms, dict):
+            hit = rooms.get(vnum)
+            if hit is not None:
+                return hit
+    if isinstance(rooms, dict):
+        for room in rooms.values():
+            if (getattr(room, "key", "") or "").lower() == lowered:
+                return room
+            leg = getattr(room, "legacy_key", None)
+            if leg and str(leg).lower() == lowered:
+                return room
+    return None
+
+
+def _hand_room_canonical_score(room) -> int:
+    """Higher = prefer as the surviving hub when ROOM NAME collides."""
+    if room is None or not is_hand_room(room):
+        return -1
+    raw = getattr(room, "vnum", None)
+    if not raw or not str(raw).strip():
+        return 0
+    try:
+        vnum = validate_vnum(raw)
+    except ValueError:
+        return 0
+    key = getattr(room, "key", "") or ""
+    if key == vnum:
+        return 2
+    return 1
+
+
+def _rewire_room_graph_pointers(game, stale, canonical, stats):
+    """Point exits / zone entries at ``canonical`` instead of ``stale``."""
+    rooms = getattr(game, "rooms", None) or {}
+    for room in rooms.values():
+        if room is None:
+            continue
+        exits = getattr(room, "exits", None) or {}
+        for direction, dest in list(exits.items()):
+            if dest is stale:
+                exits[direction] = canonical
+                stats["rewired_exits"] = stats.get("rewired_exits", 0) + 1
+        zone_to = getattr(room, "zone_exit_to", None)
+        if zone_to is stale:
+            room.zone_exit_to = canonical
+            stats["rewired_exits"] = stats.get("rewired_exits", 0) + 1
+        entries = getattr(room, "zone_entries", None) or {}
+        for alias, hub in list(entries.items()):
+            if hub is stale:
+                entries[alias] = canonical
+                stats["rewired_exits"] = stats.get("rewired_exits", 0) + 1
+
+
+def heal_duplicate_hand_room_titles(game) -> dict:
+    """Boot heal: collapse stale dig-key hand rooms that duplicate a VNUM hub.
+
+    Live map-backup merge can leave both ``The Waystation`` (legacy dig key)
+    and ``TN00001`` (VNUM identity) with the same ROOM NAME. Staff ``goto``
+    then lists two matches -- one with VNUM chrome, one without.
+    """
+    stats = {"removed": 0, "moved": 0, "rewired_exits": 0}
+    if game is None:
+        return stats
+    rooms = getattr(game, "rooms", None)
+    if not isinstance(rooms, dict):
+        return stats
+
+    by_name = {}
+    for room in rooms.values():
+        if room is None or not is_hand_room(room):
+            continue
+        name = (room_name(room) or "").strip().lower()
+        if not name:
+            continue
+        by_name.setdefault(name, []).append(room)
+
+    aliases = getattr(game, "room_aliases", None)
+    if aliases is None:
+        game.room_aliases = {}
+        aliases = game.room_aliases
+
+    for group in by_name.values():
+        if len(group) < 2:
+            continue
+        scored = [(r, _hand_room_canonical_score(r)) for r in group]
+        scored.sort(key=lambda pair: pair[1], reverse=True)
+        canonical, best = scored[0]
+        if best <= 0:
+            continue
+        canon_key = internal_room_key(canonical)
+        if not canon_key:
+            continue
+        for stale, score in scored[1:]:
+            if stale is canonical:
+                continue
+            for obj in list(getattr(stale, "contents", ()) or ()):
+                if hasattr(obj, "move_to"):
+                    obj.move_to(canonical)
+                    stats["moved"] += 1
+            _rewire_room_graph_pointers(game, stale, canonical, stats)
+            stale_key = getattr(stale, "key", None)
+            for dk, dr in list(rooms.items()):
+                if dr is stale:
+                    rooms.pop(dk, None)
+            if stale_key:
+                aliases[stale_key] = canon_key
+            leg = getattr(stale, "legacy_key", None)
+            if leg:
+                aliases[str(leg)] = canon_key
+            title = room_name(stale)
+            if title:
+                aliases[title] = canon_key
+            stats["removed"] += 1
+
+    return stats
+
+
+def hub_room(game, name, vnum=None):
+    """Resolve a hand-room hub by ROOM NAME and/or VNUM identity.
+
+    Uses ``game.rooms`` alias resolution first, then :func:`lookup_room`.
+    Player/staff strings like ``The Waystation`` work after VNUM rekey.
+    """
+    if game is None:
+        return None
+    rooms = getattr(game, "rooms", None)
+    if isinstance(rooms, dict):
+        if name:
+            hit = rooms.get(name)
+            if hit is not None:
+                return hit
+        if vnum:
+            hit = rooms.get(vnum)
+            if hit is not None:
+                return hit
+    if name:
+        room, _ = resolve_room(game, name)
+        if room is not None:
+            return room
+    if vnum:
+        room, _ = resolve_room(game, vnum)
+        return room
+    return None
+
+
+def heal_hand_room_title_aliases(game) -> int:
+    """Boot heal: register unique ROOM NAME strings in ``room_aliases``.
+
+    After VNUM rekey, ``rooms.get('The Waystation')`` only works when the
+    display title is aliased to the identity VNUM. Idempotent.
+    """
+    if game is None:
+        return 0
+    aliases = getattr(game, "room_aliases", None)
+    if aliases is None:
+        game.room_aliases = {}
+        aliases = game.room_aliases
+    rooms = getattr(game, "rooms", None) or {}
+    title_counts = {}
+    for room in rooms.values():
+        if room is None or not is_hand_room(room):
+            continue
+        name = (room_name(room) or "").strip()
+        if name:
+            key = name.lower()
+            title_counts[key] = title_counts.get(key, 0) + 1
+    added = 0
+    for room in rooms.values():
+        if room is None or not is_hand_room(room):
+            continue
+        raw = getattr(room, "vnum", None)
+        if not raw or not str(raw).strip():
+            continue
+        try:
+            vnum = validate_vnum(raw)
+        except ValueError:
+            continue
+        name = (room_name(room) or "").strip()
+        if not name or title_counts.get(name.lower(), 0) != 1:
+            continue
+        if aliases.get(name) != vnum:
+            aliases[name] = vnum
+            added += 1
+    return added
+
+
+def boot_duplicate_hand_room_titles(game, *, exclude_vehicles=True):
+    """List ambiguous hand-room ROOM NAMES at boot (for smoke / audit).
+
+    Returns ``[(title, count), ...]`` sorted by count descending. Skips
+    vehicle interior titles (``Inside the …``) when ``exclude_vehicles``.
+    """
+    if game is None:
+        return []
+    by_name = {}
+    for room in (getattr(game, "rooms", None) or {}).values():
+        if room is None or not is_hand_room(room):
+            continue
+        name = (room_name(room) or "").strip()
+        if not name:
+            continue
+        if exclude_vehicles and name.lower().startswith("inside "):
+            continue
+        by_name.setdefault(name.lower(), []).append(room)
+    hits = [
+        (rooms[0].look_title() if hasattr(rooms[0], "look_title") else name, len(rooms))
+        for name, rooms in by_name.items()
+        if len(rooms) > 1
+    ]
+    hits.sort(key=lambda pair: (-pair[1], pair[0].lower()))
+    return hits
+
+
+def heal_character_room_keys(game) -> dict:
+    """Boot heal: remap legacy ``room_key`` / home blob fields via aliases.
+
+    Idempotent. Returns a small stats dict for logs / smoke.
+    """
+    stats = {"room_key": 0, "home": 0, "workplace": 0, "other": 0}
+    if game is None:
+        return stats
+    aliases = getattr(game, "room_aliases", None) or {}
+    if not aliases:
+        return stats
+
+    def _remap(value):
+        if not value:
+            return value, False
+        text = str(value).strip()
+        if text in aliases:
+            return aliases[text], True
+        # Already a VNUM identity key.
+        if isinstance(getattr(game, "rooms", None), dict) and text in game.rooms:
+            return text, False
+        return text, False
+
+    blob_fields = (
+        ("home_room_key", "home"),
+        ("workplace_room_key", "workplace"),
+        ("haunt_room_key", "other"),
+        ("chapel_room_key", "other"),
+        ("exile_room_key", "other"),
+        ("body_room_key", "other"),
+        ("gm_spirit_room_key", "other"),
+        ("orbit_return_room", "other"),
+        ("stellar_flight_return_room", "other"),
+        ("vault_return_room", "other"),
+    )
+    for char in list(getattr(game, "characters", None) or []):
+        loc = getattr(char, "location", None)
+        if loc is not None:
+            # Location already a Room object -- ensure key is identity.
+            want = internal_room_key(loc)
+            if want and getattr(loc, "key", None) != want:
+                loc.key = want
+        for field, bucket in blob_fields:
+            raw = getattr(char, field, None)
+            new, changed = _remap(raw)
+            if changed:
+                setattr(char, field, new)
+                stats[bucket] = stats.get(bucket, 0) + 1
+        # protected_rooms list
+        prot = getattr(char, "protected_rooms", None)
+        if isinstance(prot, list) and prot:
+            rebuilt = []
+            changed_p = False
+            for item in prot:
+                new, ch = _remap(item)
+                rebuilt.append(new)
+                changed_p = changed_p or ch
+            if changed_p:
+                char.protected_rooms = rebuilt
+                stats["other"] += 1
+        # known_exits dict keys
+        known = getattr(char, "known_exits", None)
+        if isinstance(known, dict) and known:
+            rebuilt = {}
+            changed_k = False
+            for rk, dirs in known.items():
+                new, ch = _remap(rk)
+                rebuilt[new] = dirs
+                changed_k = changed_k or ch
+            if changed_k:
+                char.known_exits = rebuilt
+                stats["other"] += 1
+    return stats
 
 
 def find_room_by_vnum(game, vnum_text):
@@ -344,18 +751,74 @@ def find_room_by_vnum(game, vnum_text):
     return None
 
 
+def room_matches_needle(room, needle, *, match_key=False) -> bool:
+    """True when *needle* is a substring of ROOM NAME and/or VNUM.
+
+    Staff ``where`` / partial ``goto`` share this matcher. Optional
+    ``match_key`` keeps silent legacy dig-key substring matching for
+    ``where`` discovery until Phase 3 teardown (never teach dig keys).
+    """
+    if room is None or not needle:
+        return False
+    want = str(needle).strip().lower()
+    if not want:
+        return False
+    title = (room_name(room) or "").lower()
+    if want in title:
+        return True
+    raw_v = getattr(room, "vnum", None)
+    if raw_v is not None and str(raw_v).strip():
+        try:
+            code = validate_vnum(raw_v).lower()
+        except ValueError:
+            code = str(raw_v).strip().lower()
+        if want in code:
+            return True
+    if match_key:
+        key = (getattr(room, "key", "") or "").lower()
+        if want in key:
+            return True
+    return False
+
+
+def iter_rooms_matching(game, needle, *, match_key=False):
+    """Every live room matching *needle* (ROOM NAME / VNUM substring).
+
+    Sorted by ROOM NAME then storage key for stable staff lists.
+    """
+    want = (needle or "").strip()
+    if not want or game is None:
+        return []
+    rooms = getattr(game, "rooms", None) or {}
+    hits = [
+        room for room in rooms.values()
+        if room_matches_needle(room, want, match_key=match_key)
+    ]
+
+    def _sort_key(room):
+        return (
+            (room_name(room) or "").lower(),
+            (getattr(room, "key", "") or "").lower(),
+        )
+
+    hits.sort(key=_sort_key)
+    return hits
+
+
 def resolve_room(game, query, *, allow_internal_key=True):
-    """Resolve a staff/query string to a Room (Phase 1 identity bridge).
+    """Resolve a staff/query string to a Room (Phase 1–2 identity bridge).
 
     Order:
       1. Exact VNUM (``CA00001``).
       2. Exact ROOM NAME (case-insensitive ``look_title`` / title).
-      3. Exact internal key (``room.key``) -- silent compat until Phase 3;
+      3. Unique partial ROOM NAME / VNUM substring (case-insensitive).
+      4. Exact internal key (``room.key``) -- silent compat until Phase 3;
          disable with ``allow_internal_key=False`` to rehearse the cutover.
 
     Returns ``(room_or_None, how)`` where ``how`` is
-    ``\"vnum\"`` / ``\"room_name\"`` / ``\"internal_key\"`` /
-    ``\"ambiguous_name\"`` / ``None``. Ambiguous ROOM NAME returns
+    ``\"vnum\"`` / ``\"room_name\"`` / ``\"partial_name\"`` /
+    ``\"internal_key\"`` / ``\"ambiguous_name\"`` / ``None``.
+    Ambiguous exact or partial ROOM NAME returns
     ``(None, \"ambiguous_name\")`` -- use :func:`resolve_room_or_error`
     for a staff-facing tip that lists VNUMs.
     """
@@ -379,26 +842,44 @@ def resolve_room(game, query, *, allow_internal_key=True):
         # Shared ROOM NAMES must use VNUM -- do not fall through to a
         # coincidental internal-key match and silently pick the wrong room.
         return None, "ambiguous_name"
+    # Unique partial ROOM NAME / VNUM substring (goto Town Park, etc.).
+    partial_hits = iter_rooms_matching(game, text, match_key=False)
+    if len(partial_hits) == 1:
+        return partial_hits[0], "partial_name"
+    if len(partial_hits) > 1:
+        return None, "ambiguous_name"
     if allow_internal_key:
-        # Direct dict hit (qualified keys, legacy dig targets).
+        # Direct dict hit (qualified keys, legacy dig targets, RoomMap aliases).
         hit = rooms.get(text)
         if hit is not None:
             return hit, "internal_key"
         for room in rooms.values():
             if (getattr(room, "key", "") or "").lower() == lowered:
                 return room, "internal_key"
+            leg = getattr(room, "legacy_key", None)
+            if leg and str(leg).lower() == lowered:
+                return room, "internal_key"
+        # Game-level alias table (Phase 3 dual-read).
+        aliases = getattr(game, "room_aliases", None) or {}
+        mapped = aliases.get(text)
+        if mapped and mapped in rooms:
+            return rooms[mapped], "internal_key"
+        for aka, vnum in aliases.items():
+            if str(aka).lower() == lowered and vnum in rooms:
+                return rooms[vnum], "internal_key"
     return None, None
 
 
 def _ambiguous_name_tip(game, query) -> str:
-    """Staff tip listing VNUMs for every room that shares ``query`` as name."""
+    """Staff tip listing VNUMs for rooms matching *query* (exact or partial)."""
     text = (query or "").strip()
     lowered = text.lower()
     rooms = getattr(game, "rooms", None) or {}
-    hits = [
+    exact = [
         room for room in rooms.values()
         if room_name(room).lower() == lowered
     ]
+    hits = exact if exact else iter_rooms_matching(game, text, match_key=False)
     labels = []
     for room in hits[:12]:
         label = staff_room_label(room)
@@ -409,17 +890,18 @@ def _ambiguous_name_tip(game, query) -> str:
         more = f" (+{len(hits) - 12} more)"
     listed = ", ".join(labels) if labels else "(none)"
     return (
-        f"Several rooms share ROOM NAME {text!r}. "
-        f"Use a unique VNUM: {listed}{more}."
+        f"Several rooms match {text!r}. "
+        f"Use a unique VNUM or fuller ROOM NAME: {listed}{more}."
     )
 
 
 def resolve_room_or_error(game, query, *, allow_internal_key=True):
     """Resolve for staff verbs -- returns ``(room, None)`` or ``(None, err)``.
 
-    Staff addressing is **ROOM NAME** and **VNUM** (internal key remains
-    silent compat when ``allow_internal_key`` is True). Prefer this over
-    bare :func:`resolve_room` when the caller sends a tip to a GM.
+    Staff addressing is **ROOM NAME** and **VNUM** (partial name OK when
+    unique). Internal key remains silent compat when
+    ``allow_internal_key`` is True. Prefer this over bare
+    :func:`resolve_room` when the caller sends a tip to a GM.
     """
     text = (query or "").strip()
     if not text:

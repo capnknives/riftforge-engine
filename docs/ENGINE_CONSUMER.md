@@ -22,6 +22,7 @@ Call these **before** constructing `Character`s or loading a save:
 |------|--------|-------------------|------------------|
 | Character attach | `set_character_attacher(fn)` | no-op | `supers.character_attach.attach_supers` |
 | Persist blob | `set_blob_codec(to_blob, from_blob)` | `{}` / no-op apply | `supers.persist_blob` |
+| Game meta load/save | `set_game_meta_codec(load_fn, save_fn)` | no-op | `supers.persist_meta` |
 | Chargen | `set_chargen(async_fn)` | skip (return True) | `chargen.run` |
 | Help topics | `set_help(topics, categories)` | empty | `help_topics` maps |
 | Command dispatch | `set_dispatch(fn)` | `None` (npc_do no-ops) | `commands.dispatch` |
@@ -33,7 +34,7 @@ Call these **before** constructing `Character`s or loading a save:
 | Loot-from-body line | `set_loot_room_line(fn)` | generic "`<actor> takes <item> from <body>.`" | `supers.scavenge.loot_room_line` |
 | Strongbox relic reward | `set_make_relic_item(fn)` | `None` | `supers.faith.make_relic_item` |
 | Spirit-sight gate | `set_can_see_spirit(fn)` | only a spirit sees itself | `supers.bootstrap._can_see_spirit` (Spirit Magic OR Attunement ≥15) |
-| Dark-room night-sight | `set_can_see_in_dark(fn)` | False (torch only) | `supers.bootstrap._can_see_in_dark` (GM form, God Mantle/twin, Monster Origin, Umbral, heatvision, hostiles) |
+| Dark-room night-sight | `set_can_see_in_dark(fn)` | False (torch only) | `supers.bootstrap._can_see_in_dark` (GM form, God twin, all non-Human Origins, heatvision, hostiles) |
 | Pre-move cancel | `set_before_relocate(fn)` | `None` (nothing to cancel) | `supers.bootstrap._before_relocate` (cancels training) |
 | Post-move arrival | `set_after_arrive(fn)` | no-op | `supers.bootstrap._after_arrive` (stop work, carry body, lodging owner-enters) |
 | Room-entry encounter roll | `set_encounter_check(fn)` | no-op | `supers.world_ext.encounter_check` (wilderness/dungeon spawns + aggro) |
@@ -79,6 +80,18 @@ from supers.bootstrap import register_all_hooks
 register_all_hooks()   # attach, blob, chargen, help
 # then build Game / accept connections
 ```
+
+## Lean engine demo
+
+```text
+python -m engine
+# or: RIFTFORGE_GAME=none python server.py
+```
+
+Forces lean mode when unset, points `maps` at
+`engine/demo/content/maps/` (one-room `demo.json`), and skips game-package
+hooks. Opaque SQLite extras use `persistence.load_meta_json` /
+`save_meta_json`; game-shaped Tide/Cadence meta stays in the game codec.
 
 ## What still lives in the monorepo root
 

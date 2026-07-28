@@ -131,6 +131,7 @@ def cmd_look(character, args, game, *, after_move=False):
         extras.append(f"Enter: enter <name> -- here: {hint}")
     # Exit only at the pocket mouth you entered (zone_exit + entry stamp).
     # Keep these short -- TTS reads them on every look in town.
+    revalidate_zone_entry_stamp(character, game)
     stamped_entry = getattr(character, "zone_entry_hub_key", None)
     screenreader = bool(getattr(character, "screenreader", False))
     if stamped_entry and room.key != stamped_entry:
@@ -248,11 +249,9 @@ def cmd_look(character, args, game, *, after_move=False):
             if _is_presence_hidden(character, o):
                 continue
             label = _display_name(o, viewer=character)
-            # Pose on the room short-desc line (plain words, never color
-            # alone) so watchers see Echoes / players in bed.
-            if getattr(o, "asleep", False):
-                label = f"{label} is sleeping"
-            souls.append(label)
+            souls.append(
+                hooks.room_presence_line(label, o, room, game)
+            )
 
     # Room chrome: players always get the ROOM NAME. Staff in GM form see
     # ROOM NAME[VNUM] so dig / mappers match GMCP without opaque graph ids
@@ -876,7 +875,10 @@ def cmd_sit(character, args, game):
     character.session.send("You sit down.")
     room = getattr(character, "location", None)
     if room is not None:
-        room.broadcast(f"{character.key} sits down.", exclude=character)
+        room.broadcast(
+            f"{_presence_face(character)} sits down.",
+            exclude=character,
+        )
 
 
 def cmd_stand(character, args, game):
@@ -886,7 +888,10 @@ def cmd_stand(character, args, game):
         character.session.send("You stand up.")
         room = getattr(character, "location", None)
         if room is not None:
-            room.broadcast(f"{character.key} stands up.", exclude=character)
+            room.broadcast(
+                f"{_presence_face(character)} stands up.",
+                exclude=character,
+            )
         return
     if getattr(character, "asleep", False) or getattr(character, "resting", False):
         character.session.send("You're resting -- type 'wake' to get up.")
@@ -910,8 +915,10 @@ def cmd_move(character, direction, game):
         return
     # Awake rest cancels when you walk. (hook -- no-op without a game.)
     hooks.cancel_rest(character)
-    # Sitting is silent, unlike rest/sleep -- walking away just stands you up.
+    # Sitting / lying are silent, unlike rest/sleep -- walking away stands.
     character.sitting = False
+    character.lying = False
+    character.posture_furniture_id = None
     # Dual-layer America overland (vehicle macro / on-foot micro).
     if hooks.try_directional_move(character, direction, game):
         return
@@ -1118,8 +1125,7 @@ def _do_transition(character, dest, game, leave_text, arrive_text):
     if not stealth:
         dest.broadcast(arrive_text, exclude=character)
     cmd_look(character, "", game)
-    import world
-    world.encounter_check(game, dest)
+    hooks.encounter_check(game, dest)
     return True
 
 
@@ -1139,6 +1145,26 @@ def clear_zone_entry(character):
     if character is None:
         return
     character.zone_entry_hub_key = None
+
+
+def revalidate_zone_entry_stamp(character, game):
+    """Drop a pocket-entry stamp when the hub lives in another zone (bug #54)."""
+    stamped = getattr(character, "zone_entry_hub_key", None)
+    if not stamped:
+        return
+    room = getattr(character, "location", None)
+    if room is None:
+        clear_zone_entry(character)
+        return
+    rooms = getattr(game, "rooms", None) or {} if game else {}
+    hub = rooms.get(stamped)
+    if hub is None:
+        clear_zone_entry(character)
+        return
+    hub_zone = getattr(hub, "zone", None)
+    cur_zone = getattr(room, "zone", None)
+    if hub_zone and cur_zone and hub_zone != cur_zone:
+        clear_zone_entry(character)
 
 
 def can_exit_zone_here(character, room):
@@ -1561,7 +1587,11 @@ def cmd_who(character, args, game):
         other = getattr(session, "character", None)
         if other is None:
             continue
-        if getattr(other, "gm_spirit", False) and not viewer_is_gm:
+        if (
+            getattr(other, "gm_spirit", False)
+            and not viewer_is_gm
+            and getattr(other, "wizinvis", True)
+        ):
             continue
         marker = id(other)
         if marker in seen:
@@ -2373,6 +2403,8 @@ def cmd_account(character, args, game):
             for entry in reports_mod.recent(
                 reports_mod.SUGGEST, None, directory=game.report_dir
             ):
+                if entry.get("status") != "resolved":
+                    continue
                 key = (entry.get("reporter") or "").strip()
                 if key:
                     suggest_counts[key] = suggest_counts.get(key, 0) + 1
@@ -2403,7 +2435,7 @@ def cmd_account(character, args, game):
             f"(config oocname account|character)",
             f"  Bugs squashed: {int(account.bugs_squashed or 0)} "
             "(account lifetime)",
-            f"  Features suggested: "
+            f"  Ideas shipped: "
             f"{int(account.features_suggested or 0)} "
             "(account lifetime)",
         ]
@@ -3548,6 +3580,12 @@ def cmd_open(character, args, game):
         character.session.send(f"{item.key} isn't locked.")
         return
 
+    # Game hook: pit mimic strongboxes reveal and attack instead of paying
+    # loot (supers/purgatory_dungeon/mimic.py when a game is installed).
+    from engine import hooks
+    if hooks.before_open_container(character, item, holder, game):
+        return
+
     # holder is either a list (character.inventory) or a Room -- both
     # support .remove(obj) with the same signature, so no branch is needed.
     holder.remove(item)
@@ -3556,7 +3594,9 @@ def cmd_open(character, args, game):
     from engine import hooks
     for reward in item.loot:
         if reward.get("type") == "growth":
-            character.growth = round(character.growth + reward["amount"], 2)
+            amount = float(reward["amount"])
+            character.growth = round(character.growth + amount, 2)
+            hooks.after_growth_banked(character, amount, "lockbox")
             gains.append(f"{reward['amount']:g} banked growth")
         elif reward.get("type") == "relic":
             # hook -- None without a game installed; Phase 2 purity.
@@ -3884,24 +3924,25 @@ def cmd_hedit(character, args, game):
     )
 
 
-def _reports_section(header, label, entries):
+def _reports_section(header, label, entries, game=None):
     """Build the lines for one 'reports' section (all bugs, or all ideas).
 
     entries is already the slice to display, oldest-first. Always emits the
     header, even for an empty section, so a GM can tell "nothing open" from
-    "reports is broken."
+    "reports is broken." *game* lets reporter keys resolve to legal names.
     """
     lines = [header]
     if not entries:
         lines.append("  (none)")
         return lines
+    from engine.char_identity import reporter_display_name
     for entry in entries:
         entry_id = entry.get("id", "?")
         status = entry.get("status", "open")
         time = entry.get("time", "?")
         reporter_raw = entry.get("reporter", "?")
-        from engine.command_support import strip_ephemeral_storage_prefix
-        reporter = strip_ephemeral_storage_prefix(str(reporter_raw))
+        # Storage key stays in JSONL; display prefers legal_public_name.
+        reporter = reporter_display_name(game, reporter_raw)
         description = entry.get("description", "")
         lines.append(
             f"  [{label} #{entry_id}] ({status}) {time} {reporter}: "
@@ -3979,11 +4020,11 @@ def cmd_reports(character, args, game):
         scope += ", all statuses"
     from engine import style
     body = [style.paint("muted", f"({scope})")]
-    body += _reports_section("Bugs:", "BUG", bugs)
+    body += _reports_section("Bugs:", "BUG", bugs, game=game)
     body.append(style.wrought_rule(48))
-    body += _reports_section("Ideas:", "IDEA", suggestions)
+    body += _reports_section("Ideas:", "IDEA", suggestions, game=game)
     body.append(style.wrought_rule(48))
-    body += _reports_section("Help ideas:", "HELP", help_ideas)
+    body += _reports_section("Help ideas:", "HELP", help_ideas, game=game)
     lines = style.format_sheet(
         "REPORTS", body, width=52,
         screenreader=bool(getattr(character, "screenreader", False)),

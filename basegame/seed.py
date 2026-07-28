@@ -10,5 +10,6 @@ hang their one-time setup on.
 
 
 def seed_content(game):
-    """No-op for the skeleton reference town -- see module docstring."""
-    pass
+    """Stamp overland atlas + pocket exits after maps load."""
+    from engine import hooks
+    hooks.ensure_game_defaults(game)
