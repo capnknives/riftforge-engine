@@ -160,10 +160,20 @@ def build(character, game):
                 _safe_str(getattr(combat_target, "key", None))
                 if combat_target is not None else None
             ),
+            "mutual_focus": (
+                getattr(combat_target, "target", None) is character
+                if combat_target is not None else None
+            ),
             "sparring": bool(getattr(character, "sparring", False)),
             "combat_stance": _safe_str(
                 getattr(character, "combat_stance", None), "balanced",
             ),
+            "combat_style": _safe_str(
+                getattr(character, "combat_style", None), "",
+            ) or None,
+            "auto_combat_style": _safe_str(
+                getattr(character, "auto_combat_style", None), "",
+            ) or None,
         },
         "group": _group_snapshot(character),
         "display": {
@@ -175,6 +185,11 @@ def build(character, game):
                 getattr(character, "show_combat_tags", True),
             ),
             "show_tips": bool(getattr(character, "show_tips", True)),
+            "combat_numbers": bool(getattr(character, "combat_numbers", False)),
+            "combat_diag": bool(getattr(character, "combat_diag", False)),
+            "fightlog_enabled": bool(
+                getattr(character, "fightlog_enabled", False),
+            ),
         },
         "game": {
             "tick": int(getattr(game, "game_time_ticks", 0) or 0)
@@ -182,6 +197,21 @@ def build(character, game):
             "deploy_sha": _deploy_sha(report_dir),
         },
     }
+
+    combat_aim = getattr(character, "combat_aim", None)
+    if combat_aim:
+        ctx["combat"]["aim"] = _safe_str(combat_aim)
+    if combat_target is not None:
+        try:
+            mom = float(getattr(character, "momentum", 0.0) or 0.0)
+            ctx["combat"]["momentum"] = round(mom, 1)
+        except (TypeError, ValueError):
+            pass
+
+    # Drop empty combat-style keys (most fighters have neither set).
+    for style_key in ("combat_style", "auto_combat_style"):
+        if not ctx["combat"].get(style_key):
+            ctx["combat"].pop(style_key, None)
 
     # Strip empty optional strings for a tighter log.
     if not ctx["room"]["vnum"]:

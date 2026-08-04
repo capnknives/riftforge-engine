@@ -170,3 +170,54 @@ def level_phrase(level, *, seek=SEEK_THRESHOLD, very=0.85, critical=CRITICAL_THR
     if level >= seek:
         return "somewhat"
     return "a little"
+
+
+# -- Optional dynamic registry -----------------------------------------
+#
+# Everything above works with a plain ``names`` list/tuple a game defines
+# itself -- no registration required. This registry exists for generic
+# tooling (a `list meters` command, a lean tick driver for a game with no
+# SUPERS-style bespoke decay(), Area Studio) that wants to discover what
+# meters a game declared and their base rates without importing the game.
+# It does not replace or drive SUPERS' own ``decay()`` -- that function's
+# per-meter branching (Ashen prey freezes, Celestial lifestyle skips,
+# vessel-strain plane multipliers, fuel-as-sustenance sync, ...) is 100%
+# game fiction and stays entirely in ``supers/needs.py``, unmodified. It
+# reads its rates *from* this registry instead of a private duplicate.
+
+_meters: dict[str, dict] = {}
+
+
+def register_meter(name, base_rate, *, is_fuel=False):
+    """Register one meter's base per-tick decay rate.
+
+    Idempotent -- re-registering the same name overwrites its entry. Set
+    ``is_fuel=True`` for a meter a game may mirror from a shared fuel tank
+    for some characters instead of decaying independently (SUPERS: hunger
+    and thirst, for Vampire blood / Celestial Grace / etc.) -- purely
+    descriptive metadata here, the mirroring logic itself stays game-side.
+    """
+    _meters[str(name)] = {"base_rate": float(base_rate), "is_fuel": bool(is_fuel)}
+
+
+def registered_meters():
+    """Frozen snapshot of every registered meter name."""
+    return frozenset(_meters)
+
+
+def meter_rate(name, default=0.0):
+    """Registered base rate for ``name``, or ``default`` if unregistered."""
+    entry = _meters.get(name)
+    return entry["base_rate"] if entry is not None else default
+
+
+def is_fuel_meter(name):
+    """True when ``name`` was registered with ``is_fuel=True``."""
+    entry = _meters.get(name)
+    return bool(entry) and entry["is_fuel"]
+
+
+def reset_meters():
+    """Clear every registration. Test-only -- production boots never need
+    this (registration is idempotent; see ``register_meter``)."""
+    _meters.clear()

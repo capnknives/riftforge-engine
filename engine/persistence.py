@@ -15,8 +15,8 @@ Design notes:
 - We save a FULL SNAPSHOT every time (wipe the tables, rewrite everything).
   Characters come from game.characters (see engine/char_index.py); loose
   room items still walk the room dict once. Autosave is throttled in
-  server.Game.on_tick (every AUTOSAVE_EVERY_TICKS) so the wipe+rewrite
-  does not stall the asyncio loop every heartbeat.
+  server.Game.on_tick (every AUTOSAVE_INTERVAL_SECONDS of wall-clock time)
+  so the wipe+rewrite does not stall the asyncio loop every heartbeat.
   EXTENSION POINT: switch to dirty-tracking if the world ever gets huge.
 - Rooms themselves are NOT stored. The map is still built in code by
   build_world(); the database records which room each character/item is IN,
@@ -65,6 +65,11 @@ def _resolve_saved_room(game, room_key, character_name):
     Fix: keep the saved key. Register a stub Room under that key so the
     character stays put until the real map content is on disk. Loud log so
     staff see the map lag.
+
+    **Prevention:** persistable runtime rooms (vehicle interiors, charter
+    cabins, …) must register a pre-load ensure in
+    ``engine/runtime_rooms.py`` via ``supers/runtime_rooms.py`` so the
+    real room exists before this runs. See CONTENT_AUTHORING.md.
     """
     if not room_key:
         print(
@@ -98,6 +103,79 @@ def _resolve_saved_room(game, room_key, character_name):
     return stub
 
 
+def _safe_relocation_room(game, character):
+    """Pick an authored room for boot-heal relocation off a persistence stub."""
+    from engine.room_vnum import lookup_room
+
+    rooms = getattr(game, "rooms", None) or {}
+    start = getattr(game, "start_room", None)
+
+    def _usable(key):
+        if not key:
+            return None
+        room = lookup_room(game, key)
+        if room is None or getattr(room, "map_missing_stub", False):
+            return None
+        return room
+
+    for key in (
+        getattr(character, "home_room_key", None),
+        getattr(character, "body_room_key", None),
+    ):
+        room = _usable(key)
+        if room is not None:
+            return room
+    return start
+
+
+def heal_map_missing_stub_occupants(game):
+    """Boot heal: move bodies off persistence ``map_missing_stub`` rooms.
+
+    ``_resolve_saved_room`` can register a thin stub when the saved
+    ``room_key`` is absent from map JSON at load. Vehicle ensure and pit
+    reaping replace many of those keys later in boot, but stale DB rows
+    (old Purgatory pits, removed vehicle interiors, …) can still leave
+    Echoes/NPCs on stubs every restart until their ``room_key`` is healed.
+    """
+    if game is None:
+        return 0
+    rooms = getattr(game, "rooms", None) or {}
+    moved = 0
+    emptied_stub_keys = []
+    roster = getattr(game, "characters", None) or []
+    if isinstance(roster, dict):
+        roster = roster.values()
+    for character in list(roster):
+        loc = getattr(character, "location", None)
+        if loc is None or not getattr(loc, "map_missing_stub", False):
+            continue
+        dest = _safe_relocation_room(game, character)
+        if dest is None:
+            continue
+        stub_key = getattr(loc, "key", None)
+        try:
+            character.move_to(dest)
+        except Exception:
+            character.location = dest
+        moved += 1
+        if stub_key and stub_key not in emptied_stub_keys:
+            emptied_stub_keys.append(stub_key)
+    for stub_key in emptied_stub_keys:
+        room = rooms.get(stub_key)
+        if room is None or not getattr(room, "map_missing_stub", False):
+            continue
+        if list(room.characters()):
+            continue
+        rooms.pop(stub_key, None)
+    if moved:
+        print(
+            f"[persistence] healed {moved} occupant(s) off map_missing_stub "
+            f"rooms",
+            flush=True,
+        )
+    return moved
+
+
 # Everything the database needs to exist. "IF NOT EXISTS" makes this safe to
 # run every startup: it creates the tables on first boot and does nothing after.
 _SCHEMA = """
@@ -126,7 +204,9 @@ CREATE TABLE IF NOT EXISTS homestead_plots (
     owner_name    TEXT NOT NULL UNIQUE,
     cell_room_key TEXT NOT NULL UNIQUE,
     enter_name    TEXT,
-    hub_room_key  TEXT
+    hub_room_key  TEXT,
+    -- Homestead v2: JSON blob (micro coords, ledger, tier, residents, …).
+    meta_json     TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS homestead_rooms (
     room_key     TEXT PRIMARY KEY,
@@ -157,6 +237,25 @@ CREATE TABLE IF NOT EXISTS personal_realms (
 CREATE TABLE IF NOT EXISTS personal_realm_rooms (
     room_key     TEXT PRIMARY KEY,
     realm_id     TEXT NOT NULL,
+    description  TEXT NOT NULL,
+    flags_json   TEXT NOT NULL,
+    exits_json   TEXT NOT NULL
+);
+-- God demesnes (docs/plans/god_demesne_creation.md) -- SQLite, not git maps.
+CREATE TABLE IF NOT EXISTS demesnes (
+    demesne_id     TEXT PRIMARY KEY,
+    owner_name     TEXT NOT NULL UNIQUE,
+    host_plane     TEXT NOT NULL,
+    host_hub_key   TEXT NOT NULL,
+    hub_room_key   TEXT,
+    macro_size     INTEGER NOT NULL DEFAULT 3,
+    sealed         INTEGER NOT NULL DEFAULT 0,
+    unmade         INTEGER NOT NULL DEFAULT 0,
+    meta_json      TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS demesne_rooms (
+    room_key     TEXT PRIMARY KEY,
+    demesne_id   TEXT NOT NULL,
     description  TEXT NOT NULL,
     flags_json   TEXT NOT NULL,
     exits_json   TEXT NOT NULL
@@ -196,6 +295,45 @@ CREATE TABLE IF NOT EXISTS accounts (
     password_hash  TEXT NOT NULL DEFAULT '',
     data           TEXT NOT NULL DEFAULT '{}'
 );
+-- Player-owned civic shop fixtures (street enter mouths; P0 player_shops).
+CREATE TABLE IF NOT EXISTS player_shops (
+    shop_id        TEXT PRIMARY KEY,
+    owner_key      TEXT NOT NULL,
+    host_room_key  TEXT NOT NULL,
+    enter_alias    TEXT NOT NULL,
+    display_name   TEXT NOT NULL,
+    amenity_type   TEXT NOT NULL DEFAULT 'retail',
+    hp             INTEGER NOT NULL DEFAULT 100,
+    hp_max         INTEGER NOT NULL DEFAULT 100,
+    wrecked        INTEGER NOT NULL DEFAULT 0,
+    meta_json      TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS player_shop_rooms (
+    room_key       TEXT PRIMARY KEY,
+    shop_id        TEXT NOT NULL,
+    description    TEXT NOT NULL,
+    flags_json     TEXT NOT NULL,
+    exits_json     TEXT NOT NULL
+);
+-- Player-founded townships (docs/plans/player_towns.md).
+CREATE TABLE IF NOT EXISTS township_plots (
+    town_id        TEXT PRIMARY KEY,
+    town_name      TEXT NOT NULL,
+    founder_name   TEXT NOT NULL UNIQUE,
+    mouth_room_key TEXT NOT NULL,
+    macro_x        INTEGER NOT NULL,
+    macro_y        INTEGER NOT NULL,
+    enter_name     TEXT,
+    hub_room_key   TEXT,
+    meta_json      TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS township_rooms (
+    room_key       TEXT PRIMARY KEY,
+    town_id        TEXT NOT NULL,
+    description    TEXT NOT NULL,
+    flags_json     TEXT NOT NULL,
+    exits_json     TEXT NOT NULL
+);
 -- External-content FTS5 index (keyword + body only -- aliases already get
 -- exact-match coverage via help_aliases, see help_db.get_entry). Kept in
 -- sync by the three triggers below rather than the app re-indexing itself.
@@ -220,18 +358,49 @@ END;
 """
 
 
+def _sqlite_journal_mode():
+    """Journal mode for on-disk DBs.
+
+    Default is **DELETE** (not WAL). This MUD is single-writer; WAL's
+    concurrent-reader benefit is unused, and Docker Desktop bind-mounts of
+    ``riftforge.db`` on Windows have repeatedly corrupted under WAL
+    (``database disk image is malformed`` / btree errors during
+    ``DELETE FROM characters`` world saves). That left sessions
+    outbound-only (combat spam, dead commands).
+
+    Override with ``RIFTFORGE_SQLITE_JOURNAL`` (``WAL`` / ``DELETE`` /
+    ``TRUNCATE`` / ``MEMORY`` / ``OFF``). Live Linux can set ``WAL`` if
+    desired; DELETE remains correct and safer as the default.
+    """
+    import os
+
+    override = (os.environ.get("RIFTFORGE_SQLITE_JOURNAL") or "").strip().upper()
+    if override:
+        return override
+    return "DELETE"
+
+
 def connect(path):
     """Open (or create) the database at `path` and ensure the tables exist.
 
     `path` may also be ":memory:" -- SQLite's built-in throwaway mode, which
-    the smoke test uses so test runs never touch a real file. WAL (crash
-    safety + readers that don't block on a writer) only makes sense for a
-    real file -- ":memory:" has no journal to speak of and rejects the
-    pragma with an OperationalError.
+    the smoke test uses so test runs never touch a real file. Journal modes
+    only make sense for a real file -- ":memory:" has no journal to speak
+    of and rejects the pragma with an OperationalError.
     """
     conn = sqlite3.connect(path)
     if path != ":memory:":
-        conn.execute("PRAGMA journal_mode=WAL")
+        mode = _sqlite_journal_mode()
+        try:
+            conn.execute(f"PRAGMA journal_mode={mode}")
+        except sqlite3.Error as exc:
+            # Bad override / exotic build — fall back rather than refuse boot.
+            print(
+                f"[persistence] PRAGMA journal_mode={mode} failed ({exc!r}); "
+                "trying WAL",
+                flush=True,
+            )
+            conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)   # executescript runs several statements at once
     _migrate(conn)
     return conn
@@ -259,6 +428,8 @@ _MIGRATIONS = [
     enter_name TEXT,
     hub_room_key TEXT
 )"""),
+    # Homestead v2 meta blob (ledger, micro coords, tier, residents, …).
+    # Fresh DBs also get meta_json from _SCHEMA; ALTER covers older trees.
     (3, """CREATE TABLE IF NOT EXISTS homestead_rooms (
     room_key TEXT PRIMARY KEY,
     plot_id TEXT NOT NULL,
@@ -316,6 +487,65 @@ _MIGRATIONS = [
     display_name   TEXT NOT NULL,
     password_hash  TEXT NOT NULL DEFAULT '',
     data           TEXT NOT NULL DEFAULT '{}'
+)"""),
+    # Homestead v2: plot meta_json (ledger, micro, tier, residents, …).
+    (11, "ALTER TABLE homestead_plots ADD COLUMN meta_json TEXT NOT NULL DEFAULT '{}'"),
+    # Player shops P0: civic fixture mouths + pocket hubs.
+    (12, """CREATE TABLE IF NOT EXISTS player_shops (
+    shop_id TEXT PRIMARY KEY,
+    owner_key TEXT NOT NULL,
+    host_room_key TEXT NOT NULL,
+    enter_alias TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    amenity_type TEXT NOT NULL DEFAULT 'retail',
+    hp INTEGER NOT NULL DEFAULT 100,
+    hp_max INTEGER NOT NULL DEFAULT 100,
+    wrecked INTEGER NOT NULL DEFAULT 0,
+    meta_json TEXT NOT NULL DEFAULT '{}'
+)"""),
+    (13, """CREATE TABLE IF NOT EXISTS player_shop_rooms (
+    room_key TEXT PRIMARY KEY,
+    shop_id TEXT NOT NULL,
+    description TEXT NOT NULL,
+    flags_json TEXT NOT NULL,
+    exits_json TEXT NOT NULL
+)"""),
+    # God demesnes skeleton (docs/plans/god_demesne_creation.md).
+    (14, """CREATE TABLE IF NOT EXISTS demesnes (
+    demesne_id TEXT PRIMARY KEY,
+    owner_name TEXT NOT NULL UNIQUE,
+    host_plane TEXT NOT NULL,
+    host_hub_key TEXT NOT NULL,
+    hub_room_key TEXT,
+    macro_size INTEGER NOT NULL DEFAULT 3,
+    sealed INTEGER NOT NULL DEFAULT 0,
+    unmade INTEGER NOT NULL DEFAULT 0,
+    meta_json TEXT NOT NULL DEFAULT '{}'
+)"""),
+    (15, """CREATE TABLE IF NOT EXISTS demesne_rooms (
+    room_key TEXT PRIMARY KEY,
+    demesne_id TEXT NOT NULL,
+    description TEXT NOT NULL,
+    flags_json TEXT NOT NULL,
+    exits_json TEXT NOT NULL
+)"""),
+    (16, """CREATE TABLE IF NOT EXISTS township_plots (
+    town_id TEXT PRIMARY KEY,
+    town_name TEXT NOT NULL,
+    founder_name TEXT NOT NULL UNIQUE,
+    mouth_room_key TEXT NOT NULL,
+    macro_x INTEGER NOT NULL,
+    macro_y INTEGER NOT NULL,
+    enter_name TEXT,
+    hub_room_key TEXT,
+    meta_json TEXT NOT NULL DEFAULT '{}'
+)"""),
+    (17, """CREATE TABLE IF NOT EXISTS township_rooms (
+    room_key TEXT PRIMARY KEY,
+    town_id TEXT NOT NULL,
+    description TEXT NOT NULL,
+    flags_json TEXT NOT NULL,
+    exits_json TEXT NOT NULL
 )"""),
 ]
 
@@ -561,8 +791,8 @@ def load_moral_state(conn):
 
     Returns a dict with moral_balance, eclipse_until_tick,
     moral_event_cooldown_until, moral_maxed_side, moral_maxed_since_tick,
-    moral_last_casualty_tick, moral_scout_cooldown_until, holy_war_active
-    (defaults when keys are missing).
+    moral_last_casualty_tick, moral_scout_cooldown_until, holy_war_active,
+    rank_titles_visible (defaults when keys are missing).
     """
     def _int_meta(key, default=0):
         row = conn.execute(
@@ -583,6 +813,17 @@ def load_moral_state(conn):
             return default
         return str(row[0])
 
+    def _float_meta(key, default=0.0):
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (key,)
+        ).fetchone()
+        if not row:
+            return default
+        try:
+            return float(row[0])
+        except (TypeError, ValueError):
+            return default
+
     maxed_side = _str_meta("moral_maxed_side", None)
     # Only 'evil' / 'good' are valid hold sides.
     if maxed_side not in ("evil", "good"):
@@ -602,8 +843,22 @@ def load_moral_state(conn):
         "moral_scout_cooldown_until": _int_meta(
             "moral_scout_cooldown_until", 0
         ),
+        "moral_last_centering_tick": _int_meta(
+            "moral_last_centering_tick", 0
+        ),
+        "moral_good_window_start_tick": _int_meta(
+            "moral_good_window_start_tick", 0
+        ),
+        "moral_good_steps_in_window": _int_meta(
+            "moral_good_steps_in_window", 0
+        ),
         # Host/Infernal war global (gm holywar); 0=off 1=on. Default off.
         "holy_war_active": bool(_int_meta("holy_war_active", 0)),
+        # Rank flavor on score (gm titles); 1=on 0=off. Default on.
+        "rank_titles_visible": bool(_int_meta("rank_titles_visible", 1)),
+        "roadtrip_minutes": _float_meta("roadtrip_minutes", 30.0),
+        "vehicle_pvp_enabled": bool(_int_meta("vehicle_pvp_enabled", 0)),
+        "tow_dispatch_enabled": bool(_int_meta("tow_dispatch_enabled", 1)),
     }
 
 
@@ -649,12 +904,68 @@ def save_moral_state(conn, game):
             "('moral_scout_cooldown_until', ?)",
             (str(int(getattr(game, "moral_scout_cooldown_until", 0) or 0)),),
         )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES "
+            "('moral_last_centering_tick', ?)",
+            (
+                str(
+                    int(getattr(game, "moral_last_centering_tick", 0) or 0)
+                ),
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES "
+            "('moral_good_window_start_tick', ?)",
+            (
+                str(
+                    int(
+                        getattr(game, "moral_good_window_start_tick", 0) or 0
+                    )
+                ),
+            ),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES "
+            "('moral_good_steps_in_window', ?)",
+            (
+                str(
+                    int(
+                        getattr(game, "moral_good_steps_in_window", 0) or 0
+                    )
+                ),
+            ),
+        )
         # Holy war (Host vs Infernal) -- survives restart; default off.
         holy = 1 if bool(getattr(game, "holy_war_active", False)) else 0
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES "
             "('holy_war_active', ?)",
             (str(holy),),
+        )
+        # Rank titles on score -- survives restart; default on.
+        titles = 1 if bool(getattr(game, "rank_titles_visible", True)) else 0
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES "
+            "('rank_titles_visible', ?)",
+            (str(titles),),
+        )
+        road_min = float(getattr(game, "roadtrip_minutes", 30.0) or 30.0)
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES "
+            "('roadtrip_minutes', ?)",
+            (str(road_min),),
+        )
+        vpvp = 1 if bool(getattr(game, "vehicle_pvp_enabled", False)) else 0
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES "
+            "('vehicle_pvp_enabled', ?)",
+            (str(vpvp),),
+        )
+        tdisp = 1 if bool(getattr(game, "tow_dispatch_enabled", True)) else 0
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES "
+            "('tow_dispatch_enabled', ?)",
+            (str(tdisp),),
         )
 
 
@@ -802,60 +1113,47 @@ def save_author_mantle_event(conn, game):
     _save_meta_dict(conn, "author_mantle_event", game, "author_mantle_event")
 
 
-# Cap matches Game.ooc_history maxlen / bare-`ooc` replay (last 20 lines).
+def load_chuck_heaven_claim(conn):
+    """Load Heaven-claim Author reaction state from meta (default {})."""
+    return _load_meta_dict(conn, "chuck_heaven_claim")
+
+
+def save_chuck_heaven_claim(conn, game):
+    """Persist ``game.chuck_heaven_claim`` across copyover."""
+    _save_meta_dict(conn, "chuck_heaven_claim", game, "chuck_heaven_claim")
+
+
+# Cap matches channel_history ring sizes (bare replay last 20 lines).
 OOC_HISTORY_MAXLEN = 20
+WIZNET_HISTORY_MAXLEN = 20
 
 
 def load_ooc_history(conn):
-    """Load the global OOC ring buffer from meta (default empty list).
+    """Load the global OOC ring buffer from meta (see ``channel_history``)."""
+    from engine import channel_history
 
-    Bare ``ooc`` replays these plain ``((OOC)) [Name]: …`` lines. Missing
-    or malformed key → ``[]`` so a fresh world / pre-feature save boots
-    cleanly. Only string entries are kept; the list is truncated to the
-    last ``OOC_HISTORY_MAXLEN`` lines (oldest dropped first).
-    """
-    import json
-
-    row = conn.execute(
-        "SELECT value FROM meta WHERE key = ?", ("ooc_history",)
-    ).fetchone()
-    if not row or not row[0]:
-        return []
-    try:
-        data = json.loads(row[0])
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return []
-    if not isinstance(data, list):
-        return []
-    # Keep only plain strings; drop junk from a hand-edited meta row.
-    lines = [line for line in data if isinstance(line, str)]
-    if len(lines) > OOC_HISTORY_MAXLEN:
-        lines = lines[-OOC_HISTORY_MAXLEN:]
-    return lines
+    return channel_history.load_channel(conn, "ooc")
 
 
 def save_ooc_history(conn, game):
-    """Persist ``game.ooc_history`` so copyover / restart keep recent OOC.
+    """Persist ``game.ooc_history`` (see ``channel_history``)."""
+    from engine import channel_history
 
-    Copyover (classic execv and gateway exit) always calls ``game.save()``
-    first, so the ring buffer survives the process swap the same way
-    death_beacons / author_mantle_event do. Still a short ring — not a
-    forever chat log.
-    """
-    import json
+    channel_history.save_channel(conn, game, "ooc")
 
-    history = getattr(game, "ooc_history", None) or []
-    # deque and list both iterate in oldest→newest order.
-    lines = [line for line in history if isinstance(line, str)]
-    if len(lines) > OOC_HISTORY_MAXLEN:
-        lines = lines[-OOC_HISTORY_MAXLEN:]
-    payload = json.dumps(lines, separators=(",", ":"))
-    with conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES "
-            "('ooc_history', ?)",
-            (payload,),
-        )
+
+def load_wiznet_history(conn):
+    """Load the global wiznet ring buffer from meta (see ``channel_history``)."""
+    from engine import channel_history
+
+    return channel_history.load_channel(conn, "wiznet")
+
+
+def save_wiznet_history(conn, game):
+    """Persist ``game.wiznet_history`` (see ``channel_history``)."""
+    from engine import channel_history
+
+    channel_history.save_channel(conn, game, "wiznet")
 
 
 def save_accounts(conn, game):
@@ -869,6 +1167,23 @@ def save_accounts(conn, game):
 
     accounts = ensure_accounts_dict(game)
     with conn:
+        if not accounts:
+            # Safety: never wipe persisted accounts when the in-memory dict
+            # was not loaded yet (boot-order bug) or was accidentally cleared.
+            try:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM accounts"
+                ).fetchone()
+                existing = int(row[0]) if row else 0
+            except sqlite3.OperationalError:
+                existing = 0
+            if existing:
+                print(
+                    "[persistence] save_accounts skipped: game.accounts "
+                    f"empty but {existing} row(s) remain in SQLite",
+                    flush=True,
+                )
+                return
         conn.execute("DELETE FROM accounts")
         for account in accounts.values():
             if not isinstance(account, Account):
@@ -988,6 +1303,17 @@ def save_cadence_chances(conn, game):
     _save_meta_dict(conn, "cadence_chances", game, "cadence_chances")
 
 
+def load_taxi_mode(conn):
+    """Load GM taxi pacing mode from meta (default testing)."""
+    return _load_meta_dict(conn, "taxi_mode")
+
+
+def save_taxi_mode(conn, game):
+    """Persist game.taxi_mode onto the meta table."""
+    from engine import hooks
+    hooks.save_taxi_mode_meta(conn, game)
+
+
 def load_pet_adoption(conn):
     """Load Lebanon Adoption Agency weekly board from meta."""
     return _load_meta_dict(conn, "pet_adoption")
@@ -1006,6 +1332,16 @@ def load_incap_tuning(conn):
 def save_incap_tuning(conn, game):
     """Persist game.incap_tuning overrides onto the meta table."""
     _save_meta_dict(conn, "incap_tuning", game, "incap_tuning")
+
+
+def load_game_clock_tuning(conn):
+    """Load GM world-clock scale overrides from meta (empty = code defaults)."""
+    return _load_meta_dict(conn, "game_clock_tuning")
+
+
+def save_game_clock_tuning(conn, game):
+    """Persist game.game_clock_tuning overrides onto the meta table."""
+    _save_meta_dict(conn, "game_clock_tuning", game, "game_clock_tuning")
 
 
 def load_outgoing_damage_tuning(conn):
@@ -1046,6 +1382,36 @@ def load_pit_drop_tuning(conn):
 def save_pit_drop_tuning(conn, game):
     """Persist game.pit_drop_tuning overrides onto the meta table."""
     _save_meta_dict(conn, "pit_drop_tuning", game, "pit_drop_tuning")
+
+
+def load_marches_rim_tuning(conn):
+    """Load GM Marches fog-rim ring cap from meta."""
+    return _load_meta_dict(conn, "marches_rim_tuning")
+
+
+def save_marches_rim_tuning(conn, game):
+    """Persist game.marches_rim_tuning onto the meta table."""
+    _save_meta_dict(conn, "marches_rim_tuning", game, "marches_rim_tuning")
+
+
+def load_marches_rim_state(conn):
+    """Load Marches monthly rim seed/affix state from meta."""
+    return _load_meta_dict(conn, "marches_rim_state")
+
+
+def save_marches_rim_state(conn, game):
+    """Persist game.marches_rim_state onto the meta table."""
+    _save_meta_dict(conn, "marches_rim_state", game, "marches_rim_state")
+
+
+def load_portal_giver_costs(conn):
+    """Load GM portal vendor ticket price overrides from meta."""
+    return _load_meta_dict(conn, "portal_giver_costs")
+
+
+def save_portal_giver_costs(conn, game):
+    """Persist game.portal_giver_costs overrides onto the meta table."""
+    _save_meta_dict(conn, "portal_giver_costs", game, "portal_giver_costs")
 
 
 def load_cadence_scale(conn):
@@ -1193,6 +1559,49 @@ def _restore_herb_fields(item, state):
             pass
 
 
+def _bag_contents_for_json(item):
+    """Serialize nested bag rows for the container blob."""
+    contents = getattr(item, "bag_contents", None) or []
+    out = []
+    for sub in contents:
+        if not isinstance(sub, Item):
+            continue
+        out.append({
+            "key": sub.key,
+            "description": sub.description,
+            "container": json.loads(_item_container_blob(sub)),
+        })
+    return out
+
+
+def _restore_bag_fields(item, state):
+    """Reattach wearable bag stamps from a container blob."""
+    if state.get("is_bag"):
+        item.is_bag = True
+    if state.get("is_gear_bag"):
+        item.is_gear_bag = True
+    if state.get("bag_capacity") is not None:
+        try:
+            item.bag_capacity = int(state["bag_capacity"])
+        except (TypeError, ValueError):
+            pass
+    worn = state.get("container_worn")
+    if worn in ("back", "shoulder"):
+        item.container_worn = worn
+    raw_contents = state.get("bag_contents") or []
+    restored = []
+    for row in raw_contents:
+        if not isinstance(row, dict):
+            continue
+        sub = item_from_saved_container(
+            row.get("key") or "item",
+            row.get("description") or row.get("key") or "item",
+            row.get("container") or {},
+        )
+        restored.append(sub)
+    item.bag_contents = restored
+
+
 def _item_container_blob(item):
     """JSON for the items.container column: an Item's locked/loot state (a
     dungeon lockbox's whole reward, world.make_lockbox), same reasoning as
@@ -1249,6 +1658,10 @@ def _item_container_blob(item):
         ),
         # Corpse floor age (Wendigo larder stock gate); absent = unstamped.
         "body_dropped_tick": getattr(item, "body_dropped_tick", None),
+        # Abandoned floor loot grace (Cadence scavengers); absent = legacy pile.
+        "floor_dropped_tick": getattr(item, "floor_dropped_tick", None),
+        # Beneath Lucifer's Cage TTL; absent = stamp on next vault decay tick.
+        "vault_decay_at_tick": getattr(item, "vault_decay_at_tick", None),
         # Physical phone line id (supers/phone.py); absent = not a phone.
         "phone_number": getattr(item, "phone_number", None),
         "is_phone": bool(getattr(item, "is_phone", False)),
@@ -1263,6 +1676,13 @@ def _item_container_blob(item):
         "max_ammo": (
             int(item.max_ammo)
             if getattr(item, "max_ammo", None) is not None
+            else None
+        ),
+        "loaded_ammo_id": getattr(item, "loaded_ammo_id", None),
+        "ammo_kind": getattr(item, "ammo_kind", None),
+        "stack_charges": (
+            int(item.stack_charges)
+            if getattr(item, "stack_charges", None) is not None
             else None
         ),
         "weapon_voice": getattr(item, "weapon_voice", None),
@@ -1301,7 +1721,245 @@ def _item_container_blob(item):
             if getattr(item, "pipe_puffs", None) is not None
             else None
         ),
+        "is_bag": bool(getattr(item, "is_bag", False)),
+        "is_gear_bag": bool(getattr(item, "is_gear_bag", False)),
+        "bag_capacity": (
+            int(item.bag_capacity)
+            if getattr(item, "bag_capacity", None) is not None
+            else None
+        ),
+        "container_worn": getattr(item, "container_worn", None),
+        "bag_contents": _bag_contents_for_json(item),
+        "gear_condition": (
+            int(item.gear_condition)
+            if getattr(item, "gear_condition", None) is not None
+            else None
+        ),
     })
+
+
+_CHAR_INSERT_SQL = (
+    "INSERT INTO characters (name, description, room_key, stats) "
+    "VALUES (?, ?, ?, ?)"
+)
+_ITEM_INSERT_SQL = (
+    "INSERT INTO items "
+    "(key, description, holder_type, holder_key, container) "
+    "VALUES (?, ?, ?, ?, ?)"
+)
+
+
+def _should_skip_character_save(obj, game, seen_names):
+    """Return True when this live Character must not be written to SQLite."""
+    room = getattr(obj, "location", None)
+    if room is None:
+        return True
+    if getattr(obj, "tutorial_mentor_for", None):
+        return True
+    if getattr(obj, "transient_soul", False):
+        return True
+    key_low = (getattr(obj, "key", None) or "").lower()
+    if key_low.startswith("gmspirit:"):
+        permanent = bool(getattr(obj, "gm_spirit_permanent", False))
+        if not permanent:
+            try:
+                from engine.accounts import ensure_accounts_dict
+                for acct in ensure_accounts_dict(game).values():
+                    if acct.gm_rank not in ("gm", "head_gm"):
+                        continue
+                    want = (
+                        acct.gm_spirit_key
+                        or f"gmspirit:{acct.name}"
+                    )
+                    if want.lower() == key_low:
+                        permanent = True
+                        break
+            except Exception:
+                permanent = False
+        if not permanent:
+            return True
+    if (
+        getattr(obj, "gm_mode", False)
+        and not key_low.startswith("gmspirit:")
+    ):
+        return True
+    # God bilocate twin (supers/god_omnipresence.py): must survive copyover
+    # save/reload even though it is an is_npc shell. Key prefix covers
+    # stale in-memory flags when copyover saves before overlay bytecode
+    # reloads (bug report 152).
+    if getattr(obj, "god_twin", False) or key_low.startswith("twin:"):
+        pass
+    elif (
+        obj.is_npc
+        and not obj.spar_only
+        and not getattr(obj, "peaceful", False)
+    ):
+        return True
+    save_name = getattr(obj, "key", None) or ""
+    if save_name in seen_names:
+        print(
+            f"[persistence] skip duplicate character key "
+            f"{save_name!r} in {getattr(room, 'key', '?')}",
+            flush=True,
+        )
+        return True
+    return False
+
+
+def _character_save_rows(game, obj, seen_names):
+    """Build INSERT rows for one persistable Character (or None to skip)."""
+    room = getattr(obj, "location", None)
+    if _should_skip_character_save(obj, game, seen_names):
+        return None
+    save_name = getattr(obj, "key", None) or ""
+    seen_names.add(save_name)
+    if getattr(obj, "gm_staff_form", False):
+        spirit_key = getattr(obj, "gm_spirit_key", None) or (
+            f"gmspirit:{obj.key}"
+        )
+        finder = getattr(game, "find_character", None)
+        spirit = finder(spirit_key) if callable(finder) else None
+        spirit_room = getattr(spirit, "location", None) if spirit else None
+        if spirit_room is not None and getattr(spirit_room, "key", None):
+            obj.gm_spirit_room_key = spirit_room.key
+    blob = json.dumps(character_to_blob(obj))
+    save_room = room
+    if getattr(obj, "djinn_captive", False):
+        real = getattr(obj, "djinn_real_room", None)
+        real_key = getattr(obj, "djinn_real_room_key", None)
+        if real is not None:
+            save_room = real
+        elif real_key and real_key in game.rooms:
+            save_room = game.rooms[real_key]
+    elif getattr(room, "djinn_instance_id", None):
+        ret = getattr(obj, "djinn_mirage_return_room", None)
+        if ret is not None:
+            save_room = ret
+    char_row = (obj.key, obj.description, save_room.key, blob)
+    item_rows = []
+    for item in obj.inventory:
+        item_rows.append((
+            item.key, item.description, "character", obj.key,
+            _item_container_blob(item),
+        ))
+    for item in list(getattr(obj, "gear_bag", None) or []):
+        item_rows.append((
+            item.key, item.description, "gear", obj.key,
+            _item_container_blob(item),
+        ))
+    return char_row, item_rows
+
+
+def _room_floor_item_rows(game):
+    """Loose floor Items as INSERT tuples (skip empty wilderness cells)."""
+    rows = []
+    for room in game.rooms.values():
+        if not room.contents:
+            continue
+        for obj in room.contents:
+            if not isinstance(obj, Item):
+                continue
+            if getattr(obj, "djinn_husk", False):
+                continue
+            if getattr(obj, "ephemeral_spawn_body", False):
+                continue
+            if getattr(obj, "decay_at_tick", None) is not None:
+                continue
+            rows.append((
+                obj.key, obj.description, "room", room.key,
+                _item_container_blob(obj),
+            ))
+    return rows
+
+
+def _collect_world_save_snapshot(game):
+    """In-memory snapshot for wipe+rewrite (sync path)."""
+    from engine.char_index import iter_characters
+
+    char_rows = []
+    item_rows = []
+    seen_names = set()
+    for obj in iter_characters(game):
+        payload = _character_save_rows(game, obj, seen_names)
+        if payload is None:
+            continue
+        char_row, owned_items = payload
+        char_rows.append(char_row)
+        item_rows.extend(owned_items)
+    item_rows.extend(_room_floor_item_rows(game))
+    return char_rows, item_rows
+
+
+async def _collect_world_save_snapshot_async(game, *, yield_every=50):
+    """Cooperative snapshot build -- yields so player commands can run."""
+    import asyncio
+    from engine.char_index import iter_characters
+
+    char_rows = []
+    item_rows = []
+    seen_names = set()
+    n = 0
+    for obj in iter_characters(game):
+        payload = _character_save_rows(game, obj, seen_names)
+        if payload is not None:
+            char_row, owned_items = payload
+            char_rows.append(char_row)
+            item_rows.extend(owned_items)
+        n += 1
+        if yield_every and n % yield_every == 0:
+            await asyncio.sleep(0)
+    for room in game.rooms.values():
+        if not room.contents:
+            continue
+        for obj in room.contents:
+            if not isinstance(obj, Item):
+                continue
+            if getattr(obj, "djinn_husk", False):
+                continue
+            if getattr(obj, "ephemeral_spawn_body", False):
+                continue
+            if getattr(obj, "decay_at_tick", None) is not None:
+                continue
+            item_rows.append((
+                obj.key, obj.description, "room", room.key,
+                _item_container_blob(obj),
+            ))
+        n += 1
+        if yield_every and n % yield_every == 0:
+            await asyncio.sleep(0)
+    return char_rows, item_rows
+
+
+def _apply_world_save_snapshot(conn, char_rows, item_rows):
+    """Wipe tables and bulk-insert a pre-built snapshot (one transaction)."""
+    last_err = None
+    for attempt in range(2):
+        try:
+            with conn:
+                conn.execute("DELETE FROM characters")
+                conn.execute("DELETE FROM items")
+                if char_rows:
+                    conn.executemany(_CHAR_INSERT_SQL, char_rows)
+                if item_rows:
+                    conn.executemany(_ITEM_INSERT_SQL, item_rows)
+            return
+        except sqlite3.OperationalError as err:
+            last_err = err
+            msg = str(err).lower()
+            if attempt == 0 and "disk i/o" in msg:
+                time.sleep(0.05)
+                continue
+            raise
+    if last_err is not None:
+        raise last_err
+
+
+async def save_world_async(conn, game, *, yield_every=50):
+    """Cooperative autosave: snapshot with yields, then one fast transaction."""
+    char_rows, item_rows = await _collect_world_save_snapshot_async(
+        game, yield_every=yield_every,
+    )
+    _apply_world_save_snapshot(conn, char_rows, item_rows)
 
 
 def save_world(conn, game):
@@ -1312,167 +1970,12 @@ def save_world(conn, game):
     need one room pass -- there is no item index yet, and item counts stay
     small. Runs inside one transaction so a crash mid-save can never leave
     the file half-written -- SQLite rolls it back.
-    """
-    from engine.char_index import iter_characters
 
-    with conn:
-        # Wipe and rewrite: the snapshot approach described in the module docstring.
-        conn.execute("DELETE FROM characters")
-        conn.execute("DELETE FROM items")
-        seen_names = set()
-        for obj in iter_characters(game):
-            room = getattr(obj, "location", None)
-            if room is None:
-                continue
-            # Wilderness hostiles (is_npc, not spar_only, not
-            # peaceful) are deliberately ephemeral -- never
-            # persisted, so a restart clears whatever happens to
-            # be out. Peaceful townsfolk are lethal-capable under
-            # the afterlife stub (spar_only False) but MUST still
-            # persist. Tutorial mentors are re-seeded each boot and
-            # may exist in multiple rooms under the same key, so
-            # they stay out of the characters table. Shared hostile
-            # keys ("a feral wastes-lurker") would also collide on
-            # `name TEXT PRIMARY KEY` if two existed at once.
-            if getattr(obj, "tutorial_mentor_for", None):
-                continue
-            # Guild / Motel / plane hub spawns -- reboot clears them.
-            if getattr(obj, "transient_soul", False):
-                continue
-            # Ephemeral leftover GM staff spirits -- never persist. Permanent
-            # account-owned spirits (feature G) DO persist so gm on/off can
-            # reattach without minting a new Character each time.
-            key_low = (getattr(obj, "key", None) or "").lower()
-            if key_low.startswith("gmspirit:"):
-                permanent = bool(getattr(obj, "gm_spirit_permanent", False))
-                if not permanent:
-                    try:
-                        from engine.accounts import ensure_accounts_dict
-                        for acct in ensure_accounts_dict(game).values():
-                            if acct.gm_rank not in ("gm", "head_gm"):
-                                continue
-                            want = (
-                                acct.gm_spirit_key
-                                or f"gmspirit:{acct.name}"
-                            )
-                            if want.lower() == key_low:
-                                permanent = True
-                                break
-                    except Exception:
-                        permanent = False
-                if not permanent:
-                    continue
-                # Do NOT mutate the live Character here. Clearing gm_mode on
-                # the in-memory spirit mid-session made active staff form
-                # look like ``Wits (spirit)`` after any autosave / account
-                # save, and broke ``gm account`` / other form-gated verbs.
-                # Load already parks permanent spirits with gm_mode=False.
-            if (
-                getattr(obj, "gm_mode", False)
-                and not key_low.startswith("gmspirit:")
-            ):
-                continue
-            if (
-                obj.is_npc
-                and not obj.spar_only
-                and not getattr(obj, "peaceful", False)
-            ):
-                continue
-            # Duplicate live keys (e.g. Mantle + peel-bug husk both named
-            # Crowley) must not UNIQUE-crash the whole save / boot.
-            save_name = getattr(obj, "key", None) or ""
-            if save_name in seen_names:
-                print(
-                    f"[persistence] skip duplicate character key "
-                    f"{save_name!r} in {getattr(room, 'key', '?')}",
-                    flush=True,
-                )
-                continue
-            seen_names.add(save_name)
-            # Snapshot live spirit watch-room onto the body before blobbing
-            # so copyover / autosave restore staff where they were watching,
-            # not over wherever Cadence walked the Echo.
-            if getattr(obj, "gm_staff_form", False):
-                spirit_key = getattr(obj, "gm_spirit_key", None) or (
-                    f"gmspirit:{obj.key}"
-                )
-                finder = getattr(game, "find_character", None)
-                spirit = finder(spirit_key) if callable(finder) else None
-                spirit_room = getattr(spirit, "location", None) if spirit else None
-                if spirit_room is not None and getattr(spirit_room, "key", None):
-                    obj.gm_spirit_room_key = spirit_room.key
-            # The whole stat spine (plus every other SUPERS-composed
-            # field) rides in one JSON blob. A blob (vs a column per
-            # stat) means adding a stat never needs a schema
-            # migration -- old saves just lack the key and get
-            # defaults. character_to_blob (supers/persist_blob.py)
-            # is what actually knows the field list -- this module
-            # only knows it's "the opaque character extras dict".
-            blob = json.dumps(character_to_blob(obj))
-            # Jinn mirage pockets are runtime-only. Persist the captive /
-            # tormenting Jinn as if already awake in the real world so a
-            # restart force-releases (docs/plans/jinn_path.md).
-            save_room = room
-            if getattr(obj, "jinn_captive", False):
-                real = getattr(obj, "jinn_real_room", None)
-                real_key = getattr(obj, "jinn_real_room_key", None)
-                if real is not None:
-                    save_room = real
-                elif real_key and real_key in game.rooms:
-                    save_room = game.rooms[real_key]
-            elif getattr(room, "jinn_instance_id", None):
-                ret = getattr(obj, "jinn_mirage_return_room", None)
-                if ret is not None:
-                    save_room = ret
-            conn.execute(
-                "INSERT INTO characters (name, description, room_key, stats) "
-                "VALUES (?, ?, ?, ?)",
-                # The ? placeholders are sqlite3's safe way to pass values.
-                (obj.key, obj.description, save_room.key, blob),
-            )
-            for item in obj.inventory:
-                conn.execute(
-                    "INSERT INTO items "
-                    "(key, description, holder_type, holder_key, container) "
-                    "VALUES (?, ?, 'character', ?, ?)",
-                    (item.key, item.description, obj.key,
-                     _item_container_blob(item)),
-                )
-            # Job gear bag (supers/gear_bag) -- same Item rows, distinct
-            # holder_type so load puts them back in gear_bag not inventory.
-            for item in list(getattr(obj, "gear_bag", None) or []):
-                conn.execute(
-                    "INSERT INTO items "
-                    "(key, description, holder_type, holder_key, container) "
-                    "VALUES (?, ?, 'gear', ?, ?)",
-                    (item.key, item.description, obj.key,
-                     _item_container_blob(item)),
-                )
-        # Loose items on the floor -- one O(rooms) pass; skip empty cells
-        # so the 100x100 Wastes does not dominate autosave cost.
-        for room in game.rooms.values():
-            if not room.contents:
-                continue
-            for obj in room.contents:
-                if isinstance(obj, Item):
-                    # Living Jinn husks are runtime props -- never persist
-                    # orphan "sleeping form" corpses across reboot.
-                    if getattr(obj, "jinn_husk", False):
-                        continue
-                    # Nest / hub spawn husks (decay-stamped) -- Characters
-                    # already skip save for transient_soul; without this,
-                    # orphan "the body of Nico …" piles survive reboot.
-                    if getattr(obj, "ephemeral_spawn_body", False):
-                        continue
-                    if getattr(obj, "decay_at_tick", None) is not None:
-                        continue
-                    conn.execute(
-                        "INSERT INTO items "
-                        "(key, description, holder_type, holder_key, container) "
-                        "VALUES (?, ?, 'room', ?, ?)",
-                        (obj.key, obj.description, room.key,
-                         _item_container_blob(obj)),
-                    )
+    Production autosave uses :func:`save_world_async` so JSON/blob work can
+    yield on the asyncio loop before the single bulk INSERT transaction.
+    """
+    char_rows, item_rows = _collect_world_save_snapshot(game)
+    _apply_world_save_snapshot(conn, char_rows, item_rows)
 
 
 def load_world(conn, game):
@@ -1515,6 +2018,10 @@ def load_world(conn, game):
                 except Exception:
                     keep = False
             if not keep:
+                continue
+            # Folded staff spirits live only in character_vault until gm on.
+            vault_row = vault_get(conn, name)
+            if vault_row is not None and (vault_row[3] or "") == "gm-spirit-parked":
                 continue
         char = Character(name, description)
         saved = json.loads(blob)
@@ -1612,6 +2119,11 @@ def load_world(conn, game):
             ]
         if state.get("dirty") is not None:
             item.dirty = bool(state["dirty"])
+        if state.get("gear_condition") is not None:
+            try:
+                item.gear_condition = int(state["gear_condition"])
+            except (TypeError, ValueError):
+                pass
         # Fridge pantry timer (home grocery stock); absent on older saves.
         if state.get("stock_until_tick") is not None:
             try:
@@ -1630,6 +2142,17 @@ def load_world(conn, game):
         if state.get("body_dropped_tick") is not None:
             try:
                 item.body_dropped_tick = int(state["body_dropped_tick"])
+            except (TypeError, ValueError):
+                pass
+        # Abandoned floor loot grace / vault TTL (supers.floor_loot).
+        if state.get("floor_dropped_tick") is not None:
+            try:
+                item.floor_dropped_tick = int(state["floor_dropped_tick"])
+            except (TypeError, ValueError):
+                pass
+        if state.get("vault_decay_at_tick") is not None:
+            try:
+                item.vault_decay_at_tick = int(state["vault_decay_at_tick"])
             except (TypeError, ValueError):
                 pass
         # Physical phone line (supers/phone.py); absent on older saves.
@@ -1653,6 +2176,15 @@ def load_world(conn, game):
                 item.max_ammo = int(state["max_ammo"])
             except (TypeError, ValueError):
                 pass
+        if state.get("loaded_ammo_id"):
+            item.loaded_ammo_id = str(state["loaded_ammo_id"]).strip()
+        if state.get("ammo_kind"):
+            item.ammo_kind = str(state["ammo_kind"]).strip().lower()
+        if state.get("stack_charges") is not None:
+            try:
+                item.stack_charges = int(state["stack_charges"])
+            except (TypeError, ValueError):
+                pass
         if state.get("weapon_voice"):
             item.weapon_voice = str(state["weapon_voice"]).strip().lower()
         if state.get("artifact_lexicon"):
@@ -1660,6 +2192,7 @@ def load_world(conn, game):
         _restore_pit_mimic_fields(item, state)
         _restore_on_use_fields(item, state)
         _restore_herb_fields(item, state)
+        _restore_bag_fields(item, state)
         # bug_reports.log #21: strongboxes saved before the lockbox pass (or
         # with the default '{}' container blob) reload as flavor-only Items;
         # promote them here so `open strongbox` still pays out after a
@@ -1862,6 +2395,16 @@ def item_from_saved_container(key, description, container):
             item.body_dropped_tick = int(state["body_dropped_tick"])
         except (TypeError, ValueError):
             pass
+    if state.get("floor_dropped_tick") is not None:
+        try:
+            item.floor_dropped_tick = int(state["floor_dropped_tick"])
+        except (TypeError, ValueError):
+            pass
+    if state.get("vault_decay_at_tick") is not None:
+        try:
+            item.vault_decay_at_tick = int(state["vault_decay_at_tick"])
+        except (TypeError, ValueError):
+            pass
     if state.get("phone_number"):
         item.phone_number = str(state["phone_number"]).strip()
     if state.get("is_phone"):
@@ -1873,6 +2416,7 @@ def item_from_saved_container(key, description, container):
         item.is_ethereal = True
     _restore_pit_mimic_fields(item, state)
     _restore_on_use_fields(item, state)
+    _restore_bag_fields(item, state)
     upgrade_legacy_container(item)
     return item
 

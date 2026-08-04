@@ -19,8 +19,9 @@ combat_core, mail/socials/wearables, Stage G hooks).
 
    Prefer **`v0.2.0`** over older `v0.1.x` tags for new consumers.
    Re-exports via `tools/export_public_engine.py` ignore `__pycache__` /
-   `*.pyc` and rewrite a lean `help_topics.py` stub + public README +
-   `.github/workflows/ci.yml`.
+   `*.pyc` and rewrite a lean root `help_topics.py` facade + public README +
+   `.github/workflows/ci.yml` (player help content stays in private SUPERS:
+   `supers/help_topics.py` + `help/topics/*.py`).
 
 4. Announce in the engine CHANGELOG / commit message; never ship SUPERS
    content. Bump `supers/pyproject.toml` on the private monorepo to the

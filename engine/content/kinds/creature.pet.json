@@ -1,0 +1,117 @@
+{
+  "id": "creature.pet",
+  "label": "Bonded / house pet species",
+  "writes_to": "supers/content/pets.json",
+  "fields": {
+    "id": {
+      "type": "string",
+      "required": true,
+      "doc": "Species id (dog, cat, squirrel, …)."
+    },
+    "display": {
+      "type": "string",
+      "required": true,
+      "doc": "Player-facing species word."
+    },
+    "body_type": {
+      "type": "enum",
+      "required": true,
+      "default": "quadruped",
+      "values": [
+        "humanoid",
+        "quadruped",
+        "avian",
+        "ethereal",
+        "insectoid",
+        "serpentine",
+        "amorphous",
+        "construct"
+      ],
+      "doc": "Combat prose morphology (same enum as creature.bestiary). Dogs and cats are quadruped."
+    },
+    "anatomy_template": {
+      "type": "enum",
+      "required": false,
+      "values": [
+        "humanoid_standard",
+        "quadruped_standard",
+        "avian_standard",
+        "serpentine_standard",
+        "insectoid_standard",
+        "arachne_monstrous",
+        "amorphous_standard",
+        "ethereal_standard",
+        "construct_standard",
+        "training_dummy_standard"
+      ],
+      "doc": "Anatomy tree + look labels for bare-skin / injury lines. Defaults from body_type when omitted."
+    },
+    "description": {
+      "type": "string",
+      "required": true,
+      "doc": "Default species look prose."
+    },
+    "price": {
+      "type": "int",
+      "required": true,
+      "default": 40,
+      "doc": "Adoption shop price in dollars (0 = not sold)."
+    },
+    "assist": {
+      "type": "enum",
+      "required": false,
+      "default": "light",
+      "values": ["very_light", "light", "medium", "heavy"],
+      "doc": "How much the beast helps on chores / combat assists."
+    },
+    "hp_vit": {
+      "type": "float",
+      "required": false,
+      "default": 8,
+      "doc": "Base VIT used when spawning a beast Character."
+    },
+    "pow": {
+      "type": "float",
+      "required": false,
+      "default": 6,
+      "doc": "Base POW used when spawning a beast Character."
+    },
+    "hygiene_mess": {
+      "type": "bool",
+      "required": false,
+      "default": true,
+      "doc": "Whether Cadence can leave mess props when filthy."
+    },
+    "shop": {
+      "type": "bool",
+      "required": false,
+      "default": true,
+      "doc": "True when the species appears on the adoption board."
+    },
+    "breeds": {
+      "type": "list",
+      "required": false,
+      "doc": "Breed option list (id, name, size)."
+    },
+    "coat_colors": {
+      "type": "list",
+      "required": false,
+      "doc": "Coat color options."
+    },
+    "coat_patterns": {
+      "type": "list",
+      "required": false,
+      "doc": "Coat pattern options."
+    },
+    "eye_colors": {
+      "type": "list",
+      "required": false,
+      "doc": "Eye color options."
+    },
+    "sexes": {
+      "type": "list",
+      "required": false,
+      "doc": "Sex options."
+    }
+  }
+}

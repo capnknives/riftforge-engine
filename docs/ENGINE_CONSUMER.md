@@ -29,6 +29,7 @@ Call these **before** constructing `Character`s or loading a save:
 | Eclipse ambient line | `set_eclipse_ambient_line(fn)` | `""` | `supers.balance.eclipse_ambient_line` |
 | Vampire fear message | `set_vampire_fear_message(fn)` | `None` | `supers.slayer.fear_message_for_vampire` |
 | Look/examine quirk | `set_look_quirk(fn)` | `None` | `supers.relationships.maybe_look_quirk` |
+| Extra target match needles | `set_extra_target_match_needles(fn)` | `[]` | `supers.target_kinds.kind_match_needles` (Origin/Path/kind room targeting) |
 | Pre-move gate | `set_move_gate(fn)` | `None` (never blocks) | `supers.bootstrap._move_gate_block` (jail + hunter-safe) |
 | Cancel awake rest | `set_cancel_rest(fn)` | no-op | `supers.lodging.cancel_rest_if_any` |
 | Loot-from-body line | `set_loot_room_line(fn)` | generic "`<actor> takes <item> from <body>.`" | `supers.scavenge.loot_room_line` |
@@ -49,6 +50,10 @@ Call these **before** constructing `Character`s or loading a save:
 | After classic zone enter | `set_after_zone_enter(fn)` | no-op | clear overland coords + dungeon hub soft-stamp |
 | Special zone exit | `set_try_exit_zone(fn)` | False | `supers.overland.try_exit_to_overland` |
 | After HELP_TOPICS page | `set_after_help_topic(fn)` | no-op | `supers.quests.notify(…, "help_topic")` |
+| Kind profile dirs | `set_content_kinds_dirs(dirs)` | `[]` (no kinds) | `supers/content/kinds/` via `register_core_hooks` |
+| Kind domain validate | `set_content_kind_domain_validator(fn)` | skip | `supers.content_kinds.validators.validate_domain` |
+| Kind catalog save | `set_content_kind_save_entity(fn)` | raises if OLC save | `supers.content_kinds.persist.save_entity` |
+| Menu OLC auth | `set_olc_authorizer(fn)` | deny | GM check via `register_all_hooks` |
 
 SUPERS auto-registers attach + blob when the `supers` package is imported
 (`supers.bootstrap.register_core_hooks`). Everything else (chargen, help,
@@ -114,6 +119,29 @@ undecomposed root modules — optional hygiene tracked as
 `arch-undecomposed-core` / [`plans/codebase_health_audit_2026-07-20.md`](plans/codebase_health_audit_2026-07-20.md)
 (two-repo remotes Phases 0–6 are already done). Hooks are what let all of
 these stop **hard-coding** SUPERS imports in the meantime.
+
+## Planned hook bundles (Riftforge core expansion)
+
+Not yet implemented — tracked in
+[`plans/riftforge_core_expansion.md`](plans/riftforge_core_expansion.md).
+Each row below becomes real `set_*`/`register_*` entries in the table above
+as its phase lands; listed here now so a bundle name isn't picked twice.
+
+| Bundle | Phase | Key registrations (planned) |
+|--------|-------|------------------------------|
+| Planes | 1 | `register_plane(plane_id, metadata)`, pocket loader |
+| Gates | 1 | `register_gate_network(GateNetwork, room_predicate)` |
+| Needs | 3 | `register_meter`, `register_fuel_meter`, `tick_needs`, decay policy hook — extends existing `engine/systems/needs.py`, not a new module |
+| Cadence | 4 | `cadence_tick`, `register_need_pursuer`, `register_job_behavior` |
+| Combat | 5 | `register_combat_engine(id, build_brief, apply_brief)`, `register_combat_narrator` — wraps existing `engine/systems/combat_core.py`, not a new roll implementation |
+| Body parts | 5b | `register_anatomy_regions`, `body_parts_heal_mult`, brief `target_region`/limb fields |
+| Room env | 5c | `register_slam_target_pipeline`, `stamp_breach_pick`/`apply_breach`, layout-direction neighbor resolver |
+| Spawn | 6 | `register_nest_ai`, bestiary table loader hooks |
+| Missions | 6 | board accept/abandon/instance portal shell |
+| Civic shops | 6b | `register_civic_fixture`, enter-pocket loader, wholesale order terminal hook, fixture HP/wreck/repair |
+| Clinic | 7 | `register_clinic_rooms`, `can_hospitalize`, ward tick |
+| Justice | 7 | wanted/fines/jail + `register_crime_catalog` |
+| Studio | 8 | `studio_catalog_roots`, kind dirs (extends existing content-kind hooks) |
 
 ## See also
 

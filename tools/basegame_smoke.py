@@ -100,6 +100,16 @@ def main():
         "basegame boot should stamp overland atlas"
     )
 
+    from basegame import gates as gates_mod
+    gate_rooms = gates_mod.all_gate_rooms(game)
+    assert len(gate_rooms) == 4, (
+        f"expected four rift_gate mouths, got {len(gate_rooms)}"
+    )
+    open_keys = set(getattr(game, gates_mod.NEXUS.open_attr) or ())
+    assert len(open_keys) == gates_mod.OPEN_GATE_COUNT, (
+        f"boot should open {gates_mod.OPEN_GATE_COUNT} mouths, got {open_keys!r}"
+    )
+
     from basegame.chargen import PATH_ORDER
     placed = []
     for index, path_id in enumerate(PATH_ORDER, start=1):
@@ -129,6 +139,51 @@ def main():
     dispatch(walker, "enter notbigville", game)
     assert walker.location.key == "NB00001", walker.location.key
 
+    dispatch(walker, "exit", game)
+    macro = overland_mod._parse_pos_pair(walker.macro_pos)
+    assert macro == (35, 10), macro
+    for _ in range(10):
+        dispatch(walker, "east", game)
+    macro = overland_mod._parse_pos_pair(walker.macro_pos)
+    micro = overland_mod._parse_pos_pair(walker.micro_pos)
+    assert macro == (36, 10), macro
+    assert micro == (5, 5), micro
+    dispatch(walker, "enter rift nexus", game)
+    assert walker.location.key == "RN00001", walker.location.key
+
+    hub = walker.location
+    closed_dirs = [
+        direction
+        for direction, dest in hub.exits.items()
+        if getattr(dest, "rift_gate", False)
+        and dest.key not in open_keys
+    ]
+    visible_dirs = {
+        direction
+        for direction, _dest in gates_mod.visible_exits(hub, game)
+    }
+    assert closed_dirs, "need at least one closed mouth for visibility check"
+    for direction in closed_dirs:
+        assert direction not in visible_dirs, (
+            f"closed mouth exit {direction!r} should be hidden"
+        )
+
+    rotate_at = int(getattr(game, gates_mod.NEXUS.rotate_at_attr, 0) or 0)
+    game.game_time_ticks = rotate_at
+    gates_mod.tick_rotation(game)
+    rotated_keys = set(getattr(game, gates_mod.NEXUS.open_attr) or ())
+    assert rotated_keys != open_keys, (
+        f"tick rotation should change open set; still {rotated_keys!r}"
+    )
+
+    dispatch(walker, "exit", game)
+    assert overland_mod.overland_mode(walker) == "on_foot", (
+        "exit from Rift Nexus should return to overland"
+    )
+    macro = overland_mod._parse_pos_pair(walker.macro_pos)
+    assert macro == (36, 10), macro
+
+    walker.move_to(game.rooms["NB00001"])
     from engine.systems import weather as weather_module
     outdoor_clause = weather_module.look_clause(walker.location, game)
     assert outdoor_clause, "Main Street is outdoor and should get a weather clause"
@@ -148,6 +203,80 @@ def main():
     walker.session = _FakeSession([])
     dispatch(walker, f"mail send {peer.key} hello from square", game)
     assert peer.mail_inbox and peer.mail_inbox[0]["text"] == "hello from square"
+
+    from engine.systems import needs as needs_engine
+    from basegame import needs as basegame_needs
+
+    assert walker.hunger == 0.0 and walker.thirst == 0.0, (
+        "fresh characters should start with satisfied hunger/thirst"
+    )
+    registered = needs_engine.registered_meters()
+    assert "hunger" in registered and "thirst" in registered, registered
+    for _ in range(10):
+        basegame_needs.tick_demo_needs(game)
+    assert walker.hunger > 0.0 and walker.thirst > 0.0, (
+        "demo needs tick should raise hunger/thirst"
+    )
+    needs_engine.satisfy(walker, "hunger")
+    assert walker.hunger == 0.0 and walker.thirst > 0.0
+    needs_engine.satisfy(walker, "thirst")
+    assert walker.thirst == 0.0
+
+    from engine.systems import spawn as spawn_engine
+    from basegame import bestiary as bestiary_mod
+    from basegame import spawn_nests as spawn_nests_mod
+
+    pool = bestiary_mod.get_pool(["prairie-critter"], 0)
+    assert len(pool) >= 2, (
+        f"prairie-critter pool should list both templates, got {len(pool)}"
+    )
+    assert "critter" in spawn_engine.known_nest_ai(), (
+        "basegame boot should register critter nest AI"
+    )
+
+    den = game.rooms.get("NB00009")
+    assert den is not None, "grain elevator shed (NB00009) missing from world"
+    assert getattr(den, "spawn_nest", None) == "critter", (
+        f"NB00009 should be a critter den, got spawn_nest={getattr(den, 'spawn_nest', None)!r}"
+    )
+
+    catalog = spawn_nests_mod._load_catalog()
+    spec = catalog["critter"]
+    old_chance = spec["spawn_chance_per_tick"]
+    spec["spawn_chance_per_tick"] = 1.0
+    game._nest_rooms_cache = None
+    try:
+        spawn_nests_mod.tick_nests(game)
+    finally:
+        spec["spawn_chance_per_tick"] = old_chance
+
+    occupants = spawn_nests_mod._nest_occupants(den)
+    assert len(occupants) >= 1, (
+        "critter nest tick should top up at least one hostile in the shed"
+    )
+    assert all(getattr(n, "is_npc", False) for n in occupants), (
+        "nest occupants must be NPCs"
+    )
+
+    from basegame import combat as combat_mod
+
+    dummy = placed[2]
+    walker.hp = 100.0
+    dummy.hp = 100.0
+    walker.target = dummy
+
+    # rng=lambda: 0.0 always lands the first weighted bucket ("critical")
+    # -- deterministic single-swing check, no flaky random.random() rolls.
+    result = combat_mod.resolve_swing(walker, dummy, rng=lambda: 0.0)
+    assert result["outcome"] == "critical", result
+    assert dummy.hp == 100.0 - combat_mod.DAMAGE_PER_CRITICAL, dummy.hp
+
+    # A guaranteed-miss rng (1.0, past every weighted bucket) proves the
+    # tick-registered resolve_round path also runs cleanly with no damage.
+    dummy.hp = 100.0
+    combat_mod.resolve_round(game, rng=lambda: 1.0)
+    assert dummy.hp == 100.0, "guaranteed-miss round should not damage dummy"
+    walker.target = None
 
     server_mod.run_ticks(game)
     game.db.close()

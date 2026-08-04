@@ -1,0 +1,33 @@
+{
+    "category": "prairie-critter",
+    "creatures": [
+        {
+            "id": "dust_pup",
+            "name": "a Dust Pup",
+            "description": "A scruffy prairie critter the size of a small dog, all teeth and twitchy nerves.",
+            "tier": 0,
+            "stat_ranges": {
+                "POW": [4, 8],
+                "VIT": [4, 8],
+                "FOC": [4, 8],
+                "FIN": [6, 10],
+                "RES": [4, 8],
+                "PRE": [3, 7]
+            }
+        },
+        {
+            "id": "meadow_mouse",
+            "name": "a Meadow Mouse",
+            "description": "A twitchy rodent that nests in grain-elevator shadows and dares you to blink first.",
+            "tier": 0,
+            "stat_ranges": {
+                "POW": [3, 6],
+                "VIT": [3, 6],
+                "FOC": [5, 9],
+                "FIN": [8, 12],
+                "RES": [3, 6],
+                "PRE": [2, 5]
+            }
+        }
+    ]
+}

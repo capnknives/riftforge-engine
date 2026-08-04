@@ -34,6 +34,11 @@ Env:
     WKNZ Discord crash/uncrash posts (default 45; never shorter than
     HOLD_GRACE). Planned SIGUSR1 reloads also send ``planned_restart``
     so Discord stays quiet even on slow boots.
+  RIFTFORGE_GATEWAY_STITCH_STALE -- seconds without game→client DATA
+    before the gateway handles ``ooc`` / ``wiznet`` / ``gm recover restart``
+    / ``gm recover clearhold`` / ``gm recover revert`` / ``gm recover restoredb``
+    locally.
+    locally (default 12; covers hung game with IPC still up)
   DISCORD_BRIDGE_WEBHOOK_WKNZ -- optional; outage down/up Discord posts
 
 Stdlib only. No world / combat logic — sockets, framing, hold UX, and
@@ -48,8 +53,11 @@ import os
 import signal
 import time
 import uuid
+from collections import deque
 from typing import Optional
 
+from engine import ooc_channel
+from engine import watcher_request
 from engine.gateway_protocol import (
     TYPE_CTRL,
     TYPE_DATA,
@@ -119,6 +127,26 @@ def _discord_outage_grace_seconds(hold_grace: int | None = None) -> int:
     return max(hold, max(1, raw))
 
 
+def _stitch_stale_seconds() -> float:
+    """No game output for this long → gateway stitch mode (OOC/wiznet + GM restart)."""
+    return max(3.0, float(_env_int("RIFTFORGE_GATEWAY_STITCH_STALE", 12)))
+
+
+def _pop_complete_lines(buf: bytes) -> tuple[list[bytes], bytes]:
+    """Split telnet input on newlines; return (lines, remainder)."""
+    lines: list[bytes] = []
+    while True:
+        idx = buf.find(b"\n")
+        if idx < 0:
+            break
+        line = buf[:idx]
+        buf = buf[idx + 1 :]
+        if line.endswith(b"\r"):
+            line = line[:-1]
+        lines.append(line)
+    return lines, buf
+
+
 def _peer_host_from_writer(writer) -> Optional[str]:
     """Best-effort client IP/host from a public telnet StreamWriter.
 
@@ -145,10 +173,14 @@ class ClientSlot:
         self.reader = reader
         self.writer = writer
         self.name: Optional[str] = None  # set when game reports bound
+        self.ooc_face: Optional[str] = None  # account or character label for OOC
+        self.head_gm: bool = False  # head GM may queue restart from gateway
+        self.staff_gm: bool = False  # staff may use wiznet while game is down
         # Real public-socket peer (not the IPC loopback). Forwarded on
         # open / welcome so the game Session can ban + head-GM-notify.
         self.peer: Optional[str] = peer
         self.alive = True
+        self.line_buffer = b""  # stitch-mode line assembly
 
 
 class Gateway:
@@ -165,6 +197,7 @@ class Gateway:
         # Hold-music bookkeeping (monotonic times; None = game is up /
         # no clients / music disabled path not yet started).
         self._hold_down_since: Optional[float] = None
+        self._hold_down_since_wall: Optional[float] = None
         self._hold_next_at: Optional[float] = None
         self._hold_line_index = 0
         # One Discord down/up pair per outage that lasts past Discord grace.
@@ -172,6 +205,15 @@ class Gateway:
         # Set by game CTRL ``planned_restart`` (SIGUSR1 / copyover exit) so
         # intentional game-only reloads never hit WKNZ as a "crash".
         self._suppress_discord_outage = False
+        # Gateway stitch mirrors for global channels (plain text, no color).
+        # Authoritative rings live on the game — see engine/channel_history.py.
+        from engine import channel_history
+
+        self._stitch_histories: dict[str, deque[str]] = {}
+        for spec in channel_history.gateway_stitch_channels():
+            self._stitch_histories[spec.name] = deque(maxlen=spec.ring_max)
+        # Last time any game→client DATA frame was forwarded (stitch detect).
+        self._last_game_data_at = time.monotonic()
 
     async def send_to_game(self, frame: bytes) -> None:
         """Write one framed message to the connected game, if any."""
@@ -258,6 +300,47 @@ class Gateway:
         if (now - self._hold_down_since) >= discord_grace:
             self._discord_outage_down()
 
+    def _maybe_crash_recovery_outage(self) -> None:
+        """Tell the watcher when game IPC has been down past the crash window."""
+        if self._hold_down_since_wall is None:
+            return
+        if self._suppress_discord_outage:
+            return
+        try:
+            from engine import crash_recovery
+
+            if (time.time() - self._hold_down_since_wall) >= (
+                crash_recovery.crash_window_seconds()
+            ):
+                crash_recovery.write_gateway_outage(
+                    down_since_wall=self._hold_down_since_wall,
+                    planned_restart=False,
+                )
+        except Exception as exc:
+            print(
+                f"[gateway] crash_recovery outage file skipped: {exc!r}",
+                flush=True,
+            )
+
+    def _mark_game_ipc_down(self) -> None:
+        """Start tracking downtime when IPC drops."""
+        if self._hold_down_since is None:
+            self._hold_down_since = time.monotonic()
+        if self._hold_down_since_wall is None:
+            self._hold_down_since_wall = time.time()
+
+    def _clear_game_ipc_down(self) -> None:
+        """Clear downtime tracking when IPC returns."""
+        self._hold_down_since = None
+        self._hold_down_since_wall = None
+        self._hold_next_at = None
+        try:
+            from engine import crash_recovery
+
+            crash_recovery.clear_gateway_outage()
+        except Exception:
+            pass
+
     async def _broadcast_hold_line(self, data: bytes) -> None:
         """Send one hold-music line to every alive held client."""
         # Snapshot keys — send_to_client may drop a dead socket mid-loop.
@@ -283,12 +366,11 @@ class Gateway:
                 if game_up:
                     self._discord_outage_up()
                     self._suppress_discord_outage = False
-                    self._hold_down_since = None
+                    self._clear_game_ipc_down()
                     continue
+                self._mark_game_ipc_down()
                 now = time.monotonic()
-                if self._hold_down_since is None:
-                    self._hold_down_since = now
-                    continue
+                self._maybe_crash_recovery_outage()
                 self._maybe_discord_outage_down(now, discord_grace)
             return
         interval = max(1, _env_int("RIFTFORGE_GATEWAY_HOLD_INTERVAL", 20))
@@ -300,20 +382,17 @@ class Gateway:
                 # Game back -- Discord "we're back" if we announced down.
                 self._discord_outage_up()
                 self._suppress_discord_outage = False
-                self._hold_down_since = None
-                self._hold_next_at = None
+                self._clear_game_ipc_down()
                 continue
+            self._mark_game_ipc_down()
             now = time.monotonic()
+            self._maybe_crash_recovery_outage()
             if not has_clients:
                 # No telnet holders: still track downtime for Discord so
                 # #wknz-radio hears real outages even when nobody is parked.
-                if self._hold_down_since is None:
-                    self._hold_down_since = now
-                    continue
                 self._maybe_discord_outage_down(now, discord_grace)
                 continue
-            if self._hold_down_since is None:
-                self._hold_down_since = now
+            if self._hold_next_at is None:
                 self._hold_next_at = now + hold_grace
                 continue
             # Discord gate is independent of hold-line drip timing.
@@ -341,6 +420,292 @@ class Gateway:
         if notify_game:
             await self.send_to_game(encode_ctrl({"op": "close", "sid": session_id}))
 
+    def _should_intercept_commands(self) -> bool:
+        """True when the gateway should handle OOC / GM restart locally."""
+        if self._game_writer is None:
+            return True
+        stale = time.monotonic() - self._last_game_data_at
+        return stale >= _stitch_stale_seconds()
+
+    def _note_game_data(self) -> None:
+        """Refresh stitch timer when the game forwards bytes to a client."""
+        self._last_game_data_at = time.monotonic()
+
+    def _slot_ooc_face(self, slot: ClientSlot) -> str:
+        """Best label for gateway OOC while the game is unreachable."""
+        if slot.ooc_face:
+            return slot.ooc_face
+        if slot.name:
+            return slot.name
+        return "???"
+
+    async def _send_plain(self, session_id: str, text: str) -> None:
+        await self.send_to_client(session_id, (text + "\r\n").encode("utf-8"))
+
+    async def _broadcast_plain(self, text: str) -> None:
+        payload = (text + "\r\n").encode("utf-8")
+        for sid in list(self.clients.keys()):
+            await self.send_to_client(sid, payload)
+
+    def _slot_wiznet_face(self, slot: ClientSlot) -> str:
+        """Staff label for gateway wiznet while the game is unreachable."""
+        face = self._slot_ooc_face(slot)
+        if face.endswith("(GM)"):
+            return face
+        return f"{face}(GM)"
+
+    def _merge_chat_history(self, snapshot: dict[str, list]) -> None:
+        """Merge game-owned channel rings into gateway stitch buffers."""
+        for name, lines in (snapshot or {}).items():
+            buf = self._stitch_histories.get(name)
+            if buf is None:
+                continue
+            for line in lines or []:
+                if isinstance(line, str) and line.strip():
+                    buf.append(line.strip())
+
+    def _merge_chat_history_payload(self, payload: dict) -> None:
+        """Accept ``channels`` dict or legacy per-channel keys on *payload*."""
+        from engine import channel_history
+
+        channels = (payload or {}).get("channels")
+        if isinstance(channels, dict):
+            self._merge_chat_history(channels)
+            return
+        snapshot: dict[str, list] = {}
+        for spec in channel_history.gateway_stitch_channels():
+            raw = (payload or {}).get(spec.name)
+            if raw:
+                snapshot[spec.name] = raw
+        self._merge_chat_history(snapshot)
+
+    def _append_gateway_chat_line(self, channel: str, line: str) -> None:
+        """Record one plain chat line from the game (live mirror)."""
+        text = (line or "").strip()
+        if not text:
+            return
+        buf = self._stitch_histories.get(channel)
+        if buf is not None:
+            buf.append(text)
+
+    def _channel_message_text(self, text: str, verb: str) -> Optional[str]:
+        """Return speak body, or ``None`` when *text* is the bare verb."""
+        stripped = (text or "").strip()
+        lower = stripped.lower()
+        if lower == verb:
+            return None
+        prefix = f"{verb} "
+        if lower.startswith(prefix):
+            return stripped[len(prefix) :].strip()
+        return None
+
+    async def _replay_gateway_channel(
+        self, slot: ClientSlot, channel_name: str,
+    ) -> None:
+        from engine import channel_history
+
+        spec = channel_history.get_channel(channel_name)
+        buf = self._stitch_histories.get(channel_name)
+        if spec is None:
+            return
+        if not buf:
+            await self._send_plain(slot.session_id, spec.empty_message)
+            return
+        await self._send_plain(slot.session_id, spec.replay_header)
+        for entry in buf:
+            await self._send_plain(slot.session_id, entry)
+        await self._send_plain(slot.session_id, "")
+
+    async def _relay_gateway_wiznet(self, slot: ClientSlot, message: str) -> None:
+        """Broadcast one wiznet line from the gateway while stitch mode is on."""
+        plain = f"[WIZ] {self._slot_wiznet_face(slot)}: {message}"
+        self._append_gateway_chat_line("wiznet", plain)
+        for sid, peer in list(self.clients.items()):
+            if not peer.staff_gm:
+                continue
+            await self._send_plain(sid, plain)
+            await self._send_plain(sid, "")
+
+    async def _relay_gateway_ooc(self, slot: ClientSlot, message: str) -> None:
+        """Broadcast one OOC line from the gateway while stitch mode is on."""
+        face = self._slot_ooc_face(slot)
+        plain = ooc_channel.format_ooc_line(face, message)
+        self._append_gateway_chat_line("ooc", plain)
+        await self._broadcast_plain(plain)
+        await self._broadcast_plain("")
+        try:
+            bridge = self._discord_bridge()
+            bridge.schedule_ooc(plain)
+        except Exception as exc:
+            print(f"[gateway] ooc discord mirror skipped: {exc!r}", flush=True)
+
+    async def _relay_gateway_channel(
+        self, slot: ClientSlot, channel_name: str, message: str,
+    ) -> None:
+        if channel_name == "ooc":
+            await self._relay_gateway_ooc(slot, message)
+        elif channel_name == "wiznet":
+            await self._relay_gateway_wiznet(slot, message)
+
+    async def _handle_intercepted_line(self, slot: ClientSlot, line: bytes) -> bool:
+        """Handle stitch-mode commands. Return True when consumed."""
+        try:
+            text = line.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return False
+        if not text:
+            return True
+        lower = text.lower()
+        from engine import channel_history
+
+        channel_name = channel_history.stitch_channel_for_command(text)
+        if channel_name:
+            # Game IPC up: forward to authoritative game rings.
+            if self._game_writer is not None:
+                return False
+            spec = channel_history.get_channel(channel_name)
+            if spec is None:
+                return False
+            if spec.staff_only and not slot.staff_gm:
+                await self._send_plain(slot.session_id, "You aren't a GM.")
+                return True
+            body = self._channel_message_text(text, spec.verb)
+            if body is None:
+                await self._replay_gateway_channel(slot, channel_name)
+                return True
+            if not body:
+                await self._send_plain(slot.session_id, spec.usage_message)
+                return True
+            await self._relay_gateway_channel(slot, channel_name, body)
+            return True
+        if lower.startswith("gm recover restart") or lower.startswith(
+            "recover restart"
+        ):
+            if not slot.head_gm:
+                await self._send_plain(
+                    slot.session_id,
+                    "Only the head GM can force a game restart from here.",
+                )
+                return True
+            backup = "backup" in lower.split() or "save" in lower.split()
+            if watcher_request.queue_restart_game(
+                by=self._slot_ooc_face(slot),
+                backup=backup,
+            ):
+                if backup:
+                    tip = (
+                        "Restart queued — backup + game respawn. "
+                    )
+                else:
+                    tip = "Restart queued — game respawn (no backup). "
+                await self._send_plain(
+                    slot.session_id,
+                    f"*** [ALERT] {tip}"
+                    "Hold on; OOC still works until the Veil settles. ***",
+                )
+            else:
+                await self._send_plain(
+                    slot.session_id,
+                    "*** [ALERT] Could not queue restart (watcher request file). ***",
+                )
+            return True
+        if lower in ("gm recover revert", "recover revert"):
+            if not slot.head_gm:
+                await self._send_plain(
+                    slot.session_id,
+                    "Only the head GM can revert code to the last stable SHA.",
+                )
+                return True
+            if watcher_request.queue_revert_stable(
+                by=self._slot_ooc_face(slot),
+            ):
+                await self._send_plain(
+                    slot.session_id,
+                    "*** [ALERT] Revert queued — code rolls back to last stable "
+                    "SHA (no backup), then game respawn. Auto-deploy held until "
+                    "gm recover clearhold. ***",
+                )
+            else:
+                await self._send_plain(
+                    slot.session_id,
+                    "*** [ALERT] Could not queue revert (watcher request file). ***",
+                )
+            return True
+        if lower.startswith("gm recover restoredb") or lower.startswith(
+            "recover restoredb"
+        ):
+            if not slot.head_gm:
+                await self._send_plain(
+                    slot.session_id,
+                    "Only the head GM can restore riftforge.db from backups.",
+                )
+                return True
+            parts = text.split()
+            date = ""
+            if len(parts) >= 3:
+                date = parts[2].strip()
+            if watcher_request.queue_restore_db(
+                date=date,
+                by=self._slot_ooc_face(slot),
+            ):
+                when = date or "latest restorable nightly backup"
+                await self._send_plain(
+                    slot.session_id,
+                    "*** [ALERT] DB restore queued — copies "
+                    f"backups/{when}/riftforge.db over the live file "
+                    "(corrupt copy quarantined), then game respawn. "
+                    "Gateway stays up. ***",
+                )
+            else:
+                await self._send_plain(
+                    slot.session_id,
+                    "*** [ALERT] Could not queue restoredb "
+                    "(watcher request file). ***",
+                )
+            return True
+        if lower in (
+            "gm recover clearhold",
+            "recover clearhold",
+            "gm recover clear",
+            "recover clear",
+        ):
+            if not slot.head_gm:
+                await self._send_plain(
+                    slot.session_id,
+                    "Only the head GM can clear the crash revert hold.",
+                )
+                return True
+            if watcher_request.queue_clear_revert_hold(
+                by=self._slot_ooc_face(slot),
+            ):
+                await self._send_plain(
+                    slot.session_id,
+                    "*** [ALERT] Hold cleared — auto-deploy catch-up queued. "
+                    "Merged fixes on origin/main should sync on the next poll. ***",
+                )
+            else:
+                await self._send_plain(
+                    slot.session_id,
+                    "*** [ALERT] Could not queue clearhold (watcher request file). ***",
+                )
+            return True
+        if self._game_writer is None:
+            wait = (
+                "*** [WAIT] OOC and wiznet work while the game restarts; "
+                "other commands need the Veil to settle. ***"
+                if slot.staff_gm
+                else "*** [WAIT] OOC works while the game restarts; other "
+                "commands need the Veil to settle. ***"
+            )
+            await self._send_plain(slot.session_id, wait)
+            return True
+        return False
+
+    async def _forward_client_line(self, session_id: str, line: bytes) -> None:
+        """Send one assembled line to the game child."""
+        payload = line + b"\r\n"
+        await self.send_to_game(encode_data(session_id, payload))
+
     async def handle_telnet(self, reader, writer) -> None:
         """Accept one public telnet connection and hold it until EOF."""
         session_id = uuid.uuid4().hex  # 32 ascii chars
@@ -362,7 +727,16 @@ class Gateway:
                 data = await reader.read(4096)
                 if not data:
                     break
-                await self.send_to_game(encode_data(session_id, data))
+                if self._should_intercept_commands():
+                    slot.line_buffer += data
+                    lines, slot.line_buffer = _pop_complete_lines(slot.line_buffer)
+                    for line in lines:
+                        if await self._handle_intercepted_line(slot, line):
+                            continue
+                        if self._game_writer is not None:
+                            await self._forward_client_line(session_id, line)
+                else:
+                    await self.send_to_game(encode_data(session_id, data))
         except (ConnectionError, OSError, asyncio.CancelledError):
             pass
         finally:
@@ -391,6 +765,7 @@ class Gateway:
             # (if we announced Discord down) post the WKNZ "we're back".
             self._hold_down_since = None
             self._hold_next_at = None
+            self._note_game_data()
             self._discord_outage_up()
             # Clear planned-restart suppress whether or not Discord fired.
             self._suppress_discord_outage = False
@@ -422,10 +797,16 @@ class Gateway:
                         s = self.clients.get((payload or {}).get("sid", ""))
                         if s is not None:
                             s.name = (payload or {}).get("name") or None
+                            s.ooc_face = (payload or {}).get("ooc_face") or s.name
+                            s.head_gm = bool((payload or {}).get("head_gm"))
+                            s.staff_gm = bool((payload or {}).get("staff_gm"))
                     elif op == "unbound":
                         s = self.clients.get((payload or {}).get("sid", ""))
                         if s is not None:
                             s.name = None
+                            s.ooc_face = None
+                            s.head_gm = False
+                            s.staff_gm = False
                     elif op == "kick":
                         # Intentional quit / takeover — drop the real TCP.
                         sid = (payload or {}).get("sid", "")
@@ -441,10 +822,18 @@ class Gateway:
                             "Discord outage suppressed",
                             flush=True,
                         )
+                    elif op == "chat_history":
+                        self._merge_chat_history_payload(payload or {})
+                    elif op == "chat_append":
+                        self._append_gateway_chat_line(
+                            str((payload or {}).get("channel") or ""),
+                            str((payload or {}).get("line") or ""),
+                        )
                     elif op == "ping":
                         await self.send_to_game(encode_ctrl({"op": "pong"}))
                 elif ftype == TYPE_DATA and sid:
                     # Game → client telnet bytes.
+                    self._note_game_data()
                     await self.send_to_client(sid, payload or b"")
         except (asyncio.IncompleteReadError, ConnectionError, OSError, ValueError) as exc:
             print(f"[gateway] game IPC ended: {exc}", flush=True)

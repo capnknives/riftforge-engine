@@ -75,12 +75,21 @@ DEFAULT_FETCH_TIMEOUT = 60
 #                       "Fix overnight Cadence… (#63-#67)" (parenthetical only)
 _FIX_SUBJECT_RE = re.compile(
     r"^(?:fix(?:es|ed)?)\s+"
-    r"(?:bugs?|bug_reports\.log)\s*#"
+    r"(?:(?:in-game\s+)?bugs?|bug_reports\.log)\s*#?"
     r"(\d+)"
     r"(?:\s*[-–—]\s*#?(\d+))?"
     r"((?:\s*,\s*#?\d+)*)"
     r"\b",
     re.IGNORECASE,
+)
+# When a Fix subject closes bug #N, also close these duplicate filings.
+_BUG_RESOLVE_ALIASES: dict[int, tuple[int, ...]] = {
+    # Gary: demesne hub ``down`` + ``beasts`` crash filed twice same session.
+    239: (238,),
+}
+# Non-Fix squash subjects that still shipped a player-visible fix.
+_DEPLOY_RESOLVE_SUBJECT_HOOKS: tuple[tuple[re.Pattern[str], tuple[int, ...]], ...] = (
+    (re.compile(r"nest dens.*flood", re.IGNORECASE), (243, 244)),
 )
 # Ship suggestion subjects mirror Fix bug subjects:
 #   "Ship suggestion #92: pit auto-look"
@@ -97,6 +106,22 @@ _SHIP_SUGGESTION_SUBJECT_RE = re.compile(
 )
 # Cap range expansion so a typo like #1-9999 cannot flood resolve.
 _MAX_BUG_ID_RANGE = 50
+
+
+def expand_bug_ids_with_aliases(bug_ids) -> list[int]:
+    """Return ``bug_ids`` plus any configured duplicate tickets to close."""
+    out: list[int] = []
+    for raw in bug_ids or []:
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if n not in out:
+            out.append(n)
+        for alias in _BUG_RESOLVE_ALIASES.get(n, ()):
+            if alias not in out:
+                out.append(alias)
+    return out
 
 
 def _expand_fix_subject_bug_ids(start: int, end: int | None, extras: str) -> list[int]:
@@ -250,7 +275,13 @@ def _enabled():
     """Whether try_auto_deploy should poll this tick.
 
     GM override file wins when present; otherwise AUTO_DEPLOY env (default on).
+    Revert hold (crash recovery) forces off so hotfix / manual patches are not
+    wiped by reset --hard while staff clears the hold.
     """
+    from engine import crash_recovery
+
+    if crash_recovery.hold_active():
+        return False
     override = read_override()
     if override is not None:
         return override == _OVERRIDE_ON
@@ -330,9 +361,43 @@ def _kill_process_tree(proc):
         pass
 
 
+def _git_ssh_command_for_key(root, key_name):
+    """SSH wrapper for a deploy key under ``root/.secrets`` (container or host path)."""
+    key_path = os.path.join(root, ".secrets", key_name).replace("\\", "/")
+    return (
+        f"ssh -i {key_path} -o IdentitiesOnly=yes "
+        f"-o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+    )
+
+
+def _git_env_for(root):
+    """Subprocess env for git: deploy key via GIT_SSH_COMMAND, not core.sshCommand.
+
+    ``core.sshCommand`` in the bind-mounted ``.git/config`` is shared with the
+    Windows host. A container-only path (``/app/.secrets/…``) breaks host
+    ``git push`` / agent worktrees. Auto-deploy and manual in-container fetch
+    use ``GIT_SSH_COMMAND`` instead; see ``tools/wire_staging_github_ssh.py``.
+    """
+    env = os.environ.copy()
+    ssh_cmd = (env.get("GIT_SSH_COMMAND") or "").strip()
+    if not ssh_cmd:
+        key_name, _key_path = _find_deploy_key(root)
+        if key_name:
+            ssh_cmd = _git_ssh_command_for_key(root, key_name)
+    if ssh_cmd:
+        env["GIT_SSH_COMMAND"] = ssh_cmd
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    return env
+
+
 def _git(*args, cwd=None):
+    root = cwd or os.getcwd()
     return subprocess.check_output(
-        ["git", *args], cwd=cwd, text=True, stderr=subprocess.DEVNULL,
+        ["git", *args],
+        cwd=cwd,
+        text=True,
+        stderr=subprocess.DEVNULL,
+        env=_git_env_for(root),
     ).strip()
 
 
@@ -350,11 +415,13 @@ def _run_git(*args, cwd=None, timeout=None):
     timeout because it is local and fast.
     """
     print(f"+ git {' '.join(args)}", flush=True)
+    root = cwd or os.getcwd()
     popen_kwargs = {
         "cwd": cwd,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
+        "env": _git_env_for(root),
     }
     # New session only when we need a killable process group (timed fetch).
     if timeout and timeout > 0 and os.name != "nt":
@@ -645,6 +712,22 @@ def _restore_protected_live_files(root, stash):
         f"{drop_bit})",
         flush=True,
     )
+    try:
+        from engine import hooks
+
+        heal_stats = hooks.boot_content_heal()
+        if heal_stats:
+            print(
+                f"[auto_deploy] boot_content_heal after protect restore: "
+                f"{heal_stats}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(
+            f"[auto_deploy] boot_content_heal after protect restore failed: "
+            f"{exc!r}",
+            flush=True,
+        )
 
 
 def _reset_hard_to(root, sha):
@@ -659,8 +742,20 @@ def _reset_hard_to(root, sha):
     reset and written back afterward so GM catalog edits and staff map
     snapshots survive silent ``origin/main`` advances. Map/zone JSON
     itself follows ``origin/main`` (use ``gm maps backup`` first).
+
+    When HEAD is already ``sha``, skip the stash/reset/restore cycle —
+    re-running protect restore rewrites hundreds of mtimes and can
+    copyover-loop the game for no code change (same trap as catch-up).
     """
     ensure_git_safe_directory(root)
+    head = _head_sha(root)
+    if head and head == sha:
+        print(
+            f"[auto_deploy] working tree already at {sha[:12]} "
+            "(skipping reset --hard + protect restore)",
+            flush=True,
+        )
+        return
     print(f"[auto_deploy] syncing working tree to {sha[:12]}", flush=True)
     stash = _stash_protected_live_files(root)
     try:
@@ -670,17 +765,174 @@ def _reset_hard_to(root, sha):
     # Live populate/dig rooms may exist only in protected map_backups after
     # reset --hard. Additive heal merges missing keys back into zone/map
     # JSON without overwriting git-authored rooms.
+    #
+    # Important: reload(hooks) clears ``_auto_deploy_map_heal``, and the
+    # watcher process never runs supers.bootstrap — so heal used to
+    # silently return []. ``auto_deploy_map_heal`` late-binds map_heal
+    # after that wipe (see engine.hooks.ensure_auto_deploy_map_heal).
     try:
         import engine.hooks as hooks
 
-        # Same stale-module trap as deploy_notify: reload so map heal APIs
-        # match disk after reset --hard under a long-lived watcher.
         importlib.reload(hooks)
         heal_lines = hooks.auto_deploy_map_heal(root)
-        for line in heal_lines:
-            print(f"[auto_deploy] {line}", flush=True)
+        if heal_lines:
+            for line in heal_lines:
+                print(f"[auto_deploy] {line}", flush=True)
+        else:
+            print(
+                "[auto_deploy] map heal: nothing to merge "
+                "(backups already match live, or no map_backups)",
+                flush=True,
+            )
     except Exception as exc:
         print(f"[auto_deploy] map heal skipped: {exc}", flush=True)
+
+
+_GITHUB_SSH_ORIGIN = "git@github.com:capnknives/RiftForge.git"
+_DEPLOY_KEY_NAMES = (
+    "id_ed25519_github_staging",
+    "id_ed25519_github",
+)
+
+
+def sanitize_openssh_private_key(material):
+    """Return a single LF-only OpenSSH private key block, or None."""
+    text = (material or "").replace("\r\n", "\n").replace("\r", "\n")
+    match = re.search(
+        r"-----BEGIN OPENSSH PRIVATE KEY-----"
+        r".*?"
+        r"-----END OPENSSH PRIVATE KEY-----",
+        text,
+        re.DOTALL,
+    )
+    if not match:
+        return None
+    return match.group(0).strip() + "\n"
+
+
+def _normalize_deploy_key_file(path):
+    """Strip CR bytes from a bind-mounted deploy key (Windows Docker CRLF).
+
+    OpenSSH inside Linux rejects keys with ``\\r`` in the PEM block
+    (``error in libcrypto``). Idempotent when the file is already LF-only.
+    Returns True when the file was rewritten.
+    """
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return False
+    if b"\r" not in raw:
+        return False
+    fixed = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    try:
+        with open(path, "wb") as handle:
+            handle.write(fixed)
+        os.chmod(path, 0o600)
+    except OSError:
+        return False
+    return True
+
+
+def _find_deploy_key(root):
+    """Return ``(key_name, abs_path)`` for the first usable deploy key."""
+    for name in _DEPLOY_KEY_NAMES:
+        path = os.path.join(root, ".secrets", name)
+        if not os.path.isfile(path):
+            continue
+        _normalize_deploy_key_file(path)
+        try:
+            with open(path, "rb") as handle:
+                head = handle.read(96)
+        except OSError:
+            continue
+        if b"BEGIN OPENSSH PRIVATE KEY" in head:
+            return name, path
+    return None, None
+
+
+def ensure_github_ssh_fetch(root):
+    """Point ``origin`` at SSH when a deploy key exists; clear stale sshCommand.
+
+    Fetch auth uses ``GIT_SSH_COMMAND`` (``_git_env_for``) so the bind-mounted
+    ``.git/config`` is not poisoned with a container-only ``/app/.secrets/…``
+    path that breaks Windows host ``git push``. Staging Docker often has deploy
+    keys on the bind-mount but ``origin`` still on HTTPS (``gh`` /
+    PLAY_CHECKOUT recovery). Auto-heal before fetch so ``gm autodeploy on``
+    and ``AUTO_DEPLOY=1`` work without re-running the wire script every time
+    the remote URL flips back.
+    """
+    key_name, _key_path = _find_deploy_key(root)
+    if not key_name:
+        return False
+    try:
+        origin = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        current = (origin.stdout or "").strip()
+        if not current.startswith("git@"):
+            subprocess.run(
+                ["git", "remote", "set-url", "origin", _GITHUB_SSH_ORIGIN],
+                cwd=root,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(
+                f"[auto_deploy] origin -> {_GITHUB_SSH_ORIGIN} "
+                f"(deploy key {key_name})",
+                flush=True,
+            )
+        # Legacy wire script / live repair wrote container paths here — unset so
+        # host git (worktrees, agents) is not forced through /app/.secrets/….
+        cfg = subprocess.run(
+            ["git", "config", "--get", "core.sshCommand"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if (cfg.stdout or "").strip():
+            subprocess.run(
+                ["git", "config", "--unset", "core.sshCommand"],
+                cwd=root,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
+def _is_permanent_fetch_auth_failure(detail):
+    """True when git fetch will not self-heal without credential / URL fix."""
+    detail_l = (detail or "").lower()
+    return (
+        "could not read username" in detail_l
+        or "permission denied (publickey)" in detail_l
+        or "authentication failed" in detail_l
+        or "invalid username or password" in detail_l
+        or "terminal prompts disabled" in detail_l
+    )
+
+
+def _clear_catchup_on_permanent_fetch_failure(root, detail):
+    """Drop a queued catch-up when fetch cannot auth (staging Docker)."""
+    if not catchup_requested(root):
+        return
+    clear_catchup(root)
+    print(
+        "[auto_deploy] cleared catch-up flag: git fetch cannot authenticate "
+        f"in this environment ({detail}). Staging: `git pull --ff-only` on "
+        "the host and keep AUTO_DEPLOY=0; live uses deploy keys in "
+        ".secrets/id_ed25519_github.",
+        flush=True,
+    )
 
 
 def _fetch_origin(root):
@@ -696,6 +948,7 @@ def _fetch_origin(root):
     Timed fetch + killpg returns False so the next poll can try again.
     """
     ensure_git_safe_directory(root)
+    ensure_github_ssh_fetch(root)
     timeout = fetch_timeout_seconds()
     try:
         _run_git("fetch", "origin", "main", cwd=root, timeout=timeout or None)
@@ -713,6 +966,8 @@ def _fetch_origin(root):
         detail = getattr(exc, "_riftforge_git_detail", None) or str(exc)
         print(f"[auto_deploy] git fetch skipped: {detail}", flush=True)
         detail_l = detail.lower()
+        if _is_permanent_fetch_auth_failure(detail):
+            _clear_catchup_on_permanent_fetch_failure(root, detail)
         # One-line recovery hint for the empty-object failure we hit on Azure.
         if "empty" in detail_l or "bad object" in detail_l:
             print(
@@ -736,6 +991,40 @@ def _fetch_origin(root):
 
 def _origin_main_sha(root):
     return _git("rev-parse", "origin/main", cwd=root)
+
+
+def _head_sha(root):
+    """Checked-out commit (may lag ``origin/main`` after Fix overlays)."""
+    try:
+        return _git("rev-parse", "HEAD", cwd=root).strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+
+def _sync_head_to_tip_if_behind(root, remote_sha, *, reason=""):
+    """Move HEAD to the shipped tip when Fix overlays left the ref behind.
+
+    Fix-bug deploys overlay only the changed paths; ``.auto_deploy_state``
+    still advances ``origin_main`` to the remote tip. Without this, live
+    diagnostics show ``HEAD`` behind ``origin/main`` even though the last
+    Fix landed, and any files outside the overlay list stay stale until
+    someone runs a manual ``reset --hard``.
+    """
+    head_sha = _head_sha(root)
+    if not head_sha or head_sha == remote_sha:
+        return True
+    label = f" ({reason})" if reason else ""
+    print(
+        f"[auto_deploy] HEAD {head_sha[:12]} behind tip {remote_sha[:12]}"
+        f" -- full sync{label}",
+        flush=True,
+    )
+    try:
+        _reset_hard_to(root, remote_sha)
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        print(f"[auto_deploy] HEAD sync failed: {exc}", flush=True)
+        return False
+    return True
 
 
 def _commit_subject(sha, root):
@@ -801,6 +1090,7 @@ def parse_deploy_metadata(subject: str) -> tuple[list[int], list[int], str]:
     if len(summary) > 120:
         summary = summary[:117] + "..."
     if bug_ids:
+        bug_ids = expand_bug_ids_with_aliases(bug_ids)
         default = "A bug fix has been deployed."
     elif suggestion_ids:
         default = "A player suggestion has been shipped."
@@ -996,16 +1286,12 @@ def _commits_between(from_sha, to_sha, root):
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def collect_missed_fix_commits(root, from_sha, to_sha):
-    """List Fix-bug commits in ``from_sha..to_sha`` not yet announced.
-
-    Each entry is ``{"sha", "bug_ids", "summary"}``. Pure git + parser
-    helpers — easy to smoke-test with a real repo history.
-    """
+def _fix_commits_from_shas(root, shas):
+    """Parse Fix/Ship subjects from an ordered SHA list."""
     from tools.apply_pr_fix import files_in_commit
 
     fixes = []
-    for sha in _commits_between(from_sha, to_sha, root):
+    for sha in shas:
         try:
             subject = _commit_subject(sha, root)
             parent_count = _commit_parent_count(sha, root)
@@ -1022,11 +1308,217 @@ def collect_missed_fix_commits(root, from_sha, to_sha):
             continue
         fixes.append({
             "sha": sha,
-            "bug_ids": list(bug_ids),
+            "bug_ids": expand_bug_ids_with_aliases(bug_ids),
             "suggestion_ids": list(suggestion_ids),
             "summary": summary,
         })
     return fixes
+
+
+def collect_missed_fix_commits(root, from_sha, to_sha):
+    """List Fix-bug commits in ``from_sha..to_sha`` not yet announced.
+
+    Each entry is ``{"sha", "bug_ids", "summary"}``. Pure git + parser
+    helpers — easy to smoke-test with a real repo history.
+    """
+    return _fix_commits_from_shas(root, _commits_between(from_sha, to_sha, root))
+
+
+def _deployed_tip_sha(root):
+    """Best SHA for 'what is deployed' when scanning Fix subjects in git history."""
+    state_path = os.path.join(root, STATE_NAME)
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError, json.JSONDecodeError):
+        state = {}
+    origin = (state.get("origin_main") or "").strip()
+    if origin:
+        return origin
+    last = ((state.get("last_deploy") or {}).get("sha") or "").strip()
+    if last:
+        return last
+    for ref in ("origin/main", "HEAD"):
+        try:
+            return _git("rev-parse", ref, cwd=root).strip()
+        except subprocess.CalledProcessError:
+            continue
+    return ""
+
+
+BUG_RESOLVE_CACHE_NAME = ".bug_resolve_cache.json"
+
+# ``git log --grep`` terms for fast Fix/Ship scans (not full ``rev-list``).
+_FIX_SHIP_GREP_TERMS = (
+    "Fix bug",
+    "Fix bugs",
+    "Fix in-game",
+    "Fixes bug",
+    "Ship suggestion",
+    "Ship suggestions",
+    "Stop nest dens",
+)
+
+
+def git_root_for(directory):
+    """Repo checkout that holds ``.git`` for deploy-subject scans.
+
+    On live, ``report_dir`` (beside ``riftforge.db``) is the bind-mounted
+    repo root — same path for reports and git. Tests may use a temp report
+    dir while git lives in the real checkout.
+    """
+    if directory and os.path.isdir(os.path.join(directory, ".git")):
+        return directory
+    return _repo_root()
+
+
+def _bug_resolve_cache_path(directory):
+    return os.path.join(directory, BUG_RESOLVE_CACHE_NAME)
+
+
+def _load_bug_resolve_cache(directory):
+    path = _bug_resolve_cache_path(directory)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"tip_sha": "", "bug_ids": []}
+    bug_ids = data.get("bug_ids") or []
+    return {
+        "tip_sha": (data.get("tip_sha") or "").strip(),
+        "bug_ids": [int(x) for x in bug_ids if str(x).isdigit()],
+    }
+
+
+def _save_bug_resolve_cache(directory, *, tip_sha, bug_ids):
+    path = _bug_resolve_cache_path(directory)
+    payload = {
+        "tip_sha": tip_sha,
+        "bug_ids": sorted({int(x) for x in bug_ids}),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+
+
+def _merge_bug_id_list(existing, new_ids):
+    out = list(existing or [])
+    for raw in new_ids or []:
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if n not in out:
+            out.append(n)
+    return out
+
+
+def _collect_fix_ship_shas(git_root, to_sha, *, from_sha=None):
+    """Return SHAs whose subjects may be Fix/Ship deploys (grep, not full history)."""
+    if not to_sha:
+        return []
+    rev_range = to_sha
+    if from_sha and from_sha != to_sha:
+        rev_range = f"{from_sha}..{to_sha}"
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for term in _FIX_SHIP_GREP_TERMS:
+        try:
+            out = _git(
+                "log",
+                "--reverse",
+                "--format=%H",
+                rev_range,
+                f"--grep={term}",
+                "--regexp-ignore-case",
+                cwd=git_root,
+            )
+        except subprocess.CalledProcessError:
+            continue
+        for line in out.splitlines():
+            sha = line.strip()
+            if sha and sha not in seen:
+                seen.add(sha)
+                ordered.append(sha)
+    return ordered
+
+
+def _hook_bug_ids_from_shas(git_root, shas):
+    ids: list[int] = []
+    for sha in shas:
+        try:
+            subject = _commit_subject(sha, git_root)
+        except subprocess.CalledProcessError:
+            continue
+        for pattern, hook_ids in _DEPLOY_RESOLVE_SUBJECT_HOOKS:
+            if not pattern.search(subject):
+                continue
+            ids = _merge_bug_id_list(ids, hook_ids)
+    return ids
+
+
+def refresh_deployed_bug_id_cache(
+    git_root,
+    report_directory,
+    *,
+    full_rebuild=False,
+):
+    """Update cached deployed Fix-bug ids incrementally (fast boot path)."""
+    tip = _deployed_tip_sha(git_root)
+    cache = _load_bug_resolve_cache(report_directory)
+    bug_ids = list(cache.get("bug_ids") or [])
+    cached_tip = cache.get("tip_sha") or ""
+
+    if not tip:
+        return bug_ids
+
+    if cached_tip == tip and bug_ids and not full_rebuild:
+        return bug_ids
+
+    if full_rebuild or not cached_tip:
+        scan_from = None
+        if full_rebuild:
+            bug_ids = []
+    else:
+        scan_from = cached_tip
+
+    shas = _collect_fix_ship_shas(git_root, tip, from_sha=scan_from)
+    for fix in _fix_commits_from_shas(git_root, shas):
+        bug_ids = _merge_bug_id_list(bug_ids, fix.get("bug_ids"))
+    bug_ids = _merge_bug_id_list(bug_ids, _hook_bug_ids_from_shas(git_root, shas))
+    _save_bug_resolve_cache(report_directory, tip_sha=tip, bug_ids=bug_ids)
+    return bug_ids
+
+
+def collect_all_deployed_fix_commits(root, to_sha=None):
+    """List every Fix/Ship commit on ``to_sha`` (grep scan — ops/tooling only)."""
+    if to_sha is None:
+        to_sha = _deployed_tip_sha(root)
+    if not to_sha:
+        return []
+    shas = _collect_fix_ship_shas(root, to_sha, from_sha=None)
+    return _fix_commits_from_shas(root, shas)
+
+
+def open_bug_ids(directory="."):
+    """Return sorted ids of still-open rows in ``bug_reports.log``."""
+    from engine import reports
+
+    return sorted(
+        entry["id"]
+        for entry in reports.recent(reports.BUG, None, directory=directory)
+        if entry.get("status", "open") == "open"
+    )
+
+
+def deployed_fix_bug_ids(git_root, report_directory=None, *, full_rebuild=False):
+    """De-duplicated bug ids from deployed Fix subjects (cached, incremental)."""
+    report_directory = report_directory or git_root
+    return refresh_deployed_bug_id_cache(
+        git_root,
+        report_directory,
+        full_rebuild=full_rebuild,
+    )
 
 
 def _catchup_from_sha(state):
@@ -1229,6 +1721,15 @@ def try_auto_deploy():
     prev_sha = state.get("origin_main") or ""
     # Strict advance-only: remote must be a NEW commit vs tracked origin_main.
     if remote_sha == prev_sha:
+        # Fix overlays advance state without moving HEAD -- self-heal on the
+        # next poll so agents are not fooled by HEAD != origin/main.
+        head_sha = _head_sha(root)
+        if head_sha and head_sha != remote_sha:
+            return _sync_head_to_tip_if_behind(
+                root,
+                remote_sha,
+                reason="tracked tip matches origin/main",
+            )
         # Local files may still lag -- hint once-ish via poll log, never deploy.
         if _working_tree_behind_commit(remote_sha, root):
             print(
@@ -1241,6 +1742,7 @@ def try_auto_deploy():
     subject = _commit_subject(remote_sha, root)
     bug_ids, suggestion_ids, summary = parse_deploy_metadata(subject)
     countdown = _countdown_seconds()
+    missed_fixes = collect_missed_fix_commits(root, prev_sha, remote_sha)
 
     print(
         f"[auto_deploy] origin/main advanced {prev_sha[:12]} "
@@ -1266,7 +1768,29 @@ def try_auto_deploy():
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
             print(f"[auto_deploy] working-tree sync failed: {exc}", flush=True)
             return False
+        # A feature tip can land in the same poll batch as Fix commits
+        # underneath it -- resolve those tickets even without a Veil countdown.
+        if missed_fixes:
+            try:
+                _apply_catchup_fix_resolves(root, state, missed_fixes)
+            except Exception as exc:
+                print(
+                    f"[auto_deploy] missed-fix catch-up failed: {exc}",
+                    flush=True,
+                )
         return _advance_origin_only(root, state, remote_sha, subject, reason)
+
+    # Multi-commit gaps: only the tip Fix gets the countdown; earlier Fix
+    # subjects in the same batch still need reporter credit + resolved status.
+    earlier_fixes = [fix for fix in missed_fixes if fix["sha"] != remote_sha]
+    if earlier_fixes:
+        try:
+            _apply_catchup_fix_resolves(root, state, earlier_fixes)
+        except Exception as exc:
+            print(
+                f"[auto_deploy] earlier-fix catch-up failed: {exc}",
+                flush=True,
+            )
 
     queued = _run_deploy_pipeline(
         root,
@@ -1278,6 +1802,11 @@ def try_auto_deploy():
         files=files,
     )
     if not queued:
+        return False
+
+    if not _sync_head_to_tip_if_behind(
+        root, remote_sha, reason="after Fix overlay",
+    ):
         return False
 
     state["origin_main"] = remote_sha

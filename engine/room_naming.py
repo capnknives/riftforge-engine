@@ -328,11 +328,35 @@ _BEARING_WORD = {
 }
 
 
+def format_city_region_label(
+    *,
+    city_name=None,
+    region=None,
+    room=None,
+) -> str:
+    """Player-facing ``City, Region`` label (e.g. Willis, Texas).
+
+    Omits the region when only one part is stamped. Future plane-wide
+    grouping can reuse ``region`` on non-Earth sites.
+    """
+    if room is not None:
+        if city_name is None:
+            city_name = getattr(room, "city_name", None)
+        if region is None:
+            region = getattr(room, "region", None)
+    city = str(city_name or "").strip()
+    reg = str(region or "").strip()
+    if city and reg:
+        return f"{city}, {reg}"
+    return city or reg or ""
+
+
 def parse_city_meta(data: dict | None) -> dict:
     """Normalize zone/map top-level city naming + color fields.
 
-    Returns a dict with ``city_name``, ``city_color``, ``sub_color``,
-    ``main_colors`` (merged over defaults). Missing city_name → ``""``.
+    Returns a dict with ``city_name``, ``region``, ``city_color``,
+    ``sub_color``, ``main_colors`` (merged over defaults).
+    Missing city_name / region → ``""``.
     """
     data = data if isinstance(data, dict) else {}
     main_colors = dict(DEFAULT_MAIN_COLORS)
@@ -344,10 +368,12 @@ def parse_city_meta(data: dict | None) -> dict:
             if kind and role_s:
                 main_colors[kind] = role_s
     city_name = str(data.get("city_name") or "").strip()
+    region = str(data.get("region") or "").strip()
     city_color = str(data.get("city_color") or DEFAULT_CITY_COLOR).strip()
     sub_color = str(data.get("sub_color") or DEFAULT_SUB_COLOR).strip()
     return {
         "city_name": city_name,
+        "region": region,
         "city_color": city_color or DEFAULT_CITY_COLOR,
         "sub_color": sub_color or DEFAULT_SUB_COLOR,
         "main_colors": main_colors,
@@ -427,10 +453,11 @@ def meta_from_room(room, game=None) -> dict:
         return base
     # Prefer per-room stamps from the loader.
     city_name = str(getattr(room, "city_name", None) or "").strip()
+    region = str(getattr(room, "region", None) or "").strip()
     city_color = str(getattr(room, "city_color", None) or "").strip()
     sub_color = str(getattr(room, "sub_color", None) or "").strip()
     main_colors = getattr(room, "main_colors", None)
-    if city_name or city_color or isinstance(main_colors, dict):
+    if city_name or region or city_color or isinstance(main_colors, dict):
         merged = dict(DEFAULT_MAIN_COLORS)
         if isinstance(main_colors, dict):
             merged.update({
@@ -440,6 +467,7 @@ def meta_from_room(room, game=None) -> dict:
             })
         return {
             "city_name": city_name,
+            "region": region,
             "city_color": city_color or DEFAULT_CITY_COLOR,
             "sub_color": sub_color or DEFAULT_SUB_COLOR,
             "main_colors": merged,

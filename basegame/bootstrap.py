@@ -31,12 +31,26 @@ def register_core_hooks():
     supers.bootstrap.register_core_hooks.
     """
     from basegame.character_attach import attach_basegame
+    from basegame.maps_room_json import stamp_basegame_map_room
     from basegame.persist_blob import apply_character_blob, character_to_blob
     from basegame import stats as stats_module
 
     hooks.set_character_attacher(attach_basegame)
+    hooks.set_map_room_stamper(stamp_basegame_map_room)
     hooks.set_blob_codec(character_to_blob, apply_character_blob)
     stats_module.register_hooks()
+    _register_content_kinds_hooks()
+
+
+def _register_content_kinds_hooks():
+    """Engine kind profiles + basegame demo kinds (no SUPERS dir)."""
+    from engine.content_kinds import engine as content_kinds_engine
+
+    kinds_root = os.path.join(_CONTENT_DIR, "kinds")
+    hooks.set_content_kinds_dirs([
+        content_kinds_engine.default_engine_kinds_dir(),
+        kinds_root,
+    ])
 
 
 def register_all_hooks():
@@ -72,11 +86,19 @@ def register_all_hooks():
     # Dual-layer America overland (engine/systems/overland.py).
     from engine.systems import overland as overland_mod
 
+    from basegame import gates as gates_mod
+
     def _ensure_game_defaults(game):
         overland_mod.ensure_game_overland(game)
         overland_mod.stamp_pocket_overland_exits(game)
+        gates_mod.ensure_initialized(game)
 
     hooks.set_ensure_game_defaults(_ensure_game_defaults)
+
+    def _look_exit_visible(dest, game):
+        return gates_mod.exit_visible(dest, game)
+
+    hooks.set_look_exit_visible(_look_exit_visible)
 
     def _map_center_room(character, game):
         macro = overland_mod._parse_pos_pair(
@@ -122,3 +144,7 @@ def register_all_hooks():
         mail_mod.notify_inbox(character, game)
 
     hooks.set_after_session_attach(_after_session_attach)
+
+    # Spawn peel demo: bestiary registry + critter nest AI (no SUPERS).
+    from basegame import bestiary as _bestiary_mod  # noqa: F401
+    from basegame import spawn_nests as _spawn_nests_mod  # noqa: F401

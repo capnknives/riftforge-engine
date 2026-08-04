@@ -1,0 +1,53 @@
+{
+  "id": "map.pocket.link",
+  "label": "Overland grid pocket link",
+  "writes_to": "content/maps/*.json pockets[]",
+  "fields": {
+    "kind": {
+      "type": "enum",
+      "required": false,
+      "doc": "Pocket type.",
+      "default": "landmark",
+      "values": [
+        "dungeon",
+        "landmark",
+        "settlement"
+      ]
+    },
+    "at": {
+      "type": "list",
+      "required": true,
+      "doc": "Grid coordinates [x, y]."
+    },
+    "hub_room": {
+      "type": "string",
+      "required": true,
+      "doc": "Zone mouth room key inside rooms[]."
+    },
+    "enter_as": {
+      "type": "list",
+      "required": false,
+      "doc": "Player enter aliases on the grid cell."
+    },
+    "visible_as": {
+      "type": "string",
+      "required": false,
+      "doc": "Distant look vista name on overland map."
+    },
+    "span": {
+      "type": "list",
+      "required": false,
+      "doc": "Manual override: [width, height] macro box from \"at\" toward +x/+y (city paint only). Omit to auto-paint from zone room layout (hub-anchored rectangle; gm citypaint units sets blocks/macro, default 20). [1,1] or omit with no layouts = no extra paint."
+    },
+    "direction": {
+      "type": "string",
+      "required": false,
+      "doc": "Legacy portal direction (ignored for exits)."
+    },
+    "return_direction": {
+      "type": "string",
+      "required": false,
+      "doc": "Legacy return direction (ignored)."
+    }
+  }
+}

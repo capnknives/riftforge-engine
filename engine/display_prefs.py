@@ -52,6 +52,23 @@ _SEGMENT_TOKENS = frozenset({
 })
 
 
+def preference_character(character, game=None):
+    """Return the Character row that owns client/display prefs for ``character``.
+
+    God bilocate twins inherit prefs from the owning Mantle so ``config exits
+    compact`` and ``config screenreader`` still apply while act focus runs
+    bare verbs through the twin body.
+    """
+    try:
+        from engine import hooks
+        resolved = hooks.preference_character(character, game)
+        if resolved is not None:
+            character = resolved
+    except Exception:
+        pass
+    return character
+
+
 def ensure_display_defaults(character):
     """Attach display-pref fields if missing (load / old Characters).
 
@@ -69,6 +86,8 @@ def ensure_display_defaults(character):
         _OLD_EXITS_PROMPT,
     ):
         character.prompt_format = DEFAULT_PROMPT
+    # Empty string means prompt off -- leave it alone (do not treat as
+    # missing). Custom templates must survive copyover / reattach.
     if not hasattr(character, "display_width"):
         character.display_width = WIDTH_DEFAULT
     if not hasattr(character, "screenreader"):
@@ -115,6 +134,9 @@ def ensure_display_defaults(character):
         # Default on (a11y). Sighted players may opt out via config combattags.
         # Screenreader mode always shows tags regardless of this flag.
         character.show_combat_tags = True
+    if not hasattr(character, "autokill"):
+        # Dungeon fodder only -- pit / portal / stronghold trash (help autokill).
+        character.autokill = False
     if not hasattr(character, "show_tips"):
         character.show_tips = True
     if not hasattr(character, "next_tip_tick"):
@@ -272,7 +294,11 @@ def format_exit_abbrevs(character, game=None):
     Honors the same visibility gates as look (hooks + known secret exits).
     Returns ``-`` when nowhere / no visible exits. Labels are the signal.
     """
-    _ = game
+    try:
+        from engine import hooks
+        character = hooks.perception_character(character, game)
+    except Exception:
+        pass
     room = getattr(character, "location", None)
     if room is None:
         return "-"
@@ -311,9 +337,12 @@ def format_exit_abbrevs(character, game=None):
 
 
 def format_group_names(character):
-    """Comma-separated faces of other party members, or ``\"\"`` if solo.
+    """Comma-separated faces of other *colocated* party members, or ``\"\"``.
 
     Used by raw ``%g`` and the optional ``%Gr`` segment. Excludes self.
+    Only groupmates sharing the leader's room or vehicle appear -- apart
+    mates stay on ``group`` / room (Group) tags but not the prompt (live
+    bug #256: stale [Sam, Dean] while walking solo after a crash).
     """
     try:
         from engine import group as group_mod
@@ -321,9 +350,14 @@ def format_group_names(character):
         return ""
     if not group_mod.in_group(character):
         return ""
+    leader = group_mod.resolve_leader(character)
+    if leader is None:
+        return ""
     names = []
     for member in group_mod.group_members(character):
         if member is character:
+            continue
+        if not group_mod.mates_share_group_location(leader, member):
             continue
         face = (
             getattr(member, "assumed_face", None)
@@ -340,7 +374,11 @@ def _prompt_vitals(character, game=None):
     Optional resources (fuel / mana) only appear when the vitals builder
     stamped them -- humans never get a phantom fuel field.
     """
-    _ = game
+    try:
+        from engine import hooks
+        character = hooks.perception_character(character, game)
+    except Exception:
+        pass
     hp = 100
     max_hp = 100
     energy = getattr(character, "energy", 0)
@@ -348,6 +386,7 @@ def _prompt_vitals(character, game=None):
     stamina = int(getattr(character, "stamina", 0) or 0)
     max_stamina = stamina
     fuel_str = ""
+    fuel_label = "fuel"
     mana_str = ""
     max_mana_str = ""
     has_fuel = False
@@ -379,19 +418,26 @@ def _prompt_vitals(character, game=None):
         elif "energy_raw" in vitals:
             # Percent mode without energymax still has raw ceiling in payload.
             energy_max = ""
-        if "stamina" in vitals:
-            try:
-                stamina = int(float(vitals["stamina"]))
-            except (TypeError, ValueError):
-                pass
-        if "maxstamina" in vitals:
-            try:
-                max_stamina = int(float(vitals["maxstamina"]))
-            except (TypeError, ValueError):
-                pass
+        raw_stam = vitals.get("stamina_raw", vitals.get("stamina"))
+        raw_stam_max = vitals.get("maxstamina_raw", vitals.get("maxstamina"))
+        try:
+            cur = float(raw_stam)
+            cap = float(raw_stam_max) if raw_stam_max not in (None, "", "0") else 0.0
+            if cap > 0:
+                if cap == 100.0 and "stamina_raw" not in vitals:
+                    stamina = max(0, min(100, int(round(cur))))
+                    max_stamina = 100
+                else:
+                    stamina = max(0, min(100, int(round(100.0 * cur / cap))))
+                    max_stamina = 100
+        except (TypeError, ValueError):
+            pass
         if "fuel" in vitals:
             has_fuel = True
             fuel_str = str(vitals["fuel"])
+            # Path noun from SUPERS vitals (blood / grace / …); fall back.
+            raw_label = vitals.get("fuel_label") or "fuel"
+            fuel_label = str(raw_label).strip().lower() or "fuel"
         if "mana" in vitals:
             has_mana = True
             mana_str = str(vitals["mana"])
@@ -412,6 +458,7 @@ def _prompt_vitals(character, game=None):
         "max_stamina": max_stamina,
         "has_fuel": has_fuel,
         "fuel": fuel_str,
+        "fuel_label": fuel_label,
         "has_mana": has_mana,
         "mana": mana_str,
         "max_mana": max_mana_str,
@@ -457,7 +504,9 @@ def _expand_segment(code, v):
     if code == "Fu":
         if not v["has_fuel"]:
             return ""
-        return _seg("<dark_grey> ", f"<violet>[{v['fuel']}fuel]")
+        # Path noun from vitals (blood / grace / …); never bare "fuel".
+        noun = v.get("fuel_label") or "fuel"
+        return _seg("<dark_grey> ", f"<violet>[{v['fuel']}{noun}]")
     if code == "Ex":
         return _seg("<dark_grey> ", f"<silver>[{v['exits']}]")
     if code == "Gr":
@@ -474,9 +523,9 @@ def format_prompt(character, game=None):
     Raw tokens (always emit a value -- fine for custom templates)::
 
       %h %H   lifeforce percent / out of 100
-      %e      energy
+      %e      focus pool (legacy token name; score labels this Focus)
       %E      exit abbrevs (or ``-``)
-      %s %S   stamina current / max
+      %s %S   stamina percent / out of 100 (remaining effort)
       %f      fuel number, or ``\"\"`` when you have no fuel resource
       %m %M   mana / max mana, or ``\"\"`` when you have no mana
       %n %r   name / room
@@ -487,12 +536,12 @@ def format_prompt(character, game=None):
     ``[field]`` that **omits itself** when the resource does not apply::
 
       %Hp  [72/100hp]
-      %En  [100/100en]   (Focus capacity at Tier; raw ceiling with combatnumbers)
-      %St  [28/30st]
+      %En  [100/100en]   (Focus pool at Tier; raw ceiling with combatnumbers)
+      %St  [72/100st]
       %Mn  [88/100mn]   (mages only; percent of pool by default)
-      %Fu  [80fuel]    (fuel Origins only)
+      %Fu  [80blood]   (fuel Origins only; Path noun)
       %Ex  [n,e,s,w]
-      %Gr  [Sam, Dean] (only when grouped)
+      %Gr  [Sam, Dean] (colocated groupmates only; omits when solo/apart)
 
     Color tags (``<dark_red>``, ``<teal>``, …) expand via ``style.render``
     after tokens. Empty / disabled prompt returns \"\".

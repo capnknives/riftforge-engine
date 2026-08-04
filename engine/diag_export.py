@@ -751,6 +751,32 @@ def analyze_sync(game=None, *, reporter="?"):
     }
 
 
+def _should_announce_lag_queued(result):
+    """Wiznet when we have a hub link, even if the Cursor webhook POST failed."""
+    if not result:
+        return False
+    return bool(result.get("gist_url") or result.get("issue_url"))
+
+
+def _announce_lag_queued_if_ready(game, result, reporter):
+    if not _should_announce_lag_queued(result):
+        return
+    try:
+        from engine import kokid_notify
+
+        kokid_notify.announce_lag_queued(
+            game,
+            result.get("gist_url"),
+            result.get("issue_url"),
+            reporter,
+        )
+    except Exception as exc:
+        print(
+            f"[diag_export] kokid lag queued announce skipped: {exc}",
+            flush=True,
+        )
+
+
 async def _analyze_async(game, reporter, session):
     """Run analyze_sync off-loop; tell the GM the result."""
     try:
@@ -771,6 +797,7 @@ async def _analyze_async(game, reporter, session):
                     "(re-enable with `gm diaglog on` to capture again)."
                 )
         print(f"[diag_export] analyze: {msg}", flush=True)
+        _announce_lag_queued_if_ready(game, result, reporter)
     except Exception as exc:
         print(f"[diag_export] analyze unexpected error: {exc}", flush=True)
         if session is not None and getattr(session, "send", None):
@@ -785,6 +812,7 @@ def schedule_analyze(game, *, reporter="?", session=None):
         result = analyze_sync(game, reporter=reporter)
         if session is not None and getattr(session, "send", None):
             session.send("[GM] diaglog: " + (result.get("message") or ""))
+        _announce_lag_queued_if_ready(game, result, reporter)
         return result.get("ok", False)
 
     task = loop.create_task(_analyze_async(game, reporter, session))

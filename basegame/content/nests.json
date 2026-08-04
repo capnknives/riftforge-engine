@@ -1,0 +1,11 @@
+{
+    "_guide": "Live critter dens for basegame spawn peel demo. Room.spawn_nest maps to a key here.",
+    "nests": {
+        "critter": {
+            "bestiary_categories": ["prairie-critter"],
+            "cap_per_nest": 2,
+            "ai": "critter",
+            "spawn_chance_per_tick": 0.15
+        }
+    }
+}

@@ -210,11 +210,24 @@ class GatewayBridge:
             self.writer.write(frame)
             await self.writer.drain()
 
-    async def notify_bound(self, session_id: str, name: str) -> None:
+    async def notify_bound(
+        self,
+        session_id: str,
+        name: str,
+        *,
+        ooc_face: Optional[str] = None,
+        head_gm: bool = False,
+        staff_gm: bool = False,
+    ) -> None:
         """Tell the gateway this sid is logged in as name (for reattach)."""
-        await self.send_frame(
-            encode_ctrl({"op": "bound", "sid": session_id, "name": name})
-        )
+        msg = {"op": "bound", "sid": session_id, "name": name}
+        if ooc_face:
+            msg["ooc_face"] = ooc_face
+        if head_gm:
+            msg["head_gm"] = True
+        if staff_gm:
+            msg["staff_gm"] = True
+        await self.send_frame(encode_ctrl(msg))
 
     async def notify_unbound(self, session_id: str) -> None:
         """Clear the bound name (logout / mid-login reset)."""
@@ -233,6 +246,32 @@ class GatewayBridge:
         """
         await self.send_frame(encode_ctrl({"op": "planned_restart"}))
         await asyncio.sleep(0.05)
+
+    def _schedule_ctrl(self, msg: dict) -> None:
+        """Fire-and-forget one CTRL frame from sync game code."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self.send_frame(encode_ctrl(msg)))
+
+    async def notify_chat_history(self) -> None:
+        """Push the game's channel rings to the gateway stitch buffers."""
+        from engine import channel_history
+
+        snapshot = channel_history.export_gateway_snapshot(self.game)
+        await self.send_frame(
+            encode_ctrl({"op": "chat_history", "channels": snapshot})
+        )
+
+    def schedule_channel_mirror(self, channel_name: str, plain_line: str) -> None:
+        """Mirror one plain channel line to the gateway stitch buffer."""
+        text = (plain_line or "").strip()
+        if not text:
+            return
+        self._schedule_ctrl(
+            {"op": "chat_append", "channel": channel_name, "line": text}
+        )
 
     async def connect_and_run(self) -> None:
         """Connect to gateway IPC, hello/welcome, then pump frames forever."""
@@ -309,6 +348,15 @@ class GatewayBridge:
             # reattached (or confirmed empty). Starting earlier let Cadence
             # treat connected PCs as Echoes for one+ ticks (Cage yank).
             self._ensure_tick_loop()
+            # Seed gateway stitch buffers from the authoritative game rings
+            # so bare ooc/wiznet replay during the next IPC gap is not empty.
+            try:
+                await self.notify_chat_history()
+            except Exception as exc:
+                print(
+                    f"[gateway_client] chat_history sync skipped: {exc!r}",
+                    flush=True,
+                )
         elif op == "open":
             sid = msg.get("sid")
             if sid:
@@ -366,12 +414,60 @@ class GatewayBridge:
             # Game process restarting — do not disconnect (no Echo).
             raise
         except Exception as exc:
-            print(f"[gateway_client] session {session_id[:8]}… error: {exc}", flush=True)
+            # Uncaught failure after attach (e.g. SQLite save) used to leave
+            # character.session wired for outbound combat while play() was
+            # dead — Mudlet saw fight spam with no score/look/bug replies.
+            import traceback
+
+            print(
+                f"[gateway_client] session {session_id[:8]}… error: {exc}",
+                flush=True,
+            )
+            traceback.print_exc()
+            self._abandon_crashed_session(session_id, session)
         finally:
             # Normal run() exit means logout or client EOF — Session already
             # called disconnect if it logged in. Just drop our maps.
             self._sessions.pop(session_id, None)
             self._readers.pop(session_id, None)
+
+    def _abandon_crashed_session(self, session_id: str, session) -> None:
+        """Detach a character left live after session.run() crashed.
+
+        CancelledError (copyover / game restart) must NOT call this — held
+        clients reattach without Echo conversion. Any other exception after
+        attach needs a real disconnect so combat stops targeting the dead
+        Session writer.
+        """
+        char = getattr(session, "character", None)
+        still_bound = (
+            char is not None
+            and getattr(char, "session", None) is session
+        )
+        if not still_bound and not getattr(session, "alive", False):
+            return
+        try:
+            # Full disconnect: Echo the body, clear session, kick TCP so the
+            # client is not stuck watching outbound-only combat.
+            session.disconnect()
+        except Exception as cleanup_exc:
+            import traceback
+
+            print(
+                f"[gateway_client] session {session_id[:8]}… "
+                f"crash cleanup failed: {cleanup_exc}",
+                flush=True,
+            )
+            traceback.print_exc()
+            # Last resort: clear the pointer so combat send short-circuits.
+            force_clear = getattr(session, "force_clear_zombie_attach", None)
+            if callable(force_clear):
+                force_clear()
+            else:
+                if char is not None and getattr(char, "session", None) is session:
+                    char.session = None
+                session.character = None
+                session.alive = False
 
     async def _close_session(self, session_id: str, client_gone: bool) -> None:
         """Gateway reports client TCP closed — feed EOF so play() exits."""

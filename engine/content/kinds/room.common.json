@@ -1,0 +1,136 @@
+{
+  "id": "room.common",
+  "label": "Hand-authored room row (abstract parent)",
+  "abstract": true,
+  "writes_to": "content/maps|zones rooms[]",
+  "fields": {
+    "key": {
+      "type": "string",
+      "required": true,
+      "doc": "Unique room identity (stable; exits reference this)."
+    },
+    "title": {
+      "type": "string",
+      "required": true,
+      "doc": "ROOM NAME: City - Main - Sub (player-facing)."
+    },
+    "description": {
+      "type": "string",
+      "required": true,
+      "doc": "Room look text."
+    },
+    "zone": {
+      "type": "string",
+      "required": true,
+      "doc": "Cadence confinement id (e.g. lebanon)."
+    },
+    "area_type": {
+      "type": "enum",
+      "required": true,
+      "doc": "Terrain / area type stamp.",
+      "default": "city",
+      "values": [
+        "ruins",
+        "city",
+        "city_street",
+        "mountains",
+        "ocean",
+        "lake",
+        "forest",
+        "plains",
+        "furnace"
+      ]
+    },
+    "outdoor": {
+      "type": "bool",
+      "required": false,
+      "doc": "Outdoor room flag."
+    },
+    "exits": {
+      "type": "object",
+      "required": false,
+      "doc": "Exit map (direction -> target room key).",
+      "default": {}
+    },
+    "resources": {
+      "type": "list",
+      "required": false,
+      "doc": "Need-meter tags (food, vendor, sleep, \u2026)."
+    },
+    "jobs": {
+      "type": "list",
+      "required": false,
+      "doc": "jobs.json ids available in this room."
+    },
+    "seed_items": {
+      "type": "list",
+      "required": false,
+      "doc": "Boot seed items ({item: catalog_id} refs)."
+    },
+    "layout": {
+      "type": "object",
+      "required": false,
+      "doc": "Area Studio canvas coords {x, y, z}. Auto-stamped for any room created via `room dig`, `populate neighborhood`/`populate homes`, or an Area Studio save (wall_floor_breach_mechanic.md Phase A) -- authors do not need to set this by hand going forward. Still optional/omittable for legacy content; run tools/retrofit_zone_layout.py to backfill an older zone. Also the coordinate this feature's wall/floor breach ejects a defender along (see slam_targets.direction)."
+    },
+    "zone_exit": {
+      "type": "bool",
+      "required": false,
+      "doc": "Pocket hub mouth; exit verb returns to overland."
+    },
+    "vnum": {
+      "type": "string",
+      "required": false,
+      "doc": "Hand-room mapper id (CA00001)."
+    },
+    "legacy_key": {
+      "type": "string",
+      "required": false,
+      "doc": "Former dig / JSON key before VNUM identity."
+    },
+    "env_tags": {
+      "type": "list",
+      "required": false,
+      "doc": "Combat environment tags (maps.KNOWN_ENV_TAGS)."
+    },
+    "materials": {
+      "type": "list",
+      "required": false,
+      "doc": "Surface materials (maps.KNOWN_MATERIAL_TAGS)."
+    },
+    "slam_targets": {
+      "type": "list",
+      "required": false,
+      "doc": "Named slam-target props for combat prose."
+    },
+    "hidden_directions": {
+      "type": "list",
+      "required": false,
+      "doc": "Secret exit directions (discover to reveal)."
+    },
+    "map_glyph": {
+      "type": "string",
+      "required": false,
+      "doc": "Atlas minimap glyph override (one char)."
+    },
+    "map_layer": {
+      "type": "enum",
+      "required": false,
+      "doc": "Atlas color layer.",
+      "values": [
+        "ocean",
+        "plains",
+        "mountains",
+        "lake",
+        "highway",
+        "city",
+        "mountain_highway"
+      ]
+    },
+    "is_start": {
+      "type": "bool",
+      "required": false,
+      "doc": "Chargen start room (exactly one across all maps).",
+      "default": false
+    }
+  }
+}

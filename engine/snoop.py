@@ -81,6 +81,17 @@ def tell_paragraph(character, message):
         session.send("")
 
 
+def _snoop_game_for(target, gm=None):
+    """Best-effort Game handle for staff snoop labels (optional)."""
+    for actor in (gm, target):
+        session = getattr(actor, "session", None)
+        if session is not None:
+            game = getattr(session, "game", None)
+            if game is not None:
+                return game
+    return None
+
+
 def mirror_output(target, message):
     """Fan a viewpoint line out to every GM snooping `target`."""
     if target is None:
@@ -88,8 +99,7 @@ def mirror_output(target, message):
     snoopers = getattr(target, "snoopers", None)
     if not snoopers:
         return
-    from command_support import _public_label
-    face = _public_label(target)
+    from command_support import staff_snoop_face
     # list() so a mid-loop stop() cannot mutate the set under us.
     for gm in list(snoopers):
         sess = getattr(gm, "session", None)
@@ -98,6 +108,8 @@ def mirror_output(target, message):
         # Skip a dead telnet session (FakeSession has no .alive).
         if hasattr(sess, "alive") and not sess.alive:
             continue
+        game = _snoop_game_for(target, gm)
+        face = staff_snoop_face(target, game)
         tagged = f"% {face}> {message}"
         emit_raw(sess, _strip_for_viewer(sess, tagged))
 
@@ -113,19 +125,20 @@ def mirror_input(target, raw_line):
     snoopers = getattr(target, "snoopers", None)
     if not snoopers:
         return
-    from command_support import _public_label
-    face = _public_label(target)
+    from command_support import staff_snoop_face
     for gm in list(snoopers):
         sess = getattr(gm, "session", None)
         if sess is None:
             continue
         if hasattr(sess, "alive") and not sess.alive:
             continue
+        game = _snoop_game_for(target, gm)
+        face = staff_snoop_face(target, game)
         tagged = f"% {face}] {raw_line}"
         emit_raw(sess, _strip_for_viewer(sess, tagged))
 
 
-def start(snooper, target):
+def start(snooper, target, game=None):
     """Point `snooper` at `target`. Returns (ok, message_for_snooper)."""
     if snooper is None or target is None:
         return False, "Snoop whom?"
@@ -147,19 +160,17 @@ def start(snooper, target):
         # ``unowned amenity7`` (those stay dig/goto-only).
         from engine import room_vnum as room_vnum_mod
         where = f" ({room_vnum_mod.staff_room_label(loc)})"
-    # A staff GM spirit reads as [GM] whether piloted or parked -- never
-    # [Echo] (a parked, sessionless spirit is not a mortal logout body).
-    if getattr(target, "gm_spirit", False):
-        kind = "GM"
-    elif getattr(target, "is_npc", False):
-        kind = "NPC"
-    elif getattr(target, "session", None) is None:
-        kind = "Echo"
-    else:
-        kind = "player"
-    from command_support import _public_label
+    key_hint = ""
+    storage_key = getattr(target, "key", None)
+    if storage_key:
+        key_hint = f" #{storage_key}"
+    if game is None:
+        game = _snoop_game_for(target, snooper)
+    from command_support import staff_snoop_face, staff_snoop_kind
+    kind = staff_snoop_kind(target)
+    face = staff_snoop_face(target, game)
     return True, (
-        f"You are now snooping {_public_label(target)} [{kind}]{where}. "
+        f"You are now snooping {face} [{kind}]{where}{key_hint}. "
         f"Type 'snoop' or 'snoop off' to stop."
     )
 
@@ -177,8 +188,9 @@ def stop(snooper, quiet=False):
         snoopers.discard(snooper)
     if quiet:
         return True, ""
-    from command_support import _public_label
-    return True, f"You stop snooping {_public_label(target)}."
+    from command_support import staff_snoop_face
+    game = _snoop_game_for(target, snooper)
+    return True, f"You stop snooping {staff_snoop_face(target, game)}."
 
 
 def clear_target(target):

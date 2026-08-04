@@ -15,48 +15,27 @@ share one implementation; games point maps.set_maps_dir() at their atlas JSON.
 
 from __future__ import annotations
 
-import importlib
 import json
 import os
 import re
 
+from engine import hooks as hooks_mod
 from engine.world import Room
 
-
-def _try_game_module(qualname):
-    """Import an optional game package module; None when absent.
-
-    Public / basegame trees have no ``supers/``. SUPERS-only paths
-    (vehicles, Lebanon starter heal, solar land, planar influence) call
-    through this helper so ``engine_smoke`` stays clean. A later purity
-    pass should replace these with ``engine.hooks`` registrations
-    (see ``docs/plans/two_repo_purity.md`` § next purity pass).
-    """
-    try:
-        return importlib.import_module(qualname)
-    except ImportError:
-        return None
-
-
-# Lebanon / bunker string defaults when starter_town is not installed.
 _FALLBACK_PLAZA_KEY = "Lebanon Square"
 _FALLBACK_OVERLAND_HUB_KEY = "Main Street S9"
 _FALLBACK_BUNKER_OVERLAND_KEY = "America Overland (35, 11)"
 
 
 def _starter_keys():
-    """Plaza / overland-hub / bunker-pad keys (SUPERS starter_town or fallbacks)."""
-    st = _try_game_module("supers.starter_town")
-    if st is None:
-        return (
-            _FALLBACK_PLAZA_KEY,
-            _FALLBACK_OVERLAND_HUB_KEY,
-            _FALLBACK_BUNKER_OVERLAND_KEY,
-        )
+    """Plaza / overland-hub / bunker-pad keys (game hook or Lebanon fallbacks)."""
+    keys = hooks_mod.overland_starter_keys()
+    if keys is not None:
+        return keys
     return (
-        getattr(st, "PLAZA_KEY", _FALLBACK_PLAZA_KEY),
-        getattr(st, "OVERLAND_HUB_KEY", _FALLBACK_OVERLAND_HUB_KEY),
-        getattr(st, "BUNKER_OVERLAND_KEY", _FALLBACK_BUNKER_OVERLAND_KEY),
+        _FALLBACK_PLAZA_KEY,
+        _FALLBACK_OVERLAND_HUB_KEY,
+        _FALLBACK_BUNKER_OVERLAND_KEY,
     )
 
 
@@ -202,6 +181,38 @@ def is_virtual_room(room):
     return bool(getattr(room, "virtual_overland", False))
 
 
+def _is_foreign_overland_grid(room):
+    """True when ``room`` reuses this dual-layer *shape* for a private grid.
+
+    Other systems (a God's demesne, ``supers/demesne/overland.py``) stamp
+    their own macro/micro grid onto ephemeral rooms and set
+    ``virtual_overland`` so shared move dispatch / look extras pick them
+    up -- but their ``overland_macro`` / ``overland_micro`` coordinates
+    are local to that private grid, never indices into the real, shared
+    ``game.overland_atlas``. Engine code must not import ``supers``
+    (purity), so this checks the plain ``demesne_id`` attribute those
+    rooms stamp on themselves rather than importing the demesne module.
+
+    Any function here that reads a room's overland coords to look up
+    real atlas terrain/cities, or that calls :func:`place_on_overland`
+    with coords borrowed from a room, must skip these rooms first --
+    otherwise a God standing in their demesne gets silently relocated
+    onto the real America atlas at the same numeric coordinates.
+    """
+    return bool(getattr(room, "demesne_id", None))
+
+
+def is_real_overland_room(room):
+    """True when this is a live cell of the shared, real-world atlas.
+
+    Like :func:`is_virtual_room` but excludes private grids (demesnes)
+    that reuse the same dual-layer shape. Prefer this over
+    ``is_virtual_room`` whenever the caller is about to touch
+    ``game.overland_atlas`` or re-place the character on it.
+    """
+    return is_virtual_room(room) and not _is_foreign_overland_grid(room)
+
+
 def is_aerial_room(room):
     """True when this Room is a Stellar macro-hover sky cell."""
     return bool(getattr(room, "aerial_overland", False))
@@ -240,6 +251,10 @@ def parse_wilderness_room_key(key):
 def america_macro_from_room(room, game=None):
     """Return America macro (x, y) for a grid / virtual / gate Room, or None."""
     if room is None:
+        return None
+    if _is_foreign_overland_grid(room):
+        # A demesne's own macro coords must never be mistaken for real
+        # America Overland coordinates just because the numbers clamp.
         return None
     pair = _parse_pos_pair(getattr(room, "overland_macro", None))
     if pair is not None and clamp_macro(*pair):
@@ -303,6 +318,11 @@ def adopt_foot_overland_presence(character, game):
 
     room = getattr(character, "location", None)
     if room is None:
+        return False
+    if _is_foreign_overland_grid(room):
+        # Standing in a private grid (demesne) that reuses the dual-layer
+        # shape -- its own movement dispatch owns this, never the real
+        # America atlas. Leave the character exactly where they are.
         return False
 
     # Live virtual cell missing coords (cleared mid-session) -- rehydrate.
@@ -594,7 +614,7 @@ def virtual_exit_dest_label(room, direction, game=None):
     the default look_title repeats uselessly. Instead name what that
     step approaches (next micro cell, or a nearby settlement).
     """
-    if not is_virtual_room(room):
+    if not is_real_overland_room(room):
         return None
     direction = (direction or "").strip().lower()
     delta = _DIR_DELTA.get(direction)
@@ -669,7 +689,7 @@ def virtual_exit_dest_label(room, direction, game=None):
 
 def look_nearby_zone_lines(room, game):
     """Extra look lines: nearby settlement bearings for virtual tiles."""
-    if not is_virtual_room(room):
+    if not is_real_overland_room(room):
         return []
     ensure_game_overland(game)
     atlas = getattr(game, "overland_atlas", None)
@@ -749,6 +769,10 @@ def get_virtual_room(game, macro, micro):
                 room.zone_entries[alias] = hub
             # Also allow the hub key lowercase.
             room.zone_entries[hub.key.lower()] = hub
+
+    # Homestead v2: re-wire claimed micro mouths onto fresh virtual rooms.
+    from engine import hooks
+    hooks.on_virtual_room_created(game, room)
 
     # Hydrate dropped items for this 4D cell.
     for item in list(game.overland_ground.get(key) or []):
@@ -868,14 +892,13 @@ def prune_empty_virtual_rooms(game):
     """
     ensure_game_overland(game)
     from world import Character
-    influence_mod = _try_game_module("supers.planar_influence")
     dead = []
     for key, room in list(game.overland_rooms.items()):
         sync_ground_stash(game, room)
         has_char = any(isinstance(o, Character) for o in room.contents)
         if has_char:
             continue
-        if influence_mod is not None and influence_mod.is_influenced(room, game):
+        if hooks_mod.overland_room_influenced(room, game):
             continue
         dead.append(key)
     for key in dead:
@@ -962,6 +985,31 @@ def mission_pocket_blocks_overland_move(character):
     return room is not None and getattr(room, "mission_instance", False)
 
 
+def classic_zone_room_blocks_overland_move(character):
+    """True when the body stands in a static zone room, not on the dual layer.
+
+    Taxi drops, hospital admit, GM ``goto``, and plain ``move_to`` can leave
+    stale ``macro_pos`` / ``micro_pos`` while the character is indoors (hotel
+    guest room, asylum ward, etc.). ``overland_mode`` then reads ``on_foot``
+    and ``try_overland_move`` hijacks ``down`` / ``out`` / numbered doors
+    with "You can't go that way." instead of ``Room.exits`` (bug reports 44,
+    254, 252).
+    """
+    room = getattr(character, "location", None)
+    if room is None:
+        return False
+    if is_virtual_room(room) or is_aerial_room(room):
+        return False
+    if parse_wilderness_room_key(getattr(room, "key", "") or ""):
+        return False
+    import maps as maps_mod
+
+    parsed = maps_mod.parse_grid_key(getattr(room, "key", "") or "")
+    if parsed and parsed[0] in _AMERICA_PREFIXES:
+        return False
+    return True
+
+
 def try_overland_move(character, direction, game):
     """Handle N/S/E/W (and diagonals) while on the dual layer.
 
@@ -969,6 +1017,10 @@ def try_overland_move(character, direction, game):
     Returns False when the caller should use classic Room.exits movement.
     """
     if mission_pocket_blocks_overland_move(character):
+        return False
+    if classic_zone_room_blocks_overland_move(character):
+        if overland_mode(character) != "zone":
+            clear_overland_coords(character)
         return False
     ensure_overland_defaults(character)
     mode = overland_mode(character)
@@ -985,10 +1037,8 @@ def try_overland_move(character, direction, game):
     atlas = game.overland_atlas
     delta = _DIR_DELTA.get(direction)
     if delta is None:
-        session = getattr(character, "session", None)
-        if session is not None:
-            session.send("You can't go that way.")
-        return True
+        # Vertical / named doors (down, up, out, 3a, …) belong to Room.exits.
+        return False
 
     dx, dy = delta
     macro = _parse_pos_pair(character.macro_pos)
@@ -996,56 +1046,11 @@ def try_overland_move(character, direction, game):
         return False
 
     if mode == "vehicle":
-        nx, ny = macro[0] + dx, macro[1] + dy
-        if not clamp_macro(nx, ny):
-            _send(character, "You have reached the edge of the map.")
+        if hooks_mod.overland_queue_vehicle_macro_move(
+            character, direction, game,
+        ):
             return True
-        if not _vehicle_can_enter(atlas, nx, ny):
-            area = atlas.terrain_at(nx, ny)
-            _send(
-                character,
-                f"You can't drive onto {area} from here.",
-            )
-            return True
-        character.macro_pos = (nx, ny)
-        # Stay in the vehicle interior; update every occupant's macro.
-        vid = getattr(character, "in_vehicle", None)
-        vehicles_mod = _try_game_module("supers.vehicles") if vid else None
-        if vid and vehicles_mod is not None:
-            veh = vehicles_mod.vehicle_by_id(game, vid)
-            if veh is not None:
-                veh["macro_pos"] = (nx, ny)
-                veh["micro_pos"] = None
-                for who in vehicles_mod.vehicle_occupants(game, veh):
-                    ensure_overland_defaults(who)
-                    who.macro_pos = (nx, ny)
-                    who.micro_pos = None
-                vehicles_mod.save_parking_state(game)
-        # Off-road wear (Slice E): highway map_layer is safe.
-        area = atlas.terrain_at(nx, ny)
-        cell = atlas.terrain.get((nx, ny)) or {}
-        layer = str(cell.get("map_layer") or "").lower()
-        risk_tag = area
-        if layer in ("highway", "mountain_highway", "city") or area == "city":
-            risk_tag = "road"
-        if vid and vehicles_mod is not None:
-            kit_mod = _try_game_module("supers.vehicle_kit")
-            veh = vehicles_mod.vehicle_by_id(game, vid)
-            if kit_mod is not None:
-                dmg_msg = kit_mod.apply_offroad_step(
-                    veh, character, game, risk_tag
-                )
-                if dmg_msg:
-                    _send(character, dmg_msg)
-                    if int((veh or {}).get("condition", 100) or 100) <= 0:
-                        return True
-        _send(
-            character,
-            f"The road rolls on -- now at overland ({nx}, {ny}).",
-        )
-        # Same as hub cruise: atlas for sighted, text for screenreader.
-        if vid and vehicles_mod is not None:
-            vehicles_mod._redraw_scenic_map(character, game, nx, ny)
+        _send(character, "You cannot drive that way right now.")
         return True
 
     if mode == "flying":
@@ -1103,6 +1108,12 @@ def try_overland_move(character, direction, game):
         _send(character, "You have reached the edge of the map.")
         return True
 
+    from engine import hooks
+    block_msg = hooks.blocked_foot_step(game, (mx, my), (ux, uy))
+    if block_msg:
+        _send(character, block_msg)
+        return True
+
     old_room = character.location
     from command_support import _presence_face, is_staff_stealth_presence
     face = _presence_face(character)
@@ -1129,6 +1140,10 @@ def try_overland_move(character, direction, game):
     from engine import hooks as _hooks
     _hooks.encounter_check(game, new_room)
     prune_empty_virtual_rooms(game)
+    # Classic Room.exits moves call after_move_step from _move_one; on-foot
+    # dual-layer hops bypass that path -- still burn wilderness hike exhaustion,
+    # stamp tracks, and run move hooks (bug report 220).
+    _hooks.after_move_step(character, direction, new_room, game)
     return True
 
 
@@ -1226,9 +1241,7 @@ def try_enter_landmark(character, args, game):
         f"{face} enters {hub.key}.",
         f"{face} arrives.",
     )
-    dungeons_mod = _try_game_module("supers.dungeons")
-    if dungeons_mod is not None:
-        dungeons_mod.notify_entered_dungeon_hub(character, game, hub)
+    hooks_mod.overland_notify_dungeon_hub(character, game, hub)
     return True
 
 
@@ -1519,20 +1532,18 @@ def cadence_homeward_from_overland(game, actor, dest_room_key=None):
     if macro is None or micro is None or home_macro is None:
         # Broken stamp -- taxi if we have a dest, else bail.
         if dest_key:
-            vehicles_mod = _try_game_module("supers.vehicles")
-            if vehicles_mod is None:
-                return False
-            return vehicles_mod.cadence_travel_toward(game, actor, dest_key)
+            return hooks_mod.overland_cadence_travel_toward(
+                game, actor, dest_key,
+            )
         return False
 
     dist = overland_macro_distance(macro, home_macro)
     if dist is None or dist > WILD_ROAM_MACRO_RADIUS:
         if not dest_key:
             return False
-        vehicles_mod = _try_game_module("supers.vehicles")
-        if vehicles_mod is None:
-            return False
-        return vehicles_mod.cadence_travel_toward(game, actor, dest_key)
+        return hooks_mod.overland_cadence_travel_toward(
+            game, actor, dest_key,
+        )
 
     # Local hike: at landmark micro of the home tile -> enter pocket.
     if macro == home_macro and micro == LANDMARK_MICRO:
@@ -1703,6 +1714,12 @@ def heal_dual_layer_positions(game):
         ensure_overland_defaults(char)
         # Already on dual layer -- ensure virtual room bind.
         if overland_mode(char) == "on_foot":
+            room = getattr(char, "location", None)
+            # Clinic / hotel interiors can keep stale foot coords after
+            # admit or discharge used bare move_to (bug report 254).
+            if room is not None and not is_virtual_room(room):
+                clear_overland_coords(char)
+                continue
             macro = _parse_pos_pair(char.macro_pos)
             micro = _parse_pos_pair(char.micro_pos)
             if macro and micro:
@@ -1715,9 +1732,7 @@ def heal_dual_layer_positions(game):
             if macro:
                 place_aerial_overland(char, game, macro)
             else:
-                solar_mod = _try_game_module("supers.solar")
-                if solar_mod is not None:
-                    solar_mod.land_all_the_way(char, game)
+                hooks_mod.overland_solar_land_all_the_way(char, game)
             continue
         room = getattr(char, "location", None)
         if room is None:

@@ -17,7 +17,11 @@ do not see player IPs on the ops channel.
 """
 
 from engine.command_support import _is_head_gm, _is_staff_gm
+from engine import channel_history
 from engine import style
+
+# Re-export for callers that still import from gm_notify.
+WIZNET_HISTORY_MAX = channel_history.WIZNET_HISTORY_MAX
 
 
 def peer_host(session):
@@ -129,6 +133,58 @@ def paint_wiz_line(message):
     return style.paint("absinthe_green", f"[WIZ] {message}")
 
 
+def wiznet_speaker_label(speaker):
+    """Public staff label for wiznet -- never ``gmspirit:`` / ``husk:`` keys."""
+    from engine.command_support import _is_gm, _public_label
+    from world import Character
+
+    who = _public_label(speaker)
+    # Mortal-body staff (``gm off``) still read as staff on wiznet.
+    if (
+        isinstance(speaker, Character)
+        and _is_gm(speaker)
+        and not who.endswith("(GM)")
+    ):
+        who = f"{who}(GM)"
+    return who
+
+
+def format_wiznet_plain(speaker, message):
+    """Plain ``[WIZ] Name(GM): text`` line for history (no ANSI)."""
+    who = wiznet_speaker_label(speaker)
+    text = (message or "").strip()
+    if not text:
+        return None
+    return f"[WIZ] {who}: {text}"
+
+
+def format_wiznet_line(speaker, message):
+    """Build one painted ``[WIZ] Name(GM): text`` line for staff chat."""
+    plain = format_wiznet_plain(speaker, message)
+    if plain is None:
+        return None
+    return style.paint("absinthe_green", plain)
+
+
+def append_wiznet_history(game, plain_line):
+    """Record one plain wiznet line on the global channel ring."""
+    channel_history.append(game, "wiznet", plain_line, gateway_plain=plain_line)
+
+
+def send_wiznet_history(character, game):
+    """Replay the global wiznet ring buffer to one staff session."""
+    session = getattr(character, "session", None)
+    if session is None:
+        return
+    if channel_history.is_empty(game, "wiznet"):
+        channel_history.send_empty_hint(character, "wiznet")
+        return
+    channel_history.send_replay_header(character, "wiznet")
+    for plain in channel_history.entries(game, "wiznet"):
+        session.send(channel_history.replay_wiznet_entry(plain))
+    session.send("")
+
+
 def wiznet_broadcast(game, speaker, message, *, exclude=None):
     """Send one ``[WIZ]`` line to every online staff GM (not immersion cast).
 
@@ -136,12 +192,12 @@ def wiznet_broadcast(game, speaker, message, *, exclude=None):
     deliberate staff chat, not an ops ping you mute. Immersion cast stays
     out so in-character bodies never see the channel.
     """
-    sessions = getattr(game, "sessions", None) or []
-    who = getattr(speaker, "key", None) or "?"
-    text = (message or "").strip()
-    if not text:
+    plain = format_wiznet_plain(speaker, message)
+    if plain is None:
         return False
-    line = paint_wiz_line(f"{who}: {text}")
+    append_wiznet_history(game, plain)
+    line = style.paint("absinthe_green", plain)
+    sessions = getattr(game, "sessions", None) or []
     sent = 0
     for session in list(sessions):
         other = getattr(session, "character", None)

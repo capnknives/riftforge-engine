@@ -1,0 +1,38 @@
+{
+  "id": "lexicon.action",
+  "label": "Combat lexicon action fragment",
+  "abstract": true,
+  "writes_to": "supers/content/combat_lexicon/** actions[]",
+  "fields": {
+    "text": {
+      "type": "string",
+      "required": true,
+      "doc": "Prose template with {verb}, {target}, {poss_target}, … placeholders."
+    },
+    "verb_root": {
+      "type": "string",
+      "required": false,
+      "doc": "Infinitive verb stem for {verb} conjugation."
+    },
+    "verb_3sg": {
+      "type": "string",
+      "required": false,
+      "doc": "Third-person singular verb for {verb}."
+    },
+    "bands": {
+      "type": "list",
+      "required": false,
+      "doc": "Range bands (close, reach, far) when band-gated."
+    },
+    "tags": {
+      "type": "list",
+      "required": false,
+      "doc": "Anatomy / voice tags for clause filtering."
+    },
+    "exclude_body_types": {
+      "type": "list",
+      "required": false,
+      "doc": "Skip clause when defender body_type matches."
+    }
+  }
+}

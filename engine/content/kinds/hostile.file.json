@@ -1,0 +1,52 @@
+{
+  "id": "hostile.file",
+  "label": "Hostile catalog file envelope",
+  "writes_to": "supers/content/hostiles/*.json",
+  "fields": {
+    "templates": {
+      "type": "list",
+      "required": false,
+      "doc": "Flavor rows validated as hostile.template (key + description)."
+    },
+    "name_pools": {
+      "type": "object",
+      "required": false,
+      "doc": "Gendered name pools {male: [...], female: [...]} for random spawns."
+    },
+    "name_pool": {
+      "type": "list",
+      "required": false,
+      "doc": "Single flat name pool (some lanes, e.g. purgatory territorial)."
+    },
+    "defaults": {
+      "type": "object",
+      "required": false,
+      "doc": "Lane spawn defaults (origin/path/tier/stats/fuel_range/alignment/ai)."
+    },
+    "roles": {
+      "type": "object",
+      "required": false,
+      "doc": "Role-keyed spawn rows (hunters, criminals) with stats + tier."
+    },
+    "stage_defaults": {
+      "type": "object",
+      "required": false,
+      "doc": "Croatoan ward stage metadata (peaceful/load/finish_pref)."
+    },
+    "room_stage_by_panic": {
+      "type": "object",
+      "required": false,
+      "doc": "Croatoan panic level -> stage id map."
+    },
+    "barks": {
+      "type": "object",
+      "required": false,
+      "doc": "Stage-keyed ambient bark lines for croatoan_act."
+    },
+    "patient_zero": {
+      "type": "object",
+      "required": false,
+      "doc": "Croatoan patient-zero spawn anchor metadata."
+    }
+  }
+}

@@ -29,9 +29,36 @@ from engine.hooks import (
     can_see_spirit,
     encounter_check,
     follow_pull_skip,
+    in_veil,
     move_gate_block,
+    veil_visible_to,
 )
 from engine.world import Character
+
+
+ASLEEP_WORLD_CLOSED_MSG = (
+    "You're asleep -- the outside world is closed. Type 'wake'."
+)
+
+
+def asleep_blocks_world(character):
+    """True when lodging sleep closes sensory verbs (look, auto-look, …).
+
+    ``commands.dispatch`` enforces this for typed input; ``cmd_look`` and
+    other direct call sites must share the same gate (bug #210: vehicle
+    leave / walk arrival auto-look bypassed dispatch).
+    """
+    return bool(getattr(character, "asleep", False))
+
+
+def send_asleep_world_closed(character):
+    """If asleep, tell the player the world is closed. Returns True if blocked."""
+    if not asleep_blocks_world(character):
+        return False
+    session = getattr(character, "session", None)
+    if session is not None and hasattr(session, "send"):
+        session.send(ASLEEP_WORLD_CLOSED_MSG)
+    return True
 
 
 def _log_hook_error(where, detail=None):
@@ -130,6 +157,9 @@ def _is_presence_hidden(viewer, other):
         return False
     if other is viewer:
         return False
+    # Earth Veil layer -- death spirits, faded Ghosts, veiled Reapers, etc.
+    if in_veil(other) and not veil_visible_to(viewer, other):
+        return True
     # Staff Cadence Echo while Session pilots GM form -- true invis.
     if getattr(other, "gm_away", False) and not _can_see_gm_away(viewer, other):
         return True
@@ -147,6 +177,11 @@ def _is_presence_hidden(viewer, other):
         or getattr(other, "hellhound_invisible", False)
     ):
         if not _can_see_hellhound(viewer, other):
+            return True
+    # Mundane hide/sneak (ghost fade / umbral lurk stamp stealth_active).
+    if getattr(other, "stealth_active", False):
+        from engine import hooks
+        if not hooks.can_notice_stealth(viewer, other):
             return True
     return False
 
@@ -166,12 +201,12 @@ def _presence_hears(actor):
 
 
 def strip_ephemeral_storage_prefix(name):
-    """Peel ``gmspirit:`` / ``husk:`` prefixes (including nested doubles).
+    """Peel ``gmspirit:`` / ``husk:`` / ``twin:`` prefixes (nested too).
 
-    Storage keys like ``gmspirit:Wits`` or a corrupted
-    ``gmspirit:gmspirit:Wits`` must never reach players as a display name.
-    Also cleans a mistaken ``assumed_face`` that still carries the prefix.
-    Returns ``?`` only when the input is empty after stripping.
+    Storage keys like ``gmspirit:Wits``, ``husk:Castiel``, or
+    ``twin:Gary`` must never reach players as a display name. Also cleans
+    a mistaken ``assumed_face`` that still carries the prefix. Returns
+    ``?`` only when the input is empty after stripping.
     """
     if name is None:
         return "?"
@@ -181,7 +216,11 @@ def strip_ephemeral_storage_prefix(name):
     # Nested bug (gm on while already on a spirit) left double prefixes.
     while True:
         low = text.lower()
-        if low.startswith("gmspirit:") or low.startswith("husk:"):
+        if (
+            low.startswith("gmspirit:")
+            or low.startswith("husk:")
+            or low.startswith("twin:")
+        ):
             text = text.split(":", 1)[1].strip()
             if not text:
                 return "?"
@@ -220,8 +259,9 @@ def _presence_face(obj):
     """Public face for score / prompt / leave-arrive (no echo tags).
 
     Prefers ``assumed_face`` / ``husk_display_name`` over storage keys
-    like ``gmspirit:Wits`` or ``husk:Castiel`` so players never see those
-    internal prefixes in room traffic or sheets. When no face overlay is
+    like ``gmspirit:Wits``, ``husk:Castiel``, or ``twin:Gary`` so players
+    never see those internal prefixes in room traffic or sheets. When no
+    face overlay is
     set, uses legal given (+ visible surname). Always strips ephemeral
     prefixes from whichever string wins (including a polluted face).
 
@@ -304,17 +344,27 @@ def _simple_english_plural(noun):
     return word + "s"
 
 
+_SEVERED_HEAD_CATALOGS = frozenset(
+    {"severed_head", "severed_demon_head", "severed_leviathan_head"}
+)
+
+
 def _floor_item_stack_key(item):
     """Identity for stacking identical floor loot on look.
 
     Bodies stay unique (never ``2 bodies of Bob are here``). Catalog id
     wins when present so sixteen angel blades collapse; otherwise the
     display key (lowered) is the group.
+
+    Severed heads share a catalog id but are named per victim -- each stays
+    its own look line (like bodies) so mixed trophy piles read clearly.
     """
     if getattr(item, "is_body", False):
         # Each corpse is its own line even when keys match.
         return ("body", id(item))
     cat = getattr(item, "catalog_id", None)
+    if cat and str(cat).strip().lower() in _SEVERED_HEAD_CATALOGS:
+        return ("severed_head", id(item))
     if cat:
         return ("cat", str(cat).strip().lower())
     key = (getattr(item, "key", None) or "").strip().lower()
@@ -437,10 +487,16 @@ def _maybe_append_account_tag(name, subject, viewer):
     """Append ``(AccountName)`` when the viewer is staff with the pref on.
 
     Account names must never appear for ordinary players (feature E).
+
+    Staff already in GM form read as ``Accountname(GM)`` -- never append
+    a second ``(Accountname)`` (``CapnKnives(GM)(CapnKnives)`` is noise).
     """
     if not getattr(viewer, "gm_mode", False) and not getattr(
         viewer, "gm_spirit", False
     ):
+        return name
+    # Face is already the account + (GM); tagging again is redundant.
+    if _staff_form_label(subject):
         return name
     game = None
     session = getattr(viewer, "session", None)
@@ -563,6 +619,8 @@ def _staff_form_label(obj):
     """
     if obj is None:
         return False
+    if getattr(obj, "character_kind", None) == "gm":
+        return True
     if getattr(obj, "gm_mode", False):
         return True
     if getattr(obj, "gm_spirit", False):
@@ -836,43 +894,77 @@ def _pull_followers(leader, origin, direction, game):
         pass
 
 
-def _find_item(query, items):
-    """Return the first Item whose key (or aliases) contains `query`.
+def _item_name_matches(needle, item):
+    """True when ``needle`` (lowercased) hits an item key or alias substring."""
+    if not needle:
+        return False
+    if needle in item.key.lower():
+        return True
+    for alias in getattr(item, "aliases", ()) or ():
+        if needle in str(alias).lower():
+            return True
+    return False
 
-    Case-insensitive substring match. The leading underscore in the name is a
-    Python convention meaning "internal helper" -- not a command the player
-    types. Lets 'get sword' match 'a rusted sword', and 'look in fridge'
-    match a refrigerator that lists 'fridge' in Item.aliases.
+
+def _collect_item_matches(query, items):
+    """All items whose key or alias contains ``query`` (inventory order).
+
+    Ordinals are peeled by ``_find_item`` / ``_find_item_prefer_locked``;
+    pass the remaining name fragment here.
     """
-    query = query.lower()              # lowercase once, up front
-    for item in items:
-        # 'in' on strings is a substring test: is "sword" inside "a rusted sword"?
-        if query in item.key.lower():
-            return item                # found one -- hand it back immediately
-        for alias in getattr(item, "aliases", ()) or ():
-            if query in str(alias).lower():
-                return item
-    return None                        # looped through everything, no match
+    needle = (query or "").strip().lower()
+    if not needle:
+        return []
+    return [item for item in items if _item_name_matches(needle, item)]
 
 
-def _find_item_prefer_locked(query, items):
+def _find_item(query, items, character=None):
+    """Return an Item whose key (or aliases) contains ``query``.
+
+    Case-insensitive substring match. Supports ``2.pistol`` / ``other
+    pistol`` ordinals (bug report 126: duplicate names with one equipped).
+    When ``character`` is passed and several items match without an ordinal,
+    the game hook ``inventory_item_match_rank`` sorts candidates so carried
+    (not worn) copies win over equipped duplicates.
+    """
+    from engine.char_identity import parse_target_ordinal, pick_ordinal
+
+    ordinal, rest = parse_target_ordinal(query)
+    needle = rest if rest else (query or "")
+    matches = _collect_item_matches(needle, items)
+    if not matches:
+        return None
+    if ordinal is not None:
+        return pick_ordinal(matches, ordinal)
+    if len(matches) > 1 and character is not None:
+        from engine import hooks
+        matches = sorted(
+            matches,
+            key=lambda item: hooks.inventory_item_match_rank(character, item),
+        )
+    return matches[0]
+
+
+def _find_item_prefer_locked(query, items, character=None):
     """Like _find_item, but when several keys match, pick a locked container
     first (bug_reports.log #21: a leftover flavor strongbox sitting next to a
     real lockbox made `open strongbox` hit the wrong one and say "isn't
     locked")."""
-    query = query.lower()
-    matches = []
-    for item in items:
-        hit = query in item.key.lower()
-        if not hit:
-            for alias in getattr(item, "aliases", ()) or ():
-                if query in str(alias).lower():
-                    hit = True
-                    break
-        if hit:
-            matches.append(item)
+    from engine.char_identity import parse_target_ordinal, pick_ordinal
+
+    ordinal, rest = parse_target_ordinal(query)
+    needle = rest if rest else (query or "")
+    matches = _collect_item_matches(needle, items)
     if not matches:
         return None
+    if ordinal is not None:
+        return pick_ordinal(matches, ordinal)
+    if len(matches) > 1 and character is not None:
+        from engine import hooks
+        matches = sorted(
+            matches,
+            key=lambda item: hooks.inventory_item_match_rank(character, item),
+        )
     for item in matches:
         if item.locked:
             return item
@@ -945,8 +1037,104 @@ def resolve_named_character(actor, query, game=None, candidates=None):
     return None
 
 
+def verb_target_token(actor, target, game=None):
+    """Build an npc_do / snoop-safe target string that resolves to ``target``.
+
+    Cadence planners already picked the Character object; this turns it into
+    a command token without ``husk:`` / ``gmspirit:`` storage keys. Labels
+    use given name, ``First Last``, or presence face -- never a mashed login
+    key like ``ZackMarkson``. When several co-located bodies share the same
+    label, prefixes an ordinal (``2.Zack``) so dispatch still hits the prey.
+    """
+    from engine.char_identity import (
+        character_given_name,
+        character_surname,
+        humanize_storage_key,
+        legal_public_name,
+    )
+
+    def _humanize_if_mash(label, storage_key):
+        """Turn ``ZackMarkson`` into ``Zack Markson`` when label is the mash."""
+        peeled = strip_ephemeral_storage_prefix(storage_key or "")
+        text = (label or "").strip()
+        if not text:
+            return humanize_storage_key(peeled)
+        if peeled and text.lower() == peeled.lower():
+            return humanize_storage_key(peeled)
+        return text
+
+    def _verb_target_labels(subject):
+        """Ordered player-facing labels (most specific first)."""
+        labels = []
+        storage_key = getattr(subject, "key", None)
+        peeled = strip_ephemeral_storage_prefix(storage_key or "")
+
+        face = _presence_face(subject)
+        if face and face != "?":
+            labels.append(_humanize_if_mash(face, storage_key))
+
+        given = character_given_name(subject).strip()
+        sur = character_surname(subject).strip()
+        if given and sur:
+            labels.append(f"{given} {sur}")
+        elif given:
+            labels.append(_humanize_if_mash(given, storage_key))
+        pub = legal_public_name(subject)
+        if pub and pub != "?":
+            labels.append(_humanize_if_mash(pub, storage_key))
+        if peeled:
+            labels.append(humanize_storage_key(peeled))
+
+        seen = set()
+        ordered = []
+        for label in labels:
+            clean = (label or "").strip()
+            if not clean:
+                continue
+            key = clean.lower()
+            if key not in seen:
+                seen.add(key)
+                ordered.append(clean)
+        return ordered
+
+    if not isinstance(target, Character):
+        return humanize_storage_key(strip_ephemeral_storage_prefix(target))
+
+    labels = _verb_target_labels(target)
+    fallback = labels[0] if labels else humanize_storage_key(
+        getattr(target, "key", None),
+    )
+    room = getattr(actor, "location", None)
+    if room is None:
+        return fallback
+    candidates = [
+        c for c in room.characters()
+        if c is not actor and isinstance(c, Character)
+    ]
+    for token in labels:
+        matches = _collect_character_matches(
+            token, candidates, self_character=actor,
+        )
+        if target not in matches:
+            continue
+        if len(matches) == 1:
+            return token
+        matches = sorted(
+            matches,
+            key=lambda ch: (getattr(ch, "key", "") or "").lower(),
+        )
+        idx = matches.index(target) + 1
+        return f"{idx}.{token}"
+    return fallback
+
+
 def _collect_character_matches(query, characters, self_character=None):
-    """All Characters whose key / given / face contain ``query`` (lower)."""
+    """All Characters whose key / given / face / kind aliases contain ``query``.
+
+    Kind/race aliases (``arachne``, ``vampire``, …) come from the
+    ``extra_target_match_needles`` hook when the game registers one --
+    bare engine stays name-only.
+    """
     from engine.char_identity import identity_match_needles
 
     needle = (query or "").strip().lower()
@@ -970,9 +1158,94 @@ def _collect_character_matches(query, characters, self_character=None):
                     "presence_face_for (find)",
                     getattr(char, "key", None),
                 )
+        # Origin/Path/kind tokens (game-owned). Viewer may be None when a
+        # call site omitted self_character -- obvious hostiles still match.
+        if not matched:
+            try:
+                from engine.hooks import extra_target_match_needles
+                for label in extra_target_match_needles(self_character, char):
+                    if needle in label:
+                        matched = True
+                        break
+            except Exception:
+                _log_hook_error(
+                    "extra_target_match_needles (find)",
+                    getattr(char, "key", None),
+                )
         if matched and char not in hits:
             hits.append(char)
     return hits
+
+
+def sort_character_target_matches(matches):
+    """Stable target order for ordinals and staff disambiguation.
+
+    God Mantle bodies sort before their bilocated ``twin:`` husks so
+    ``gary`` / ``2.gary`` / ``other gary`` always mean mantle / twin /
+    twin (bug report 214). Remaining ties break on storage key.
+    """
+    if not matches:
+        return []
+
+    def _sort_key(ch):
+        is_twin = bool(getattr(ch, "god_twin", False))
+        key = (getattr(ch, "key", "") or "").lower()
+        return (1 if is_twin else 0, key)
+
+    return sorted(matches, key=_sort_key)
+
+
+def _resolve_god_twin_owner(target, game=None):
+    """Return the owning Mantle for a bilocated twin, when resolvable."""
+    if target is None or not getattr(target, "god_twin", False):
+        return None
+    owner_key = getattr(target, "god_twin_owner_key", None)
+    if not owner_key:
+        return None
+    if game is not None:
+        finder = getattr(game, "find_character", None)
+        if callable(finder):
+            owner = finder(owner_key)
+            if owner is not None:
+                return owner
+    rooms = getattr(game, "rooms", None) if game is not None else None
+    if rooms:
+        for room in rooms.values():
+            for ch in room.characters():
+                if getattr(ch, "key", None) == owner_key:
+                    return ch
+    return None
+
+
+def staff_snoop_face(target, game=None):
+    """Staff snoop tag: public face plus mantle/twin when omnipresent.
+
+    Bilocated twins borrow the owner's legal name and append ``(twin)`` so
+    GMs can tell ``snoop Gary`` from ``snoop 2.gary``. Active Mantles with
+    a standing twin append ``(mantle)`` for the same reason.
+    """
+    if target is None:
+        return "?"
+    if getattr(target, "god_twin", False):
+        owner = _resolve_god_twin_owner(target, game)
+        base = _public_label(owner if owner is not None else target)
+        return f"{base} (twin)"
+    if getattr(target, "god_twin_key", None):
+        return f"{_public_label(target)} (mantle)"
+    return _public_label(target)
+
+
+def staff_snoop_kind(target):
+    """Short kind tag for ``snoop`` confirmation lines."""
+    if getattr(target, "god_twin", False):
+        return "twin"
+    if getattr(target, "gm_spirit", False):
+        return "GM"
+    if getattr(target, "is_npc", False):
+        return "NPC"
+    if getattr(target, "session", None) is None:
+        return "Echo"
+    return "player"
 
 
 def _find_character(query, characters, self_character=None):
@@ -1008,6 +1281,36 @@ def _find_character(query, characters, self_character=None):
     return matches[0]
 
 
+def _staff_identity_character(character, game=None):
+    """Resolve God omnipresence twins to the owning Mantle for staff checks.
+
+    Bilocated twins borrow the player's Session for room verbs but are not
+    linked Accounts -- staff rank must follow the God body (bug report 135).
+    Engine-only: reads ``god_twin`` / ``god_twin_owner_key`` without importing
+    supers (two-repo purity).
+    """
+    if character is None or not getattr(character, "god_twin", False):
+        return character
+    if game is None:
+        session = getattr(character, "session", None)
+        if session is not None:
+            game = getattr(session, "game", None)
+    owner_key = getattr(character, "god_twin_owner_key", None)
+    if not owner_key or game is None:
+        return character
+    finder = getattr(game, "find_character", None)
+    if callable(finder):
+        owner = finder(owner_key)
+        if owner is not None:
+            return owner
+    rooms = getattr(game, "rooms", None) or {}
+    for room in rooms.values():
+        for ch in room.characters():
+            if getattr(ch, "key", None) == owner_key:
+                return ch
+    return character
+
+
 def _is_gm(character):
     """Is this character any rank of GM (ordinary or head)?
 
@@ -1019,6 +1322,8 @@ def _is_gm(character):
     session = getattr(character, "session", None)
     if session is not None:
         game = getattr(session, "game", None)
+    character = _staff_identity_character(character, game)
+    if session is not None:
         # Cast / alt ride: Session remembers the staff account from gm on.
         staff_name = getattr(session, "staff_account", None)
         if staff_name and game is not None:
@@ -1052,6 +1357,8 @@ def _is_head_gm(character):
     session = getattr(character, "session", None)
     if session is not None:
         game = getattr(session, "game", None)
+    character = _staff_identity_character(character, game)
+    if session is not None:
         staff_name = getattr(session, "staff_account", None)
         if staff_name and game is not None:
             try:

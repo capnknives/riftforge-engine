@@ -19,6 +19,20 @@
         "heartland"
       ],
       "visible_as": "Notbigville, Kansas"
+    },
+    {
+      "kind": "landmark",
+      "at": [
+        36,
+        10
+      ],
+      "hub_room": "RN00001",
+      "enter_as": [
+        "rift nexus",
+        "nexus",
+        "rift"
+      ],
+      "visible_as": "Rift Nexus"
     }
   ],
   "grid": {

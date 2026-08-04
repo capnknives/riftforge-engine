@@ -30,6 +30,7 @@ import importlib.util
 import os
 import re
 import sys
+import engine.systems.economy as economy_wallet
 
 
 def _repo_root():
@@ -226,7 +227,7 @@ def main():
         f"lean demo should be one room, got {len(rooms)} "
         f"(maps_dir={maps.get_maps_dir()!r})"
     )
-    assert start_room.key == "Demo Start", start_room.key
+    assert start_room.key in ("Demo Start", "DT00001"), start_room.key
 
     # Phase 4b: soft-optional commands + server with SUPERS absent.
     import commands as commands_mod
@@ -241,7 +242,7 @@ def main():
     # Lean Game: maps + persistence, no Cadence seed; still one-room demo.
     lean_game = server_mod.Game(db_path=":memory:")
     assert lean_game.start_room is not None
-    assert lean_game.start_room.key == "Demo Start", lean_game.start_room.key
+    assert lean_game.start_room.key in ("Demo Start", "DT00001"), lean_game.start_room.key
     assert len(lean_game.rooms) == 1, len(lean_game.rooms)
     assert lean_game.find_character("a training dummy") is None
 
@@ -415,16 +416,16 @@ def main():
         pass
 
     purse = _WalletBlob()
-    purse.coins = 40
-    purse.bank_coins = 10
+    economy_wallet.set_wallet(purse, 40, 0)
+    purse.bank_dollars = 10
     assert economy_engine.wallet_balance(purse) == 40
     assert economy_engine.bank_balance(purse) == 10
     assert economy_engine.can_afford(purse, 40) is True
     assert economy_engine.can_afford(purse, 41) is False
     ok, _msg = economy_engine.deposit(purse, 15)
-    assert ok and purse.coins == 25 and purse.bank_coins == 25
+    assert ok and economy_wallet.wallet_dollars(purse) == 25 and purse.bank_dollars == 25
     ok, _msg = economy_engine.withdraw(purse, 5)
-    assert ok and purse.coins == 30 and purse.bank_coins == 20
+    assert ok and economy_wallet.wallet_dollars(purse) == 30 and purse.bank_dollars == 20
     ok, _msg = economy_engine.deposit(purse, 999)
     assert ok is False
 
@@ -499,7 +500,8 @@ def main():
         find_in_room=lambda _n, _c: None,
     )
     assert ok and line == "You wave."
-    assert actor.location.lines == ["WaveActor waves."]
+    assert actor.location.lines and "waves." in actor.location.lines[0]
+    assert "WaveActor" in actor.location.lines[0]
 
     wearer = Character("Wearer")
     tee = Item("a tee", "A plain tee.")

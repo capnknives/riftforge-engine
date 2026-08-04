@@ -880,8 +880,13 @@ def look_clause(room, game, *, screenreader=False, character=None):
         )
     if outdoor:
         if screenreader:
-            return f"Weather: {cond}. {wind} wind. About {temp} F."
-        return f"[WX] {cond}, about {temp} F, {wind} wind."
+            base = f"Weather: {cond}. {wind} wind. About {temp} F."
+        else:
+            base = f"[WX] {cond}, about {temp} F, {wind} wind."
+        ambient = _look_ambient_line(cond, wind, screenreader=screenreader)
+        if ambient:
+            return f"{base} {ambient}"
+        return base
     # Indoor dampen — only speak sky when precip/storm/tornado matter.
     if cond in ("rain", "storm", "snow") or w.get("tornado_watch"):
         damp = {
@@ -955,7 +960,19 @@ def assess_look_vision(
     if after_move:
         chance *= VISION_AFTER_MOVE_WHITEOUT_MULT
 
-    roller = rng if rng is not None else random
+    # Seed whiteout the same way day-condition rolls are seeded -- unseeded
+    # ``random`` made outdoor snow/storm looks nondeterministic (and often
+    # wiped people/items on a fresh tick-0 boot). Callers may still pass
+    # an explicit ``rng`` for tests.
+    if rng is not None:
+        roller = rng
+    else:
+        cal = _cal(game)
+        doy = _day_of_year(cal)
+        rid = resolve_region(room, game, character)
+        roller = _rng_for(
+            int(cal.get("year") or 2015), doy, f"{rid}:vision",
+        )
     whiteout = bool(chance > 0 and roller.random() < chance)
     fail_line = None
     if whiteout:
@@ -1679,6 +1696,41 @@ def _mirror_discord_tornado(track):
 # Atmospheric messaging + tick
 # ---------------------------------------------------------------------------
 
+def _look_ambient_line(condition, wind, *, screenreader=False):
+    """Extra outdoor flavor on look (S3.1 -- not a second weather mechanic)."""
+    pools = {
+        "clear": (
+            "Sun warms the open air.",
+            "A dry breeze slides past.",
+            "The sky holds steady.",
+        ),
+        "cloudy": (
+            "Clouds flatten the light.",
+            "The air feels still under the overcast.",
+        ),
+        "fog": (
+            "Fog softens the street edges.",
+            "Moisture hangs low.",
+        ),
+        "rain": (
+            "Rain needles the open air.",
+            "Puddles tick underfoot.",
+        ),
+        "storm": (
+            "Gusts shove at you.",
+            "Thunder mutters in the distance.",
+        ),
+        "snow": (
+            "Snowflakes find exposed skin.",
+            "The cold bites sharper in the open.",
+        ),
+    }
+    line = random.choice(pools.get(condition, pools["cloudy"]))
+    if screenreader:
+        return line
+    return f"[WX] {line}"
+
+
 def _atmos_line(condition, tornado_near=False):
     """One sparse ambient beat."""
     if tornado_near:
@@ -1688,15 +1740,37 @@ def _atmos_line(condition, tornado_near=False):
             "[WARNING] Debris grit stings; seek sturdy shelter.",
         ))
     pools = {
-        "clear": ("A dry breeze slides past.", "Sun holds steady."),
-        "cloudy": ("Clouds thicken overhead.", "The light goes flat."),
-        "fog": ("Fog softens the edges of the street.", "Moisture hangs low."),
-        "rain": ("Rain needles the open air.", "Puddles tick underfoot."),
+        "clear": (
+            "A dry breeze slides past.",
+            "Sun holds steady.",
+            "Heat shimmers off the pavement.",
+            "Cicadas or distant traffic fill the quiet.",
+        ),
+        "cloudy": (
+            "Clouds thicken overhead.",
+            "The light goes flat.",
+            "A cooler breath moves through the block.",
+        ),
+        "fog": (
+            "Fog softens the edges of the street.",
+            "Moisture hangs low.",
+            "Headlights bloom in the gray.",
+        ),
+        "rain": (
+            "Rain needles the open air.",
+            "Puddles tick underfoot.",
+            "Wet asphalt shines under the sky.",
+        ),
         "storm": (
             "[WX] Thunder mutters to the west.",
             "[WX] Gusts shove at you.",
+            "[WX] The wind worries at loose signs.",
         ),
-        "snow": ("Snowflakes find your collar.", "The cold bites sharper."),
+        "snow": (
+            "Snowflakes find your collar.",
+            "The cold bites sharper.",
+            "Breath ghosts in the air.",
+        ),
     }
     return random.choice(pools.get(condition, pools["cloudy"]))
 
@@ -1742,6 +1816,8 @@ def _tick_atmosphere(game):
         ):
             continue
         ch.weather_atmos_tick = ticks
+        from engine import hooks
+        hooks.character_atmos_tick(ch)
         _tell(ch, _atmos_line(cond, tornado_near=bool(near)))
 
 

@@ -17,6 +17,12 @@ T3 hygiene peels (`persistence-api` / `lean-demo` / dirty-saves **bench**)
 are done in [`refactor_plan.md`](refactor_plan.md); full incremental
 dirty-saves stay parked until measured GO.
 
+**Follow-on expansion (unparked plan):** phased engine framework promotion
+(planes/gates, schemas/OLC, needs/Cadence/combat peels, body parts, slam/breach,
+civic shops, spawn/missions, clinic/crime, Studio bridge) —
+[`riftforge_core_expansion.md`](riftforge_core_expansion.md). Not product `#1`
+unless scheduled.
+
 **Naming:** two-repo **Phase 7** (this file) is **not** combat
 “Phase 7” template-blend weaving — that stays parked under combat prose
 plans.
@@ -46,7 +52,7 @@ plans.
 |-------|------|----------------|
 | **0** | Document destination | This file + consumer/upgrade stubs linked from AGENTS/HANDOFF |
 | **1** | Registry hooks | Character/persist/chargen/help registered; no hardwired `attach_supers` / blob import |
-| **2** | Engine purity | ✅ `rg "from supers\|import supers" engine/` is empty (incl. old function-local lazy imports in `engine/verbs/basic.py`) |
+| **2** | Engine purity | ✅ `rg "from supers\|import supers" engine/` empty; `engine_hooks_purity_tests` + `engine-only-smoke` enforced (restored 2026-08-03) |
 | **2b** | `command_support.py` purity | ✅ shared move/spirit-sight helpers hookified; zero supers imports in `engine/command_support.py` |
 | **3** | Lean world + game bootstrap | ✅ MVP: lean `engine/world.py`/`engine/persistence.py`; dual installable packages declared; game entry alias added |
 | **4** | Engine-only smoke | ✅ CI job `engine-only-smoke` green with SUPERS absent (`tools/engine_smoke.py`) |
@@ -247,6 +253,7 @@ Archive of the A1/A2/Plan B design note:
 | **8** — lean Character debt (`t3-lean-room-flags`) | ✅ Done | [#849](https://github.com/capnknives/RiftForge/pull/849) |
 | **9** — mail / socials / clothing + basegame proof | ✅ Done | [#864](https://github.com/capnknives/RiftForge/pull/864) |
 | **G** — root `server.py` / `maps.py` / chargen/help | ✅ Done | Maps stamper [#865](https://github.com/capnknives/RiftForge/pull/865); boot seed / chargen / help [#867](https://github.com/capnknives/RiftForge/pull/867) |
+| **10** — content kind engine + menu OLC → `engine/` | ✅ Done | [#1247](https://github.com/capnknives/RiftForge/pull/1247) — `engine/content_kinds/`, `engine/olc.py`; SUPERS profiles/validators/persist/guess/inspect stay private |
 
 ### Boundary rule (locked)
 
@@ -256,9 +263,9 @@ defaults exist today.
 
 | Layer | Owns |
 |-------|------|
-| **`engine/` / `engine/systems/`** | Primitives + frameworks: meters, coin/vendor APIs, pathfind BFS, battle-brief build/apply, content store, tick registry, shared spine, generic ambient weather **and** CONUS `regional_weather` / overland / storm chase / globe+aerial (Notbigville / `v0.3.0`), lean Character surface |
+| **`engine/` / `engine/systems/`** | Primitives + frameworks: meters, coin/vendor APIs, pathfind BFS, battle-brief build/apply, content store, tick registry, **content kind profiles + menu OLC** (`engine/content_kinds/`, `engine/olc.py`), shared spine, generic ambient weather **and** CONUS `regional_weather` / overland / storm chase / globe+aerial (Notbigville / `v0.3.0`), lean Character surface |
 | **`basegame/`** | Proof consumer: adopts engine frameworks; ships minimal verbs/help/maps; no SUPERS lore |
-| **`supers/`** | Catalogs, Origin/Path/Cadence fiction, combat prose/lexicon, daylight + clinic/radio/elemental **hooks** into regional weather, Tier flavor names, fuel economies, town AI; thin facades for peeled frameworks |
+| **`supers/`** | Catalogs, Origin/Path/Cadence fiction, combat prose/lexicon, daylight + clinic/radio/elemental **hooks** into regional weather, Tier flavor names, fuel economies, town AI; **kind JSON profiles**, domain validators, persist paths, guess heuristics, GM inspect sheets; thin facades for peeled frameworks |
 
 **Confirm before promoting (edge cases):** public remote visibility (new
 tags / friend access), anything that would force SUPERS lore into the
@@ -270,6 +277,45 @@ crime, alignment/incap kill methods, combat prose/narrate/lexicon, full
 `training.py` Track-B, `daylight`, Origin fuel chassis. CONUS weather /
 storm chase / America overland / globe flight now live under
 `engine/systems/` with supers re-export facades (`v0.3.0`).
+
+### Content kinds + OLC (locked — Stage 10)
+
+The **kind-profile template engine** and **menu OLC wizard** are engine
+frameworks every RiftForge game can opt into. SUPERS was the first consumer;
+do **not** grow new kind-engine logic under `supers/`.
+
+| Layer | Owns |
+|-------|------|
+| **`engine/content_kinds/`** | Profile load (`extends` merge), `blank` / `apply_template` / `normalize_kind` / `diff_missing` / `explain_kind`, generic policy lint (`room_title_shape`, porch/living shell warnings), `validate_kind` shell |
+| **`engine/olc.py`** | In-game wizard session (`olc new` / `set` / `show` / `done` / `cancel`); calls hooks for auth + save |
+| **`engine/hooks.py`** | `set_content_kinds_dirs`, `set_content_kind_domain_validator`, `set_content_kind_save_entity`, `set_olc_authorizer` |
+| **`supers/content/kinds/*.json`** | Kind profile data (item.*, room.*, npc.*, …) |
+| **`supers/content_kinds/validators.py`** | Boot-aligned domain checks (items roster, NPC power, quests, …) |
+| **`supers/content_kinds/persist.py`** | Catalog write paths (items.json, npc files, map rooms, …) |
+| **`supers/content_kinds/guess.py`** | Migration heuristics for legacy rows |
+| **`supers/content_kinds/inspect.py`** | GM `stat` / `score` kind-field sheets |
+| **`supers/content_kinds/engine.py`** | **Facade only** — re-exports `engine.content_kinds.engine` |
+
+**Agent rules (do not skip):**
+
+1. **Never add `from supers` inside `engine/`** for kinds or OLC — register
+   game behavior through hooks (`supers/bootstrap.py` wires SUPERS today).
+2. **Never implement profile merge, field coercion, or OLC session state in
+   `supers/`** — extend `engine/content_kinds/` or `engine/olc.py` instead.
+3. **New kind profiles** go in the game's `content/kinds/` tree; register
+   the directory with `set_content_kinds_dirs` at boot.
+4. **New domain validation** belongs in the game's `validators.py` (or
+   equivalent), not inlined in tools or Area Studio.
+5. **Import path:** tools and Studio may keep `from supers.content_kinds
+   import …` via the facade; engine code uses `engine.content_kinds` /
+   `engine.olc` directly.
+6. **Public engine tag:** when Stage 10 merges, bump `riftforge-engine` pin
+   per `docs/RELEASING_RIFTFORGE.md` if the public export ships the new
+   modules.
+
+Surfaces that share the engine (thin callers only): `tools/content_new.py`,
+`tools/content_migrate_kinds.py`, Area Studio prefabs, `gm olc` /
+`help build-kinds`. Design note: [`content_template_engine.md`](content_template_engine.md).
 
 ### Done notes (Stages 1–9, A1/A2, Plan B)
 
@@ -342,7 +388,7 @@ storm chase / America overland / globe flight now live under
   `persistence.py`, `snoop.py`) — Character was already lean, nothing
   moved. The debt was entirely on `Room`: ~46 fields (Vampire/hunter
   hunt-AI, Demon travel + Hellcraft wards, Croatoan, Divine consecration,
-  Cadence lodging/homestead, town-system flags, Jinn mirage ids, city
+  Cadence lodging/homestead, town-system flags, Djinn mirage ids, city
   paint metadata) had zero `engine/` reader and moved to new
   `supers/room_attach.py`, wired through new `set_room_attacher`/
   `attach_room` hooks (`engine/hooks.py`, mirroring the Character
@@ -404,17 +450,30 @@ explicit “start overland purity” (or similar) ask.
 
 | Item | Why it exists | Suggested fix when unparked |
 |------|---------------|-----------------------------|
-| Lazy optional ``importlib`` loads of ``supers.*`` inside `engine/systems/overland.py` | Foot travel works without them; vehicles / dungeons / Lebanon starter / solar / planar influence still resolve via `_try_game_module` when SUPERS is installed | Replace with `engine.hooks` registrations (Stage-1 / vehicle-enter pattern); then assert no ``supers`` strings under `engine/` even via importlib |
+| Lazy optional ``importlib`` loads of ``supers.*`` inside `engine/systems/overland.py` | Foot travel works without them; vehicles / dungeons / Lebanon starter / solar / planar influence still resolve via hooks when SUPERS is installed | **Done 2026-08-04** — `engine.hooks` overland peer registrations; zero `importlib` / `supers.*` qualnames in `engine/systems/overland.py` |
 | Dual weather modules | `engine/systems/weather.py` = tiny ambient kit (Stage 3); `regional_weather.py` = CONUS + tornadoes | Keep both; optionally strengthen module docs / README — **do not** merge or delete ambient without asking |
 | SUPERS re-export facades | `supers/weather.py`, `overland.py`, `storm_watch.py`, `globe.py`, `stellar_globe_flight.py` | **Keep** until a dedicated call-site rewrite is worth the churn |
 | Climate-contrast pockets | Plan wanted Seattle/Miami; hubs must exist at atlas link time | Add stub zones + pocket rows when someone wants climate demo contrast |
 | `engine_smoke` vs monorepo | Smoke fails if `supers/` is present by design | Run purity/engine smoke in the public export tree or with `supers` renamed aside |
 
 **Done for v0.3.0 (boot gate, not full purity):**
-- `from supers` / `import supers` lines removed from `engine/` (scanner-clean).
 - `_do_transition` uses `hooks.encounter_check` (not root `world.encounter_check`).
 - Hellhound sight via `hooks.set_can_see_hellhound`.
-- Overland still optionally loads SUPERS modules by qualname for vehicle/Cadence paths.
+- Overland optional game paths use `engine.hooks` overland peer registrations (not `importlib` ``supers.*``).
+
+**Done 2026-08-03 (Phase 2 gate restored):**
+- Zero `from supers` / `import supers` under `engine/` (scanner + `engine_hooks_purity_tests`).
+- Generic map heal merge peeled to `engine/map_heal.py`; `supers/map_heal.py` is a facade.
+- Game behavior (containers, say/languages, autosplit, GM spirit, copyover blob reload, …) registers via new `engine/hooks.py` surfaces wired in `supers/bootstrap.py`.
+- `smoke_test.engine_hooks_purity_tests()` re-enabled; `tools/engine_smoke.py` passes with `supers/` renamed aside.
+
+**Done 2026-08-03 (Track 2 framework peels):**
+- `engine/systems/utility_delay.py`, `engine/systems/floor_loot.py`, `engine/systems/languages.py` (catalog) + `engine/systems/containers.py` peeled from `supers/`; thin re-export facades remain.
+- `engine/map_backups.py` + `engine/map_archive.py` peeled; `supers/map_archive.tick_nag` stays game-side (GM mode gate).
+- Item catalog, floor-loot vault, map hot-reload, and containers peer hooks registered in `supers/bootstrap.py`.
+
+**Done 2026-08-04 (Track 3 overland importlib cleanup):**
+- `engine/systems/overland.py` no longer uses `_try_game_module("supers.*")`; starter keys, planar influence, vehicle roadtrip, dungeon hub notify, Cadence travel, and Solar land wire through `engine.hooks` registrations in `supers/bootstrap.py`.
 
 ### Delegation (who leads what)
 

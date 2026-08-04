@@ -1,0 +1,17 @@
+{
+  "id": "catalog.appearance_slot",
+  "label": "Appearance catalog option",
+  "writes_to": "supers/content/appearance*.json slot arrays",
+  "fields": {
+    "id": {
+      "type": "string",
+      "required": true,
+      "doc": "Option id stored on Character.appearance[slot]."
+    },
+    "name": {
+      "type": "string",
+      "required": true,
+      "doc": "Player-facing option label."
+    }
+  }
+}

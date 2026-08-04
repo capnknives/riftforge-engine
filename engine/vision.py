@@ -16,6 +16,11 @@ def has_light_source(character):
     for item in getattr(character, "inventory", None) or []:
         if getattr(item, "provides_light", False):
             return True
+    equipment = getattr(character, "equipment", None)
+    if isinstance(equipment, dict):
+        for piece in equipment.values():
+            if piece is not None and getattr(piece, "provides_light", False):
+                return True
     return False
 
 

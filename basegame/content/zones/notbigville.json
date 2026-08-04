@@ -109,7 +109,22 @@
             "zone": "notbigville",
             "outdoor": true,
             "exits": {
-                "north": "NB00001"
+                "north": "NB00001",
+                "west": "NB00009"
+            }
+        },
+        {
+            "key": "NB00009",
+            "title": "Notbigville - Grain Elevator - Shed",
+            "vnum": "NB00009",
+            "description": "A lean-to beside the grain elevator where prairie critters nest in the chaff. The door hangs open on one hinge.",
+            "area_type": "city",
+            "zone": "notbigville",
+            "outdoor": false,
+            "spawn_nest": "critter",
+            "bestiary_categories": ["prairie-critter"],
+            "exits": {
+                "east": "NB00007"
             }
         },
         {

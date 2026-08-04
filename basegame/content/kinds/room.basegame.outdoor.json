@@ -1,0 +1,14 @@
+{
+  "id": "room.basegame.outdoor",
+  "label": "Basegame outdoor room",
+  "extends": "room.engine",
+  "writes_to": "basegame/content/zones rooms[]",
+  "fields": {
+    "outdoor": {
+      "type": "bool",
+      "required": true,
+      "default": true,
+      "doc": "Outdoor room flag."
+    }
+  }
+}

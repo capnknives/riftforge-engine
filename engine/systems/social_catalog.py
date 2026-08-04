@@ -123,11 +123,36 @@ def resolve_verb(name, catalog):
     return None
 
 
-def format_template(template, actor, target=None):
+def _social_face(character, viewer=None):
+    """Public label for social templates -- never ``gmspirit:`` / ``husk:`` keys.
+
+    Staff GM form reads ``Name(GM)`` (viewer-independent). When *viewer* is
+    set, hood/mask and introduce gates match room look / emote behavior.
+    """
+    if character is None:
+        return "?"
+    try:
+        from engine.command_support import _display_name
+        if viewer is not None:
+            return _display_name(character, viewer=viewer)
+        return _display_name(character)
+    except Exception:
+        from engine.command_support import strip_ephemeral_storage_prefix
+        return strip_ephemeral_storage_prefix(getattr(character, "key", "?"))
+
+
+def format_template(
+    template,
+    actor,
+    target=None,
+    *,
+    actor_viewer=None,
+    target_viewer=None,
+):
     """Fill ``{actor}`` / ``{target}`` placeholders in a template string."""
     return template.format(
-        actor=actor.key,
-        target=target.key if target is not None else "",
+        actor=_social_face(actor, actor_viewer),
+        target=_social_face(target, target_viewer) if target is not None else "",
     )
 
 
@@ -162,7 +187,9 @@ def perform(character, catalog, verb_id, target_name, game, *, find_in_room):
         solo = spec.get("solo")
         if not solo:
             return False, f"That social needs a target. Try: {verb_id} <name>"
-        self_line = format_template(solo["self"], character)
+        self_line = format_template(
+            solo["self"], character, actor_viewer=character,
+        )
         others_line = format_template(solo["others"], character)
         room.broadcast(others_line, exclude=character)
         return True, self_line
@@ -170,8 +197,20 @@ def perform(character, catalog, verb_id, target_name, game, *, find_in_room):
     targeted = spec.get("targeted")
     if not targeted:
         return False, f"You can't use '{verb_id}' on someone."
-    self_line = format_template(targeted["self"], character, target)
-    target_line = format_template(targeted["target"], character, target)
+    self_line = format_template(
+        targeted["self"],
+        character,
+        target,
+        actor_viewer=character,
+        target_viewer=character,
+    )
+    target_line = format_template(
+        targeted["target"],
+        character,
+        target,
+        actor_viewer=target,
+        target_viewer=target,
+    )
     others_line = format_template(targeted["others"], character, target)
     if getattr(target, "session", None) is not None and not getattr(
         target, "asleep", False

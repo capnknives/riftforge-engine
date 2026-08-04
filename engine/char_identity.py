@@ -217,12 +217,16 @@ def identity_match_needles(char) -> list[str]:
     """Lowercase strings that should match this character in targeting."""
     needles = []
     key = (getattr(char, "key", None) or "").lower()
+    raw_key = getattr(char, "key", None) or ""
     if key:
         needles.append(key)
         # Peel ephemeral prefix for bare-name match.
         peeled = _strip_prefix(key).lower()
         if peeled and peeled != "?" and peeled not in needles:
             needles.append(peeled)
+        spaced = humanize_storage_key(raw_key).lower()
+        if spaced and spaced not in needles and spaced != peeled:
+            needles.append(spaced)
     given = character_given_name(char).lower()
     if given and given not in needles:
         needles.append(given)

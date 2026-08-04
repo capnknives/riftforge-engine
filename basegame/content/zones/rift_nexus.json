@@ -1,0 +1,87 @@
+{
+    "id": "rift_nexus",
+    "plane": "earth",
+    "realm": "prime",
+    "autoload": true,
+    "_comment": "Demo pocket off Notbigville: hub + four elemental rift mouths (basegame gates demo). Atlas pocket at (36,10) on earth_america.json.",
+    "city_name": "Rift Nexus",
+    "city_color": "dark_grey",
+    "sub_color": "slate_grey",
+    "main_colors": {
+        "street": "silver",
+        "default": "silver"
+    },
+    "rooms": [
+        {
+            "key": "RN00001",
+            "title": "Rift Nexus - Hub - Convergence",
+            "vnum": "RN00001",
+            "description": "A chalk circle and four mismatched arches ring a shallow basin of still air. Each arch flickers with a different elemental hue; only some mouths are open at any moment.",
+            "area_type": "ruins",
+            "zone": "rift-nexus",
+            "outdoor": false,
+            "exits": {
+                "north": "RN00002",
+                "south": "RN00003",
+                "east": "RN00004",
+                "west": "RN00005"
+            }
+        },
+        {
+            "key": "RN00002",
+            "title": "Rift Nexus - Fire Mouth - Ember Throat",
+            "vnum": "RN00002",
+            "description": "Heat ripples from a scorched stone arch. Ash drifts in a draft that smells like a forge left running.",
+            "area_type": "ruins",
+            "zone": "rift-nexus",
+            "plane": "fire",
+            "outdoor": false,
+            "rift_gate": true,
+            "exits": {
+                "south": "RN00001"
+            }
+        },
+        {
+            "key": "RN00003",
+            "title": "Rift Nexus - Water Mouth - Brine Throat",
+            "vnum": "RN00003",
+            "description": "A cool arch weeps condensation. The stone underfoot is slick with salt and tide-smell.",
+            "area_type": "ruins",
+            "zone": "rift-nexus",
+            "plane": "water",
+            "outdoor": false,
+            "rift_gate": true,
+            "exits": {
+                "north": "RN00001"
+            }
+        },
+        {
+            "key": "RN00004",
+            "title": "Rift Nexus - Air Mouth - Gale Throat",
+            "vnum": "RN00004",
+            "description": "A pale arch hums with wind that never quite settles. Dust spirals in the opening like a held breath.",
+            "area_type": "ruins",
+            "zone": "rift-nexus",
+            "plane": "air",
+            "outdoor": false,
+            "rift_gate": true,
+            "exits": {
+                "west": "RN00001"
+            }
+        },
+        {
+            "key": "RN00005",
+            "title": "Rift Nexus - Stone Mouth - Cairn Throat",
+            "vnum": "RN00005",
+            "description": "A squat arch of raw granite. The air is dry and the light flat, as if the room forgot color.",
+            "area_type": "ruins",
+            "zone": "rift-nexus",
+            "plane": "stone",
+            "outdoor": false,
+            "rift_gate": true,
+            "exits": {
+                "east": "RN00001"
+            }
+        }
+    ]
+}

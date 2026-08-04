@@ -21,6 +21,7 @@ from __future__ import annotations
 # Classic wear slots that may hold clothing. Weapon / shield stay combat-only.
 CLOTHING_SLOTS = frozenset({
     "head",
+    "over",
     "body",
     "arms",
     "hands",
@@ -34,7 +35,7 @@ CLOTHING_SLOTS = frozenset({
 
 # Stable look order (top-down, matching worn gear display).
 CLOTHING_LOOK_ORDER = (
-    "head", "about", "neck", "body", "arms", "hands",
+    "head", "over", "about", "neck", "body", "arms", "hands",
     "finger", "waist", "legs", "feet",
 )
 

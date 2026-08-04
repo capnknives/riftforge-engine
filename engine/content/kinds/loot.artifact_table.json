@@ -1,0 +1,48 @@
+{
+  "id": "loot.artifact_table",
+  "label": "Mythic artifact loot pool file",
+  "writes_to": "supers/content/loot/*.json",
+  "fields": {
+    "pool_id": {
+      "type": "string",
+      "required": true,
+      "doc": "Pool id (filename stem when omitted)."
+    },
+    "label": {
+      "type": "string",
+      "required": false,
+      "doc": "Studio / GM display label."
+    },
+    "assigned_to": {
+      "type": "list",
+      "required": false,
+      "doc": "Spawn source ids (string or list in JSON; loot_pools normalizes)."
+    },
+    "mythic": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "When true, rows may reference mythic item ids."
+    },
+    "rows": {
+      "type": "list",
+      "required": false,
+      "doc": "Flat {item, chance} rows (or use bands instead)."
+    },
+    "bands": {
+      "type": "object",
+      "required": false,
+      "doc": "Tier-band rows (low/mid/high) for salvage-style tables."
+    }
+  },
+  "policies": [
+    {
+      "id": "rows_or_bands",
+      "doc": "Exactly one of rows or bands required. Validated by supers/loot_pools.py."
+    },
+    {
+      "id": "assigned_to_union",
+      "doc": "assigned_to may be a string or list in live JSON; domain validator accepts both."
+    }
+  ]
+}

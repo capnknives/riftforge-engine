@@ -99,7 +99,7 @@ IDLE_SPECTATOR = frozenset({
     # Origin status panes (read-only fuel / kit summaries)
     "grace", "blood", "instinct", "devouring", "carrion", "souls",
     "integrity", "favor", "mana", "mutations",
-    "spirit", "ki", "hellcraft", "congregation", "findhusk",
+    "spirit", "ki", "hellcraft", "congregation", "findvessel", "findhusk",
     # Clock / prefs / tutorial meta
     "time", "date", "timeformat", "color",
     "config", "alias", "prompt",
@@ -108,7 +108,7 @@ IDLE_SPECTATOR = frozenset({
     # Training sheet / regimen picker (suggestion #75 -- do not wake idle)
     "regimen",
     # OOC / account (outbound tell/ooc stay spectator; inbound already works)
-    "ooc", "tell", "whisper",
+    "ooc", "tell", "whisper", "reply", "r",
     "bug", "suggest", "setpass", "quit",
     # Relationship / mission list panes (write shortcuts like friend wake)
     "relate", "relationship",
@@ -132,8 +132,23 @@ IDLE_WAKE_MOVE = frozenset(DIRECTIONS) | frozenset({
 IDLE_WAKE_AGGRESSIVE = frozenset({
     "attack", "kill", "hit", "fight", "spar",
     "bite", "stake", "slay", "maul", "crush", "devour",
-    "smite", "judgment", "blade", "rend", "gnaw", "howl", "hunt",
+    "smite", "judgment", "rend", "gnaw", "howl", "hunt",
     "flee", "disengage",
+})
+
+# Sleep: block sensory / physical / outbound RP; sheet + vitals stay open.
+# Derived from IDLE_SPECTATOR so idle watch and asleep recovery stay aligned.
+ASLEEP_BLOCK = frozenset({
+    "look", "l", "examine", "exa", "ex",
+    "say", "'", "emote", "em", "tell", "whisper", "reply", "r",
+    "rest", "sleep", "sit", "stand", "lay",
+    "idlemode", "idle",
+}) | IDLE_WAKE_MOVE | IDLE_WAKE_AGGRESSIVE
+
+ASLEEP_SPECTATOR = (IDLE_SPECTATOR - ASLEEP_BLOCK) | frozenset({
+    "wake", "logout", "hp", "fuel", "where", "coins",
+    "account", "combatnumbers", "bigmap", "atlas", "brief",
+    "dominion", "bounty", "cases", "quests", "journal", "mail",
 })
 
 
@@ -177,8 +192,12 @@ def parse(raw):
 # COMMANDS is engine-only.
 COMMANDS = {**ENGINE_COMMANDS, **GAME_COMMANDS}
 
-def dispatch(character, raw, game):
-    """Route one line of input to the right handler."""
+def dispatch(character, raw, game, *, force_actor=None):
+    """Route one line of input to the right handler.
+
+    ``force_actor`` runs the verb as another body (God ``twin`` / ``omni``
+    one-shots) without changing sustained act focus on the login character.
+    """
     # D65: expand player aliases before parse (never shadows built-ins).
     from engine import display_prefs
     display_prefs.ensure_display_defaults(character)
@@ -187,6 +206,11 @@ def dispatch(character, raw, game):
     verb, args = parse(raw)            # unpack the (verb, args) tuple into two vars
     if not verb:                       # blank line -- do nothing
         return
+
+    # Bloodrite chapel tithe (two-word player phrase).
+    if verb == "consume" and (args or "").strip().lower() == "tithe":
+        verb = "consumetithe"
+        args = ""
 
     # Stamp player activity for auto-idle (skip Cadence SilentSession).
     from engine.npc_act import SilentSession
@@ -199,25 +223,23 @@ def dispatch(character, raw, game):
             _idle_flavor.stamp_input_activity(character, game)
         except ImportError:
             # Lean engine: stamp the AFK clock without SUPERS helpers.
-            character.last_input_tick = getattr(
-                game, "game_time_ticks", 0
-            ) or 0
+            import time
+            character.last_input_monotonic = time.monotonic()
 
-    # Sleep closes the outside world: only wake / help / quit / logout work.
+    # Sleep closes the room (no look / move / speech) but sheet panes stay
+    # open -- hp, fuel, needs, score, inventory, who, config, …
     # Resting (awake) still hears everything; combat/move cancel rest below.
-    _ASLEEP_ALLOWED = frozenset({
-        "wake", "help", "commands", "quit", "logout", "score", "sc",
-        "ooc", "bug", "suggest",
-    })
-    if getattr(character, "asleep", False) and verb not in _ASLEEP_ALLOWED:
+    from engine.command_support import (
+        ASLEEP_WORLD_CLOSED_MSG,
+        asleep_blocks_world,
+    )
+    if asleep_blocks_world(character) and verb not in ASLEEP_SPECTATOR:
         if resolve_walk_direction(verb, getattr(character, "location", None)):
             character.session.send(
                 "You're asleep -- type 'wake' before you can move."
             )
             return
-        character.session.send(
-            "You're asleep -- the outside world is closed. Type 'wake'."
-        )
+        character.session.send(ASLEEP_WORLD_CLOSED_MSG)
         return
 
     # GM freeze: staff paralyzed the player -- only help / quit / bug path.
@@ -265,13 +287,39 @@ def dispatch(character, raw, game):
 
     # GM mute: block global / room speech channels only (not movement).
     _MUTED_VERBS = frozenset({
-        "say", "'", "emote", "em", "tell", "whisper", "ooc",
+        "say", "'", "emote", "em", "tell", "whisper", "reply", "r", "ooc",
     })
     if getattr(character, "muted", False) and verb in _MUTED_VERBS:
         character.session.send(
             "You're muted by staff -- you can't use that channel."
         )
         return
+
+    # Vessel shared-wheel passenger gate (movement/combat vs mind/wheel).
+    try:
+        from supers import vessel_passenger as _vp_gate
+        blocked, gate_msg = _vp_gate.dispatch_gate(character, verb, game)
+        if blocked:
+            character.session.send(gate_msg)
+            return
+    except ImportError:
+        pass
+
+    # Combat KO / immortal incap / headless containment -- full freeze except
+    # look and sheet panes (bug #322: west/east while [KO] must not work).
+    try:
+        from supers import combat_ko as _ko_gate
+        blocked, gate_msg = _ko_gate.dispatch_gate(character, verb, game)
+        if blocked:
+            if resolve_walk_direction(
+                verb, getattr(character, "location", None),
+            ):
+                character.session.send(_ko_gate.COMBAT_KO_MOVE_BLOCKED_MSG)
+            else:
+                character.session.send(gate_msg)
+            return
+    except ImportError:
+        pass
 
     # Manual cardinals / aggression cancel a paced walk (say/emote keep it).
     # ``walk`` itself manages focus inside cmd_walk.
@@ -326,6 +374,8 @@ def dispatch(character, raw, game):
                 character.session.send(
                     "You snap back -- your Echo stirs and you are present again."
                 )
+                from supers import training as training_mod
+                training_mod.send_pending_offline_break(character)
                 if (
                     character.location
                     and not is_staff_stealth_presence(character)
@@ -335,6 +385,24 @@ def dispatch(character, raw, game):
                         f"{face}'s echo stirs and comes back to life.",
                         exclude=character,
                     )
+
+    # God omnipresence: sustained act focus redirects bare verbs to the twin
+    # body (session is bound in god_omnipresence.sync_focus_session).
+    actor = character
+    if force_actor is not None:
+        actor = force_actor
+    else:
+        try:
+            from supers import god_omnipresence as go
+            if go.should_redirect_to_twin(character, verb):
+                twin = go.resolve_twin(character, game)
+                if (
+                    twin is not None
+                    and getattr(twin, "location", None) is not None
+                ):
+                    actor = twin
+        except ImportError:
+            pass
 
     # Awake rest cancels on most active verbs (not look/help/score/wake).
     if getattr(character, "resting", False) and not getattr(
@@ -347,7 +415,7 @@ def dispatch(character, raw, game):
         if (
             verb not in _REST_KEEP
             and resolve_walk_direction(
-                verb, getattr(character, "location", None),
+                verb, getattr(actor, "location", None),
             ) is None
         ):
             try:
@@ -356,27 +424,6 @@ def dispatch(character, raw, game):
             except ImportError:
                 from engine import hooks
                 hooks.cancel_rest(character)
-
-    # God omnipresence: when focused on twin, room verbs / movement run as
-    # the twin body (session output still reaches the God).
-    actor = character
-    _twin_session_restore = None
-    try:
-        from supers import god_omnipresence as go
-        if go.should_redirect_to_twin(character, verb):
-            twin = go.resolve_twin(character, game)
-            if twin is not None and getattr(twin, "location", None) is not None:
-                actor = twin
-                if twin.session is None:
-                    twin.session = character.session
-                    _twin_session_restore = twin
-                # Plain tag so screenreaders know which body is active.
-                if verb in ("look", "l") or resolve_walk_direction(
-                    verb, getattr(character, "location", None),
-                ):
-                    pass  # look/move feedback comes from handlers
-    except ImportError:
-        pass
 
     # Soft-but-strict authored quest gate (Family Business foyer, …).
     # Same layer as asleep/frozen -- not a pre-parser black hole.
@@ -412,13 +459,9 @@ def dispatch(character, raw, game):
             )
             if not allowed:
                 character.session.send(nudge)
-                if _twin_session_restore is not None:
-                    _twin_session_restore.session = None
                 display_prefs.send_prompt(character, game)
                 return
         cmd_move(actor, walk_dir, game)
-        if _twin_session_restore is not None:
-            _twin_session_restore.session = None
         display_prefs.send_prompt(character, game)
         return
 
@@ -428,8 +471,6 @@ def dispatch(character, raw, game):
         )
         if not allowed:
             character.session.send(nudge)
-            if _twin_session_restore is not None:
-                _twin_session_restore.session = None
             display_prefs.send_prompt(character, game)
             return
 
@@ -441,12 +482,25 @@ def dispatch(character, raw, game):
             character.session.send(
                 f"'{verb}' is temporarily disabled by staff."
             )
-            if _twin_session_restore is not None:
-                _twin_session_restore.session = None
             display_prefs.send_prompt(character, game)
             return
         handler, _help_text = entry
+        _twin_owner = None
+        try:
+            from supers import god_omnipresence as _go_kit
+            if _go_kit.is_god_twin(actor):
+                _twin_owner = _go_kit.resolve_owner(actor, game)
+                if _twin_owner is not None:
+                    _go_kit.sync_twin_kit(_twin_owner, actor)
+        except ImportError:
+            pass
         handler(actor, args, game)  # call whichever function we found
+        if _twin_owner is not None:
+            try:
+                from supers import god_omnipresence as _go_kit
+                _go_kit.pull_twin_kit_to_owner(_twin_owner, actor)
+            except ImportError:
+                pass
         # Authored quests: simple verb steps (look / gear / track / …).
         # Dedicated events (takehunt, rent, …) fire from success paths.
         if _quest_gate is not None:
@@ -466,9 +520,6 @@ def dispatch(character, raw, game):
                 traceback.print_exc()
     else:
         character.session.send(f"Unknown command: '{verb}'. Try 'help'.")
-
-    if _twin_session_restore is not None:
-        _twin_session_restore.session = None
 
     # D65: reprint custom prompt after every command (empty template = skip).
     display_prefs.send_prompt(character, game)

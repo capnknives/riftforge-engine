@@ -45,6 +45,30 @@ _FILENAMES = {
 # tell triaged entries apart from new ones.
 STATUSES = ("open", "resolved", "rejected")
 
+# Labels shown in GM ``reports`` / ``reports show`` output.
+DISPLAY_LABELS = {
+    BUG: "BUG",
+    SUGGEST: "IDEA",
+    HELP: "HELP",
+}
+
+# Parse words staff type after ``show`` / ``resolve`` (bug, idea, …).
+KIND_ALIASES = {
+    "bug": BUG,
+    "bugs": BUG,
+    "suggest": SUGGEST,
+    "suggestion": SUGGEST,
+    "suggestions": SUGGEST,
+    "idea": SUGGEST,
+    "ideas": SUGGEST,
+    "help": HELP,
+}
+
+
+def parse_kind_word(kind_word):
+    """Map a staff-facing kind token to BUG / SUGGEST / HELP, or None."""
+    return KIND_ALIASES.get((kind_word or "").lower())
+
 
 def _path(kind, directory):
     """Return the absolute path for a report kind under directory."""
@@ -64,7 +88,8 @@ def register_after_mark(callback):
     _after_mark_hooks.append(callback)
 
 
-def record(kind, reporter, description, history, directory=".", context=None):
+def record(kind, reporter, description, history, directory=".", context=None,
+           subject=None):
     """Append one timestamped report as a single JSON line.
 
     history is a list of [line, traceback_or_None] pairs from the session
@@ -78,9 +103,10 @@ def record(kind, reporter, description, history, directory=".", context=None):
 
     Returns the payload dict that was written, including a 1-based ``id``
     (the physical line number in the JSONL file -- same numbering
-    recent()/mark() use). Callers that POST a webhook (bugs only -- see
-    engine/bug_webhook.py) can hand this dict straight to the notifier
-    without re-reading the log.
+    recent()/mark() use). Callers that POST a webhook (bugs via
+    engine/bug_webhook.py; suggestions via engine/suggestion_webhook.py --
+    both GM-on-demand) can hand this dict straight to the notifier without
+    re-reading the log.
     """
     lines = []
     errors = []
@@ -103,6 +129,8 @@ def record(kind, reporter, description, history, directory=".", context=None):
     }
     if context:
         payload["context"] = context
+    if subject:
+        payload["subject"] = subject
     path = _path(kind, directory)
     # "a" appends; if the file doesn't exist yet, open creates it.
     with open(path, "a", encoding="utf-8") as f:
@@ -157,6 +185,68 @@ def recent(kind, n, directory="."):
         return entries
     # Slice the tail: entries[-n:] is the last n; if fewer exist, all of them.
     return entries[-n:]
+
+
+def get_by_id(kind, entry_id, directory="."):
+    """Return one parsed report by its stable id, or None when missing."""
+    for entry in recent(kind, None, directory=directory):
+        if entry.get("id") == entry_id:
+            return entry
+    return None
+
+
+def format_entry_lines(kind, entry, *, game=None):
+    """Plain-text detail body for one report (GM show / host sync_reports)."""
+    label = DISPLAY_LABELS.get(kind, (kind or "?").upper())
+    entry_id = entry.get("id", "?")
+    status = entry.get("status", "open")
+    reporter_raw = entry.get("reporter", "?")
+    reporter = reporter_raw
+    if game is not None:
+        from engine.char_identity import reporter_display_name
+
+        reporter = reporter_display_name(game, reporter_raw)
+
+    lines = [
+        f"{label} #{entry_id} ({status})",
+        f"time: {entry.get('time', '?')}",
+        f"reporter: {reporter}",
+    ]
+    subject_raw = entry.get("subject")
+    if subject_raw:
+        if game is not None:
+            from engine.char_identity import reporter_display_name
+
+            subject_label = reporter_display_name(game, subject_raw)
+        else:
+            subject_label = subject_raw
+        lines.append(f"subject: {subject_label}")
+    lines.extend([
+        "",
+        (entry.get("description") or "").strip(),
+    ])
+    history = entry.get("history") or []
+    if history:
+        lines.append("")
+        lines.append("history:")
+        for line in history:
+            lines.append(f"  {line}")
+    errors = entry.get("errors") or []
+    if errors:
+        lines.append("")
+        lines.append("errors:")
+        for err in errors:
+            lines.append(f"  > {err.get('line', '?')}")
+            tb = (err.get("traceback") or "").strip()
+            if tb:
+                for tb_line in tb.splitlines():
+                    lines.append(f"    {tb_line}")
+    context = entry.get("context")
+    if context:
+        lines.append("")
+        lines.append("context:")
+        lines.append(json.dumps(context, indent=2, sort_keys=True))
+    return lines
 
 
 def mark(kind, entry_id, status, directory=".", game=None):

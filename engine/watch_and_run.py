@@ -71,6 +71,10 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from engine import game_heartbeat
+from engine import boot_stability
+from engine import crash_recovery
+from engine import world_backup
+from engine import watcher_request
 
 POLL_SECONDS = 1.0        # how often to check for changed files
 
@@ -99,6 +103,7 @@ _COPYOVER_SKIP_PREFIXES = (
     # write; watching them caused an unnecessary copyover after each build.
     "content/map_backups",
     "content/map_archives",
+    "backups",
 )
 
 
@@ -141,6 +146,13 @@ def reload_auto_deploy():
     importlib.reload(apply_pr_fix)
     importlib.reload(deploy_notify)
     importlib.reload(hooks)
+    # Watcher is not the game child — bootstrap never re-registers map
+    # heal after this hooks reload. Late-bind so the next reset --hard
+    # actually merges content/map_backups into zone/map JSON.
+    try:
+        hooks.ensure_auto_deploy_map_heal(reload_impl=True)
+    except Exception:
+        pass
     mod = importlib.reload(auto_deploy)
     return mod
 
@@ -256,6 +268,9 @@ def _spawn_game(env=None):
     Inherits env so ``RIFTFORGE_GATEWAY`` reaches the child.
     """
     game_heartbeat.clear_heartbeat()
+    from engine import boot_stability
+
+    boot_stability.reset_post_tick_counter()
     child_env = os.environ.copy()
     if env:
         child_env.update(env)
@@ -364,6 +379,196 @@ def _gateway_paths_changed(before, after):
     return False
 
 
+def _respawn_game(_proc, _game_spawn_wall, *, spawn_failures):
+    """Apply crash budget / backoff, then spawn a fresh game child."""
+    root = _repo_root()
+    if not boot_stability.load_stable(root):
+        delay = crash_recovery.spawn_backoff_seconds(
+            failure_count=spawn_failures,
+            root=root,
+        )
+        if delay > 0:
+            print(
+                f"[watch] no stable boot stamp yet -- "
+                f"backing off {delay:.0f}s before respawn",
+                flush=True,
+            )
+            time.sleep(delay)
+    return _spawn_game()
+
+
+def _maybe_auto_revert(*, reason_prefix=""):
+    """Revert bind-mount when crash budget trips. Returns True if reverted.
+
+    Never raises — git / FS failures must not kill this long-lived watcher
+    (often Docker PID 1). Failed or skipped reverts set the crash hold and
+    clear ``.gateway_outage.json`` so the next tick does not spin.
+    """
+    trip, reason = crash_recovery.should_revert()
+    if not trip:
+        return False
+    try:
+        ok, detail = crash_recovery.revert_to_last_stable(
+            reason=f"{reason_prefix}{reason}".strip(),
+        )
+    except Exception as exc:
+        # Belt-and-suspenders: revert_to_last_stable already traps git
+        # errors, but any unexpected blow-up still must not take down PID 1.
+        print(f"[watch] auto-revert raised: {exc!r}", flush=True)
+        try:
+            crash_recovery.set_revert_hold(
+                reason=f"{reason_prefix}revert raised: {exc!r}"[:500],
+            )
+            crash_recovery.clear_gateway_outage()
+        except Exception:
+            pass
+        return False
+    if ok:
+        print(
+            f"[watch] auto-reverted to stable {str(detail)[:12]}; "
+            "auto-deploy held (gm recover clearhold)",
+            flush=True,
+        )
+    else:
+        print(
+            f"[watch] auto-revert did not apply ({detail})",
+            flush=True,
+        )
+    return ok
+
+
+def _after_game_exit(proc, *, hang_kill=False, root=None):
+    """Record exit, maybe trip DB hold, maybe code-revert."""
+    root = root or _repo_root()
+    crash_recovery.record_exit(
+        returncode=proc.returncode,
+        hang_kill=hang_kill,
+        root=root,
+    )
+    action, _detail = crash_recovery.evaluate_db_corruption(root=root)
+    if action == "auto_restored":
+        return
+    if crash_recovery.db_hold_active(root=root):
+        return
+    _maybe_auto_revert(reason_prefix="exit: ")
+
+
+def _signal_planned_copyover(proc):
+    """SIGUSR1 for a deliberate reload; do not count as a crash."""
+    crash_recovery.mark_planned_restart()
+    try:
+        proc.send_signal(signal.SIGUSR1)
+        return True
+    except (AttributeError, OSError) as exc:
+        print(
+            f"[watch] SIGUSR1 unavailable ({exc}); "
+            "restarting server.py",
+            flush=True,
+        )
+        return False
+
+
+def _maybe_watcher_request(proc):
+    """Head-GM recovery queue: restart and/or code revert, then respawn."""
+    req = watcher_request.take_pending()
+    if not req:
+        return proc, None, False
+    op = req.get("op")
+    by = (req.get("by") or "staff").strip() or "staff"
+    if op == "restart_game":
+        if req.get("backup"):
+            try:
+                world_backup.run_backup(force=True, triggered_by=by)
+            except Exception as exc:
+                print(
+                    f"[watch] backup before restart failed: {exc!r}",
+                    flush=True,
+                )
+        crash_recovery.mark_planned_restart()
+        if proc is not None and proc.poll() is None:
+            print(
+                f"[watch] watcher_request restart_game by {by!r} "
+                f"(backup={bool(req.get('backup'))}) -- stopping game child",
+                flush=True,
+            )
+            _stop_game(proc)
+        new_proc, wall = _spawn_game()
+        return new_proc, wall, True
+    if op == "revert_stable":
+        ok, detail = crash_recovery.revert_to_last_stable(
+            reason=f"gm recover revert by {by}",
+        )
+        if not ok:
+            print(
+                f"[watch] revert_stable failed ({detail!r}) "
+                f"requested by {by!r}",
+                flush=True,
+            )
+            return proc, None, False
+        print(
+            f"[watch] revert_stable to {detail[:12]} by {by!r} "
+            "-- respawning game child",
+            flush=True,
+        )
+        crash_recovery.mark_planned_restart()
+        if proc is not None and proc.poll() is None:
+            _stop_game(proc)
+        new_proc, wall = _spawn_game()
+        return new_proc, wall, True
+    if op == "clear_revert_hold":
+        crash_recovery.resume_after_crash_hold(root=_repo_root())
+        print(
+            f"[watch] clear_revert_hold by {by!r} — "
+            "auto-deploy catch-up queued",
+            flush=True,
+        )
+        if proc is not None and proc.poll() is None:
+            return proc, None, True
+        crash_recovery.mark_planned_restart()
+        new_proc, wall = _spawn_game()
+        return new_proc, wall, True
+    if op == "restore_db":
+        date = (req.get("date") or "").strip() or None
+        if proc is not None and proc.poll() is None:
+            print(
+                f"[watch] restore_db {date or 'latest'} by {by!r} "
+                "-- stopping game child",
+                flush=True,
+            )
+            _stop_game(proc)
+        ok, detail = world_backup.restore_live_db(
+            date,
+            root=_repo_root(),
+            triggered_by=by,
+        )
+        if not ok:
+            print(
+                f"[watch] restore_db failed ({detail!r}) "
+                f"requested by {by!r}",
+                flush=True,
+            )
+            return proc, None, False
+        crash_recovery.clear_db_hold(root=_repo_root())
+        state = crash_recovery.load_state(root=_repo_root())
+        state["recent_exits"] = []
+        state["last_db_restore"] = {
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "detail": detail,
+            "by": by,
+            "date": date or "(latest)",
+        }
+        crash_recovery.save_state(state, root=_repo_root())
+        print(
+            f"[watch] restore_db OK ({detail}) by {by!r} "
+            "-- respawning game child",
+            flush=True,
+        )
+        crash_recovery.mark_planned_restart()
+        new_proc, wall = _spawn_game()
+        return new_proc, wall, True
+    return proc, None, False
+
+
 def main():
     root = _repo_root()
     os.chdir(root)
@@ -386,6 +591,8 @@ def main():
     before = _snapshot()
     pending_copyover = False
     copyover_boot_grace = _copyover_boot_grace_seconds()
+    spawn_failures = 0
+    backup_running = False
 
     # First load (and later deploy polls reload) so auto_deploy patches that
     # arrive via reset --hard actually run inside this long-lived watcher.
@@ -415,6 +622,66 @@ def main():
 
     while True:
         time.sleep(POLL_SECONDS)
+
+        proc, new_wall, restarted = _maybe_watcher_request(proc)
+        if restarted:
+            game_spawn_wall = new_wall
+            before = _snapshot()
+            pending_copyover = False
+            continue
+
+        stable = boot_stability.load_stable()
+        if stable:
+            try:
+                stable_mtime = os.path.getmtime(boot_stability.stable_path())
+            except OSError:
+                stable_mtime = 0
+            if stable_mtime >= (game_spawn_wall - 1.0):
+                spawn_failures = 0
+                crash_recovery.clear_gateway_outage()
+
+        if crash_recovery.gateway_outage_tripped():
+            print(
+                "[watch] gateway outage past crash window -- "
+                "evaluating auto-revert",
+                flush=True,
+            )
+            # Hold already on (prior failed/skipped revert): clear the
+            # stale outage flag and do NOT kill the game again. Hang-check
+            # / exit paths still respawn a dead child.
+            if crash_recovery.hold_active(root=root):
+                print(
+                    "[watch] revert hold active -- clearing stale "
+                    "gateway outage (not stopping game)",
+                    flush=True,
+                )
+                crash_recovery.clear_gateway_outage()
+                continue
+            # Attempt tree revert FIRST. Only stop+respawn when the reset
+            # succeeds — otherwise a git failure used to leave the game
+            # dead (or kill PID 1) while ``.gateway_outage.json`` survived
+            # and re-tripped every restart.
+            reverted = _maybe_auto_revert(reason_prefix="gateway: ")
+            if reverted:
+                if proc.poll() is None:
+                    _stop_game(proc)
+                proc, game_spawn_wall = _spawn_game()
+                before = _snapshot()
+                pending_copyover = False
+                continue
+            # Failed/skipped: hold + outage clear already done inside
+            # revert path. Leave a live game child alone; a dead one is
+            # handled by the normal poll()/hang-check branches below.
+            continue
+
+        if not backup_running and world_backup.backup_due():
+            backup_running = True
+            try:
+                world_backup.run_backup(triggered_by="scheduler")
+            except Exception as exc:
+                print(f"[watch] backup error (will retry): {exc}", flush=True)
+            finally:
+                backup_running = False
 
         # Reap git zombies (and any other orphaned children) before we
         # look at the server child -- keeps the PID cgroup from filling up.
@@ -448,7 +715,13 @@ def main():
                     "-- restarting (no copyover possible for a crash)",
                     flush=True,
                 )
-            proc, game_spawn_wall = _spawn_game()
+            _after_game_exit(proc, root=root)
+            if crash_recovery.db_hold_active(root=root):
+                continue
+            spawn_failures += 1
+            proc, game_spawn_wall = _respawn_game(
+                proc, game_spawn_wall, spawn_failures=spawn_failures,
+            )
             before = _snapshot()
             pending_copyover = False
             continue
@@ -472,7 +745,13 @@ def main():
                     flush=True,
                 )
             _stop_game(proc)
-            proc, game_spawn_wall = _spawn_game()
+            _after_game_exit(proc, hang_kill=True, root=root)
+            if crash_recovery.db_hold_active(root=root):
+                continue
+            spawn_failures += 1
+            proc, game_spawn_wall = _respawn_game(
+                proc, game_spawn_wall, spawn_failures=spawn_failures,
+            )
             before = _snapshot()
             pending_copyover = False
             continue
@@ -480,32 +759,39 @@ def main():
         # Boot heal / auto-deploy catalog merges can touch watched JSON while
         # the child is still importing -- defer one copyover instead of
         # SIGUSR1-stacking during startup (exit -10 storms mid-chargen).
-        if (
-            pending_copyover
-            and proc.poll() is None
-            and (time.time() - game_spawn_wall) >= copyover_boot_grace
-        ):
-            print(
-                "[watch] deferred copyover -- signaling game "
-                "(boot grace elapsed; gateway holds clients)",
-                flush=True,
-            )
-            try:
-                proc.send_signal(signal.SIGUSR1)
-            except (AttributeError, OSError) as exc:
+        if pending_copyover and proc.poll() is None:
+            if crash_recovery.hold_active(root=root):
                 print(
-                    f"[watch] deferred SIGUSR1 unavailable ({exc}); "
-                    "restarting server.py",
+                    "[watch] revert hold active -- clearing deferred copyover",
                     flush=True,
                 )
-                _stop_game(proc)
-                proc, game_spawn_wall = _spawn_game()
-            pending_copyover = False
-            before = _snapshot()
-            continue
+                pending_copyover = False
+                before = _snapshot()
+                continue
+            if (time.time() - game_spawn_wall) >= copyover_boot_grace:
+                print(
+                    "[watch] deferred copyover -- signaling game "
+                    "(boot grace elapsed; gateway holds clients)",
+                    flush=True,
+                )
+                if not _signal_planned_copyover(proc):
+                    _stop_game(proc)
+                    proc, game_spawn_wall = _spawn_game()
+                pending_copyover = False
+                before = _snapshot()
+                continue
 
         after = _snapshot()
         if after != before:
+            if crash_recovery.hold_active(root=root):
+                print(
+                    "[watch] revert hold active -- skipping copyover "
+                    "on file change",
+                    flush=True,
+                )
+                pending_copyover = False
+                before = after
+                continue
             if _watcher_self_changed(before, after):
                 _reexec_watcher(proc, gateway_proc)
             # Gateway process modules do not hot-reload -- restart holder
@@ -554,15 +840,7 @@ def main():
                     "hot-reloading (copyover)",
                     flush=True,
                 )
-            try:
-                proc.send_signal(signal.SIGUSR1)
-            except (AttributeError, OSError) as exc:
-                # Windows / odd signal set: fall back to full restart.
-                print(
-                    f"[watch] SIGUSR1 unavailable ({exc}); "
-                    "restarting server.py",
-                    flush=True,
-                )
+            if not _signal_planned_copyover(proc):
                 _stop_game(proc)
                 proc, game_spawn_wall = _spawn_game()
             pending_copyover = False

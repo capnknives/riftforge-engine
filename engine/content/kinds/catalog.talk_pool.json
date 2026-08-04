@@ -1,0 +1,17 @@
+{
+  "id": "catalog.talk_pool",
+  "label": "Townsperson talk line pool",
+  "writes_to": "supers/content/talk.json lines{}",
+  "fields": {
+    "id": {
+      "type": "string",
+      "required": true,
+      "doc": "Pool id (dict key in talk.json lines; idle is required)."
+    },
+    "templates": {
+      "type": "list",
+      "required": true,
+      "doc": "Non-empty list of template strings ({name}, {player}, …)."
+    }
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "id": "room.engine",
+  "label": "Engine room stamps (abstract parent)",
+  "abstract": true,
+  "extends": "room.common",
+  "fields": {
+    "gravity": {
+      "type": "float",
+      "required": false,
+      "doc": "Gravity multiplier (default 1.0).",
+      "default": 1.0
+    },
+    "wilderness": {
+      "type": "bool",
+      "required": false,
+      "doc": "Wilderness encounter tick eligibility."
+    },
+    "bestiary_categories": {
+      "type": "list",
+      "required": false,
+      "doc": "Bestiary spawn category tags."
+    },
+    "resource_capacity": {
+      "type": "object",
+      "required": false,
+      "doc": "Per-resource meter cap map (need -> max)."
+    },
+    "dungeon": {
+      "type": "bool",
+      "required": false,
+      "doc": "Dungeon encounter stamp (inherits from map when omitted)."
+    },
+    "no_random_spawn": {
+      "type": "bool",
+      "required": false,
+      "doc": "Suppress random wilderness spawns."
+    },
+    "no_combat": {
+      "type": "bool",
+      "required": false,
+      "doc": "Combat disabled in this room."
+    },
+    "dark": {
+      "type": "bool",
+      "required": false,
+      "doc": "Dark room (needs light). Sewers default dark."
+    }
+  }
+}

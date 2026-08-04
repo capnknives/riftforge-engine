@@ -22,7 +22,7 @@ def is_account_login_keyword(raw):
     return (raw or "").strip().lower() == ACCOUNT_LOGIN_KEYWORD
 
 
-async def login_via_account(session):
+async def login_via_account(session, known_account=None):
     """Account name → password → character/cast pick. Return Character or None.
 
     ``None`` means disconnect mid-flow or the player backed out to the
@@ -32,28 +32,51 @@ async def login_via_account(session):
 
     Staff accounts (``gm`` / ``head_gm``) also list immersion cast as a
     secondary roster after owned characters.
+
+    ``known_account`` (soft logout): skip the account-name prompt and use
+    this account name; password is still required before the pick list.
     """
     game = session.game
-    session.send(
-        "Account name (or blank to return to character login):"
-    )
-    raw = await session.read_line()
-    if raw is None:
-        return None
-    raw = (raw or "").strip()
-    if not raw:
-        session.send("By what name are you known?")
-        return False  # sentinel: back out (not disconnect)
-    cleaned, err = accounts_mod.normalize_account_name(raw)
-    if err:
-        session.send(err)
-        session.send("By what name are you known?")
-        return False
-    account = accounts_mod.find_account(game, cleaned)
-    if account is None:
-        session.send("No such account. By what name are you known?")
-        return False
-    session.send("Account password:")
+    if known_account:
+        cleaned, err = accounts_mod.normalize_account_name(known_account)
+        if err:
+            session.send(err)
+            session.send("By what name are you known?")
+            return False
+        account = accounts_mod.find_account(game, cleaned)
+        if account is None:
+            session.send("No such account. By what name are you known?")
+            return False
+        session.send(
+            f"Account {account.name} -- enter password to pick a character:"
+        )
+    else:
+        session.send(
+            "Account name (or blank to return to character login):"
+        )
+        raw = await session.read_line()
+        if raw is None:
+            return None
+        raw = (raw or "").strip()
+        if not raw:
+            session.send("By what name are you known?")
+            return False  # sentinel: back out (not disconnect)
+        cleaned, err = accounts_mod.normalize_account_name(raw)
+        if err:
+            session.send(err)
+            session.send("By what name are you known?")
+            return False
+        account = accounts_mod.find_account(game, cleaned)
+        if account is None:
+            session.send(
+                "No such account. New here? Back out and type a character "
+                "name instead -- you'll be offered an account once that "
+                "character exists. Otherwise, check the spelling and try "
+                "'account' again."
+            )
+            session.send("By what name are you known?")
+            return False
+        session.send("Account password:")
     password = await session.read_line()
     if password is None:
         return None
@@ -118,21 +141,37 @@ async def login_via_account(session):
     return tagged[idx - 1][1]
 
 
-async def offer_account_link(session, character):
-    """After attach: offer create / link / skip when unlinked (feature B).
+def character_needs_account_link_offer(character):
+    """True when login should pause for create/link/skip before entering play.
 
-    No-op for NPCs, husks, gm spirits, or already-linked characters.
+    Immersion cast bodies are excluded -- they are for world immersion and
+    GM control, not player account rosters.
+    """
+    if character is None:
+        return False
+    if getattr(character, "is_npc", False):
+        return False
+    key_low = (getattr(character, "key", None) or "").lower()
+    if key_low.startswith("husk:") or key_low.startswith("gmspirit:"):
+        return False
+    if getattr(character, "immersion", False):
+        return False
+    if (getattr(character, "account", None) or "").strip():
+        return False
+    return True
+
+
+async def offer_account_link(session, character):
+    """Offer create / link / skip when unlinked (feature B).
+
+    Call **before** Session attach / welcome / room broadcasts so the player
+    finishes account setup while still at the login prompt.
+
+    No-op for NPCs, husks, gm spirits, immersion cast, or linked characters.
     Returns False on disconnect mid-offer (caller should abort play);
     True otherwise (including skip).
     """
-    if character is None:
-        return True
-    if getattr(character, "is_npc", False):
-        return True
-    key_low = (getattr(character, "key", None) or "").lower()
-    if key_low.startswith("husk:") or key_low.startswith("gmspirit:"):
-        return True
-    if (getattr(character, "account", None) or "").strip():
+    if not character_needs_account_link_offer(character):
         return True
 
     game = session.game

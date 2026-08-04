@@ -129,6 +129,24 @@ async def _notify_gateway_planned_restart(game):
         )
 
 
+def reload_world_save_modules():
+    """Reload persistence + blob codec from disk before a copyover snapshot.
+
+    Auto-deploy overlays land on the bind-mount while this process still
+    holds older bytecode -- without a reload, ``game.save()`` would skip
+    God twins and omit new blob fields (bug report 152).
+    """
+    import importlib
+
+    from engine import hooks
+    from engine import persistence as ep
+
+    ep = importlib.reload(ep)
+    from engine import hooks
+    hooks.reload_blob_codec()
+    return ep
+
+
 async def _perform(game):
     """Announce, save, then hot-reload.
 
@@ -141,13 +159,17 @@ async def _perform(game):
     """
     print("[copyover] reload requested -- freezing connections briefly", flush=True)
 
+    from engine import crash_recovery
+    crash_recovery.mark_planned_restart()
+
     from engine.gateway_client import gateway_enabled
 
     await _announce_before(game)
 
     # Persist the world NOW -- the new process's Game.__init__ reloads from
     # disk, so whatever isn't saved here is lost, same as any other restart.
-    game.save()
+    reload_world_save_modules()
+    game.save(copyover=True)
 
     if gateway_enabled():
         # Watcher holds :4000; exiting is the reload. Players already got

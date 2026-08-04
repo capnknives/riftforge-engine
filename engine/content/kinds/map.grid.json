@@ -1,0 +1,96 @@
+{
+  "id": "map.grid",
+  "label": "Overland procedural grid block (abstract)",
+  "abstract": true,
+  "fields": {
+    "key_prefix": {
+      "type": "string",
+      "required": true,
+      "doc": "Room key prefix for generated cells."
+    },
+    "width": {
+      "type": "int",
+      "required": true,
+      "doc": "Grid width in cells."
+    },
+    "height": {
+      "type": "int",
+      "required": true,
+      "doc": "Grid height in cells."
+    },
+    "default_description": {
+      "type": "string",
+      "required": true,
+      "doc": "Cell description template with {x}/{y}."
+    },
+    "wrap": {
+      "type": "bool",
+      "required": false,
+      "doc": "Torus edges when true."
+    },
+    "glyph_set": {
+      "type": "enum",
+      "required": false,
+      "doc": "Minimap glyph family.",
+      "values": [
+        "atlas"
+      ]
+    },
+    "virtual_overland": {
+      "type": "bool",
+      "required": false,
+      "doc": "Dual-layer macro overland (vehicles)."
+    },
+    "gravity": {
+      "type": "float",
+      "required": false,
+      "doc": "Default cell gravity multiplier."
+    },
+    "wilderness": {
+      "type": "bool",
+      "required": false,
+      "doc": "Default wilderness flag for generated cells."
+    },
+    "outdoor": {
+      "type": "bool",
+      "required": false,
+      "doc": "Default outdoor flag for generated cells."
+    },
+    "area_type": {
+      "type": "enum",
+      "required": false,
+      "doc": "Default area_type for cells.",
+      "values": [
+        "ruins",
+        "city",
+        "city_street",
+        "mountains",
+        "ocean",
+        "lake",
+        "forest",
+        "plains",
+        "furnace"
+      ]
+    },
+    "bestiary_categories": {
+      "type": "list",
+      "required": false,
+      "doc": "Default spawn categories for cells."
+    },
+    "zone": {
+      "type": "string",
+      "required": false,
+      "doc": "Default Cadence zone id for cells."
+    },
+    "cell_overrides": {
+      "type": "object",
+      "required": false,
+      "doc": "Per-cell override map keyed by x,y."
+    },
+    "portals": {
+      "type": "list",
+      "required": false,
+      "doc": "Legacy grid portal pairs (prefer pockets[] on overland maps)."
+    }
+  }
+}

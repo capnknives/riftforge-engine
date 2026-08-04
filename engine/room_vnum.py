@@ -37,6 +37,26 @@ def is_hand_room(room) -> bool:
     return getattr(room, "grid_prefix", None) is None
 
 
+def hand_room_wants_vnum(room) -> bool:
+    """True when a hand room should receive a persistent VNUM identity.
+
+    Ephemeral procedural pockets (Pit floors, God demesne grids, etc.)
+    stay key-only until they are torn down -- stamping them would leak
+    mapper ids and collapse parallel instances that share a template
+    title (see ``heal_duplicate_hand_room_titles``).
+    """
+    if not is_hand_room(room):
+        return False
+    if getattr(room, "purgatory_pit", False):
+        return False
+    if getattr(room, "pit_run_tag", None):
+        return False
+    # God demesne micro/hub rooms: per-owner procedural pocket (pit parallel).
+    if getattr(room, "demesne_id", None):
+        return False
+    return True
+
+
 def bare_key_name(key: str) -> str:
     """Strip ``map_id:`` qualify and trailing `` #N`` collision suffixes.
 
@@ -182,6 +202,161 @@ def allocate_vnum_for_name(key: str, title=None, *, taken: set[str]) -> str:
     name = display_name_for_vnum(key, title)
     prefix = letter_prefix(name)
     return next_vnum(prefix, taken)
+
+
+def stamp_hand_room(game, room, *, taken: set[str] | None = None) -> str:
+    """Allocate a VNUM when missing and register the room under it.
+
+    Mutates ``room.key``, ``room.vnum``, ``room.legacy_key`` (when the
+    pre-stamp key differed), ``game.rooms``, and ``game.room_aliases``.
+    Idempotent when the room is already keyed by its VNUM. Grid cells and
+    ephemeral Pit rooms are left unchanged.
+
+    Returns the canonical identity string (VNUM for stamped hand rooms,
+    else ``room.key``).
+    """
+    if room is None or not hand_room_wants_vnum(room):
+        return getattr(room, "key", "") or ""
+
+    rooms = getattr(game, "rooms", None) if game is not None else None
+    aliases = getattr(game, "room_aliases", None) if game is not None else None
+    if game is not None and aliases is None:
+        game.room_aliases = {}
+        aliases = game.room_aliases
+
+    old_key = (getattr(room, "key", "") or "").strip()
+    raw = getattr(room, "vnum", None)
+    if raw is not None and str(raw).strip():
+        try:
+            vnum = validate_vnum(raw)
+        except ValueError:
+            if taken is None:
+                taken = collect_taken_vnums(
+                    rooms.values() if isinstance(rooms, dict) else ()
+                )
+            vnum = allocate_vnum_for_name(
+                old_key, getattr(room, "title", None), taken=taken,
+            )
+    else:
+        if taken is None:
+            taken = collect_taken_vnums(
+                rooms.values() if isinstance(rooms, dict) else ()
+            )
+        vnum = allocate_vnum_for_name(
+            old_key, getattr(room, "title", None), taken=taken,
+        )
+    room.vnum = vnum
+    if taken is not None:
+        taken.add(vnum)
+
+    ensure_title_before_rekey(room)
+    leg = getattr(room, "legacy_key", None)
+    if not leg and old_key and old_key != vnum:
+        room.legacy_key = old_key
+        leg = old_key
+
+    room.key = vnum
+    if isinstance(rooms, dict):
+        existing = rooms.get(vnum)
+        if existing is not None and existing is not room:
+            # Persistence may register a map_missing_stub under this VNUM
+            # when characters load before runtime vehicle interiors exist.
+            if getattr(existing, "map_missing_stub", False):
+                for who in list(existing.characters()):
+                    try:
+                        who.move_to(room)
+                    except Exception:
+                        who.location = room
+                for dk, dr in list(rooms.items()):
+                    if dr is existing:
+                        rooms.pop(dk, None)
+        for dk, dr in list(rooms.items()):
+            if dr is room and dk != vnum:
+                rooms.pop(dk, None)
+        rooms[vnum] = room
+        if isinstance(aliases, dict):
+            for alias in (leg, old_key):
+                if alias and str(alias).strip() and alias != vnum:
+                    aliases[str(alias).strip()] = vnum
+    return vnum
+
+
+def _remap_identity_token(text, aliases):
+    """Map a stored room-key string through ``room_aliases``."""
+    if not text or not aliases:
+        return text, False
+    key = str(text).strip()
+    if not key:
+        return text, False
+    mapped = aliases.get(key)
+    if mapped and mapped != key:
+        return mapped, True
+    return text, False
+
+
+def heal_hand_room_string_refs(game) -> int:
+    """Remap ``main_homeroom`` / homestead plot keys via ``room_aliases``.
+
+    Idempotent. Returns how many fields were rewritten.
+    """
+    if game is None:
+        return 0
+    aliases = getattr(game, "room_aliases", None) or {}
+    if not aliases:
+        return 0
+    changed = 0
+    for room in (getattr(game, "rooms", None) or {}).values():
+        if room is None:
+            continue
+        raw = getattr(room, "main_homeroom", None)
+        new, ch = _remap_identity_token(raw, aliases)
+        if ch:
+            room.main_homeroom = new
+            changed += 1
+    plots = getattr(game, "homestead_plots", None) or {}
+    for plot in plots.values():
+        if not isinstance(plot, dict):
+            continue
+        for field in ("hub_room_key", "cell_room_key"):
+            new, ch = _remap_identity_token(plot.get(field), aliases)
+            if ch:
+                plot[field] = new
+                changed += 1
+        meta = plot.get("meta")
+        if not isinstance(meta, dict):
+            continue
+        for field in ("yard_shop_room_key", "garage_pad_room_key"):
+            new, ch = _remap_identity_token(meta.get(field), aliases)
+            if ch:
+                meta[field] = new
+                changed += 1
+    return changed
+
+
+def heal_unstamped_hand_rooms(game) -> dict:
+    """Boot heal: stamp VNUMs on every persistent hand room and rekey.
+
+    Returns ``{"stamped": n, "rekeyed": m, "string_refs": k}``.
+    """
+    stats = {"stamped": 0, "rekeyed": 0, "string_refs": 0}
+    if game is None:
+        return stats
+    rooms = getattr(game, "rooms", None) or {}
+    taken = collect_taken_vnums(rooms.values())
+    for room in list(rooms.values()):
+        if room is None or not hand_room_wants_vnum(room):
+            continue
+        had_vnum = bool(
+            getattr(room, "vnum", None) and str(room.vnum).strip()
+        )
+        old_key = getattr(room, "key", "") or ""
+        stamp_hand_room(game, room, taken=taken)
+        if not had_vnum:
+            stats["stamped"] += 1
+        if old_key != getattr(room, "key", ""):
+            stats["rekeyed"] += 1
+    stats["string_refs"] = heal_hand_room_string_refs(game)
+    return stats
 
 
 def room_name(room) -> str:
@@ -448,6 +623,32 @@ def lookup_room(game, key):
     return None
 
 
+def room_keys_match(game, left, right) -> bool:
+    """True when two room key strings denote the same live Room.
+
+    After Phase-3 VNUM rekey, ``room.key`` is ``BS00002`` while authored
+    quests/tutorials still name ``Bunker Library Stacks`` (``legacy_key`` /
+    ``room_aliases``). Compare identity, not raw strings.
+    """
+    if left is None or right is None:
+        return False
+    left_s = str(left).strip()
+    right_s = str(right).strip()
+    if not left_s or not right_s:
+        return False
+    if left_s == right_s:
+        return True
+    if game is None:
+        return False
+    left_room = lookup_room(game, left_s)
+    right_room = lookup_room(game, right_s)
+    return (
+        left_room is not None
+        and right_room is not None
+        and left_room is right_room
+    )
+
+
 def _hand_room_canonical_score(room) -> int:
     """Higher = prefer as the surviving hub when ROOM NAME collides."""
     if room is None or not is_hand_room(room):
@@ -504,6 +705,9 @@ def heal_duplicate_hand_room_titles(game) -> dict:
     by_name = {}
     for room in rooms.values():
         if room is None or not is_hand_room(room):
+            continue
+        # Never collapse parallel God demesne instances (pit uses purgatory_pit).
+        if getattr(room, "demesne_id", None):
             continue
         name = (room_name(room) or "").strip().lower()
         if not name:

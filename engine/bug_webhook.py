@@ -10,8 +10,11 @@ Why this module exists (and why it is NOT inside reports.py):
   call schedule_open_bugs() / schedule_bug_report(). That way a public playtest
   can leave the URL configured without every stranger's `bug` firing Cursor.
 
-Only *bugs* fire this webhook -- suggestions stay local (the Cursor fixer
-automation is for reproducible game bugs, not feature ideas).
+Only *bugs* fire this webhook (kind=bug). Player ideas use a **separate**
+automation via ``engine/suggestion_webhook.py`` (GM ``sendsuggest`` /
+``squashsuggest``). Lag dumps use ``engine/diag_export.py``
+(``gm diaglog analyze``). Catalog: ``engine/cursor_automations.py`` and
+``.cursor/automations/``.
 
 Networking here is deliberate and narrow: one HTTPS POST via the standard
 library (urllib). No third-party HTTP client. The game is single-threaded
@@ -175,12 +178,17 @@ def _log_task_exception(task):
         print(f"[bug_webhook] background task crashed: {exc}", flush=True)
 
 
-def schedule_open_bugs(directory, *, bug_ids=None):
+def schedule_open_bugs(directory, *, bug_ids=None, game=None):
     """Re-POST open bugs from bug_reports.log to the fixer webhook.
 
     bug_ids=None sends every open entry; otherwise only the listed ids that
-    are still open. Returns (scheduled_count, matched_count).
+    are still open. When ``game`` is passed (GM squashbug path), each payload
+    is enriched with a fresh context snapshot when the reporter is still in
+    the world roster. Returns ``(scheduled_count, matched_count,
+    scheduled_ids)`` where ``scheduled_ids`` is the list of bug ids that
+    actually queued.
     """
+    from engine import bug_report_payload
     from engine import reports
 
     open_bugs = [
@@ -192,10 +200,29 @@ def schedule_open_bugs(directory, *, bug_ids=None):
         open_bugs = [entry for entry in open_bugs if entry.get("id") in wanted]
 
     scheduled = 0
+    scheduled_ids = []
     for entry in open_bugs:
-        if schedule_bug_report(entry):
+        body = bug_report_payload.enrich_bug_payload(entry, game)
+        if schedule_bug_report(body):
             scheduled += 1
-    return scheduled, len(open_bugs)
+            # Remember this id so Kokid can wiznet when the fixer PR opens.
+            try:
+                from engine import kokid_notify
+
+                bid = entry.get("id")
+                if bid is not None:
+                    bid = int(bid)
+                    scheduled_ids.append(bid)
+                    kokid_notify.watch_bug_ids([bid])
+            except Exception as exc:
+                print(f"[bug_webhook] kokid watch skipped: {exc}", flush=True)
+                bid = entry.get("id")
+                if bid is not None:
+                    try:
+                        scheduled_ids.append(int(bid))
+                    except (TypeError, ValueError):
+                        pass
+    return scheduled, len(open_bugs), scheduled_ids
 
 
 def schedule_bug_report(record_payload, *, url=None):

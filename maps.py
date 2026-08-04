@@ -40,6 +40,7 @@ docs/CONTENT_AUTHORING.md, help build-maps, map editor Pockets panel.
 
 import glob
 import json
+import math
 import os
 import re
 
@@ -107,6 +108,7 @@ def get_zones_dir():
 AREA_TYPES = {
     "ruins": [],
     "city": [],
+    "city_street": [],
     "mountains": [],
     "ocean": [],
     "lake": [],
@@ -116,6 +118,51 @@ AREA_TYPES = {
     # not wild-by-default (see WILD_AREA_TYPES); no random wilderness rolls.
     "furnace": [],
 }
+
+# Geometry / setting tags for combat environment gating (room_environment_hooks.md).
+# "outdoor"/"indoor" are derived from Room.outdoor at brief-build time --
+# do not author them in JSON.
+KNOWN_ENV_TAGS = frozenset({
+    "wall_nearby", "low_ceiling", "open_sky", "clutter", "covered",
+    "hard_surface", "soft_ground", "mud", "water_edge", "narrow",
+    "uneven_footing",
+    # Named slam-target prop classes (slam_targets[].tags).
+    "wall", "furniture", "vehicle", "fixture", "hazard",
+})
+
+# Construction / surface materials -- drives prose gating and future
+# MATERIAL_STRENGTH lookups for grapple/throw math (not used this wave).
+KNOWN_MATERIAL_TAGS = frozenset({
+    "wood", "drywall", "brick", "concrete", "stone", "glass", "steel",
+    "asphalt", "dirt", "warded",
+})
+
+# Three-tier strength per material (future grapple/throw; stamped on brief
+# via supers.environment.material_strengths for mechanics readers).
+MATERIAL_STRENGTH = {
+    "wood": "soft", "drywall": "soft", "dirt": "soft",
+    "brick": "hard", "stone": "hard", "asphalt": "hard",
+    "concrete": "reinforced", "steel": "reinforced", "warded": "reinforced",
+    "glass": "soft",
+}
+
+# HP band per MATERIAL_STRENGTH tier for a breachable slam_targets entry
+# (wall_floor_breach_mechanic.md Phase B). Wires up MATERIAL_STRENGTH,
+# previously stamped on the brief but read by nothing. Tunable; not a
+# player-visible number today (combat prose describes wear, not a bar).
+MATERIAL_STRENGTH_HP = {"soft": 40, "hard": 90, "reinforced": 160}
+
+# Which layout axis a slam_targets entry breaches into when it reaches 0
+# HP (wall_floor_breach_mechanic.md Phase B) -- the 8 compass values move
+# x/y at the room's own layout.z; up/down move z at the same x/y, same
+# convention as dig_room / retrofit_zone_layout.py's LAYER_UP/LAYER_DOWN.
+# Omitted direction = ground-slam only, never breachable (Phase A's
+# cosmetic-only fallback stays the permanent behavior for those props).
+KNOWN_SLAM_DIRECTIONS = frozenset({
+    "north", "south", "east", "west",
+    "northeast", "northwest", "southeast", "southwest",
+    "up", "down",
+})
 
 # Legacy map JSON may still say area_type "wilderness" from before bug #26
 # retired it as a terrain tag. Remap at load so old content keeps working
@@ -149,8 +196,10 @@ KNOWN_RESOURCE_TAGS = frozenset({
     # Home shower / wash for the hygiene Cadence need.
     "hygiene",
     # Easy-fit town services (D63/D64/D68): player rumor board, post mail,
-    # and scrip bank counters -- same resource-tag shape as vendor/work.
+    # and dollar bank counters -- same resource-tag shape as vendor/work.
     "bank", "mail", "rumor_board",
+    # Tailor bench for sew / Tailoring (Hattie's Threads, clothing_craft.py).
+    "tailor",
     # Leisure venue flavors (personality prefs; still need entertainment/social
     # on the room for ambient sate). library also marks hunter research dens.
     "bar", "arcade", "theater", "library", "park", "plaza", "nightlife",
@@ -194,6 +243,187 @@ REALM_FOR_PLANE = {
 
 # Pocket kinds for map JSON pockets[] metadata (authors/tools).
 POCKET_KINDS = frozenset({"settlement", "dungeon", "landmark"})
+
+# Multi-tile city "paint" for America pockets (docs/plans/
+# zone_layout_retrofit.md Phase 2). Off by default -- a pocket's own
+# "at" cell, hub wiring, and enter/exit are unaffected either way; this
+# only gates whether EXTRA macro cells get city terrain/glyph/desc.
+#
+# When ON and a pocket has no manual ``span`` override (or span is
+# [1,1]), paint is derived from the linked zone file's room ``layout``
+# coords relative to ``hub_room``, using ``CITY_PAINT_LAYOUT_UNITS``
+# in-town layout blocks per macro cell (default 20; wilderness micro
+# stays MICRO_SIZE=10). Manual ``span``: [w,h] still wins -- corner
+# +x/+y box from ``at`` for staff fixes.
+#
+# Flipped by ``gm citypaint on|off|status``; layout-units dial via
+# ``gm citypaint units <n>``; persisted via supers/persist_meta.py.
+# Does not retroactively repaint already-loaded rooms -- a map reload
+# (e.g. ``gm maps restore earth_america``) is required.
+CITY_PAINT_ENABLED = False
+CITY_PAINT_LAYOUT_UNITS_DEFAULT = 20
+CITY_PAINT_LAYOUT_UNITS_MIN = 1
+CITY_PAINT_LAYOUT_UNITS_MAX = 200
+CITY_PAINT_LAYOUT_UNITS = CITY_PAINT_LAYOUT_UNITS_DEFAULT
+
+# hub_room key (or legacy_key) -> zone JSON doc; rebuilt from
+# content/zones/*.json on load (see refresh_zone_hub_index).
+LAST_ZONE_DOC_BY_HUB_KEY = {}
+
+
+def set_city_paint_enabled(value):
+    """Flip the Phase 2 city-paint gate. See CITY_PAINT_ENABLED above."""
+    global CITY_PAINT_ENABLED
+    CITY_PAINT_ENABLED = bool(value)
+
+
+def set_city_paint_layout_units(value):
+    """Set in-town layout blocks per macro paint cell (gm citypaint units)."""
+    global CITY_PAINT_LAYOUT_UNITS
+    n = int(value)
+    if not (CITY_PAINT_LAYOUT_UNITS_MIN <= n <= CITY_PAINT_LAYOUT_UNITS_MAX):
+        raise ValueError(
+            f"city paint layout_units must be "
+            f"{CITY_PAINT_LAYOUT_UNITS_MIN}.."
+            f"{CITY_PAINT_LAYOUT_UNITS_MAX}"
+        )
+    CITY_PAINT_LAYOUT_UNITS = n
+
+
+def city_paint_meta_snapshot():
+    """Persisted city-paint blob for meta save/load."""
+    return {
+        "enabled": bool(CITY_PAINT_ENABLED),
+        "layout_units": int(CITY_PAINT_LAYOUT_UNITS),
+    }
+
+
+def apply_city_paint_meta(blob):
+    """Restore city-paint gate + layout-units dial from meta JSON."""
+    if not isinstance(blob, dict):
+        return
+    if "enabled" in blob:
+        set_city_paint_enabled(blob["enabled"])
+    units = blob.get("layout_units")
+    if units is not None:
+        set_city_paint_layout_units(units)
+
+
+def refresh_zone_hub_index():
+    """Rebuild hub_room -> zone JSON from content/zones/*.json on disk."""
+    global LAST_ZONE_DOC_BY_HUB_KEY
+    index = {}
+    if not os.path.isdir(_ZONES_DIR):
+        LAST_ZONE_DOC_BY_HUB_KEY = index
+        return index
+    for path in sorted(glob.glob(os.path.join(_ZONES_DIR, "*.json"))):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"[maps] zone hub index skipped {path!r}: {exc}")
+            continue
+        _index_zone_doc_rooms(index, data)
+    LAST_ZONE_DOC_BY_HUB_KEY = index
+    return index
+
+
+def _index_zone_doc_rooms(index, zone_doc):
+    """Register every room key/legacy_key in one zone doc into index."""
+    for room in zone_doc.get("rooms") or []:
+        if not isinstance(room, dict):
+            continue
+        key = room.get("key")
+        if key:
+            index[str(key)] = zone_doc
+        legacy = room.get("legacy_key")
+        if legacy:
+            index[str(legacy)] = zone_doc
+
+
+def register_zone_doc_for_hub(hub_key, zone_doc):
+    """Test/smoke helper: point one hub at a zone doc without disk I/O."""
+    global LAST_ZONE_DOC_BY_HUB_KEY
+    LAST_ZONE_DOC_BY_HUB_KEY = dict(LAST_ZONE_DOC_BY_HUB_KEY)
+    _index_zone_doc_rooms(LAST_ZONE_DOC_BY_HUB_KEY, zone_doc)
+    if hub_key:
+        LAST_ZONE_DOC_BY_HUB_KEY[str(hub_key)] = zone_doc
+
+
+def zone_doc_for_pocket(pocket, hub_key):
+    """Resolve zone JSON for auto paint (optional pocket zone_id, else hub)."""
+    zone_id = str(pocket.get("zone_id") or "").strip()
+    if zone_id:
+        if not os.path.isdir(_ZONES_DIR):
+            return None
+        path = os.path.join(_ZONES_DIR, f"{zone_id}.json")
+        if not os.path.isfile(path):
+            path = os.path.join(_ZONES_DIR, zone_id)
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                return None
+    if not LAST_ZONE_DOC_BY_HUB_KEY:
+        refresh_zone_hub_index()
+    return LAST_ZONE_DOC_BY_HUB_KEY.get(str(hub_key))
+
+
+def layout_footprint_macro_rect(zone_doc, hub_key, *, layout_units=None):
+    """Macro paint rectangle from zone layouts relative to hub_room.
+
+    Returns (mx_lo, mx_hi, my_lo, my_hi) inclusive macro offsets from the
+    pocket mouth, or None when the zone/hub/layout data is missing.
+    """
+    units = (
+        int(layout_units)
+        if layout_units is not None
+        else int(CITY_PAINT_LAYOUT_UNITS)
+    )
+    if units < 1:
+        return None
+    hub_lx = hub_ly = None
+    coords = []
+    hub_key = str(hub_key or "")
+    for room in zone_doc.get("rooms") or []:
+        if not isinstance(room, dict):
+            continue
+        layout = room.get("layout")
+        if not isinstance(layout, dict):
+            continue
+        if "x" not in layout or "y" not in layout:
+            continue
+        try:
+            lx, ly = int(layout["x"]), int(layout["y"])
+        except (TypeError, ValueError):
+            continue
+        coords.append((lx, ly))
+        key = str(room.get("key") or "")
+        legacy = str(room.get("legacy_key") or "")
+        if key == hub_key or legacy == hub_key:
+            hub_lx, hub_ly = lx, ly
+    if hub_lx is None or not coords:
+        return None
+    dxs = [lx - hub_lx for lx, ly in coords]
+    dys = [ly - hub_ly for lx, ly in coords]
+    return (
+        math.floor(min(dxs) / units),
+        math.floor(max(dxs) / units),
+        math.floor(min(dys) / units),
+        math.floor(max(dys) / units),
+    )
+
+
+def recommended_rect_span_from_layout(zone_doc, hub_key, *, layout_units=None):
+    """Offline advice: [width, height] macro box matching auto paint."""
+    rect = layout_footprint_macro_rect(
+        zone_doc, hub_key, layout_units=layout_units,
+    )
+    if rect is None:
+        return [1, 1]
+    mx_lo, mx_hi, my_lo, my_hi = rect
+    return [mx_hi - mx_lo + 1, my_hi - my_lo + 1]
 
 # Filled by the most recent load_all_maps() call -- Game may copy this onto
 # game.map_registry. Keys are map file "id" strings.
@@ -695,9 +925,15 @@ MINIMAP_RADIUS = 3
 # max(|dx|, |dy|)). Tunable in one place; pockets opt in with
 # JSON "visible_as". Same-cell (d == 0) is omitted -- the gateway
 # description + Enter line already cover standing on the landmark.
+#
+# Staff (gm_mode) keep the long continental bands for ops / building.
+# Players get short immersion bands so Texas woods do not name LA / NY.
 LANDMARK_NEARBY_MAX = 8
 LANDMARK_DISTANCE_MAX = 20
 LANDMARK_HORIZON_MAX = 35
+PLAYER_LANDMARK_NEARBY_MAX = 2
+PLAYER_LANDMARK_DISTANCE_MAX = 3
+PLAYER_LANDMARK_HORIZON_MAX = 4
 
 # Filled by _link_pockets during load_all_maps; cleared at each reload.
 # Key = grid_prefix (e.g. "The Wastes"); value = list of
@@ -734,29 +970,60 @@ def _bearing_8way(dx, dy):
     return ns + ew
 
 
-def _landmark_band_phrase(distance):
+def _landmark_band_limits(*, gm=False):
+    """Return (nearby_max, distance_max, horizon_max) for look vista.
+
+    ``gm=True`` (staff ``gm_mode``) keeps the long continental bands.
+    Players use the short immersion caps so a Texas homestead does not
+    list every coast city on look.
+    """
+    if gm:
+        return (
+            LANDMARK_NEARBY_MAX,
+            LANDMARK_DISTANCE_MAX,
+            LANDMARK_HORIZON_MAX,
+        )
+    return (
+        PLAYER_LANDMARK_NEARBY_MAX,
+        PLAYER_LANDMARK_DISTANCE_MAX,
+        PLAYER_LANDMARK_HORIZON_MAX,
+    )
+
+
+def _landmark_band_phrase(distance, *, nearby_max=None, distance_max=None,
+                          horizon_max=None):
     """Return the look prefix for a Chebyshev distance, or None if hidden.
 
     Bands (inclusive): nearby 1..NEARBY_MAX, distance NEARBY_MAX+1..DISTANCE_MAX,
     horizon DISTANCE_MAX+1..HORIZON_MAX. Distance 0 and beyond HORIZON_MAX
-    return None (caller omits the line).
+    return None (caller omits the line). Defaults are the staff (long) caps
+    when limits are omitted -- callers should pass player/GM limits.
     """
-    if distance <= 0 or distance > LANDMARK_HORIZON_MAX:
+    if nearby_max is None:
+        nearby_max = LANDMARK_NEARBY_MAX
+    if distance_max is None:
+        distance_max = LANDMARK_DISTANCE_MAX
+    if horizon_max is None:
+        horizon_max = LANDMARK_HORIZON_MAX
+    if distance <= 0 or distance > horizon_max:
         return None
-    if distance <= LANDMARK_NEARBY_MAX:
+    if distance <= nearby_max:
         return "Nearby"
-    if distance <= LANDMARK_DISTANCE_MAX:
+    if distance <= distance_max:
         return "In the distance"
     return "On the horizon"
 
 
-def landmark_vista_lines(room):
+def landmark_vista_lines(room, character=None):
     """Build look extras naming distant landmarks on this overland cell.
 
     Only stamped grid rooms participate (grid_prefix + grid_x/y). Landmarks
     come from pockets that authored visible_as at load time. Returns an
     empty list indoors, off-grid, or when nothing is in range. Lines are
     sorted nearer-first, then by name, so output stays stable.
+
+    ``character`` selects band caps: staff with ``gm_mode`` see the long
+    continental vista; everyone else gets player immersion range.
     """
     prefix = getattr(room, "grid_prefix", None)
     px = getattr(room, "grid_x", None)
@@ -767,6 +1034,9 @@ def landmark_vista_lines(room):
     if not landmarks:
         return []
 
+    gm = bool(character is not None and getattr(character, "gm_mode", False))
+    nearby_max, distance_max, horizon_max = _landmark_band_limits(gm=gm)
+
     scored = []
     for entry in landmarks:
         lx, ly = entry["x"], entry["y"]
@@ -775,7 +1045,12 @@ def landmark_vista_lines(room):
         dy = ly - py
         # Chebyshev: king-move distance on the grid (fits 8-way bearings).
         distance = max(abs(dx), abs(dy))
-        phrase = _landmark_band_phrase(distance)
+        phrase = _landmark_band_phrase(
+            distance,
+            nearby_max=nearby_max,
+            distance_max=distance_max,
+            horizon_max=horizon_max,
+        )
         if phrase is None:
             continue
         direction = _bearing_8way(dx, dy)
@@ -834,6 +1109,9 @@ def _room_display_glyph(room):
         if text:
             # One cell only -- never let JSON paste a multi-char mess.
             return text[0]
+    # Homestead claim on this America pad (live stamp, may lack map_glyph).
+    if getattr(room, "homestead_owner", None):
+        return "H"
     glyph_set = getattr(room, "glyph_set", None)
     return _cell_glyph(getattr(room, "area_type", "plains"), glyph_set=glyph_set)
 
@@ -886,7 +1164,7 @@ def _map_legend_for(rooms_sample):
     if uses_atlas:
         return (
             "@=you *=city .=plains ^=mtn ~=ocean o=lake "
-            "==EW-hwy |=NS-hwy +=junction T=forest "
+            "==EW-hwy |=NS-hwy +=junction T=forest H=homestead "
             "(bright=highway/city; muted=topo)"
         )
     return " ".join(
@@ -963,6 +1241,25 @@ TOWN_MINIMAP_RADIUS = 2
 LOOK_TOWN_MINIMAP_RADIUS = 1   # 3x3
 LOOK_GRID_MINIMAP_RADIUS = 2   # 5x5 instead of 7x7
 
+# Hand rooms in towns never draw the small ASCII window (map / maplook /
+# mapmove). Overland grids and dungeons still use layout / exit-graph /
+# terrain windows; ``map big`` / ``atlas`` are separate (macro atlas).
+_LOCAL_MAP_SUPPRESSED_AREA_TYPES = frozenset({"city", "city_street"})
+
+
+def local_map_suppressed(room):
+    """True when the local minimap must not render for *room*.
+
+    Town interiors (city / city_street hand rooms) stay text-only on look.
+    Grid cells and non-town pockets are unaffected.
+    """
+    if room is None:
+        return True
+    if getattr(room, "grid_prefix", None) is not None:
+        return False
+    area = (getattr(room, "area_type", None) or "").strip().lower()
+    return area in _LOCAL_MAP_SUPPRESSED_AREA_TYPES
+
 
 def _town_room_glyph(room):
     """Single glyph for a town neighbor on the local map.
@@ -1014,6 +1311,44 @@ def _rooms_by_layout(rooms, map_id, layout_z):
         if key not in index:
             index[key] = room
     return index
+
+
+def find_room_by_layout_direction(rooms, room, direction):
+    """Return the room one layout cell over from ``room`` in ``direction``,
+    or ``None`` when nothing is stamped there.
+
+    Combat-callable generalization of the ``_LAYOUT_XY_DELTA`` /
+    ``_rooms_by_layout`` machinery ASCII minimaps already use
+    (wall_floor_breach_mechanic.md Phase C) -- reuses the exact same
+    layout geometry Studio/the retrofit crawler already stamp, rather
+    than inventing a second coordinate system for breach targeting.
+    ``direction`` accepts the 8 compass values or ``up``/``down`` (z
+    axis, same convention as ``dig_room`` / retrofit's LAYER_UP/DOWN).
+
+    Never raises: a room with no layout, or nothing stamped at the
+    destination cell, is a normal "no neighbor here" outcome -- callers
+    (e.g. a wall breach) are expected to degrade gracefully, not treat
+    this as a content defect.
+    """
+    if room is None or rooms is None:
+        return None
+    lx = getattr(room, "layout_x", None)
+    ly = getattr(room, "layout_y", None)
+    if lx is None or ly is None:
+        return None
+    lz = int(getattr(room, "layout_z", None) or 0)
+    d = str(direction or "").strip().lower()
+    if d in _LAYOUT_XY_DELTA:
+        dx, dy = _LAYOUT_XY_DELTA[d]
+        target_xy, target_z = (int(lx) + dx, int(ly) + dy), lz
+    elif d == "up":
+        target_xy, target_z = (int(lx), int(ly)), lz + 1
+    elif d == "down":
+        target_xy, target_z = (int(lx), int(ly)), lz - 1
+    else:
+        return None
+    index = _rooms_by_layout(rooms, getattr(room, "map_id", None), target_z)
+    return index.get(target_xy)
 
 
 def render_layout_minimap(
@@ -1137,7 +1472,7 @@ def render_local_map(
     ``compact`` (look embed): smaller radius and no header/legend so the
     room sheet stays short; bare ``map`` leaves this False.
     """
-    if center_room is None:
+    if center_room is None or local_map_suppressed(center_room):
         return None
     is_grid = (
         getattr(center_room, "grid_prefix", None) is not None
@@ -1426,6 +1761,96 @@ def _room_looks_like_sewer(key, title=None):
     return "sewer" in blob
 
 
+def _validate_env_tag_list(tags, *, filename, key, field_name):
+    """Fail loud on unknown env tag strings (room_environment_hooks.md)."""
+    if tags is None:
+        return
+    if not isinstance(tags, list):
+        raise ValueError(
+            f"{filename}: room key {key!r}: {field_name} must be a list"
+        )
+    for tag in tags:
+        if tag not in KNOWN_ENV_TAGS:
+            raise ValueError(
+                f"{filename}: room key {key!r} has unknown {field_name} "
+                f"value {tag!r} -- must be one of {sorted(KNOWN_ENV_TAGS)}"
+            )
+
+
+def _validate_material_list(materials, *, filename, key):
+    """Fail loud on unknown material tag strings."""
+    if materials is None:
+        return
+    if not isinstance(materials, list):
+        raise ValueError(
+            f"{filename}: room key {key!r}: materials must be a list"
+        )
+    for tag in materials:
+        if tag not in KNOWN_MATERIAL_TAGS:
+            raise ValueError(
+                f"{filename}: room key {key!r} has unknown materials "
+                f"value {tag!r} -- must be one of "
+                f"{sorted(KNOWN_MATERIAL_TAGS)}"
+            )
+
+
+def _validate_slam_targets(targets, *, filename, key):
+    """Validate optional named slam/throw surface list on a room."""
+    if targets is None:
+        return
+    if not isinstance(targets, list):
+        raise ValueError(
+            f"{filename}: room key {key!r}: slam_targets must be a list"
+        )
+    seen_ids = set()
+    for entry in targets:
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"{filename}: room key {key!r}: each slam_targets entry "
+                "must be an object"
+            )
+        prop_id = entry.get("id")
+        label = entry.get("label")
+        if not isinstance(prop_id, str) or not prop_id.strip():
+            raise ValueError(
+                f"{filename}: room key {key!r}: slam_targets id must be a "
+                "non-empty string"
+            )
+        if prop_id in seen_ids:
+            raise ValueError(
+                f"{filename}: room key {key!r}: duplicate slam_targets "
+                f"id {prop_id!r}"
+            )
+        seen_ids.add(prop_id)
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError(
+                f"{filename}: room key {key!r}: slam_targets {prop_id!r} "
+                "needs a non-empty label"
+            )
+        _validate_env_tag_list(
+            entry.get("tags"), filename=filename, key=key,
+            field_name=f"slam_targets[{prop_id!r}].tags",
+        )
+        _validate_material_list(
+            entry.get("materials"), filename=filename, key=key,
+        )
+        direction = entry.get("direction")
+        if direction is not None and direction not in KNOWN_SLAM_DIRECTIONS:
+            raise ValueError(
+                f"{filename}: room key {key!r}: slam_targets {prop_id!r} "
+                f"has unknown direction {direction!r} -- must be one of "
+                f"{sorted(KNOWN_SLAM_DIRECTIONS)} or omitted"
+            )
+        hp_max = entry.get("hp_max")
+        if hp_max is not None and (
+            not isinstance(hp_max, int) or isinstance(hp_max, bool) or hp_max <= 0
+        ):
+            raise ValueError(
+                f"{filename}: room key {key!r}: slam_targets {prop_id!r} "
+                f"hp_max must be a positive integer, got {hp_max!r}"
+            )
+
+
 def _stamp_room_city_meta(room, data):
     """Copy zone/map city_name + color roles onto a live Room.
 
@@ -1436,13 +1861,14 @@ def _stamp_room_city_meta(room, data):
         return
     if not any(
         k in data
-        for k in ("city_name", "city_color", "sub_color", "main_colors")
+        for k in ("city_name", "region", "city_color", "sub_color", "main_colors")
     ):
         return
     from engine.room_naming import parse_city_meta
 
     meta = parse_city_meta(data)
     room.city_name = meta["city_name"] or None
+    room.region = meta["region"] or None
     room.city_color = meta["city_color"]
     room.sub_color = meta["sub_color"]
     room.main_colors = dict(meta["main_colors"])
@@ -1463,6 +1889,7 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
               vnum=None, layout=None,
               jobs=None,
               legacy_key=None,
+              env_tags=None, materials=None, slam_targets=None,
               game_fields=None):
     """Create one Room and insert it into the shared `rooms` dict.
 
@@ -1664,6 +2091,22 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
         room.outdoor = bool(outdoor)
     else:
         room.outdoor = bool(room.wilderness)
+    # Environment hooks (room_environment_hooks.md): None = JSON omitted
+    # (resolve_env_defaults fills from area_type + outdoor at combat time);
+    # explicit [] = intentionally empty; non-empty list = authored override.
+    _validate_env_tag_list(
+        env_tags, filename=filename, key=key, field_name="env_tags",
+    )
+    _validate_material_list(materials, filename=filename, key=key)
+    _validate_slam_targets(slam_targets, filename=filename, key=key)
+    if env_tags is not None:
+        room.env_tags = list(env_tags)
+    if materials is not None:
+        room.materials = list(materials)
+    if slam_targets is not None:
+        room.slam_targets = [
+            dict(entry) for entry in slam_targets
+        ]
     # D67 dark rooms (omitted -> Room default False). Sewers default dark.
     if dark is None and _room_looks_like_sewer(key, title):
         dark = True
@@ -1728,6 +2171,81 @@ def _resolve_plane_and_realm(filename, data):
             f"(expected {expected_realm!r})"
         )
     return plane, realm
+
+
+def validate_map_file_header(data, *, where):
+    """Validate shared map/zone JSON header (kind lint; boot-aligned plane/realm).
+
+    ``where`` is used as the filename label in error messages (basename ok).
+    """
+    if not isinstance(data, dict):
+        raise ValueError(f"{where}: expected a dict")
+    label = where if str(where).endswith(".json") else f"{where}.json"
+    _resolve_plane_and_realm(label, data)
+
+
+def validate_zone_header(data, *, where):
+    """Validate a zone pocket file header (``content/zones/*.json``)."""
+    from supers import content_validate as cv
+
+    validate_map_file_header(data, where=where)
+    cv.require_keys(data, ("city_name", "rooms"), where)
+    cv.require_nonempty_str(data, "city_name", where)
+    rooms = data.get("rooms")
+    if not isinstance(rooms, list) or not rooms:
+        raise ValueError(f"{where}: rooms must be a non-empty list")
+
+
+def validate_grid_block(grid, *, where):
+    """Validate a procedural ``grid`` object on an overland map file."""
+    from supers import content_validate as cv
+
+    if not isinstance(grid, dict):
+        raise ValueError(f"{where}: grid must be an object")
+    cv.require_keys(
+        grid,
+        ("key_prefix", "width", "height", "default_description"),
+        where,
+    )
+    cv.require_nonempty_str(grid, "key_prefix", where)
+    cv.require_nonempty_str(grid, "default_description", where)
+    width = grid.get("width")
+    height = grid.get("height")
+    if not isinstance(width, int) or isinstance(width, bool) or width <= 0:
+        raise ValueError(f"{where}: grid.width must be a positive int")
+    if not isinstance(height, int) or isinstance(height, bool) or height <= 0:
+        raise ValueError(f"{where}: grid.height must be a positive int")
+
+
+def validate_pocket_link(pocket, *, where):
+    """Validate one ``pockets[]`` entry on an overland map file."""
+    from supers import content_validate as cv
+
+    if not isinstance(pocket, dict):
+        raise ValueError(f"{where}: pocket must be an object")
+    cv.require_keys(pocket, ("at", "hub_room"), where)
+    kind = pocket.get("kind", "landmark")
+    if kind not in POCKET_KINDS:
+        raise ValueError(
+            f"{where}: pocket kind {kind!r} must be one of {sorted(POCKET_KINDS)}"
+        )
+    at = pocket.get("at")
+    if not (isinstance(at, (list, tuple)) and len(at) == 2):
+        raise ValueError(f'{where}: pocket needs "at": [x, y]')
+    cv.require_nonempty_str(pocket, "hub_room", where)
+    span = pocket.get("span")
+    if span is not None:
+        if not (
+            isinstance(span, (list, tuple)) and len(span) == 2
+            and all(
+                isinstance(v, int) and not isinstance(v, bool) and v >= 1
+                for v in span
+            )
+        ):
+            raise ValueError(
+                f'{where}: pocket "span" must be [width, height] of '
+                f"positive ints"
+            )
 
 
 def _build_grid(rooms, filename, grid, plane=None, realm=None, map_id=None):
@@ -1863,6 +2381,9 @@ def _build_grid(rooms, filename, grid, plane=None, realm=None, map_id=None):
                 map_glyph=override.get("map_glyph"),
                 map_layer=override.get("map_layer"),
                 glyph_set=cell_glyph_set,
+                env_tags=override.get("env_tags"),
+                materials=override.get("materials"),
+                slam_targets=override.get("slam_targets"),
                 game_fields=override,
             )
 
@@ -2002,12 +2523,77 @@ def _link_room_exits(rooms, filename, room_data):
             )
 
 
-def _pocket_enter_aliases(hub, pocket):
+# Short player-facing enter aliases for look hints (one label per hub).
+# Longer than pathfind's homeward list on purpose -- hotels, highways, etc.
+_LOOK_ENTER_ALIAS_PREF = (
+    "city", "gate", "plaza", "town", "heaven", "hell", "nest", "bunker",
+    "waystation", "highway", "hotel", "dungeon", "ruins", "pit", "lebanon",
+    "welcome", "crossroads", "asylum", "orchard", "ridge", "mafia",
+)
+
+
+def _alias_looks_like_vnum(alias):
+    """True when ``alias`` is a hand-room vnum token (TN00001, tn00001)."""
+    from engine import room_vnum as room_vnum_mod
+    return room_vnum_mod.parse_vnum(alias) is not None
+
+
+def _best_player_enter_alias(aliases, hub):
+    """Pick one ``enter <alias>`` label for a hub (look footer / gossip)."""
+    hub_key = (getattr(hub, "key", None) or "").strip().lower()
+    clean = []
+    for alias in aliases:
+        text = str(alias or "").strip().lower()
+        if not text:
+            continue
+        if _alias_looks_like_vnum(text):
+            continue
+        if text == hub_key and _alias_looks_like_vnum(hub_key):
+            continue
+        clean.append(text)
+    if not clean:
+        title = getattr(hub, "title", None)
+        if title and str(title).strip():
+            return str(title).strip().lower()
+        return hub_key or None
+    for pref in _LOOK_ENTER_ALIAS_PREF:
+        if pref in clean:
+            return pref
+    return min(clean, key=len)
+
+
+def zone_entry_look_hints(zone_entries, *, limit=4):
+    """Player-facing ``enter`` labels for one gateway cell's zone_entries.
+
+    Returns one short alias per distinct hub (never bare vnums like TN00001).
+    """
+    if not zone_entries:
+        return []
+    by_hub = {}
+    for alias, hub in zone_entries.items():
+        if hub is None:
+            continue
+        hid = id(hub)
+        if hid not in by_hub:
+            by_hub[hid] = (hub, [])
+        by_hub[hid][1].append(alias)
+    labels = []
+    for hub, aliases in by_hub.values():
+        label = _best_player_enter_alias(aliases, hub)
+        if label:
+            labels.append(label)
+    labels.sort()
+    return labels[:limit]
+
+
+def pocket_enter_aliases(hub, pocket):
     """Build lowercase enter <name> aliases for one pocket hub.
 
     Always includes the hub room key and Room.zone (when set). Optional
     pocket JSON \"enter_as\": [\"city\", \"town\"] adds more player-facing
-    names without changing the hub key.
+    names without changing the hub key. Public: reused by
+    supers/demesne/pocket.py (Phase 1 demesne mounting) so both hosts
+    share one alias rule.
     """
     aliases = set()
     aliases.add(hub.key.lower())
@@ -2018,6 +2604,128 @@ def _pocket_enter_aliases(hub, pocket):
         aliases.add(str(extra).strip().lower())
     aliases.discard("")
     return sorted(aliases)
+
+
+_SPRAWL_DESC_TEMPLATE = (
+    "You stand in the sprawling reaches of {name}, its rooftops and haze "
+    "visible for miles along the highway."
+)
+
+
+def _pocket_span_cells(x, y, span, width, height):
+    """Yield every (cx, cy) in a manual +x/+y span box from pocket ``at``.
+
+    Corner convention (docs/plans/zone_layout_retrofit.md Phase 2 lock):
+    (x, y) is one corner, box extends toward +x/+y -- (x, x+sx-1) by
+    (y, y+sy-1), inclusive. Always includes (x, y) itself (the caller
+    excludes it before painting, since that cell stays the single
+    enter/exit mouth). Raises loud (ValueError) when the box exceeds
+    grid bounds -- an authored-content defect, same rigor as the
+    existing "at" bounds check in _link_pockets.
+    """
+    sx, sy = int(span[0]), int(span[1])
+    x_max, y_max = x + sx - 1, y + sy - 1
+    if x_max >= width or y_max >= height:
+        raise ValueError(
+            f"pocket span {sx}x{sy} at [{x}, {y}] exceeds grid "
+            f"{width}x{height} (box reaches [{x_max}, {y_max}])"
+        )
+    for cy in range(y, y_max + 1):
+        for cx in range(x, x_max + 1):
+            yield (cx, cy)
+
+
+def _macro_offset_paint_cells(at_x, at_y, mx_lo, mx_hi, my_lo, my_hi):
+    """Yield atlas (cx, cy) for hub-anchored bidirectional macro paint."""
+    for mdx in range(int(mx_lo), int(mx_hi) + 1):
+        for mdy in range(int(my_lo), int(my_hi) + 1):
+            if mdx == 0 and mdy == 0:
+                continue
+            yield at_x + mdx, at_y + mdy
+
+
+def _paint_city_sprawl_cell(
+    rooms, filename, prefix, pocket, at_x, at_y, cx, cy,
+    mouth, hub_cells, claimed, mouth_at,
+):
+    """Paint one macro cell as city sprawl (first-claim-wins)."""
+    if (cx, cy) == (at_x, at_y):
+        return
+    if (cx, cy) in hub_cells:
+        print(
+            f"[maps] {filename}: pocket paint at {mouth_at!r} skips "
+            f"[{cx},{cy}] -- claimed by another pocket's mouth"
+        )
+        return
+    if (cx, cy) in claimed:
+        print(
+            f"[maps] {filename}: pocket paint at {mouth_at!r} skips "
+            f"[{cx},{cy}] -- already painted by pocket at "
+            f"{claimed[(cx, cy)]!r}"
+        )
+        return
+    cell = rooms.get(f"{prefix} ({cx}, {cy})")
+    if cell is None:
+        return
+    claimed[(cx, cy)] = mouth_at
+    city_name = str(
+        pocket.get("visible_as") or pocket.get("hub_room") or "the city"
+    ).strip()
+    base_glyph = getattr(mouth, "map_glyph", None)
+    glyph = (
+        base_glyph.lower()
+        if base_glyph and str(base_glyph).isalpha()
+        else "c"
+    )
+    cell.area_type = "city"
+    cell.wilderness = False
+    cell.map_layer = "city"
+    cell.map_glyph = glyph
+    cell.description = _SPRAWL_DESC_TEMPLATE.format(name=city_name)
+
+
+def _paint_pocket_span(
+    rooms, filename, prefix, pocket, x, y, mouth, hub_cells, claimed,
+    width, height,
+):
+    """Paint city terrain onto one pocket's span cells (Phase 2).
+
+    No-op when CITY_PAINT_ENABLED is off (default). Manual pocket ``span``
+    (any dimension > 1) uses the legacy +x/+y corner box. Otherwise auto-
+    paint from the linked zone file's room ``layout`` footprint (hub-
+    anchored rectangle; Z ignored). The pocket mouth cell is never painted.
+    First-claim-wins on contested cells (batch load does not abort).
+    """
+    if not CITY_PAINT_ENABLED:
+        return
+    span = pocket.get("span")
+    manual = (
+        isinstance(span, (list, tuple))
+        and len(span) == 2
+        and (int(span[0]) > 1 or int(span[1]) > 1)
+    )
+    hub_key = pocket.get("hub_room")
+    mouth_at = (x, y)
+    if manual:
+        paint_cells = list(_pocket_span_cells(x, y, span, width, height))
+    else:
+        zone_doc = zone_doc_for_pocket(pocket, hub_key)
+        if zone_doc is None:
+            return
+        rect = layout_footprint_macro_rect(zone_doc, hub_key)
+        if rect is None:
+            return
+        mx_lo, mx_hi, my_lo, my_hi = rect
+        if mx_lo == 0 and mx_hi == 0 and my_lo == 0 and my_hi == 0:
+            return
+        paint_cells = list(
+            _macro_offset_paint_cells(x, y, mx_lo, mx_hi, my_lo, my_hi)
+        )
+    for cx, cy in paint_cells:
+        _paint_city_sprawl_cell(
+            rooms, filename, prefix, pocket, x, y, cx, cy,
+            mouth, hub_cells, claimed, mouth_at,
+        )
 
 
 def _link_pockets(rooms, filename, data):
@@ -2042,6 +2750,18 @@ def _link_pockets(rooms, filename, data):
     width = int(grid["width"])
     height = int(grid["height"])
     hub_keys = []
+    # Pre-pass: every pocket's own mouth cell is off-limits to span paint
+    # (tolerates malformed "at" here -- the main loop below raises loud on
+    # that pocket before span painting is ever consulted for it).
+    hub_cells = set()
+    for pocket in pockets:
+        at = pocket.get("at")
+        if isinstance(at, (list, tuple)) and len(at) == 2:
+            try:
+                hub_cells.add((int(at[0]), int(at[1])))
+            except (TypeError, ValueError):
+                pass
+    claimed = {}
     for i, pocket in enumerate(pockets):
         kind = pocket.get("kind", "landmark")
         if kind not in POCKET_KINDS:
@@ -2090,7 +2810,7 @@ def _link_pockets(rooms, filename, data):
         # Zone travel (enter / exit) -- not movement exits.
         # Only the pocket hub is a zone_exit mouth: exit from Southern
         # Highway / South Gate / etc., not every house or sewer room.
-        for alias in _pocket_enter_aliases(hub, pocket):
+        for alias in pocket_enter_aliases(hub, pocket):
             prior = cell.zone_entries.get(alias)
             if prior is not None and prior is not hub:
                 raise ValueError(
@@ -2126,6 +2846,13 @@ def _link_pockets(rooms, filename, data):
                 "y": y,
                 "name": visible_as,
             })
+        # Multi-tile city paint (Phase 2) -- no-op unless CITY_PAINT_ENABLED
+        # and pocket["span"] both say otherwise; never touches this mouth
+        # cell or its enter/exit wiring above.
+        _paint_pocket_span(
+            rooms, filename, prefix, pocket, x, y, cell,
+            hub_cells, claimed, width, height,
+        )
         hub_keys.append(hub_key)
     return hub_keys
 
@@ -2153,6 +2880,7 @@ def _stamp_registry_entry(registry, filename, data, plane, realm, map_id):
         "runtime_hub": data.get("runtime_hub"),
         # Official city label + ROOM NAME paint roles (docs/AREA_BUILDING.md).
         "city_name": city_meta["city_name"],
+        "region": city_meta["region"],
         "city_color": city_meta["city_color"],
         "sub_color": city_meta["sub_color"],
         "main_colors": city_meta["main_colors"],
@@ -2220,6 +2948,9 @@ def create_rooms_from_map_data(rooms, filename, data):
             vnum=room_data.get("vnum"),
             layout=room_data.get("layout"),
             legacy_key=room_data.get("legacy_key"),
+            env_tags=room_data.get("env_tags"),
+            materials=room_data.get("materials"),
+            slam_targets=room_data.get("slam_targets"),
             game_fields=room_data,
         )
         _stamp_room_city_meta(rooms[room_data["key"]], data)
@@ -2248,6 +2979,8 @@ def link_map_data(rooms, filename, data):
                 ),
                 room_key,
             ))
+    if not LAST_ZONE_DOC_BY_HUB_KEY:
+        refresh_zone_hub_index()
     _link_pockets(rooms, filename, data)
     return seed_items
 
@@ -2296,7 +3029,7 @@ def wire_pocket_at_cell(
         "enter_as": list(enter_as or []),
         "visible_as": visible_as or "",
     }
-    for alias in _pocket_enter_aliases(hub, pocket):
+    for alias in pocket_enter_aliases(hub, pocket):
         prior = cell.zone_entries.get(alias)
         if prior is not None and prior is not hub:
             raise ValueError(
@@ -2371,6 +3104,7 @@ def load_all_maps(*, include_deferred=False):
 
     # Fresh registry each load so copyover / re-import never duplicates.
     _LANDMARKS_BY_PREFIX = {}
+    refresh_zone_hub_index()
 
     rooms = {}
     start_room = None
@@ -2436,10 +3170,30 @@ def load_all_maps(*, include_deferred=False):
                 vnum=room_data.get("vnum"),
                 layout=room_data.get("layout"),
                 legacy_key=room_data.get("legacy_key"),
+                env_tags=room_data.get("env_tags"),
+                materials=room_data.get("materials"),
+                slam_targets=room_data.get("slam_targets"),
                 game_fields=room_data,
             )
             _stamp_room_city_meta(rooms[room_data["key"]], data)
         _stamp_registry_entry(registry, filename, data, plane, realm, map_id)
+
+    # Pass 1.5: stamp missing hand-room VNUMs before exit wiring / rekey.
+    from engine import room_vnum as room_vnum_mod
+    _taken_vnums = room_vnum_mod.collect_taken_vnums(rooms.values())
+    for _room in rooms.values():
+        if _room is None or not room_vnum_mod.hand_room_wants_vnum(_room):
+            continue
+        _raw_v = getattr(_room, "vnum", None)
+        if _raw_v is not None and str(_raw_v).strip():
+            continue
+        _vnum = room_vnum_mod.allocate_vnum_for_name(
+            getattr(_room, "key", ""),
+            getattr(_room, "title", None),
+            taken=_taken_vnums,
+        )
+        _room.vnum = _vnum
+        _taken_vnums.add(_vnum)
 
     # Pass 2: every Room now exists, so wire exits and collect the rest.
     for filename, data in map_files:

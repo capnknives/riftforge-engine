@@ -16,10 +16,10 @@ import asyncio                        # Python's built-in async networking libra
 import os
 import time
 import traceback
-from collections import deque
 
 import persistence
 from engine import bug_webhook  # noqa: F401 -- loads webhook helpers (GM squashbugs)
+from engine import suggestion_webhook  # noqa: F401 -- GM sendsuggest / squashsuggest
 from engine import discord_bridge  # noqa: F401 -- tagged Discord radio bridge
 from engine import copyover
 from world import build_world, Character
@@ -54,9 +54,12 @@ register_all_hooks()
 # tick-based and untouched (already validated by balance_sim.py in
 # real-world terms); this clock is new state + display/flavor only.
 TICKS_PER_GAME_DAY = 9600
-# Full SQLite snapshot cadence: every N heartbeats (3s each). 20 → ~60s.
-# Immediate saves still run on connect/disconnect/shutdown.
-AUTOSAVE_EVERY_TICKS = 20
+# Full SQLite snapshot cadence: wall-clock seconds, not game_time_ticks --
+# ticks only advance a fraction per heartbeat under gm clock scale (stock
+# scale 1 = 1/3 tick/heartbeat), so a tick-count gate silently stretched
+# autosave to ~3x this interval when the world clock defaulted to 1:1
+# real-time. Immediate saves still run on connect/disconnect/shutdown.
+AUTOSAVE_INTERVAL_SECONDS = 60.0
 
 
 class Game:
@@ -69,12 +72,27 @@ class Game:
         # path so hang recovery does not treat a slow boot as a freeze.
         from engine import game_heartbeat
         game_heartbeat.touch_heartbeat("game_init")
+        from engine import boot_profile as boot_profile_mod
+        boot_profile_mod.reset()
+        # Additive heal from protected content/map_backups BEFORE the map
+        # load: auto-deploy reset --hard makes zone/map JSON follow git,
+        # and the watcher historically no-op'd heal (hooks reload + no
+        # bootstrap). Copyover / game-only restart must still restore
+        # populate / dig rooms that only survived in the hot backup slot.
+        try:
+            from engine import hooks as hooks_mod
+            for line in hooks_mod.auto_deploy_map_heal(os.getcwd()) or []:
+                print(f"[boot] {line}", flush=True)
+        except Exception as exc:
+            print(f"[boot] map heal skipped: {exc}", flush=True)
+        boot_profile_mod.mark("map_heal")
         # Live Character roster (engine/char_index.py). RoomMap stamps
         # room.game on every insert so Room.add/remove keep the set
         # truthful (including procedural dungeons and smoke ad-hoc rooms).
         # Must land BEFORE load_world / seeding so move_to registers Echoes.
         from engine.char_index import RoomMap
         raw_rooms, self.start_room, seed_items = build_world()
+        boot_profile_mod.mark("build_world")
         self.characters = set()
         self.rooms = RoomMap(self)
         self.rooms.update(raw_rooms)
@@ -95,11 +113,16 @@ class Game:
         # Wall-clock unix time of this process boot -- MSSP UPTIME (engine/mssp.py).
         # Not persisted; resets on every restart / copyover process spawn.
         self.started_at = time.time()
-        # Global OOC ring buffer: bare `ooc` shows the last 20 channel lines.
-        # Kept in meta via save_ooc_history so copyover / restart keep recent
-        # chat (still a short ring — not a forever log). Refilled after db
-        # connect below.
-        self.ooc_history = deque(maxlen=20)
+        # Telnet listen port for MSSP PORT metadata (engine/mssp.py listen_port).
+        self.listen_port = int(os.environ.get("RIFTFORGE_PORT", "4000"))
+        # Autosave cadence clock (AUTOSAVE_INTERVAL_SECONDS) -- wall-clock,
+        # not persisted; resets on boot same as started_at.
+        self._last_autosave_monotonic = time.monotonic()
+        # Global channel rings (ooc, wiznet, …) — see engine/channel_history.py.
+        # Deques are created here; meta refill happens after db connect below.
+        from engine import channel_history
+
+        channel_history.init_game(self)
         # Engine-level Accounts (above Characters). Filled by
         # persistence.load_accounts after the world load; empty until then.
         self.accounts = {}
@@ -110,6 +133,7 @@ class Game:
         self.report_dir = os.path.dirname(db_path) or "."
 
         self.db = persistence.connect(db_path)
+        boot_profile_mod.mark("db_connect")
         # Milestone E: the compressed clock -- 0 for a fresh world, or
         # wherever a returning world left off (reused for both branches
         # below, so it's loaded once here rather than duplicated in each).
@@ -118,7 +142,7 @@ class Game:
         # maps to that date. Fresh worlds use 0. Upgraded worlds missing
         # the key rebase so "today" becomes 2015-10-15 without resetting
         # game_time_ticks (cooldowns stay valid). Then the clock keeps
-        # advancing at 3x forever.
+        # advancing at the configured pace (stock 1x real-time calendar).
         from engine import game_calendar
         stored_epoch = persistence.load_calendar_epoch_day(self.db)
         if stored_epoch is None:
@@ -131,6 +155,10 @@ class Game:
         else:
             self.calendar_epoch_day = max(0, int(stored_epoch))
         game_calendar.set_active_epoch_day_offset(self.calendar_epoch_day)
+        from engine import game_clock_tuning
+        self.game_clock_tuning = game_clock_tuning.normalize_loaded(
+            persistence.load_game_clock_tuning(self.db)
+        )
         # Lean / pre-seed defaults so the first save() (fresh world) never
         # trips AttributeError in persistence.save_moral_state. Persisted
         # meta is loaded immediately below -- BEFORE any save() -- so boot
@@ -138,23 +166,35 @@ class Game:
         # World Tide, gmworld lifetime tallies, or death beacons.
         self.vampire_townsfolk_kills = 0
         self.moral_balance = 0
+        self.roadtrip_minutes = 30.0
+        self.vehicle_pvp_enabled = False
         self.heaven_soul_count = 0
         self.hell_soul_count = 0
         # Physical phone number allocator (supers/phone.py); 555-XXXX.
         self.next_phone_seq = 1000
         self.hue_courts = {}
         self.death_beacons = {}
+        # Lebanon civic housing construction (supers/town_construction.py).
+        self.town_construction = {"zones": {}}
         # Chuck Author mantle-resume (meta JSON; idle until load/restore).
         self.author_mantle_event = {}
+        self.chuck_heaven_claim = {}
         self.eclipse_until_tick = 0
         self.moral_event_cooldown_until = 0
         self.moral_maxed_side = None
         self.moral_maxed_since_tick = 0
         self.moral_last_casualty_tick = 0
         self.moral_scout_cooldown_until = 0
+        self.moral_good_window_start_tick = 0
+        self.moral_good_steps_in_window = 0
         # Host/Infernal holy war (gm holywar) -- default OFF until staff
         # flips it; later becomes a scheduled world event outside Tide.
         self.holy_war_active = False
+        # Rank flavor on player score (gm titles) -- default ON; staff may
+        # hide path/court words gamewide until the ladder is ready.
+        self.rank_titles_visible = True
+        # Gamewide who layout (``gm whomode``); default RP introduce/veil rules.
+        self.gm_who_mode = "rp"
         self.rumor_boards = {}
         # GM gmworld lifetime counters (haunts / missions / tips / …).
         self.lifetime_stats = {}
@@ -174,9 +214,17 @@ class Game:
         self.hell_exile_tuning = {}
         # GM Purgatory pit loot knobs (``gm pit drops``) -- empty = defaults.
         self.pit_drop_tuning = {}
+        # GM Marches fog-rim ring cap + monthly rim seed state.
+        self.marches_rim_tuning = {}
+        self.marches_rim_state = {}
+        self.rowena_portal_run = None
+        self.portal_giver_costs = {}
         # GM runtime verb blocks (``gm disable <verb>``) -- in-memory toggle set.
-        self.disabled_verbs = set()
+        # ``dothepit`` starts disabled; staff toggle with ``gm disable``.
+        self.disabled_verbs = {"dothepit"}
         self.homestead_plots = {}
+        self.player_shops = {}
+        self.demesnes = {}
         self.gather_nodes = {}
         self.personal_realms = {}
         self._load_persisted_meta()
@@ -198,27 +246,34 @@ class Game:
             from supers import gathering as gathering_mod
             homestead_mod.load_homesteads(self.db, self)
             gathering_mod.load_gather_nodes(self.db, self)
+            from supers import player_shops as player_shops_mod
+            player_shops_mod.load_player_shops(self.db, self)
+            from supers import township as township_mod
+            township_mod.load_townships(self.db, self)
             from supers import personal_realm as personal_realm_mod
             personal_realm_mod.load_personal_realms(self.db, self)
+            from supers.demesne import load_demesnes
+            load_demesnes(self.db, self)
+        boot_profile_mod.mark("load_personal_realms")
+
+        # Persistable runtime rooms (vehicle interiors, charter cabins, …)
+        # must exist before load_world.  Register new surfaces in
+        # supers/runtime_rooms.py (see CONTENT_AUTHORING.md).
+        if _HAS_SUPERS:
+            from supers import runtime_rooms as runtime_rooms_mod
+            runtime_rooms_mod.ensure_before_load(self)
 
         if persistence.is_seeded(self.db):
             # A returning world: restore every character (as an Echo) and every
             # item to wherever they were when the server last saved.
             persistence.load_world(self.db, self)
-            # Drop any zombie gmspirit: rows that older saves still had
-            # (load also skips them; this covers in-memory leftovers).
+            # Wire deferred demesne hub exits AFTER rooms are placed (demesne
+            # hub exit targets may be classic rooms placed by load_world).
             if _HAS_SUPERS:
                 try:
-                    from supers import cadence as cadence_mod
-                    cadence_mod.purge_orphan_gm_spirits(self)
+                    from supers.demesne.persist import resolve_pending_demesne_exits
+                    resolve_pending_demesne_exits(self)
                 except Exception:
-                    # Boot cleanup is best-effort, but a failure here means
-                    # zombie gmspirit rows may linger -- log it instead of
-                    # hiding it so staff can see the world came up dirty.
-                    print(
-                        "[server] purge_orphan_gm_spirits failed during load:",
-                        flush=True,
-                    )
                     traceback.print_exc()
         else:
             # Brand-new world: place the starter items, then record that we did
@@ -228,19 +283,46 @@ class Game:
             persistence.mark_seeded(self.db)
             self.save()
 
+        boot_profile_mod.mark("load_world")
+
         # Engine accounts: load after characters so back-pointers reconcile.
         persistence.load_accounts(self.db, self)
         try:
             from engine import accounts as accounts_mod
             accounts_mod.reconcile_accounts(self)
             accounts_mod.migrate_legacy_gm_ranks(self)
+            # After load: recreate known wiped player accounts (e.g. Matt)
+            # so the next save keeps them -- never race SQLite while the
+            # live process still holds an older in-memory accounts dict.
+            accounts_mod.heal_restored_player_accounts(self)
         except Exception:
             print("[server] account reconcile/migrate failed:", flush=True)
             traceback.print_exc()
 
+        boot_profile_mod.mark("load_accounts")
+
+        if persistence.is_seeded(self.db) and _HAS_SUPERS:
+            # Fold / reap zombie gmspirit rows only AFTER accounts are in
+            # memory. ``fold_parked_gm_spirit`` may call ``game.save()``;
+            # ``save_accounts`` wipe-rewrites the table and must not run with
+            # an empty ``game.accounts`` dict (that erased live staff ranks).
+            try:
+                from supers import cadence as cadence_mod
+                cadence_mod.purge_orphan_gm_spirits(self)
+            except Exception:
+                print(
+                    "[server] purge_orphan_gm_spirits failed during load:",
+                    flush=True,
+                )
+                traceback.print_exc()
+
         # Game-package boot seed (SUPERS Cadence/heals, or basegame stub).
         # Lean engine ("none"): no-op — meta already loaded above.
         game_select.seed_content(self)
+        boot_profile_mod.mark("seed_content")
+        from engine import boot_stability
+        boot_stability.mark_boot_finished()
+        boot_profile_mod.print_report()
 
     def _load_persisted_meta(self):
         """Load Game meta counters from SQLite before any boot save().
@@ -280,7 +362,10 @@ class Game:
             parse_target_ordinal,
             pick_ordinal,
         )
-        from engine.command_support import _collect_character_matches
+        from engine.command_support import (
+            _collect_character_matches,
+            sort_character_target_matches,
+        )
 
         raw = (name or "").strip()
         if not raw:
@@ -312,7 +397,9 @@ class Game:
         # staff spirits are filtered out (not part of the live world).
         if ordinal is not None:
             pool = [o for o in self.characters if not _parked_gm_spirit(o)]
-            matches = _collect_character_matches(rest, pool)
+            matches = sort_character_target_matches(
+                _collect_character_matches(rest, pool)
+            )
             return pick_ordinal(matches, ordinal)
 
         # Two-pass exact: never let an ephemeral prefix steal a bare key.
@@ -353,9 +440,8 @@ class Game:
         if len(given_hits) == 1:
             return given_hits[0]
         if len(given_hits) > 1:
-            # Ambiguous without ordinal -- first hit (legacy). Prefer
-            # callers that peel ``2.name`` before reaching here.
-            return given_hits[0]
+            # Ambiguous without ordinal -- stable mantle-before-twin order.
+            return sort_character_target_matches(given_hits)[0]
         return None
 
     def find_login_character(self, name):
@@ -420,15 +506,46 @@ class Game:
             epoch_day_offset=getattr(self, "calendar_epoch_day", 0),
         )
 
-    def save(self):
+    def save(self, *, copyover=False):
         """Snapshot the whole world to the database (see persistence.py)."""
         from engine import hooks as hooks_mod
+
+        if copyover:
+            from engine import persistence as ep
+
+            ep.save_world(self.db, self)
+            ep.save_game_time(self.db, self.game_time_ticks)
+            ep.save_calendar_epoch_day(
+                self.db, getattr(self, "calendar_epoch_day", 0)
+            )
+            ep.save_game_clock_tuning(self.db, self)
+            ep.save_accounts(self.db, self)
+            hooks_mod.save_game_meta(self, self.db)
+            if _HAS_SUPERS:
+                try:
+                    from supers import homestead as homestead_mod
+                    from supers import gathering as gathering_mod
+                    homestead_mod.save_homesteads(self.db, self)
+                    gathering_mod.save_gather_nodes(self.db, self)
+                    from supers import player_shops as player_shops_mod
+                    player_shops_mod.save_player_shops(self.db, self)
+                    from supers import township as township_mod
+                    township_mod.save_townships(self.db, self)
+                    from supers import personal_realm as personal_realm_mod
+                    personal_realm_mod.save_personal_realms(self.db, self)
+                    from supers.demesne.persist import save_demesnes
+                    save_demesnes(self.db, self)
+                except Exception:
+                    print("[server] homestead/gather save failed:", flush=True)
+                    traceback.print_exc()
+            return
 
         persistence.save_world(self.db, self)
         persistence.save_game_time(self.db, self.game_time_ticks)
         persistence.save_calendar_epoch_day(
             self.db, getattr(self, "calendar_epoch_day", 0)
         )
+        persistence.save_game_clock_tuning(self.db, self)
         persistence.save_accounts(self.db, self)
         # SUPERS Tide / Cadence / tuning / rumor / OOC (no-op when lean).
         hooks_mod.save_game_meta(self, self.db)
@@ -439,8 +556,14 @@ class Game:
                 from supers import gathering as gathering_mod
                 homestead_mod.save_homesteads(self.db, self)
                 gathering_mod.save_gather_nodes(self.db, self)
+                from supers import player_shops as player_shops_mod
+                player_shops_mod.save_player_shops(self.db, self)
+                from supers import township as township_mod
+                township_mod.save_townships(self.db, self)
                 from supers import personal_realm as personal_realm_mod
                 personal_realm_mod.save_personal_realms(self.db, self)
+                from supers.demesne.persist import save_demesnes
+                save_demesnes(self.db, self)
             except Exception:
                 # Never let a homestead codec abort the rest of the snapshot.
                 traceback.print_exc()
@@ -471,6 +594,15 @@ class Game:
                 traceback.print_exc()
             # Stamp after work so a completed heavy tick resets the clock.
             game_heartbeat.touch_heartbeat("post_tick")
+            from engine import boot_stability
+            boot_stability.note_post_tick()
+            from engine import world_backup
+            if world_backup.backup_request_pending():
+                try:
+                    self.save()
+                except Exception:
+                    traceback.print_exc()
+                world_backup.write_ack()
 
     async def run_heartbeat_async(self):
         """Advance clock, run the async tick pipeline, autosave when due.
@@ -478,27 +610,138 @@ class Game:
         Cadence ``tick_async`` yields between actors so player commands
         can run on the same asyncio loop during a long lifestyle pass.
         """
-        self.game_time_ticks += 1
+        from engine import game_clock_tuning
+        game_clock_tuning.advance_game_time_ticks(self)
         await run_ticks_async(self)
-        self._maybe_autosave()
+        await self._maybe_autosave_async()
 
     def on_tick(self):
         """Sync heartbeat for smoke/tools -- no Cadence yields.
 
         Production ``tick_loop`` uses ``run_heartbeat_async`` instead.
         """
-        self.game_time_ticks += 1
+        from engine import game_clock_tuning
+        game_clock_tuning.advance_game_time_ticks(self)
         run_ticks(self)
         self._maybe_autosave()
 
+    async def save_async(self):
+        """Cooperative world snapshot (yields during blob work).
+
+        Login and autosave share this path so the asyncio loop can serve
+        other sessions while JSON rows are built. Only one save runs at a
+        time -- concurrent callers spin with ``asyncio.sleep(0)``.
+        """
+        import asyncio
+        from engine import hooks as hooks_mod
+        from engine import persistence
+
+        while getattr(self, "_autosave_running", False):
+            await asyncio.sleep(0)
+        self._autosave_running = True
+        try:
+            await persistence.save_world_async(self.db, self)
+            persistence.save_game_time(self.db, self.game_time_ticks)
+            persistence.save_calendar_epoch_day(
+                self.db, getattr(self, "calendar_epoch_day", 0)
+            )
+            persistence.save_game_clock_tuning(self.db, self)
+            persistence.save_accounts(self.db, self)
+            hooks_mod.save_game_meta(self, self.db)
+            if _HAS_SUPERS:
+                try:
+                    from supers import homestead as homestead_mod
+                    from supers import gathering as gathering_mod
+                    homestead_mod.save_homesteads(self.db, self)
+                    gathering_mod.save_gather_nodes(self.db, self)
+                    from supers import player_shops as player_shops_mod
+                    player_shops_mod.save_player_shops(self.db, self)
+                    from supers import township as township_mod
+                    township_mod.save_townships(self.db, self)
+                    from supers import personal_realm as personal_realm_mod
+                    personal_realm_mod.save_personal_realms(self.db, self)
+                    from supers.demesne.persist import save_demesnes
+                    save_demesnes(self.db, self)
+                except Exception:
+                    traceback.print_exc()
+        finally:
+            self._autosave_running = False
+
+    def schedule_save_async(self):
+        """Queue a cooperative snapshot without blocking the caller.
+
+        ``Session.disconnect`` uses this so other players are not frozen
+        while JSON rows are built. Falls back to sync ``save()`` when no
+        asyncio loop is running (smoke / tests). Shutdown still calls
+        sync ``save()`` so the process exits with a completed write.
+        """
+        import asyncio
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.save()
+            return
+        loop.create_task(self.save_async())
+
+    async def _maybe_autosave_async(self):
+        """Autosave every AUTOSAVE_INTERVAL_SECONDS of wall-clock time.
+
+        Builds the character/item snapshot with ``asyncio.sleep(0)`` yields
+        so player commands can run during JSON work; the SQLite wipe+rewrite
+        stays one short transaction. Post-login uses the same cooperative
+        path; disconnect schedules the same cooperative path; shutdown
+        still calls sync ``save()`` immediately.
+        """
+        if not self._autosave_due():
+            return
+        if getattr(self, "_autosave_running", False):
+            return
+        from engine import diag_export
+        import time as _save_time
+        _diag = diag_export.diag_enabled()
+        _t_save = _save_time.perf_counter() if _diag else None
+        await self.save_async()
+        if _diag and _t_save is not None:
+            diag_export.append_event(
+                "D",
+                "server.py:on_tick:autosave",
+                "autosave_ms",
+                {
+                    "save_ms": round(
+                        (_save_time.perf_counter() - _t_save) * 1000.0, 2
+                    ),
+                    "game_time_ticks": self.game_time_ticks,
+                    "n_rooms": len(getattr(self, "rooms", {}) or {}),
+                    "n_chars": len(
+                        getattr(self, "characters", ()) or ()
+                    ),
+                },
+            )
+
+    def _autosave_due(self):
+        """True once every AUTOSAVE_INTERVAL_SECONDS of wall-clock time.
+
+        Wall-clock, not ``game_time_ticks`` -- ticks only advance a fraction
+        per heartbeat under ``gm clock scale`` (stock scale 1 = 1/3
+        tick/heartbeat), so a tick-count gate silently stretched this to
+        ~3x the interval once the world clock defaulted to 1:1 real-time.
+        """
+        now = time.monotonic()
+        last = getattr(self, "_last_autosave_monotonic", None)
+        if last is not None and (now - last) < AUTOSAVE_INTERVAL_SECONDS:
+            return False
+        self._last_autosave_monotonic = now
+        return True
+
     def _maybe_autosave(self):
-        """Autosave every AUTOSAVE_EVERY_TICKS heartbeats (~60s at 3s/tick).
+        """Autosave every AUTOSAVE_INTERVAL_SECONDS of wall-clock time.
 
         Wipe+rewrite SQLite across ~12k rooms blocks the single asyncio
-        thread and felt like command lag. Connect / disconnect / shutdown
-        still call save() immediately.
+        thread and felt like command lag. Login and disconnect schedule
+        cooperative ``save_async``; shutdown still calls ``save()`` immediately.
         """
-        if self.game_time_ticks % AUTOSAVE_EVERY_TICKS != 0:
+        if not self._autosave_due():
             return
         from engine import diag_export
         import time as _save_time
@@ -554,8 +797,19 @@ async def main():
     # Prove the child is alive during long Game() / world load so the
     # watcher boot-grace clock has a fresh stamp once import finishes.
     from engine import game_heartbeat
+
     game_heartbeat.touch_heartbeat("main_enter")
-    game = Game()
+    try:
+        game = Game()
+    except Exception as exc:
+        # Watcher reads this on child exit to spot DB corruption loops.
+        try:
+            from engine import boot_failure
+
+            boot_failure.record_boot_failure(exc, phase="Game()")
+        except Exception:
+            pass
+        raise
     game_heartbeat.touch_heartbeat("game_ready")
     from engine.gateway_client import GatewayBridge, gateway_enabled
 
@@ -592,12 +846,13 @@ async def main():
     # Direct telnet (RIFTFORGE_GATEWAY=0): bind :4000 + optional copyover.
     # start_server listens for connections. The lambda is a tiny inline function:
     # asyncio hands it (reader, writer) for each new client, and we add `game`.
+    port = int(os.environ.get("RIFTFORGE_PORT", "4000"))
     server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, game),
         host="0.0.0.0",                   # accept connections on any network interface
-        port=int(os.environ.get("RIFTFORGE_PORT", "4000")),
+        port=port,
     )
-    print("SUPERS engine listening on port 4000  (telnet localhost 4000)")
+    print(f"SUPERS engine listening on port {port}  (telnet localhost {port})")
 
     # Copyover (see copyover.py): SIGUSR1 triggers a hot in-place reload that
     # keeps every connected client's socket open across it -- distinct from

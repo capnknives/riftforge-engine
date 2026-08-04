@@ -1,0 +1,22 @@
+{
+  "id": "catalog.cast_bark",
+  "label": "Immersion cast bark tag pool",
+  "writes_to": "supers/content/cast_barks.json characters{}",
+  "fields": {
+    "character_key": {
+      "type": "string",
+      "required": true,
+      "doc": "Cast character key (dict key in cast_barks.json characters)."
+    },
+    "tag": {
+      "type": "string",
+      "required": true,
+      "doc": "Bark trigger tag id."
+    },
+    "lines": {
+      "type": "list",
+      "required": true,
+      "doc": "Non-empty list of bark template strings."
+    }
+  }
+}

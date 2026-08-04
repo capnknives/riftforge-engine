@@ -1,0 +1,97 @@
+{
+  "id": "catalog.persona",
+  "label": "Persona trait modifier row",
+  "writes_to": "supers/content/personas.json traits{}",
+  "fields": {
+    "id": {
+      "type": "string",
+      "required": true,
+      "doc": "Trait tag id (dict key in personas.json traits)."
+    },
+    "hunger_mult": {
+      "type": "float",
+      "required": false,
+      "doc": "Hunger decay multiplier."
+    },
+    "thirst_mult": {
+      "type": "float",
+      "required": false,
+      "doc": "Thirst decay multiplier."
+    },
+    "energy_mult": {
+      "type": "float",
+      "required": false,
+      "doc": "Sleep/energy decay multiplier."
+    },
+    "social_mult": {
+      "type": "float",
+      "required": false,
+      "doc": "Social need decay multiplier."
+    },
+    "entertainment_mult": {
+      "type": "float",
+      "required": false,
+      "doc": "Entertainment need decay multiplier."
+    },
+    "hygiene_mult": {
+      "type": "float",
+      "required": false,
+      "doc": "Hygiene need decay multiplier."
+    },
+    "gym_mult": {
+      "type": "float",
+      "required": false,
+      "doc": "Gym need decay multiplier."
+    },
+    "homesickness_mult": {
+      "type": "float",
+      "required": false,
+      "doc": "Homesick drip multiplier."
+    },
+    "duty_mult": {
+      "type": "float",
+      "required": false,
+      "doc": "Duty meter gain multiplier."
+    },
+    "fear_mult": {
+      "type": "float",
+      "required": false,
+      "doc": "Fear accrual multiplier."
+    },
+    "thrift": {
+      "type": "float",
+      "required": false,
+      "doc": "Spend reluctance multiplier."
+    },
+    "wander": {
+      "type": "float",
+      "required": false,
+      "doc": "Idle wander probability multiplier."
+    },
+    "chatter": {
+      "type": "float",
+      "required": false,
+      "doc": "Ambient talk chance multiplier."
+    },
+    "seek_mult": {
+      "type": "float",
+      "required": false,
+      "doc": "Need-seek threshold multiplier."
+    },
+    "morning_energy_mult": {
+      "type": "float",
+      "required": false,
+      "doc": "Morning energy band multiplier."
+    },
+    "night_energy_mult": {
+      "type": "float",
+      "required": false,
+      "doc": "Night energy band multiplier."
+    },
+    "assertiveness": {
+      "type": "float",
+      "required": false,
+      "doc": "Cadence social lead/follow weight (summed across traits)."
+    }
+  }
+}

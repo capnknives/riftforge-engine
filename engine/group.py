@@ -43,6 +43,11 @@ GROUP_SOLO_COOLDOWN_TICKS = 9600
 # at the 3s heartbeat (live bug #67, requested explicitly by the reporter).
 GROUP_REGROUP_COOLDOWN_TICKS = 600
 
+# Live leader with zero colocated followers: shorter grace before disband.
+# Echo followers still get Cadence catch-up ticks to path in (bug #256).
+# 20 ticks ~ 60s at the 3s heartbeat (full grace stays 100 / ~5 min).
+GROUP_LIVE_ALONE_DISBAND_TICKS = 20
+
 
 def resolve_leader(character):
     """Walk ``following`` to the root leader (or self when solo).
@@ -196,6 +201,7 @@ def format_group_sheet(character, game=None):
             "(see 'help group' / 'help follow' / 'help beckon').\r\n"
             "When grouped: group front|back sets your display row."
         )
+    leader = members[0]
     lines = ["", "Your group:"]
     for member in members:
         name = getattr(member, "key", "?")
@@ -205,9 +211,14 @@ def format_group_sheet(character, game=None):
             or name
         )
         you = " (you)" if member is character else ""
+        apart = (
+            member is not leader
+            and not mates_share_group_location(leader, member)
+        )
+        apart_tag = " (apart)" if apart else ""
         hp, max_hp = member_hp_pair(member)
         row = row_label(member)
-        lines.append(f"  {face}  {hp}/{max_hp}hp - {row}{you}")
+        lines.append(f"  {face}  {hp}/{max_hp}hp - {row}{you}{apart_tag}")
     # Game flavor (pack SEEK convoy / burger rule) -- optional hook.
     try:
         from engine import hooks
@@ -438,6 +449,21 @@ def _group_tick(game):
     return int(getattr(game, "game_time_ticks", 0) or 0)
 
 
+def _character_plane(character):
+    """Plane id for colocation rules (default earth when unknown)."""
+    room = getattr(character, "location", None)
+    if room is None:
+        return "earth"
+    return getattr(room, "plane", None) or "earth"
+
+
+def mates_share_group_plane(a, b):
+    """True when two bodies stand on the same plane (earth, purgatory, …)."""
+    if a is None or b is None:
+        return False
+    return _character_plane(a) == _character_plane(b)
+
+
 def mates_share_group_location(a, b):
     """True when two bodies count as together for group unit rules.
 
@@ -445,6 +471,8 @@ def mates_share_group_location(a, b):
     false-trigger instant disband).
     """
     if a is None or b is None:
+        return False
+    if not mates_share_group_plane(a, b):
         return False
     a_room = getattr(a, "location", None)
     b_room = getattr(b, "location", None)
@@ -494,18 +522,55 @@ def _clear_apart_stamp(leader):
         leader._group_apart_since_tick = None
 
 
+def live_present(character):
+    """True when a body has an active player Session (not Echo / idlemode)."""
+    if character is None:
+        return False
+    if getattr(character, "session", None) is None:
+        return False
+    if hasattr(character, "acts_as_echo") and character.acts_as_echo():
+        return False
+    return True
+
+
+def _colocated_follower_count(leader):
+    """How many followers share the leader's room or vehicle."""
+    if leader is None:
+        return 0
+    count = 0
+    for mate in group_members(leader)[1:]:
+        if mates_share_group_location(leader, mate):
+            count += 1
+    return count
+
+
+def _apart_disband_ticks(leader):
+    """Grace window before an apart party auto-disbands."""
+    if live_present(leader) and _colocated_follower_count(leader) == 0:
+        return GROUP_LIVE_ALONE_DISBAND_TICKS
+    return GROUP_APART_DISBAND_TICKS
+
+
 def maintain_group_colocation(leader, game):
     """Disband only after GROUP_APART_DISBAND_TICKS apart (not same tick).
 
     Returns True when the party was disbanded. While apart but inside the
     grace window, followers may Cadence-step to catch up (see
-    ``cadence_may_step``).
+    ``cadence_may_step``). Cross-plane splits disband immediately -- there
+    is no reunite path while one mate is in Purgatory and another on Earth
+    (live bug report 188).
     """
     if leader is None or game is None:
         return False
     if not in_group(leader):
         _clear_apart_stamp(leader)
         return False
+    members = group_members(leader)
+    for mate in members[1:]:
+        if not mates_share_group_plane(leader, mate):
+            disband_group(leader, game, reason="separated")
+            _clear_apart_stamp(leader)
+            return True
     if all_members_colocated(leader):
         _clear_apart_stamp(leader)
         return False
@@ -514,7 +579,7 @@ def maintain_group_colocation(leader, game):
     if since is None:
         leader._group_apart_since_tick = now
         return False
-    if (now - int(since)) < GROUP_APART_DISBAND_TICKS:
+    if (now - int(since)) < _apart_disband_ticks(leader):
         return False
     disband_group(leader, game, reason="separated")
     _clear_apart_stamp(leader)
@@ -653,6 +718,11 @@ def disband_group(leader, game, *, reason="separated"):
                 if frozenset((id(a), id(b))) in escalated:
                     continue
                 _stamp_pair_regroup_cooldown(a, b, game)
+    elif reason == "reconnect_apart":
+        msg = (
+            "[Group] You reconnect apart from your party -- "
+            "the group bond cleared. Follow or beckon again to regroup."
+        )
     else:
         msg = "[Group] The party disbands."
     for member in list(members):
@@ -677,6 +747,35 @@ def validate_group_colocation(anchor, game):
     if leader is None:
         return False
     return maintain_group_colocation(leader, game)
+
+
+def heal_group_on_session_attach(character, game):
+    """Live login / reconnect: clear stale apart follow bonds (crash #256).
+
+    Echo and idlemode bodies keep apart grace -- Cadence may still catch
+    up. A present player must not walk solo with a ghost party roster.
+    """
+    if character is None or game is None:
+        return
+    if not live_present(character):
+        return
+    if not in_group(character):
+        return
+    if all_members_colocated(character):
+        return
+    leader = resolve_leader(character)
+    if leader is None:
+        return
+    if is_leader(character):
+        disband_group(leader, game, reason="reconnect_apart")
+        return
+    _peel_from_group(character, game, reason="reconnect_apart")
+    sess = getattr(character, "session", None)
+    if sess is not None:
+        sess.send(
+            "[Group] You reconnect apart from the party -- "
+            "the group bond cleared. Follow or beckon again to regroup."
+        )
 
 
 def heal_separated_groups(game):

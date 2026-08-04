@@ -12,6 +12,8 @@ Pure engine: no supers imports. Static fields are constants here; PLAYERS and
 UPTIME read live Game state.
 """
 
+import os
+
 from engine import telnet
 
 # Subnegotiation markers inside IAC SB MSSP ... IAC SE (not printable ASCII).
@@ -21,11 +23,14 @@ MSSP_VAL = 2
 # Listing-facing game name -- matches Session.run's welcome banner.
 MSSP_NAME = "Mortals and Monsters"
 
+# Default telnet port when Game has no listen_port (matches server.py).
+MSSP_DEFAULT_PORT = "4000"
+
 # Fixed metadata crawlers expect. Omit CONTACT / WEBSITE / DISCORD until
-# those URLs exist in-repo (do not invent).
+# those URLs exist in-repo (do not invent). PORT is emitted from
+# listen_port(game) at build time -- not duplicated here.
 _STATIC_FIELDS = (
     ("NAME", MSSP_NAME),
-    ("PORT", "4000"),
     ("CODEBASE", "Riftforge"),
     ("FAMILY", "Custom"),
     ("GENRE", "Horror"),
@@ -45,6 +50,15 @@ _STATIC_FIELDS = (
 # Text probes some listing sites send at the name prompt when WILL MSSP
 # never arrived (MudVerse / Grapevine fallback). Exact match, case-folded.
 TEXT_PROBE_NAMES = frozenset({"mssp", "mssp-request"})
+
+
+def listen_port(game) -> str:
+    """Telnet listen port for MSSP PORT (game attr, else RIFTFORGE_PORT env)."""
+    if game is not None:
+        port = getattr(game, "listen_port", None)
+        if port is not None:
+            return str(int(port))
+    return os.environ.get("RIFTFORGE_PORT", MSSP_DEFAULT_PORT)
 
 
 def player_count(game) -> int:
@@ -71,10 +85,17 @@ def build_status(game):
         ("NAME", MSSP_NAME),
         ("PLAYERS", str(player_count(game))),
         ("UPTIME", uptime),
+        ("PORT", listen_port(game)),
     ]
+    status_override = None
+    if game is not None:
+        status_override = getattr(game, "mssp_status", None)
     # Skip the duplicate NAME already emitted as required.
     for key, value in _STATIC_FIELDS:
         if key == "NAME":
+            continue
+        if key == "STATUS" and status_override:
+            pairs.append((key, str(status_override)))
             continue
         pairs.append((key, value))
     return pairs

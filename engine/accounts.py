@@ -234,6 +234,8 @@ def link_character(game, account, character):
         return "That character has no storage key."
     if getattr(character, "is_npc", False):
         return "NPCs cannot be linked to an account."
+    if getattr(character, "immersion", False):
+        return "Immersion cast cannot be linked to an account."
     # Refuse husks / gm spirits -- only real login bodies.
     key_low = key.lower()
     if key_low.startswith("husk:") or key_low.startswith("gmspirit:"):
@@ -312,6 +314,44 @@ def gm_spirit_key_for_account(account):
     return f"gmspirit:{account.name}"
 
 
+def _vaulted_character_keys_lower(game):
+    """Lowercase storage keys in ``character_vault`` (folded offline bodies).
+
+    Folded characters are intentionally absent from ``game.characters`` at
+    boot. ``reconcile_accounts`` must not drop their roster slots or account
+    login / ``gm off <name>`` will think they do not exist until someone
+    manually relinks.
+    """
+    db = getattr(game, "db", None)
+    if db is None:
+        return set()
+    try:
+        from engine import persistence
+
+        return {
+            (row[0] or "").strip().lower()
+            for row in persistence.vault_list(db)
+            if row and (row[0] or "").strip()
+        }
+    except Exception:
+        return set()
+
+
+def _playable_account_link_key(char):
+    """Storage key for account roster membership, or None when not linkable."""
+    if char is None or getattr(char, "is_npc", False):
+        return None
+    if getattr(char, "immersion", False):
+        return None
+    key = (getattr(char, "key", None) or "").strip()
+    if not key:
+        return None
+    key_low = key.lower()
+    if key_low.startswith("husk:") or key_low.startswith("gmspirit:"):
+        return None
+    return key
+
+
 def reconcile_accounts(game):
     """Boot heal: keep account.character_keys ↔ character.account honest.
 
@@ -321,6 +361,10 @@ def reconcile_accounts(game):
     linked = 0
     repaired_back = 0
     dropped_stale = 0
+    vaulted_kept = 0
+    roster_repaired = 0
+    cast_unlinked = 0
+    vaulted_keys = _vaulted_character_keys_lower(game)
     # Index characters by lower key for fast lookup.
     by_key = {}
     for char in list(getattr(game, "characters", None) or []):
@@ -341,8 +385,21 @@ def reconcile_accounts(game):
             seen.add(low)
             char = by_key.get(low)
             if char is None:
-                # Character folded/vaulted/gone -- drop from roster.
+                # Folded bodies live in character_vault, not the live roster.
+                if low in vaulted_keys:
+                    kept.append(k)
+                    vaulted_kept += 1
+                    continue
+                # Truly gone -- drop from roster.
                 dropped_stale += 1
+                continue
+            if getattr(char, "immersion", False):
+                # Cast bodies ride the staff menu only -- never account rosters.
+                dropped_stale += 1
+                if (getattr(char, "account", None) or "").strip():
+                    char.account = ""
+                    repaired_back += 1
+                    cast_unlinked += 1
                 continue
             kept.append(getattr(char, "key", k) or k)
             # Force back-pointer to this account.
@@ -354,6 +411,35 @@ def reconcile_accounts(game):
         # Ensure gm_spirit_key is stamped when ranked.
         if account.gm_rank in ("gm", "head_gm"):
             account.gm_spirit_key = gm_spirit_key_for_account(account)
+
+    # Live bodies may carry ``character.account`` without a roster row when
+    # a prior boot dropped them while vaulted (old reconcile) or link only
+    # stamped the back-pointer.
+    cast_unlinked = 0
+    for char in by_key.values():
+        key = _playable_account_link_key(char)
+        if not key:
+            # Immersion cast must never ride account rosters.
+            if getattr(char, "immersion", False) and (
+                getattr(char, "account", None) or ""
+            ).strip():
+                char.account = ""
+                repaired_back += 1
+                cast_unlinked += 1
+            continue
+        claimed = (getattr(char, "account", None) or "").strip()
+        if not claimed:
+            continue
+        account = find_account(game, claimed)
+        if account is None:
+            char.account = ""
+            repaired_back += 1
+            continue
+        existing_low = {k.lower() for k in account.character_keys}
+        if key.lower() not in existing_low:
+            account.character_keys.append(key)
+            roster_repaired += 1
+            linked += 1
 
     # Characters that claim an account which does not exist -- clear.
     for char in by_key.values():
@@ -369,7 +455,91 @@ def reconcile_accounts(game):
         "links": linked,
         "repaired": repaired_back,
         "dropped": dropped_stale,
+        "vaulted_kept": vaulted_kept,
+        "roster_repaired": roster_repaired,
+        "cast_unlinked": cast_unlinked,
     }
+
+
+# Known player accounts wiped by a shutdown-save race (empty in-memory
+# accounts dict rewritten over SQLite). Boot heal restores them once so
+# a single game-only restart is enough -- no offline DB race.
+_RESTORED_PLAYER_ACCOUNTS = (
+    {
+        "name": "Matt",
+        "character_keys": ("Daniel", "Vorath"),
+        # Temporary until Matt changes it; character login still uses
+        # each body's own password_hash.
+        "temp_password": "Restore2026",
+    },
+)
+
+
+def heal_restored_player_accounts(game):
+    """Boot heal: recreate known wiped player accounts and relink bodies.
+
+    Idempotent. Runs after ``load_accounts`` / ``reconcile_accounts`` so the
+    in-memory dict already has staff rows; creating Matt here means the
+    next ``save_accounts`` keeps everyone. Returns how many accounts were
+    created or re-linked.
+    """
+    accounts = ensure_accounts_dict(game)
+    finder = getattr(game, "find_character", None)
+    if not callable(finder):
+        return {"created": 0, "linked": 0}
+
+    created = 0
+    linked = 0
+    for spec in _RESTORED_PLAYER_ACCOUNTS:
+        name = (spec.get("name") or "").strip()
+        if not name:
+            continue
+        account = find_account(game, name)
+        if account is None:
+            temp = (spec.get("temp_password") or "").strip() or "Restore2026"
+            # Prefer copying a linked body's password hash when present so
+            # the player can reuse a password they already know; otherwise
+            # hash the documented temp password.
+            pw_hash = ""
+            for key in spec.get("character_keys") or ():
+                char = finder(key)
+                if char is None:
+                    continue
+                body_hash = (getattr(char, "password_hash", None) or "").strip()
+                if body_hash:
+                    pw_hash = body_hash
+                    break
+            used_body_hash = bool(pw_hash)
+            if not pw_hash:
+                pw_hash = auth.hash_password(temp)
+            account = Account(name, password_hash=pw_hash, display_name=name)
+            account.ooc_identity = OOC_IDENTITY_ACCOUNT
+            register_account(game, account)
+            created += 1
+            how = (
+                "copied a linked character password_hash"
+                if used_body_hash
+                else f"temp password {temp!r} (player should reset)"
+            )
+            print(
+                f"[accounts] boot-heal restored account {name!r} ({how})",
+                flush=True,
+            )
+
+        for key in spec.get("character_keys") or ():
+            char = finder(key)
+            if char is None:
+                continue
+            err = link_character(game, account, char)
+            if err is None:
+                linked += 1
+            elif err:
+                print(
+                    f"[accounts] boot-heal link {key!r} -> {name!r}: {err}",
+                    flush=True,
+                )
+
+    return {"created": created, "linked": linked, "accounts": len(accounts)}
 
 
 def migrate_legacy_gm_ranks(game):
@@ -430,19 +600,11 @@ def playable_link_target(game, character):
     if character is None:
         return None, "Nothing to link."
     key_low = (getattr(character, "key", None) or "").lower()
-    is_spirit = (
-        bool(getattr(character, "gm_spirit", False))
-        or key_low.startswith("gmspirit:")
-    )
+    from engine import hooks
+    is_spirit = hooks.is_gm_spirit(character)
     if not is_spirit:
         return character, None
-    # Prefer the live body pointer stamped by ``gm on``.
-    body = getattr(character, "gm_mode_body", None)
-    if body is None:
-        body_key = getattr(character, "gm_body_key", None)
-        if body_key and game is not None:
-            finder = getattr(game, "find_character", None)
-            body = finder(body_key) if callable(finder) else None
+    body = hooks.resolve_gm_body(character, game)
     if body is None:
         return None, (
             "Leave GM form (`gm off`) or reconnect as your character "

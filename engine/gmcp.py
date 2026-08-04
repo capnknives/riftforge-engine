@@ -204,6 +204,12 @@ def handle_telnet_event(session, event):
                 session.gmcp_enabled = True
                 send_hello(session)
                 send_supports(session)
+                # Chargen / account-link can take many read_line turns after
+                # the client already sent Core.Supports.Set with no character
+                # attached -- re-push once GMCP is live when a body exists.
+                if session.character is not None:
+                    push_char_identity(session.character)
+                    push_vitals(session.character)
             return
         if _cmd == telnet.DONT:
             session.gmcp_enabled = False

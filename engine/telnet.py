@@ -163,15 +163,22 @@ def parse_stream(buf: bytes):
     return bytes(text), events, remainder
 
 
-def text_to_command_line(text: bytes) -> str:
-    """Turn accumulated application text into one stripped printable line.
+def text_to_command_line(text: bytes, *, keep_indent: bool = False) -> str:
+    """Turn accumulated application text into one printable line.
 
     Matches the old _clean() printable-ASCII policy for login / commands so
     control bytes and high-bit garbage never become Character keys. Newlines
     and CR are discarded (the caller already split on line endings).
+
+    Default ``keep_indent=False`` strips leading and trailing spaces (normal
+    command lines). Pass ``keep_indent=True`` for modal editors / paste
+    capture (hedit, bug/suggest) so intentional leading indent survives --
+    only trailing whitespace is trimmed then.
     """
     out = []
     for b in text:
         if 32 <= b < 127:
             out.append(chr(b))
-    return "".join(out).strip()
+    line = "".join(out)
+    # Editors need leading spaces; commands do not.
+    return line.rstrip() if keep_indent else line.strip()

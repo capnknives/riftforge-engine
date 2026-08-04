@@ -204,6 +204,39 @@ def describe_ticket_ref(bug_ids=None, suggestion_ids=None):
     return " and ".join(parts)
 
 
+def describe_ticket_live_clause(bug_ids=None, suggestion_ids=None):
+    """Post-copyover announce clause: 'Bug #N fix is live', etc.
+
+    Bug-only deploys say *fix* so players do not read 'Bug #N is live' as the
+    bug itself shipping. Suggestion-only deploys say *ship*; mixed batches keep
+    the neutral 'is live' wording.
+    """
+    bug_ids = list(bug_ids or [])
+    suggestion_ids = list(suggestion_ids or [])
+    ref = describe_ticket_ref(bug_ids, suggestion_ids)
+    if ref == "A tear in the script":
+        return "The mend is live"
+    if bug_ids and not suggestion_ids:
+        return f"{ref} fix is live"
+    if suggestion_ids and not bug_ids:
+        return f"{ref} ship is live"
+    return f"{ref} is live"
+
+
+def describe_ticket_countdown_verb(bug_ids=None, suggestion_ids=None):
+    """Veil countdown verb: ``has/have been mended/shipped``."""
+    bug_ids = list(bug_ids or [])
+    suggestion_ids = list(suggestion_ids or [])
+    if bug_ids and not suggestion_ids:
+        base = "mended"
+    else:
+        base = "shipped"
+    count = len(bug_ids) + len(suggestion_ids)
+    if count > 1:
+        return f"have been {base}"
+    return f"has been {base}"
+
+
 def queue_deploy(directory, *, pr, bug_id=None, bug_ids=None,
                  suggestion_id=None, suggestion_ids=None, summary="",
                  countdown_seconds=30, triggered_by="unknown", commit_sha=None):
@@ -328,9 +361,11 @@ def _apply_catchup_fixes(game, fixes):
                 last_summary = "Player suggestions have been shipped."
             else:
                 last_summary = "Reported bugs have been fixed."
-        ref = describe_ticket_ref(all_bug_ids, all_suggestion_ids)
+        live_clause = describe_ticket_live_clause(
+            all_bug_ids, all_suggestion_ids,
+        )
         game.broadcast_all(
-            f"*** The Veil holds. {ref} is live (catch-up): "
+            f"*** The Veil holds. {live_clause} (catch-up): "
             f"{last_summary} ***"
         )
 
@@ -433,12 +468,12 @@ def _reconcile_missed_fix_resolves_from_auto_deploy_state(game):
         with open(state_path, encoding="utf-8") as f:
             state = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
-        return False
+        return reconcile_open_bugs_from_deployed_fixes(game)
 
     last_sha = (state.get("last_deploy") or {}).get("sha") or ""
     origin_sha = state.get("origin_main") or ""
     if not last_sha or not origin_sha or last_sha == origin_sha:
-        return False
+        return reconcile_open_bugs_from_deployed_fixes(game)
 
     from engine import auto_deploy
 
@@ -446,12 +481,12 @@ def _reconcile_missed_fix_resolves_from_auto_deploy_state(game):
         directory, last_sha, origin_sha,
     )
     if not missed:
-        return False
+        return reconcile_open_bugs_from_deployed_fixes(game)
 
     completed = _load_completed_keys(directory)
     pending = [fix for fix in missed if fix["sha"] not in completed]
     if not pending:
-        return False
+        return reconcile_open_bugs_from_deployed_fixes(game)
 
     # Normalize keys for _apply_catchup_fixes (file hand-off uses commit_sha).
     fixes = [
@@ -464,16 +499,57 @@ def _reconcile_missed_fix_resolves_from_auto_deploy_state(game):
         for fix in pending
     ]
     applied = _apply_catchup_fixes(game, fixes)
-    if not applied:
+    if applied:
+        auto_deploy.record_catchup_last_deploy(directory, pending[-1])
+        print(
+            f"[deploy_notify] copyover reconciled {len(pending)} missed Fix "
+            f"commit(s) from auto_deploy state",
+            flush=True,
+        )
+    return applied or reconcile_open_bugs_from_deployed_fixes(game)
+
+
+def reconcile_open_bugs_from_deployed_fixes(game):
+    """Close open tickets whose Fix subjects are already on the deployed tree.
+
+    Idempotent boot/copyover heal for tickets that stayed ``open`` because
+    resolve ran once at deploy time but ``reports.mark`` failed, the catch-up
+    hand-off was lost, or the squash subject used a duplicate id (#239 vs
+    #238) covered by ``auto_deploy._BUG_RESOLVE_ALIASES``.
+    """
+    directory = game.report_dir
+    from engine import auto_deploy
+
+    git_root = auto_deploy.git_root_for(directory)
+    open_ids = set(auto_deploy.open_bug_ids(directory))
+    if not open_ids:
         return False
 
-    auto_deploy.record_catchup_last_deploy(directory, pending[-1])
-    print(
-        f"[deploy_notify] copyover reconciled {len(pending)} missed Fix "
-        f"commit(s) from auto_deploy state",
-        flush=True,
+    deployed_ids = set(
+        auto_deploy.deployed_fix_bug_ids(git_root, directory),
     )
-    return True
+    to_close = sorted(open_ids & deployed_ids)
+    if not to_close:
+        return False
+
+    for bug_id in to_close:
+        try:
+            reports.mark(
+                reports.BUG, int(bug_id), "resolved", directory=directory,
+                game=game,
+            )
+            print(
+                f"[deploy_notify] deployed-fix heal marked bug "
+                f"#{bug_id} resolved",
+                flush=True,
+            )
+        except (ValueError, IndexError) as exc:
+            print(
+                f"[deploy_notify] deployed-fix heal could not mark bug "
+                f"#{bug_id} resolved: {exc}",
+                flush=True,
+            )
+    return bool(to_close)
 
 
 def tick(game):
@@ -540,10 +616,7 @@ async def _run_countdown(game, signal):
     total = int(signal.get("countdown_seconds", 30))
 
     ticket_ref = describe_ticket_ref(bug_ids, suggestion_ids)
-    if bug_ids and not suggestion_ids:
-        verb = "has been mended"
-    else:
-        verb = "has been shipped"
+    verb = describe_ticket_countdown_verb(bug_ids, suggestion_ids)
     game.broadcast_all(
         f"*** {ticket_ref} {verb}: {summary} ***\r\n"
         f"*** The Veil will reseal in {total} seconds. Stay put -- "
@@ -597,15 +670,10 @@ async def on_resume(game):
     )
     summary = signal.get("summary") or "A reported bug has been fixed."
 
-    ticket_ref = describe_ticket_ref(bug_ids, suggestion_ids)
-    if ticket_ref != "A tear in the script":
-        game.broadcast_all(
-            f"*** The Veil holds. {ticket_ref} is live: {summary} ***"
-        )
-    else:
-        game.broadcast_all(
-            f"*** The Veil holds. The mend is live: {summary} ***"
-        )
+    live_clause = describe_ticket_live_clause(bug_ids, suggestion_ids)
+    game.broadcast_all(
+        f"*** The Veil holds. {live_clause}: {summary} ***"
+    )
 
     for bug_id in bug_ids:
         try:

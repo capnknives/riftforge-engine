@@ -1,0 +1,74 @@
+{
+  "id": "creature.pet_instance",
+  "label": "Named pet instance (household / authored beast)",
+  "writes_to": "content/pets/instances.json",
+  "fields": {
+    "key": {
+      "type": "string",
+      "required": true,
+      "doc": "Character key (unique in world)."
+    },
+    "species_id": {
+      "type": "string",
+      "required": true,
+      "doc": "pets.json species id (dog, squirrel, …)."
+    },
+    "description": {
+      "type": "string",
+      "required": true,
+      "doc": "Look text for this named pet."
+    },
+    "owner_key": {
+      "type": "string",
+      "required": false,
+      "default": "",
+      "doc": "Player or NPC owner key."
+    },
+    "home_room_key": {
+      "type": "string",
+      "required": true,
+      "doc": "Room key where the pet sleeps / roams from."
+    },
+    "zone": {
+      "type": "string",
+      "required": true,
+      "doc": "Cadence confinement zone (plot id or town)."
+    },
+    "pet_appearance": {
+      "type": "object",
+      "required": true,
+      "default": {},
+      "doc": "Breed / coat / sex / size appearance dict."
+    },
+    "peaceful": {
+      "type": "bool",
+      "required": false,
+      "default": true,
+      "doc": "Non-combat household pet."
+    },
+    "hp_vit": {
+      "type": "float",
+      "required": false,
+      "default": 8,
+      "doc": "Base VIT when spawning."
+    },
+    "pow": {
+      "type": "float",
+      "required": false,
+      "default": 6,
+      "doc": "Base POW when spawning."
+    },
+    "sanctuary_household": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "Hillside Sanctuary roam-only household flag."
+    },
+    "sanctuary_roam": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "Roam plot without leaving zone."
+    }
+  }
+}

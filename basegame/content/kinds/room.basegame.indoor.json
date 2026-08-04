@@ -1,0 +1,14 @@
+{
+  "id": "room.basegame.indoor",
+  "label": "Basegame indoor room",
+  "extends": "room.engine",
+  "writes_to": "basegame/content/zones rooms[]",
+  "fields": {
+    "outdoor": {
+      "type": "bool",
+      "required": true,
+      "default": false,
+      "doc": "Indoor room."
+    }
+  }
+}

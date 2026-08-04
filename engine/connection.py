@@ -256,6 +256,16 @@ class Session:
         # "login" = name/password prompts; "creating" = mid-chargen;
         # None = fully in play (on game.sessions) or not yet registered.
         self.login_stage = None
+        # Soft ``logout`` (character select without closing TCP): play()
+        # exits the command loop, disconnect(keep_connection=True) parks
+        # the body as an Echo, then _run_inner re-enters login.
+        self._soft_logout = False
+        self._soft_relogin = False
+        # Account name to prefer for the soft-logout character pick
+        # (skip re-typing ``account`` when the body was linked).
+        self._soft_logout_account = None
+        # Character key of whoever last sent this Session a tell (for ``reply``).
+        self.last_tell_from = None
 
     def _register_connecting(self, stage="login"):
         """Track this socket on game.connecting_sessions for GM users.
@@ -321,11 +331,24 @@ class Session:
         sid = self.gateway_session_id
         if bridge is None or not sid or not bind or bind == "?":
             return
+        from engine import ooc_channel
+
+        ooc_face = ooc_channel.speaker_face_for_session(self, self.game)
+        head_gm = ooc_channel.session_is_head_gm(self, self.game)
+        staff_gm = ooc_channel.session_is_staff_gm(self, self.game)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(bridge.notify_bound(sid, bind))
+        loop.create_task(
+            bridge.notify_bound(
+                sid,
+                bind,
+                ooc_face=ooc_face,
+                head_gm=head_gm,
+                staff_gm=staff_gm,
+            )
+        )
 
     def _kick_gateway_client(self):
         """Ask the gateway to drop the public TCP (quit / intentional close)."""
@@ -338,6 +361,22 @@ class Session:
         except RuntimeError:
             return
         loop.create_task(bridge.kick_client(sid))
+
+    def _notify_gateway_unbound(self):
+        """Clear the gateway's bound character name (soft logout / swap).
+
+        Keeps the public TCP held; the next successful login calls
+        ``_notify_gateway_bound`` with the new body name.
+        """
+        bridge = self.gateway_bridge
+        sid = self.gateway_session_id
+        if bridge is None or not sid:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(bridge.notify_unbound(sid))
 
     # --- output ------------------------------------------------------------
     def _write_raw(self, data: bytes):
@@ -450,7 +489,13 @@ class Session:
                 break
             line_bytes = raw[:nl]
             self._text_buf = bytearray(raw[nl + sep_len :])
-            line = telnet.text_to_command_line(line_bytes)
+            # HEDIT / report paste: keep leading indent (space is content).
+            keep_indent = (
+                self.help_edit is not None or self.report_capture is not None
+            )
+            line = telnet.text_to_command_line(
+                line_bytes, keep_indent=keep_indent,
+            )
             self._pending_lines.append(line)
 
     # --- input -------------------------------------------------------------
@@ -485,9 +530,15 @@ class Session:
         # Always drop from connecting_sessions on exit (mid-login hangup,
         # chargen abort, or play() end). Promote-to-play already removes us;
         # this is the safety net for early ``return`` paths that skip
-        # disconnect().
+        # disconnect(). Soft ``logout`` parks the body as an Echo and
+        # re-enters ``_run_inner`` on the same TCP (character select).
         try:
-            await self._run_inner()
+            while True:
+                await self._run_inner()
+                if not getattr(self, "_soft_relogin", False):
+                    break
+                self._soft_relogin = False
+                self.alive = True
         finally:
             self._leave_connecting()
 
@@ -520,10 +571,11 @@ class Session:
                 # Do not stamp last_input_tick when already idle -- autoidle
                 # skips idle bodies anyway; leaving the stamp alone avoids
                 # resetting AFK context after a hot reload.
+                # Module-level ``hooks`` only -- a local import here made
+                # ``hooks`` local for all of _run_inner and crashed new-character
+                # surname login (bug #311 UnboundLocalError).
                 if not getattr(char, "idle_mode", False):
-                    char.last_input_tick = getattr(
-                        self.game, "game_time_ticks", 0
-                    ) or 0
+                    hooks.stamp_input_activity(char, self.game)
                 self.character = char
                 # Reattach skips the name prompt -- never on connecting_sessions.
                 self._promote_to_sessions()
@@ -555,10 +607,19 @@ class Session:
         mssp.offer_mssp(self)
         # Classic MUD connect card: gothic wrought splash + creator/engine
         # credits (paint() 16-color -- no Character prefs yet).
-        for line in style.format_login_banner():
+        game = getattr(self, "game", None)
+        status_text = getattr(game, "login_status_text", None) if game else None
+        for line in style.format_login_banner(status_text=status_text):
             self.send(line)
+        # Soft logout may stamp a linked account for character select.
+        prefer_acct = getattr(self, "_soft_logout_account", None)
+        self._soft_logout_account = None
         self.send("By what name are you known?")
-        self.send("(Or type 'account' to log into an account.)")
+        self.send(
+            "(New here? Just type a name to start your first character -- "
+            "you'll be offered an account afterward. Already have an "
+            "account? Type 'account' to log in.)"
+        )
         # Staff `gm users` can see this socket as flags=login until promote.
         self._register_connecting("login")
 
@@ -570,7 +631,11 @@ class Session:
         # When True, password already verified via account login (feature C).
         account_login_ok = False
         while True:
-            raw_name = await self.read_line()
+            if prefer_acct:
+                # Soft logout → jump into account character pick once.
+                raw_name = "account"
+            else:
+                raw_name = await self.read_line()
             if raw_name is None:
                 return                # disconnected before finishing login
             # Listing crawlers that skip telnet MSSP may type "mssp" or
@@ -583,7 +648,11 @@ class Session:
             # Feature C: keyword ``account`` → account name/pass → pick char.
             from engine import account_login as account_login_mod
             if account_login_mod.is_account_login_keyword(raw_name):
-                picked = await account_login_mod.login_via_account(self)
+                known = prefer_acct
+                prefer_acct = None  # only auto-enter once
+                picked = await account_login_mod.login_via_account(
+                    self, known_account=known,
+                )
                 if picked is None:
                     return  # disconnected mid-account login
                 if picked is False:
@@ -624,6 +693,7 @@ class Session:
                     self._take_over_session(live_holder)
                     takeover = True
                 break
+            prefer_acct = None  # typed a real name; drop soft-logout prefer
             # Strip client window tags (P1/P4…) then require letters-only
             # (bug_reports.log #28). Digits used to pass isalnum() and baked
             # session tags into Character.key forever.
@@ -856,7 +926,16 @@ class Session:
             break                     # verified reconnect / takeover
 
         if existing:
-            # ---- RECONNECT / TAKEOVER: reattach the wires ----
+            # ---- RECONNECT / TAKEOVER: account offer, then reattach ----
+            # Unlinked bodies finish create/link/skip before welcome text,
+            # room broadcasts, or Session promotion (feature B ordering).
+            from engine import account_login as account_login_mod
+            if account_login_mod.character_needs_account_link_offer(existing):
+                linked_ok = await account_login_mod.offer_account_link(
+                    self, existing
+                )
+                if not linked_ok:
+                    return
             # Echo wake (section 4-E) when the body had no Session; takeover
             # when we just kicked a live Session -- character never left play.
             char = existing
@@ -885,7 +964,7 @@ class Session:
             # engine/copyover.py resume()).
             char.idle_mode = False
             # Fresh login starts the auto-idle AFK clock now.
-            char.last_input_tick = getattr(self.game, "game_time_ticks", 0) or 0
+            hooks.stamp_input_activity(char, self.game)
             self.character = char
             self._promote_to_sessions()
             # Public face for room / welcome / staff ping -- never
@@ -984,6 +1063,14 @@ class Session:
             if not await hooks.run_chargen(self, char):
                 # Client hung up mid-chargen -- do not place or persist.
                 return
+            # Account create/link/skip before the body enters the world.
+            from engine import account_login as account_login_mod
+            if account_login_mod.character_needs_account_link_offer(char):
+                linked_ok = await account_login_mod.offer_account_link(
+                    self, char
+                )
+                if not linked_ok:
+                    return
             # An Awakened Nature (Vampire/Angel/Demon/Leviathan/Elemental)
             # sets a one-shot chargen_start_room_key so the character
             # materializes in its homezone instead of the ordinary
@@ -1017,7 +1104,9 @@ class Session:
         # raised IntegrityError here; Mudlet stayed connected with no
         # command loop while the world kept ticking ("commands don't parse").
         try:
-            self.game.save()
+            # Cooperative snapshot: yields during JSON work so other
+            # sessions are not frozen on the single asyncio thread.
+            await self.game.save_async()
         except Exception as exc:
             print(
                 f"[connection] post-login save failed ({exc!r}) -- "
@@ -1031,14 +1120,12 @@ class Session:
                 )
             except Exception:
                 pass
-        # Feature B: unlinked playable body → create / link / skip offer.
+        # Clients often send Core.Supports.Set during login prompts. Sync
+        # Char packages when a character is attached (bootstrap hook ran
+        # earlier for new chars; reconnect path attaches above).
         if self.character is not None:
-            from engine import account_login as account_login_mod
-            linked_ok = await account_login_mod.offer_account_link(
-                self, self.character
-            )
-            if not linked_ok:
-                return
+            from engine import gmcp
+            gmcp.on_session_attach(self.character, self.game)
         # Gateway: remember who is on this held socket for the next game boot.
         if self.character is not None:
             self._notify_gateway_bound(self.character.key)
@@ -1054,6 +1141,10 @@ class Session:
         here -- skipping the name/password prompt above entirely, since a
         copyover already knows who was on this socket before the reload.
         """
+        # Late Core.Supports.Set during login/account-link is common; look
+        # also pushes Room.Info -- sync identity/vitals once more first.
+        from engine import gmcp
+        gmcp.on_session_attach(self.character, self.game)
         try:
             dispatch(self.character, "look", self.game)   # show them the room right away
         except Exception:
@@ -1069,21 +1160,23 @@ class Session:
             line = await self.read_line()
             if line is None:
                 break                 # client disconnected — leave the loop
-            if line == "":
-                continue              # they just hit enter — wait for the next line
             if self.report_capture is not None:
                 # Multi-line bug/suggest capture is active: EVERY line (even
                 # one that looks like a command) is buffered, not dispatched,
                 # until the '.' terminator -- that's the whole point, see
-                # __init__'s comment on report_capture.
+                # __init__'s comment on report_capture. Blank lines are kept
+                # (paste spacing); do not skip "" before this gate.
                 self._handle_report_capture_line(line)
                 continue
             if self.help_edit is not None:
                 # HEDIT modal editor is active: every line is a buffer edit
                 # (/i, /d, /r, ...) or an appended body line, never a normal
                 # game command -- same gate shape as report_capture above.
+                # Blank Enter appends an empty body line (help page spacing).
                 self._handle_help_edit_line(line)
                 continue
+            if line == "":
+                continue              # they just hit enter — wait for the next line
             # Record BEFORE dispatch so a crash still lands in history;
             # redact setpass so plaintext never hits bug reports (H2).
             entry = [history_line_for_storage(line), None]
@@ -1108,6 +1201,11 @@ class Session:
             # applying "backpressure" so we don't pile up unlimited data.
             await self.writer.drain()
 
+        # Soft logout: park body as Echo, keep TCP, re-enter character select.
+        if getattr(self, "_soft_logout", False):
+            self._soft_logout = False
+            self.disconnect(keep_connection=True)
+            return
         self.disconnect()             # loop ended -> clean up
 
     def _handle_report_capture_line(self, line):
@@ -1128,12 +1226,21 @@ class Session:
             # proposed keyword ahead of the pasted body) -- not report-kind
             # specific, any future paste-capture caller can use it.
             prefix = self.report_capture.get("prefix")
+            # Read optional fields before clearing capture -- a live crash
+            # (bug report 209) hit .get on None when subject_key was read
+            # after ``self.report_capture = None`` below.
+            subject_key = self.report_capture.get("subject_key")
             self.report_capture = None
             if not description:
                 self.send("Empty report -- nothing logged.")
                 return
             if prefix:
                 description = f"{prefix}\n{description}"
+            subject_character = None
+            if subject_key:
+                finder = getattr(self.game, "find_character", None)
+                if callable(finder):
+                    subject_character = finder(subject_key)
             if kind == reports.BUG:
                 noun = "bug report"
             elif kind == reports.HELP:
@@ -1143,6 +1250,7 @@ class Session:
             bug_filing.record_and_confirm(
                 self.character, kind, description,
                 _report_history(self.character), self.game.report_dir, noun,
+                subject_character=subject_character if kind == reports.BUG else None,
             )
             return
         if line.strip().lower() == "cancel":
@@ -1195,15 +1303,19 @@ class Session:
             return
 
         if cmd == "i":
-            sub = rest.split(maxsplit=1)
-            if len(sub) != 2 or not sub[0].isdigit():
+            # One space after the line number is the separator; everything
+            # after that is body text as-is (leading indent is content).
+            # str.split() would collapse those spaces and flatten the page.
+            match = re.match(r"^(\d+) (.*)$", rest)
+            if not match:
                 self.send("Usage: /i <line> <text>")
                 return
-            pos = int(sub[0])
+            pos = int(match.group(1))
+            text = match.group(2)
             if pos < 1 or pos > len(state["body"]) + 1:
                 self.send(f"Line must be between 1 and {len(state['body']) + 1}.")
                 return
-            state["body"].insert(pos - 1, sub[1])
+            state["body"].insert(pos - 1, text)
             self.send(f"Inserted at line {pos}.")
             return
 
@@ -1217,6 +1329,15 @@ class Session:
                 return
             removed = state["body"].pop(pos - 1)
             self.send(f"Deleted line {pos}: {removed}")
+            return
+
+        if cmd == "clear":
+            count = len(state["body"])
+            state["body"] = []
+            if count:
+                self.send(f"Cleared {count} body line(s).")
+            else:
+                self.send("Body already empty.")
             return
 
         if cmd == "r":
@@ -1306,8 +1427,8 @@ class Session:
             return
 
         self.send(
-            "Unknown editor command. Try: /list /i /d /r /syntax /category "
-            "/alias /gm /ic /preview /save /cancel"
+            "Unknown editor command. Try: /list /i /d /clear /r /syntax "
+            "/category /alias /gm /ic /preview /save /cancel"
         )
 
     def _take_over_session(self, character):
@@ -1347,12 +1468,17 @@ class Session:
             except Exception:
                 pass
 
-    def disconnect(self):
+    def disconnect(self, *, keep_connection=False):
         # Tidy up when a player leaves. THE INVARIANT (systems doc section 4-E):
         # logout is NOT deletion. The character stays in the world as an Echo —
         # an invulnerable, session-less figure — so we detach the session but
         # deliberately do NOT remove the character from its room.
-        self.alive = False
+        #
+        # keep_connection=True (soft ``logout``): Echo conversion + save, but
+        # leave the TCP / gateway socket up and set ``_soft_relogin`` so
+        # Session.run() re-enters the name/account character-select flow.
+        if not keep_connection:
+            self.alive = False
         # Capture name before we clear session / leave sessions list,
         # so the staff ping still has a readable label (mid-chargen included).
         # Peer IP is filled per recipient at ping time (head_gm only).
@@ -1376,13 +1502,15 @@ class Session:
             if getattr(self.character, "gm_mode", False) or getattr(
                 self.character, "gm_spirit", False
             ):
-                body = getattr(self.character, "gm_mode_body", None)
-                body_key = getattr(self.character, "gm_body_key", None)
-                if body is None and body_key:
-                    for obj in getattr(self.game, "characters", ()) or ():
-                        if getattr(obj, "key", None) == body_key:
-                            body = obj
-                            break
+                from engine import hooks
+                body = hooks.resolve_gm_body(self.character, self.game)
+                if body is None:
+                    body_key = getattr(self.character, "gm_body_key", None)
+                    if body_key:
+                        for obj in getattr(self.game, "characters", ()) or ():
+                            if getattr(obj, "key", None) == body_key:
+                                body = obj
+                                break
                 if body is not None:
                     # Intent survives quit -- body stays true-invis Echo.
                     body.gm_away = True
@@ -1419,13 +1547,14 @@ class Session:
                     except Exception:
                         permanent = False
                 if permanent:
-                    # Park: stay in room, sessionless, true-invis.
+                    # Fold staff spirit out of the live world; body stays Echo.
                     spirit.gm_mode = False
                     spirit.gm_spirit = True
                     spirit.gm_spirit_permanent = True
                     spirit.session = None
                     self.character = None
                     break_follows(spirit)
+                    hooks.park_gm_spirit_on_disconnect(spirit, self.game)
                 else:
                     # Legacy ephemeral leftover -- despawn.
                     spirit.gm_mode = False
@@ -1451,6 +1580,9 @@ class Session:
                     self.character.location.broadcast(
                         f"{face} goes still, leaving only an echo."
                     )
+                if keep_connection:
+                    # Soft logout must clear so login can attach a new body.
+                    self.character = None
         if self in self.game.sessions:
             self.game.sessions.remove(self)
         self._leave_connecting()
@@ -1458,13 +1590,43 @@ class Session:
         # the recipient walk; exclude= still guards FakeSession edge cases.
         if disconnect_name:
             from engine import gm_notify
+            verb = (
+                "has logged out to character select{from}."
+                if keep_connection
+                else "has disconnected{from}."
+            )
             gm_notify.ping_gms(
                 self.game,
-                f"{disconnect_name} has disconnected{{from}}.",
+                f"{disconnect_name} {verb}",
                 exclude=leaving,
                 peer_session=self,
             )
-        self.game.save()              # persist the Echo's final position/inventory
+        # Persist Echo position — but never let a save failure leave the
+        # character.session pointer half-cleared (same class of bug as the
+        # post-login save guard above: outbound combat with no command loop).
+        try:
+            schedule = getattr(self.game, "schedule_save_async", None)
+            if callable(schedule):
+                schedule()
+            else:
+                self.game.save()
+        except Exception as exc:
+            print(
+                f"[connection] disconnect save failed ({exc!r}) -- "
+                "session already detached",
+                flush=True,
+            )
+        if keep_connection:
+            # Soft logout: clear gateway bind, stay on TCP, re-enter login.
+            self._notify_gateway_unbound()
+            self.history.clear()
+            self.report_capture = None
+            self.help_edit = None
+            self.staff_account = None
+            self.reset_gmcp()
+            self._soft_relogin = True
+            self.alive = True
+            return
         # Gateway: drop the public TCP on intentional quit / client EOF path.
         # (Game-process restart cancels play() without calling disconnect.)
         self._kick_gateway_client()
@@ -1472,3 +1634,23 @@ class Session:
             self.writer.close()
         except Exception:
             pass                      # already closing/closed — nothing to do
+
+    def force_clear_zombie_attach(self):
+        """Last-resort clear when disconnect() itself fails mid-crash cleanup.
+
+        Used by ``gateway_client._abandon_crashed_session`` so a broken save
+        cannot leave ``character.session`` pointing at a dead Session that
+        still receives combat broadcasts.
+        """
+        char = self.character
+        if char is not None and getattr(char, "session", None) is self:
+            char.session = None
+        self.character = None
+        self.alive = False
+        sessions = getattr(self.game, "sessions", None)
+        if sessions is not None and self in sessions:
+            try:
+                sessions.remove(self)
+            except ValueError:
+                pass
+        self._leave_connecting()

@@ -5,6 +5,7 @@ storm_chase.py -- Tornado Hunter desk job + chase board (engine framework).
 from __future__ import annotations
 
 import random
+import engine.systems.economy as economy_wallet
 
 JOB_ID = "tornado_hunter"
 DESK_KEYS = frozenset({
@@ -14,8 +15,8 @@ DESK_KEYS = frozenset({
     "notbigville:Storm Watch Office",
 })
 
-RESEARCH_SCRIP = 2
-CHASE_BASE_SCRIP = 12
+RESEARCH_PAY_DOLLARS = 2
+CHASE_BASE_PAY_DOLLARS = 12
 CHASE_DUTY_BONUS = 4
 PROBE_RADIUS = 1  # Chebyshev tiles from target macro
 
@@ -59,17 +60,21 @@ def research(character, game):
     """On-duty desk research: small dollars + regional flavor log."""
     if not is_on_duty_hunter(character, game):
         return False, refuse_duty(character, game), None
+    from engine import hooks
+    busy = hooks.utility_delay_begin(character, game, "storm_research")
+    if busy:
+        return False, busy, None
     from engine.systems import regional_weather as weather_mod
 
     room = getattr(character, "location", None)
     w = weather_mod.weather_for_room(room, game, character)
-    character.coins = int(getattr(character, "coins", 0) or 0) + RESEARCH_SCRIP
+    economy_wallet.credit_wallet(character, dollars=RESEARCH_PAY_DOLLARS)
     msg = (
         f"[RESEARCH] You log {w.get('region_name')} normals -- "
         f"{w.get('condition')}, about {w.get('temp_f')} F, "
         f"{w.get('wind')} wind. Watch flag: "
         f"{'yes' if w.get('tornado_watch') else 'no'}. "
-        f"+{RESEARCH_SCRIP} dollars."
+        f"+{RESEARCH_PAY_DOLLARS} dollars."
     )
     room_line = f"{character.key} hunches over a radar terminal, logging sky data."
     return True, msg, room_line
@@ -167,7 +172,7 @@ def takechase(character, game):
             "my": int(my),
             "scale": t.get("scale"),
             "kind": "live_tornado",
-            "pay_coins": CHASE_BASE_SCRIP,
+            "pay_dollars": CHASE_BASE_PAY_DOLLARS,
             "board_room": "lebanon:Storm Watch Office",
         }
     else:
@@ -188,7 +193,7 @@ def takechase(character, game):
             "my": my,
             "scale": None,
             "kind": "storm_cell",
-            "pay_coins": CHASE_BASE_SCRIP - 2,
+            "pay_dollars": CHASE_BASE_PAY_DOLLARS - 2,
             "board_room": "lebanon:Storm Watch Office",
         }
 
@@ -290,12 +295,16 @@ def reportchase(character, game):
         return False, "No data yet. probe near the target cell first.", None
 
     brief = getattr(character, "chase_brief", None) or {}
-    pay = int(brief.get("pay_coins") or CHASE_BASE_SCRIP)
+    pay = int(
+        brief.get("pay_dollars")
+        or brief.get("pay_coins")
+        or CHASE_BASE_PAY_DOLLARS
+    )
     bonus = 0
     if is_on_duty_hunter(character, game):
         bonus = CHASE_DUTY_BONUS
         pay += bonus
-    character.coins = int(getattr(character, "coins", 0) or 0) + pay
+    economy_wallet.credit_wallet(character, dollars=pay)
     title = brief.get("title") or "chase"
     _clear_chase(character)
     bonus_bit = f" (includes +{bonus} on-duty bonus)" if bonus else ""

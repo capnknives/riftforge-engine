@@ -81,9 +81,11 @@ class Item(GameObject):
     `loot` is a list of small reward dicts rather than one hardcoded type,
     so a future reward (an actual Item drop, once equipment/materials exist
     -- D30) can be added as a new dict "type" without changing the
-    container mechanic itself. Today: {"type": "growth", "amount": n} and
-    optional {"type": "relic", "id": <divine relic id>} (congregation-
-    happiness items for Divine -- see supers.faith.DIVINE_RELICS).
+    container mechanic itself. Today: {"type": "dollars", "amount": n},
+    {"type": "item", "id": <catalog id>}, and optional
+    {"type": "relic", "id": <divine relic id>} (congregation-happiness
+    items for Divine -- see supers.faith.DIVINE_RELICS). Banked growth is
+    no longer a lockbox payout (combat pays growth).
     EXTENSION POINT: give items weight, value, or SUPERS stats/Aspects here.
     """
 
@@ -171,6 +173,17 @@ class Room(GameObject):
         # bestiary_categories explicitly (see maps._add_room). Defaults to
         # "plains" -- open scrubland for the overworld grid.
         self.area_type = "plains"
+        # Structured environment data (room_environment_hooks.md): geometry
+        # and surface tags for combat prose gating today and future
+        # grapple/throw mechanics. Controlled vocabulary validated at map
+        # load (maps.KNOWN_ENV_TAGS / KNOWN_MATERIAL_TAGS). Empty lists
+        # mean "unspecified" until maps._add_room or resolve_env_defaults
+        # fills defaults from area_type + outdoor. None = inherit defaults;
+        # explicit [] = intentionally empty.
+        self.env_tags = None
+        self.materials = None
+        # Optional named slam/throw surfaces ({id, label, tags, materials}).
+        self.slam_targets = []
         # Cadence town simulation (docs/SYSTEMS_DESIGN.md D33, a D31 follow-on):
         # which NEEDS resources this room offers autonomous NPCs. Plain string
         # tags -- "food", "water", "sleep", "vendor", "blood" -- authored per
@@ -287,7 +300,7 @@ class Room(GameObject):
         self.map_layer = None
         # Optional glyph table name ("atlas") for default topo symbols.
         self.glyph_set = None
-        # Optional spoofed ROOM NAME (Jinn mirage pockets). Internal key
+        # Optional spoofed ROOM NAME (Djinn mirage pockets). Internal key
         # stays unique in game.rooms; look / exit lists use look_title()
         # so the victim sees the real place name with no "fake" tell.
         # Runtime override -- wins over authored title when set.
@@ -306,7 +319,7 @@ class Room(GameObject):
     def look_title(self):
         """ROOM NAME for look / exit lists / who / walk prose.
 
-        Precedence: runtime look_key (Jinn mirage) > usable authored title >
+        Precedence: runtime look_key (Djinn mirage) > usable authored title >
         flag-based generic (when dig left an opaque ``unowned shopN`` /
         ``amenityN`` key with no real title) > internal key. Never invents
         dream/fake wording -- callers must not add tells either. Staff dig
@@ -421,6 +434,13 @@ class Room(GameObject):
                 continue
             if predicate is not None and not predicate(char):
                 continue
+            game = getattr(self, "game", None)
+            try:
+                from engine import hooks
+                if not hooks.room_broadcast_deliver(char, self, game):
+                    continue
+            except Exception:
+                pass
             # Per-watcher formatting for introduction / hood faces.
             if callable(message) and not isinstance(message, (str, bytes)):
                 text = message(char)
@@ -428,6 +448,11 @@ class Room(GameObject):
                     continue
             else:
                 text = message
+            try:
+                from engine import hooks
+                text = hooks.room_broadcast_transform(char, self, text, game)
+            except Exception:
+                pass
             if char.session:
                 char.session.send(text)
                 if blank_after:
@@ -503,6 +528,25 @@ class Character(GameObject):
         # each tick (persisted); auto_style_notice_tick throttles "out of
         # fuel" notices so a dry tank doesn't spam every heartbeat.
         self.combat_stance = "balanced"   # balanced | aggressive | defensive
+        # Favored combat style (Martial / Weapons / Magic) -- soft-gates
+        # prose voice lanes + Mastery prefer. Distinct from one-shot
+        # combat_style (bite/smite/…) and from combat_stance (aggro curve).
+        # See docs/plans/ranged_combat_positioning.md + help style.
+        self.favored_combat_style = None  # None | martial | weapons | magic
+        self.blocked_combat_styles = []   # list of style ids soft-blocked
+        # When True, TK/psychic combat prose (openers, modifiers, tagged
+        # action lines) is suppressed for this character's own lines.
+        self.suppress_tk_prose = False
+        # Melee vs ranged engagement preference (FIN paces close/retreat).
+        # Distinct from combat_stance. None = auto from style / weapon.
+        self.engagement_stance = None     # None | melee | ranged
+        # Fight-ephemeral engagement band state (cleared on disengage).
+        self.engagement_vs = {}           # foe_key -> close|reach|far
+        self.engagement_progress = {}     # pair_key -> float
+        self.engagement_pressed = False
+        self.engagement_moving_shot = False   # one-beat retreating-fire tax
+        self.engagement_closing = False
+        self.engagement_retreating = False
         self.combat_intent = None         # None | "press" | "guard" | "feint"
         self.feint_exposed = False
         # Vanguard protect (group_combat_mechanics.md): standing ally you
@@ -524,6 +568,12 @@ class Character(GameObject):
         self.vit_second_wind_used = False
         self.auto_combat_style = None     # None | bite | smite | maul | devour | stake | crush | rend | blade
         self.auto_style_notice_tick = -999
+        # Active Override (Path signature instant strikes): stamp of the
+        # game_time_ticks when this fighter last resolved an instant Path
+        # verb. resolve_round skips the normal auto-swing when equal to
+        # the current tick so DPM stays one action per heartbeat. Not
+        # persisted -- fight punctuation only (-1 = never).
+        self.last_instant_action_tick = -1
         # Perspective rendering (section 7 item 4, D17): which pronoun the
         # prose renderer's small conjugation helper uses in third person
         # ("he"/"she"/"they" -- combat_prose.py's ONLY consumer so far).
@@ -571,8 +621,11 @@ class Character(GameObject):
         self.idle_mode = False
         # Auto-idle preference: after ~30 real minutes with no typed input,
         # slip into idlemode (supers.verbs.engine_flavor). Default on;
-        # toggle with `autoidle`. Persisted. last_input_tick is session-only.
+        # toggle with `autoidle`. Persisted. last_input_monotonic is
+        # session-only (wall-clock AFK gate).
         self.auto_idle = True
+        self.last_input_monotonic = 0.0
+        # Legacy session field (unused for autoidle after wall-clock gate).
         self.last_input_tick = 0
         # Milestone E's catch-up mechanic: a live multiplier on this
         # character's training gain-chance, recomputed fresh every tick by

@@ -17,7 +17,9 @@ are the same story -- the six-primary spine is generic engine content now
 there's no ``bg_stats`` here.
 """
 
+from basegame import needs as needs_module
 from basegame import stats as stats_module
+import engine.systems.economy as economy_wallet
 
 
 def attach_basegame(character):
@@ -40,7 +42,7 @@ def attach_basegame(character):
     character.hp = stats_module.max_hp(character)
     # Text mail inbox (engine/systems/mail.py) -- same shape SUPERS uses.
     character.mail_inbox = []
-    character.coins = 0
+    economy_wallet.set_wallet(character, 0, 0)
     character.job = None
     character.on_duty = False
     character.chase_id = None
@@ -53,3 +55,4 @@ def attach_basegame(character):
     character.stellar_globe_lat = None
     character.stellar_flight_macro = None
     character.orbit_return_room = None
+    needs_module.attach_character(character)

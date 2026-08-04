@@ -50,13 +50,17 @@ COLORS = {
     # Plan tags ----------------------------------------------------------
     "dark_grey": "\x1b[90m",
     "slate_grey": "\x1b[90m",
+    "gray": "\x1b[37m",
     "silver": "\x1b[37m",
     "white": "\x1b[97m",
     "bright_white": "\x1b[97m",
     "light_grey": "\x1b[37m",
     "dark_red": "\x1b[31m",
+    "red": "\x1b[91m",
     "gold": "\x1b[33m",
     "dark_purple": "\x1b[35m",
+    "dark_magenta": "\x1b[35m",
+    "magenta": "\x1b[95m",
     # sighted_color_guide.md known-gap #1: BADGE_COLORS["witch"] names
     # "violet" but the role was never defined, so Witch badges silently
     # rendered uncolored. Alias into the purple family (16-color magenta;
@@ -75,9 +79,10 @@ COLORS = {
     "header": "\x1b[31m",
     "ok": "\x1b[32m",
     "warn": "\x1b[33m",
-    "error": "\x1b[31m",
+    "error": "\x1b[91m",
     "muted": "\x1b[90m",
     "accent": "\x1b[35m",
+    "blood": "\x1b[31m",
     # Combat / chat direction roles (prefs #19 / #23 / #29) --------------
     # Gothic + keyword-pop + structural accents (2026-07-19 / 21 / 21):
     # direction roles stay soft tints so every-swing accents (verbs, tags,
@@ -100,13 +105,17 @@ COLORS = {
 COLORS_XTERM256 = {
     "dark_grey": "\x1b[38;5;240m",
     "slate_grey": "\x1b[38;5;242m",
+    "gray": "\x1b[38;5;245m",
     "silver": "\x1b[38;5;252m",
     "white": "\x1b[38;5;255m",
     "bright_white": "\x1b[38;5;255m",
     "light_grey": "\x1b[38;5;250m",
     "dark_red": "\x1b[38;5;88m",
+    "red": "\x1b[38;5;167m",
     "gold": "\x1b[38;5;178m",
     "dark_purple": "\x1b[38;5;97m",
+    "dark_magenta": "\x1b[38;5;97m",
+    "magenta": "\x1b[38;5;134m",
     # Witch-badge violet (see COLORS note): soft orchid, distinct from
     # dark_purple at 256 depth so Witch and Occultist badges don't merge.
     "violet": "\x1b[38;5;134m",
@@ -123,6 +132,7 @@ COLORS_XTERM256 = {
     "error": "\x1b[38;5;167m",
     "muted": "\x1b[38;5;240m",
     "accent": "\x1b[38;5;97m",
+    "blood": "\x1b[38;5;88m",
     # Structural-accents 256 pairing (combat_color_structural_accents.md):
     # Outgoing body = prose grey (250) so bright_white verbs actually pop
     # (parchment 187 was white-on-white after keyword-pop); incoming soft
@@ -168,13 +178,67 @@ def paint(role, text, depth="ansi"):
 
     Unknown roles pass text through unchanged. Empty text stays empty.
     ``depth`` selects 16-color vs Xterm256 (prefs #6).
+
+    Role ``blood`` alternates ``dark_red`` and ``red`` per word so dried
+    blood and fresh crimson read together (sighted + color on only).
     """
     if not text:
         return text
+    if role == "blood":
+        return paint_blood(text, depth=depth)
     code = code_for(role, depth)
     if code is None:
         return text
     return f"{code}{text}{RESET}"
+
+
+def paint_blood(text, depth="ansi"):
+    """Gothic blood tint: alternate dark_red and bright red per word.
+
+    Whitespace is left plain so wrapped combat tags stay readable. Used
+    for [DMG]/[BLEED] accents and critical need-meter fills when color
+    is on; screenreader and ``color off`` never call this path.
+    """
+    if not text:
+        return text
+    # Split on whitespace runs so we can paint words without losing spacing.
+    parts = re.split(r"(\s+)", str(text))
+    roles = ("dark_red", "red")
+    out = []
+    word_i = 0
+    for part in parts:
+        if not part:
+            continue
+        if part.isspace():
+            out.append(part)
+            continue
+        role = roles[word_i % 2]
+        out.append(paint(role, part, depth=depth))
+        word_i += 1
+    return "".join(out)
+
+
+def blood_accent_template(text):
+    """Build ``paint_layered`` markup alternating ``dark_red`` / ``red``.
+
+    Returns a template ending in ``<_base>`` so combat prose can wrap
+    blood tags without a special-case in ``paint_layered``.
+    """
+    plain = strip_ansi(str(text))
+    if not plain:
+        return "<_base>"
+    parts = re.split(r"(\s+)", plain)
+    roles = ("dark_red", "red")
+    chunks = []
+    word_i = 0
+    for part in parts:
+        if not part or part.isspace():
+            chunks.append(part)
+            continue
+        role = roles[word_i % 2]
+        chunks.append(f"<{role}>{part}")
+        word_i += 1
+    return "".join(chunks) + "<_base>"
 
 
 def paint_for(character, role, text, depth=None):
@@ -193,6 +257,22 @@ def strip_ansi(text):
     if not text or "\x1b" not in text:
         return text
     return _ANSI_RE.sub("", text)
+
+
+def strip_paint_markup(text):
+    """Remove ANSI and paint_layered ``<tag>`` switches for plain log/TTS text.
+
+    Combat prose and ``prefix_combat_tags`` embed accents like
+    ``<warn>[CRIT]<_base>`` and ``<bright_white>scorch<_base>`` for sighted
+    clients. Replay buffers (fightlog, journal copies) must store and show
+    readable prose with plain ``[DMG]``/``[CRIT]`` tags only.
+    """
+    if not text:
+        return text
+    plain = strip_ansi(str(text))
+    if "<" not in plain:
+        return plain
+    return _TAG_RE.sub("", plain)
 
 
 def visible_len(text):
@@ -390,12 +470,15 @@ LOGIN_STATUS = "Pre-alpha"
 LOGIN_SPACED_TITLE = "M O R T A L S   &   M O N S T E R S"
 
 
-def format_login_banner(width=WHO_WIDTH):
+def format_login_banner(width=WHO_WIDTH, status_text=None):
     """Build the connect splash: title, setting blurb, creator + engine.
 
     Returns painted lines (wrought rules / silver title / muted blurb /
     gold creator / muted engine / soft-crimson status). Callers send each
     line before the name prompt. Width matches the who-list chrome.
+
+    ``status_text`` overrides the default ``LOGIN_STATUS`` line body
+    (e.g. ``Alpha #1082.``) when Game meta sets ``login_status_text``.
 
     Pre-login has no ``config screenreader`` yet, so the title stays
     **unspaced** (``Mortals and Monsters``, not letter-spaced) and credits
@@ -427,7 +510,14 @@ def format_login_banner(width=WHO_WIDTH):
         )
     )
     lines.append(
-        paint("dark_red", pad(f"Status: {LOGIN_STATUS}.", w, "center"))
+        paint(
+            "dark_red",
+            pad(
+                f"Status: {status_text or f'{LOGIN_STATUS}.'}",
+                w,
+                "center",
+            ),
+        )
     )
     lines.extend(["", rule, ""])
     return lines
@@ -537,9 +627,14 @@ def format_moral_meter(balance, *, lean="", eclipse=False, width=WHO_WIDTH,
 NEED_METER_SEEK_BAND = 0.60
 NEED_METER_CRITICAL_BAND = 0.95
 
+# Resource / satisfaction fill: how empty the tank is before warn / crisis
+# (mirrors fuel WARN ~25% and CRITICAL ~5% remaining).
+RESOURCE_METER_WARN_REMAINING = 0.40   # fill <= 40% → gold
+RESOURCE_METER_CRIT_REMAINING = 0.05   # fill <= 5% → dark_red
+
 
 def need_meter_fill_role(level, *, critical=False):
-    """Gothic vitals fill role for a 0→1 need / fuel-pressure bar.
+    """Gothic vitals fill role for a 0→1 *pressure* bar (full = bad).
 
     Bands match Cadence seek / critical so the tint tracks the same
     pressure the phrases already name (a11y: color is decoration only)::
@@ -548,8 +643,7 @@ def need_meter_fill_role(level, *, critical=False):
         seek   (>= seek)     gold            -- rising warn
         crit   (>= critical) dark_red        -- dried-blood crisis
 
-    ``critical=True`` forces the crisis role even when ``level`` is a
-    derived pressure (fuel row) that already flipped the bang glyphs.
+    ``critical=True`` forces the crisis role even when ``level`` is low.
     """
     if critical or float(level) >= NEED_METER_CRITICAL_BAND:
         return "dark_red"
@@ -558,17 +652,35 @@ def need_meter_fill_role(level, *, critical=False):
     return "absinthe_green"
 
 
-def format_need_meter(level, *, critical=False, width=16):
+def resource_meter_fill_role(fill, *, critical=False):
+    """Gothic vitals fill role for a 0→1 *resource / satisfaction* bar.
+
+    Full bar = good (absinthe green); empty / critical = dark_red.
+    Mid-low fill warns gold. Used for Path tanks (Blood / Grace) and
+    inverted lifestyle needs display (nourishment, rest, …).
+    """
+    lvl = float(fill)
+    if critical or lvl <= RESOURCE_METER_CRIT_REMAINING:
+        return "dark_red"
+    if lvl <= RESOURCE_METER_WARN_REMAINING:
+        return "gold"
+    return "absinthe_green"
+
+
+def format_need_meter(level, *, critical=False, width=16, frame="pressure"):
     """Unipolar 0→1 need bar (left fill), gothic vitals / Tide glyphs.
 
-    Fill grows left→right as the need rises (0 = empty track, 1 = full).
+    ``level`` is how much of the track to fill (0 = empty, 1 = full).
+    Callers choose the frame:
+
+      * ``pressure`` (default) -- fill rises with a problem; color via
+        ``need_meter_fill_role`` (full → red). Kept for legacy smoke.
+      * ``resource`` -- fill rises with wellness / tank stock; color via
+        ``resource_meter_fill_role`` (full → green, empty → red).
+
     Critical meters use `=` fill and a trailing `!` inside the brackets so
     color-off clients still read severity (section 8 a11y). Color is
     decoration only -- callers should pair this with a plain-language phrase.
-
-    Sighted paint (prompt / World Tide kinship): dark_grey chrome brackets,
-    absinthe→gold→crimson fill by pressure band (see
-    ``need_meter_fill_role``), empty track stays dark_grey ash.
 
     Returns the painted bar string only, e.g. `[########--------]` or
     `[============---!]`.
@@ -584,16 +696,28 @@ def format_need_meter(level, *, critical=False, width=16):
     body = (fill_ch * filled) + ("-" * empty)
     if critical:
         body = body + "!"
-    # Gothic vitals gradient (not flat silver) -- still paired with phrases.
-    fill_role = need_meter_fill_role(lvl, critical=critical)
-    # Fill first; leftover track (dashes and optional bang) stays ash chrome.
-    # The bang sits in the empty slice when critical so it stays readable
-    # even if fill_role and alert gold would fight -- dark_grey `!` next to
-    # crimson `=` is enough; the plain `!!` phrase carries severity.
-    painted_body = (
-        paint(fill_role, body[:filled])
-        + paint("dark_grey", body[filled:])
-    )
+    if frame == "resource":
+        fill_role = resource_meter_fill_role(lvl, critical=critical)
+    else:
+        fill_role = need_meter_fill_role(lvl, critical=critical)
+    # Fill first; leftover track (dashes) stays ash chrome.
+    # Critical bang is painted crisis-red so an empty resource tank (0
+    # fill cells) still shows severity in color -- phrases carry meaning
+    # for color-off / screenreader clients.
+    fill_text = body[:filled]
+    if fill_role == "dark_red" and filled > 0:
+        painted_body = paint_blood(fill_text)
+    else:
+        painted_body = paint(fill_role, fill_text)
+    rest = body[filled:]
+    if critical and rest.endswith("!"):
+        painted_body = (
+            painted_body
+            + paint("dark_grey", rest[:-1])
+            + paint("dark_red", "!")
+        )
+    else:
+        painted_body = painted_body + paint("dark_grey", rest)
     return paint("dark_grey", "[") + painted_body + paint("dark_grey", "]")
 
 
@@ -608,7 +732,7 @@ def _format_who_entry_row(entry, width):
     badge_cell = pad(badge, 8)
     left = render(
         f"<dark_grey>[ <{bcolor}>{badge_cell} <dark_grey>] "
-        f"<white>{name}"
+        f"<slate_grey>{name}"
     )
     # Dot leaders between name and status (visible width aware).
     status_plain = status
@@ -620,13 +744,13 @@ def _format_who_entry_row(entry, width):
         status_plain = (status_plain[:keep] + "..") if keep else ""
         dots_budget = max(3, w - name_width - 1 - len(status_plain))
     dots = paint("dark_grey", " " + ("." * dots_budget) + " ")
-    return left + dots + paint("light_grey", status_plain)
+    return left + dots + paint("muted", status_plain)
 
 
 def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
                moral_balance=None, lean="", eclipse=False,
                echo_entries=None, gm_names=None, unknown_count=0,
-               screenreader=False):
+               unknown_label="Unknown Count", screenreader=False):
     """Build the plan's Mortals & Monsters who list.
 
     `entries` is an iterable of dicts::
@@ -648,7 +772,8 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
     matches that list (online only; cast members with gm_rank are omitted).
 
     ``unknown_count`` is the player-facing hole: veiled + unintroduced
-    souls that would otherwise appear on this viewer's list.
+    souls that would otherwise appear on this viewer's list. Staff may
+    override the footer label (e.g. ``Offline Echoes`` via ``gm whomode``).
 
     ``screenreader=True`` (prefs #30 / #32) flattens wrought rules into
     semantic headers and vertical lists.
@@ -685,7 +810,8 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
                     lines.append(f"  {badge}: {name}. {status}".rstrip() + ".")
         lines.append("")
         lines.append(f"Visible souls: {souls}. Time: {time_label or 'unknown'}.")
-        lines.append(f"Unknown count: {unknown}.")
+        label = (unknown_label or "Unknown Count").strip() or "Unknown Count"
+        lines.append(f"{label}: {unknown}.")
         if moral_balance is not None:
             bal = int(moral_balance)
             # Same Tide prose as format_moral_meter(screenreader=True).
@@ -702,7 +828,7 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
     gm_list = list(gm_names) if gm_names else []
     if gm_list:
         lines.append(rule)
-        gm_title = paint("silver", pad("G M", w, "center"))
+        gm_title = paint("dark_magenta", pad("G M", w, "center"))
         lines.append(gm_title)
         lines.append(rule)
         lines.append("")
@@ -712,9 +838,9 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
         for name in gm_list:
             # Plain `[GM] Name` -- rank detail stays on gmlist; a11y without
             # color alone (brackets + letters carry the meaning).
-            lines.append(render(f"  <dark_grey>[<gold>GM<dark_grey>] <white>{name}"))
+            lines.append(render(f"  <dark_grey>[<gold>GM<dark_grey>] <slate_grey>{name}"))
         lines.append("")
-    title = paint("silver", pad("M O R T A L S   &   M O N S T E R S", w, "center"))
+    title = paint("dark_magenta", pad("M O R T A L S   &   M O N S T E R S", w, "center"))
     lines.extend([rule, title, rule, ""])
     if not entries:
         lines.append(paint("muted", "  (none online)"))
@@ -726,7 +852,7 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
         lines.append("")
         lines.append(rule)
         echo_title = paint(
-            "silver", pad("E C H O E S", w, "center")
+            "dark_magenta", pad("E C H O E S", w, "center")
         )
         lines.append(echo_title)
         lines.append(rule)
@@ -746,7 +872,7 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
     gap = max(2, w - visible_len(souls_bit) - visible_len(time_bit))
     lines.append(souls_bit + (" " * gap) + time_bit)
     unknown_bit = render(
-        f"<dark_purple> Unknown Count: <silver>{unknown}"
+        f"<dark_purple> {unknown_label or 'Unknown Count'}: <silver>{unknown}"
     )
     lines.append(unknown_bit)
     # World Good/Evil meter sits under souls/time, still inside wrought rules.
@@ -808,14 +934,14 @@ def format_tome(title, body_lines, *, related=None, syntax=None,
 
     w = max(40, int(width))
     heavy = paint("dark_red", rule_equals(w))
-    light = paint("dark_red", hrule(w))
+    light = paint("dark_grey", hrule(w))
     lines = [
         heavy,
-        render(f"<gold> TOME: <white>{title}"),
+        render(f"<gold> TOME: <dark_magenta>{title}"),
         heavy,
     ]
     if syntax:
-        lines.append(render(f"<dark_grey> SYNTAX:  <silver>{syntax}"))
+        lines.append(render(f"<dark_grey> SYNTAX:  <dark_magenta>{syntax}"))
         lines.append(light)
     lines.append("")
     for raw in body_lines:
@@ -825,16 +951,16 @@ def format_tome(title, body_lines, *, related=None, syntax=None,
             continue
         # Soft-wrap long plain lines at w; keep short/painted lines intact.
         if "\x1b" in text or visible_len(text) <= w:
-            lines.append(paint("light_grey", text) if "\x1b" not in text
+            lines.append(paint("slate_grey", text) if "\x1b" not in text
                          else text)
         else:
-            lines.extend(_wrap_plain(text, w, color="light_grey"))
+            lines.extend(_wrap_plain(text, w, color="slate_grey"))
     lines.append("")
     lines.append(light)
     if related:
         if isinstance(related, (list, tuple)):
             related = ", ".join(related)
-        lines.append(render(f"<dark_grey> RELATED: <silver>{related}"))
+        lines.append(render(f"<dark_grey> RELATED: <dark_magenta>{related}"))
     lines.append(heavy)
     return lines
 
@@ -864,17 +990,17 @@ def format_help_index(categories, *, width=TOME_WIDTH, screenreader=False):
     heavy = paint("dark_red", rule_equals(w))
     lines = [
         heavy,
-        render("<gold> TOME: <white>Help Index"),
+        render("<gold> TOME: <dark_magenta>Help Index"),
         heavy,
-        paint("muted", " Type 'help <name>' for a page.  'commands' for verbs."),
+        paint("dark_grey", " Type 'help <name>' for a page.  'commands' for verbs."),
         "",
     ]
     for category, topics in categories:
-        lines.append(paint("dark_red", category))
+        lines.append(paint("dark_magenta", category))
         lines.append(paint("dark_grey", hrule(min(40, w))))
         for name, blurb in topics:
             lines.append(
-                render(f"<silver>  {name} <dark_grey>-- <light_grey>{blurb}")
+                render(f"<silver>  {name} <dark_grey>-- <slate_grey>{blurb}")
             )
         lines.append("")
     lines.append(heavy)
@@ -1015,12 +1141,12 @@ def format_commands_list(entries, *, gm_entries=None, width=TOME_WIDTH,
         return lines
 
     heavy = paint("dark_red", rule_equals(w))
-    light = paint("dark_red", hrule(w))
+    light = paint("dark_grey", hrule(w))
     lines = [
         heavy,
-        render("<gold> TOME: <white>Commands"),
+        render("<gold> TOME: <dark_magenta>Commands"),
         heavy,
-        paint("muted", " Type 'help <name>' for topics.  One-liners below."),
+        paint("dark_grey", " Type 'help <name>' for topics.  One-liners below."),
         "",
     ]
     for label, blurb in entries or []:
@@ -1029,7 +1155,7 @@ def format_commands_list(entries, *, gm_entries=None, width=TOME_WIDTH,
         lines.append("")
         # Keep the exact "GM COMMANDS:" label -- smoke tests and players
         # already key off it (suggestions.log #40).
-        lines.append(paint("dark_red", "GM COMMANDS:"))
+        lines.append(paint("dark_magenta", "GM COMMANDS:"))
         lines.append(paint("dark_grey", hrule(min(40, w))))
         for label, blurb in gm_entries:
             lines.extend(_entry_rows(label, blurb))
@@ -1065,7 +1191,7 @@ def format_sheet(title, body_lines, *, width=48, screenreader=False):
 
     w = max(32, int(width))
     heavy = paint("dark_red", rule_equals(w))
-    light = paint("dark_red", hrule(w))
+    light = paint("dark_grey", hrule(w))
     lines = [
         heavy,
         render(f"<gold> {title}"),
@@ -1179,23 +1305,23 @@ def format_menu(title, options, *, prompt="What is your will?", width=67,
         return lines
 
     w = max(40, int(width))
-    border = paint("midnight_blue", "+" + ("=" * (w - 2)) + "+")
+    border = paint("dark_grey", "+" + ("=" * (w - 2)) + "+")
     mid = (
-        paint("dark_cyan", "|")
-        + pad(paint("absinthe_green", _space_title(title)), w - 2, "center")
-        + paint("dark_cyan", "|")
+        paint("dark_magenta", "|")
+        + pad(paint("dark_magenta", _space_title(title)), w - 2, "center")
+        + paint("dark_magenta", "|")
     )
     lines = [border, mid, border, ""]
     for i, (label, hint) in enumerate(options, start=1):
         lines.append(render(
-            f"<dark_grey>      (<absinthe_green>{i}<dark_grey>) "
-            f"<white>{label}"
-            + (f"       <dark_cyan>-> <dark_grey>({hint})" if hint else "")
+            f"<dark_grey>      (<dark_red>{i}<dark_grey>) "
+            f"<slate_grey>{label}"
+            + (f"       <dark_grey>-> <muted>({hint})" if hint else "")
         ))
     lines.append("")
-    lines.append(paint("midnight_blue", "+" + ("-" * (w - 2)) + "+"))
+    lines.append(paint("dark_grey", "+" + ("-" * (w - 2)) + "+"))
     lines.append(render(
-        f"<dark_cyan> > <silver>{prompt} <dark_grey>[1-{len(options)}]:"
+        f"<dark_magenta> > <silver>{prompt} <dark_grey>[1-{len(options)}]:"
     ))
     return lines
 
@@ -1224,25 +1350,25 @@ def format_dialogue(speaker_line, quote, choices, *, width=65,
         return lines
 
     w = max(40, int(width))
-    top = paint("slate_grey", "." + ("-" * (w - 2)) + ".")
-    bot = paint("slate_grey", "'" + ("-" * (w - 2)) + "'")
-    div = paint("slate_grey", "|" + ("-" * (w - 2)) + "|")
+    top = paint("dark_grey", "." + ("-" * (w - 2)) + ".")
+    bot = paint("dark_grey", "'" + ("-" * (w - 2)) + "'")
+    div = paint("dark_grey", "|" + ("-" * (w - 2)) + "|")
     lines = [
         top,
-        paint("pale_blue", " | ") + paint("silver", speaker_line),
+        paint("dark_grey", " | ") + paint("dark_magenta", speaker_line),
         div,
-        paint("white", '  "' + quote + '"'),
+        paint("slate_grey", '  "' + quote + '"'),
         "",
     ]
     choice_list = list(choices) if choices else []
     for i, choice in enumerate(choice_list, start=1):
         lines.append(render(
-            f"<slate_grey>  [ <pale_blue>{i} <slate_grey>] "
-            f"<light_grey>\"{choice}\""
+            f"<dark_grey>  [ <dark_magenta>{i} <dark_grey>] "
+            f"<slate_grey>\"{choice}\""
         ))
     lines.append(bot)
     if choice_list:
-        lines.append(render("<pale_blue> > <dark_grey>Reply:"))
+        lines.append(render("<dark_magenta> > <dark_grey>Reply:"))
     return lines
 
 
@@ -1280,7 +1406,7 @@ def _section_header(label, width=ROOM_WIDTH):
     prefix_plain = f"  [ {label} ] "
     dots = max(3, int(width) - len(prefix_plain))
     return render(
-        f"<dark_purple>  [ <silver>{label} <dark_purple>] "
+        f"<dark_magenta>  [ <silver>{label} <dark_magenta>] "
         f"<dark_grey>{'.' * dots}"
     )
 
@@ -1519,7 +1645,7 @@ def _sparse_exits_line(exits, *, verbose=True):
             label = _exit_display_name(direction)
             # Gold direction + soft dest -- labels carry meaning, not color.
             lines.append(
-                render(f"<gold>{label}<silver> - <absinthe_green>{dest}")
+                render(f"<dark_red>{label}<dark_grey> - <slate_grey>{dest}")
             )
         return lines
 
@@ -1587,9 +1713,27 @@ def format_room(title, description, *, area_tag="Indoors", exits=None,
                     lines.append(text)
             lines.append("")
         if exits:
-            lines.append("Paths:")
-            for direction, dest in exits:
-                lines.append(f"  {direction}: {dest}.")
+            if exits_verbose:
+                lines.append("Paths:")
+                for direction, dest in exits:
+                    lines.append(f"  {direction}: {dest}.")
+            else:
+                # Compact SR: one abbrev line (matches config exits compact).
+                tokens = []
+                seen = set()
+                by_dir = _exit_dir_set(exits)
+                for name in _EXIT_LINE_ORDER:
+                    if name in by_dir:
+                        tokens.append(_exit_abbrev(name))
+                        seen.add(name)
+                for direction, _dest in exits:
+                    key = str(direction).strip().lower()
+                    if key in seen:
+                        continue
+                    tokens.append(_exit_abbrev(direction))
+                    seen.add(key)
+                if tokens:
+                    lines.append(f"Paths: {', '.join(tokens)}.")
             lines.append("")
         if souls:
             lines.append("Souls:")
@@ -1622,7 +1766,7 @@ def format_room(title, description, *, area_tag="Indoors", exits=None,
     header = (
         title_display
         + (" " * gap)
-        + render(f"<dark_grey>[ <slate_grey>{area_tag} <dark_grey>]")
+        + render(f"<dark_grey>[ <dark_magenta>{area_tag} <dark_grey>]")
     )
 
     lines = ["", header, ""]
@@ -1634,10 +1778,10 @@ def format_room(title, description, *, area_tag="Indoors", exits=None,
             if not para:
                 lines.append("")
                 continue
-            wrapped = _wrap_plain(para, w - 2, color="light_grey")
+            wrapped = _wrap_plain(para, w - 2, color="slate_grey")
             for row in wrapped:
                 plain_row = strip_ansi(row)
-                lines.append("  " + paint("light_grey", plain_row))
+                lines.append("  " + paint("slate_grey", plain_row))
         lines.append("")
 
     if extras:
@@ -1662,11 +1806,11 @@ def format_room(title, description, *, area_tag="Indoors", exits=None,
 
     # Plain long-desc lines (LOTJ) -- no list-bullet chrome on look.
     for soul in souls:
-        lines.append(paint("gold", str(soul)))
+        lines.append(paint("dark_magenta", str(soul)))
     if souls:
         lines.append("")
     for item in items:
-        lines.append(paint("light_grey", str(item)))
+        lines.append(paint("muted", str(item)))
     if items:
         lines.append("")
 
@@ -1702,6 +1846,7 @@ BADGE_COLORS = {
     "vampire": "dark_red",
     "shifter": "teal",
     "leviathan": "dark_cyan",
+    "arachne": "pale_blue",
     # Celestial Mantles -----------------------------------------------------
     "angel": "bright_white",
     "demon": "dark_purple",

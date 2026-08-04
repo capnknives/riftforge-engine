@@ -52,6 +52,7 @@ _after_session_attach = None
 # reconnect takeover, intentional quit, and client EOF all pass through
 # engine/connection.py before session is cleared.
 _on_session_disconnect = None
+_park_gm_spirit_on_disconnect = None
 
 # GMCP Char.Vitals / Char.Status payload builders (SUPERS fills meters;
 # engine/gmcp.py sends). fn(character) -> dict or None.
@@ -84,6 +85,10 @@ _eclipse_ambient_line = None
 # Per-room look extras (e.g. planar influence note). fn(room, game) -> list[str].
 _room_look_extras = None
 
+# Virtual Paths not stored on ``Room.exits`` (pit descent after boss kill).
+# fn(room, character, game) -> list[(direction, dest_label)].
+_room_look_virtual_exits = None
+
 # Soft fear nudge shown to a Vampire after `look` when a Slayer/hunter
 # shares the room. fn(character, room) -> str or None.
 _vampire_fear_message = None
@@ -103,6 +108,10 @@ _look_extra_lines = None
 _move_gate = None
 _follow_pull_skip = None
 _report_context_extra = None
+_room_broadcast_deliver = None
+_room_broadcast_transform = None
+_perception_character = None
+_preference_character = None
 
 # Optional rewrite of enter/exit/in/out destinations (e.g. spill NPCs off
 # a no_loiter hub). fn(character, dest, game) -> Room (may be dest).
@@ -128,6 +137,7 @@ _loot_room_line = None
 # Build an inventory Item for a strongbox's {"type": "relic", "id": ...}
 # reward. fn(relic_id) -> Item or None.
 _make_relic_item = None
+_grant_relic_loot = None
 
 # After a locked container is forced open (cmd_open). Games use this for
 # mission strongbox objective flags, etc. fn(character, item) -> None.
@@ -150,6 +160,16 @@ _can_see_spirit = None
 # Deal hellhound invis pierce. Default False (no Deal kit in bare engine).
 # fn(viewer, hound) -> bool.
 _can_see_hellhound = None
+_can_notice_stealth = None
+
+# Veil-layer membership + sight pierce (death spirits, faded Ghosts, veiled
+# Reapers, vessel-free Mantle walks share Prime's XYZ map but not its
+# interaction/visibility). Bare engine default: nobody is Veil-layer, so
+# both hooks are moot with no game installed. fn(character) -> bool /
+# fn(viewer, other) -> bool / fn() -> str.
+_in_veil = None
+_veil_visible_to = None
+_veil_look_tag = None
 
 # Dark-room sight gate (D67): can `character` see in a dark room without
 # a carried light? Engine default is False (torch required). SUPERS
@@ -207,6 +227,12 @@ _room_presence_line = None
 # registers so ``echo look quiet|full`` works without engine importing game.
 _echo_look_bits = None
 
+# Extra room-target match needles (Origin/Path/kind aliases).
+# fn(viewer, subject) -> iterable[str] | None. Engine matches the typed
+# query against these the same way as name faces (substring). Bare engine
+# returns empty so kind targeting is game-owned.
+_extra_target_match_needles = None
+
 # Viewer-relative look/examine body text.
 # fn(viewer, subject) -> str | None.
 _look_body_for = None
@@ -223,6 +249,10 @@ _encounter_check = None
 # Ensure Evil Strikes Back world-meter fields exist on `game` before saving
 # them. fn(game) -> None (side-effecting only).
 _ensure_game_defaults = None
+
+# Heal on-disk content catalogs (duplicate ids, ...) after an auto-deploy
+# protect-restore. fn() -> {name: count}.
+_boot_content_heal = None
 
 # Re-derive a character's max HP (used after un-spiriting a character whose
 # body was lost on load -- see engine/persistence.py's load_world).
@@ -373,6 +403,24 @@ def ensure_game_defaults(game):
     is set (a bare engine install has no moral-balance meter)."""
     if _ensure_game_defaults is not None:
         _ensure_game_defaults(game)
+
+
+def set_boot_content_heal(fn):
+    """Register fn() -> {name: count} that heals on-disk content catalogs
+    (duplicate ids, ...) after an auto-deploy protect-restore. Pass None
+    to restore the no-op default (a bare engine install has no catalog
+    files to heal).
+    """
+    global _boot_content_heal
+    _boot_content_heal = fn
+
+
+def boot_content_heal():
+    """Run the registered content-heal hook and return its {name: count}
+    stats dict, or {} if none is registered."""
+    if _boot_content_heal is not None:
+        return _boot_content_heal()
+    return {}
 
 
 def set_recompute_hp(fn):
@@ -595,6 +643,22 @@ def on_session_disconnect(character, game, *, to_echo=True):
         _on_session_disconnect(character, game, to_echo=to_echo)
 
 
+def set_park_gm_spirit_on_disconnect(fn):
+    """Register fn(spirit, game) to fold a permanent GM spirit on logout.
+
+    Called from ``engine.connection`` when a staff Session disconnects while
+    in ``gm on``. Pass None to clear.
+    """
+    global _park_gm_spirit_on_disconnect
+    _park_gm_spirit_on_disconnect = fn
+
+
+def park_gm_spirit_on_disconnect(spirit, game):
+    """Fold a sessionless permanent GM spirit on disconnect, if registered."""
+    if _park_gm_spirit_on_disconnect is not None:
+        _park_gm_spirit_on_disconnect(spirit, game)
+
+
 def set_gmcp_char_vitals(fn):
     """Register fn(character) -> dict for Char.Vitals GMCP payloads.
 
@@ -702,6 +766,28 @@ def room_look_extras(room, game, character=None):
         return list(_room_look_extras(room, game, character) or [])
     except TypeError:
         return list(_room_look_extras(room, game) or [])
+
+
+def set_room_look_virtual_exits(fn):
+    """Register fn(room, character, game) -> list[(direction, label)].
+
+    Used for exits that are not physical ``Room.exits`` links (Purgatory
+    pit ``down`` after a floor boss dies). Pass None to clear.
+    """
+    global _room_look_virtual_exits
+    _room_look_virtual_exits = fn
+
+
+def room_look_virtual_exits(room, character, game):
+    """Return virtual look exits for this viewer, or []."""
+    if _room_look_virtual_exits is None:
+        return []
+    try:
+        return list(
+            _room_look_virtual_exits(room, character, game) or []
+        )
+    except TypeError:
+        return list(_room_look_virtual_exits(room, character) or [])
 
 
 def set_vampire_fear_message(fn):
@@ -856,6 +942,90 @@ def report_context_extra(character, game):
     return {}
 
 
+def set_room_broadcast_deliver(fn):
+    """Register fn(watcher, room, game) -> bool for room.broadcast delivery.
+
+    Return False to skip sending a line to ``watcher`` (God Mantle body
+    while focused through a twin elsewhere, …). Default: deliver.
+    """
+    global _room_broadcast_deliver
+    _room_broadcast_deliver = fn
+
+
+def room_broadcast_deliver(watcher, room, game=None):
+    """True when ``watcher`` should receive traffic from ``room``."""
+    if _room_broadcast_deliver is not None:
+        try:
+            return bool(_room_broadcast_deliver(watcher, room, game))
+        except Exception:
+            return True
+    return True
+
+
+def set_room_broadcast_transform(fn):
+    """Register fn(watcher, room, text, game) -> str for room.broadcast.
+
+    Lets Gods tag dual-sense traffic before it reaches the Session.
+    """
+    global _room_broadcast_transform
+    _room_broadcast_transform = fn
+
+
+def room_broadcast_transform(watcher, room, text, game=None):
+    """Return room line text after optional per-watcher transforms."""
+    if _room_broadcast_transform is not None:
+        try:
+            return _room_broadcast_transform(watcher, room, text, game)
+        except Exception:
+            return text
+    return text
+
+
+def set_perception_character(fn):
+    """Register fn(character, game) -> Character for prompt / located UI.
+
+    Used when the login body is not the body the player perceives (God
+    twin focus). Return the same character when unchanged.
+    """
+    global _perception_character
+    _perception_character = fn
+
+
+def perception_character(character, game=None):
+    """Character whose room / exits the client UI should reflect."""
+    if _perception_character is not None:
+        try:
+            perceived = _perception_character(character, game)
+            if perceived is not None:
+                return perceived
+        except Exception:
+            pass
+    return character
+
+
+def set_preference_character(fn):
+    """Register fn(character, game) -> Character for client/display prefs.
+
+    Used when bare verbs run through a God bilocate twin while ``config``
+    and other prefs stay on the owning Mantle. Return the same character
+    when unchanged.
+    """
+    global _preference_character
+    _preference_character = fn
+
+
+def preference_character(character, game=None):
+    """Character whose client/display prefs apply to this session."""
+    if _preference_character is not None:
+        try:
+            owner = _preference_character(character, game)
+            if owner is not None:
+                return owner
+        except Exception:
+            pass
+    return character
+
+
 def set_transition_dest(fn):
     """Register fn(character, dest, game) -> Room for enter/exit/in/out."""
     global _transition_dest
@@ -1000,6 +1170,19 @@ def make_relic_item(relic_id):
     return None
 
 
+def set_grant_relic_loot(fn):
+    """Register fn(character, relic_id, tier=1) -> loot summary str."""
+    global _grant_relic_loot
+    _grant_relic_loot = fn
+
+
+def grant_relic_loot(character, relic_id, tier=1):
+    """Apply a relic strongbox payout, or None if no game hook."""
+    if _grant_relic_loot is not None:
+        return _grant_relic_loot(character, relic_id, tier=tier)
+    return None
+
+
 def set_after_open_container(fn):
     """Register fn(character, item) after cmd_open consumes a locked box.
 
@@ -1051,6 +1234,20 @@ def after_growth_banked(character, amount, source="unknown"):
 # Games may auto-stow reagents into a gear bag. fn(character, item) ->
 # optional player message str, or None.
 _after_acquire_item = None
+_before_acquire_item = None
+
+
+def set_before_acquire_item(fn):
+    """Register fn(character, item) -> str|None refusal before inventory add."""
+    global _before_acquire_item
+    _before_acquire_item = fn
+
+
+def before_acquire_item(character, item):
+    """Run pre-acquire hook; return refusal message or None if allowed."""
+    if _before_acquire_item is not None:
+        return _before_acquire_item(character, item)
+    return None
 
 
 def set_after_acquire_item(fn):
@@ -1110,6 +1307,80 @@ def can_see_hellhound(viewer, hound=None):
     if _can_see_hellhound is not None:
         return bool(_can_see_hellhound(viewer, hound))
     return False
+
+
+def set_in_veil(fn):
+    """Register fn(character) -> bool for the Veil-layer membership check.
+
+    Pass None to restore the default: nobody is Veil-layer.
+    """
+    global _in_veil
+    _in_veil = fn
+
+
+def in_veil(character):
+    """Does `character` operate on the Veil layer rather than Prime?
+
+    Default (no game installed): False. SUPERS registers the real check
+    (death spirits, faded Ghosts, veiled Reapers, vessel-free Mantle walks)
+    from ``supers.veil``.
+    """
+    if _in_veil is not None:
+        return bool(_in_veil(character))
+    return False
+
+
+def set_veil_visible_to(fn):
+    """Register fn(viewer, other) -> bool for Veil-layer sight pierce.
+
+    Pass None to restore the default: nobody pierces the Veil.
+    """
+    global _veil_visible_to
+    _veil_visible_to = fn
+
+
+def veil_visible_to(viewer, other):
+    """Can `viewer` see `other` while `other` is on the Veil layer?
+
+    Only meaningful when ``in_veil(other)`` is True. Default (no game
+    installed): False.
+    """
+    if _veil_visible_to is not None:
+        return bool(_veil_visible_to(viewer, other))
+    return False
+
+
+def set_veil_look_tag(fn):
+    """Register fn() -> str for the Veil look-line tag prefix.
+
+    Pass None to restore the default: empty string.
+    """
+    global _veil_look_tag
+    _veil_look_tag = fn
+
+
+def veil_look_tag():
+    """Plain-text tag prefix for a Veil-layer look line (a11y: never
+    color-only). Default (no game installed): "".
+    """
+    if _veil_look_tag is not None:
+        return _veil_look_tag()
+    return ""
+
+
+def set_can_notice_stealth(fn):
+    """Register fn(viewer, other, game=None) -> bool for hide/sneak pierce."""
+    global _can_notice_stealth
+    _can_notice_stealth = fn
+
+
+def can_notice_stealth(viewer, other, game=None):
+    """Can `viewer` spot ``other`` while ``other`` is in mundane stealth?"""
+    if viewer is other:
+        return True
+    if _can_notice_stealth is not None:
+        return bool(_can_notice_stealth(viewer, other, game))
+    return True
 
 
 def set_can_see_in_dark(fn):
@@ -1324,8 +1595,37 @@ def presence_face_for(viewer, subject):
     return None
 
 
+def set_extra_target_match_needles(fn):
+    """Register fn(viewer, subject) -> iterable[str] for kind/race targeting.
+
+    SUPERS uses this so ``kill arachne`` / ``stake vampire`` resolve when
+    the kit is publicly obvious or the viewer has logged recognition.
+    Pass None to clear (bare engine: no extra needles).
+    """
+    global _extra_target_match_needles
+    _extra_target_match_needles = fn
+
+
+def extra_target_match_needles(viewer, subject):
+    """Lowercase-ready kind/race aliases for room targeting, or []."""
+    if _extra_target_match_needles is None:
+        return []
+    try:
+        raw = _extra_target_match_needles(viewer, subject)
+    except Exception:
+        return []
+    if not raw:
+        return []
+    out = []
+    for item in raw:
+        text = str(item or "").strip().lower()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
 def set_room_presence_line(fn):
-    """Register fn(face_label, character, room, game) -> str for look souls.
+    """Register fn(face_label, character, room, game, *, viewer=None) -> str for look souls.
 
     SUPERS uses this for positional state (``is standing here``, ``[KO] …
     is unconscious here``). Pass None to restore the lean engine default.
@@ -1334,10 +1634,12 @@ def set_room_presence_line(fn):
     _room_presence_line = fn
 
 
-def room_presence_line(face_label, character, room, game=None):
+def room_presence_line(face_label, character, room, game=None, *, viewer=None):
     """Full room-presence line for one Character, or a bare label fallback."""
     if _room_presence_line is not None:
-        return _room_presence_line(face_label, character, room, game)
+        return _room_presence_line(
+            face_label, character, room, game, viewer=viewer,
+        )
     label = (face_label or "?").strip()
     if getattr(character, "asleep", False):
         return f"{label} is sleeping here"
@@ -1711,6 +2013,7 @@ _dungeon_entry_refusal = None
 # returns a player-facing refusal string to block the drop, or None to allow
 # it. fn(character, item) -> str | None.
 _item_drop_refusal = None
+_inventory_item_match_rank = None
 
 # Clear a character's dual-layer overland coordinates when they step into a
 # classic zone. fn(character) -> None (side-effecting only).
@@ -1921,6 +2224,24 @@ def item_drop_refusal(character, item):
     return None
 
 
+def set_inventory_item_match_rank(fn):
+    """Register fn(character, item) -> int for duplicate inventory picks.
+
+    Lower rank sorts earlier when ``_find_item`` has several substring hits
+    and no ordinal (e.g. equipped vs carried duplicate names). Pass None to
+    restore the flat default (inventory order only).
+    """
+    global _inventory_item_match_rank
+    _inventory_item_match_rank = fn
+
+
+def inventory_item_match_rank(character, item):
+    """Sort key for ambiguous inventory item matches; 0 = default."""
+    if _inventory_item_match_rank is not None:
+        return _inventory_item_match_rank(character, item)
+    return 0
+
+
 def set_clear_overland_coords(fn):
     """Register fn(character) that clears dual-layer overland coordinates.
 
@@ -1934,6 +2255,90 @@ def clear_overland_coords(character):
     """Clear the character's overland coords via the game hook, or do nothing."""
     if _clear_overland_coords is not None:
         _clear_overland_coords(character)
+
+
+# Optional overland peers (engine/systems/overland.py -- no importlib supers).
+_overland_starter_keys = None
+_overland_room_influenced = None
+_overland_queue_vehicle_macro_move = None
+_overland_notify_dungeon_hub = None
+_overland_cadence_travel_toward = None
+_overland_solar_land_all_the_way = None
+
+
+def set_overland_starter_keys(fn):
+    """Register fn() -> (plaza_key, hub_key, bunker_pad_key)."""
+    global _overland_starter_keys
+    _overland_starter_keys = fn
+
+
+def overland_starter_keys():
+    """Starter-town keys from the game hook, or None when unset."""
+    if _overland_starter_keys is not None:
+        return _overland_starter_keys()
+    return None
+
+
+def set_overland_room_influenced(fn):
+    """Register fn(room, game) -> bool (skip virtual-room prune when True)."""
+    global _overland_room_influenced
+    _overland_room_influenced = fn
+
+
+def overland_room_influenced(room, game=None):
+    if _overland_room_influenced is not None:
+        return bool(_overland_room_influenced(room, game))
+    return False
+
+
+def set_overland_queue_vehicle_macro_move(fn):
+    """Register fn(character, direction, game) -> bool."""
+    global _overland_queue_vehicle_macro_move
+    _overland_queue_vehicle_macro_move = fn
+
+
+def overland_queue_vehicle_macro_move(character, direction, game):
+    if _overland_queue_vehicle_macro_move is not None:
+        return bool(
+            _overland_queue_vehicle_macro_move(character, direction, game),
+        )
+    return False
+
+
+def set_overland_notify_dungeon_hub(fn):
+    """Register fn(character, game, hub_room) after entering a dungeon hub."""
+    global _overland_notify_dungeon_hub
+    _overland_notify_dungeon_hub = fn
+
+
+def overland_notify_dungeon_hub(character, game, hub_room):
+    if _overland_notify_dungeon_hub is not None:
+        _overland_notify_dungeon_hub(character, game, hub_room)
+
+
+def set_overland_cadence_travel_toward(fn):
+    """Register fn(game, character, dest_room_key) -> bool."""
+    global _overland_cadence_travel_toward
+    _overland_cadence_travel_toward = fn
+
+
+def overland_cadence_travel_toward(game, character, dest_room_key):
+    if _overland_cadence_travel_toward is not None:
+        return bool(
+            _overland_cadence_travel_toward(game, character, dest_room_key),
+        )
+    return False
+
+
+def set_overland_solar_land_all_the_way(fn):
+    """Register fn(character, game) to land a flying Solar character."""
+    global _overland_solar_land_all_the_way
+    _overland_solar_land_all_the_way = fn
+
+
+def overland_solar_land_all_the_way(character, game):
+    if _overland_solar_land_all_the_way is not None:
+        _overland_solar_land_all_the_way(character, game)
 
 
 def set_mission_entrance(fn):
@@ -1953,8 +2358,10 @@ def mission_entrance(character, game, room, raw):
     return None
 
 
-# Auto-deploy map heal (supers.map_heal.heal_all_from_hot_backups) after
-# git reset --hard + protect restore. fn(root) -> list[str] log lines.
+# Auto-deploy / boot map heal (supers.map_heal.heal_all_from_hot_backups)
+# after git reset --hard + protect restore, and again before build_world so
+# copyover picks up populate rooms that only survived in map_backups.
+# fn(root) -> list[str] log lines.
 _auto_deploy_map_heal = None
 
 
@@ -1967,8 +2374,695 @@ def set_auto_deploy_map_heal(fn):
     _auto_deploy_map_heal = fn
 
 
+def ensure_auto_deploy_map_heal(*, reload_impl=False):
+    """Late-bind engine map heal when bootstrap never ran (watcher).
+
+    ``watch_and_run.reload_auto_deploy`` reloads this module every deploy
+    poll, which resets ``_auto_deploy_map_heal`` to None. The game child
+    re-registers via bootstrap; the long-lived watcher never runs bootstrap.
+    Re-bind ``engine.map_heal`` here so post-reset heal merges hot backups.
+
+    Returns True when a heal callback is bound.
+    """
+    global _auto_deploy_map_heal
+    try:
+        from engine import map_heal as map_heal_mod
+        if reload_impl:
+            import importlib
+            map_heal_mod = importlib.reload(map_heal_mod)
+        _auto_deploy_map_heal = map_heal_mod.heal_all_from_hot_backups
+        return True
+    except ImportError:
+        return False
+
+
 def auto_deploy_map_heal(root):
-    """Merge protected map_backups into live JSON after deploy reset."""
+    """Merge protected map_backups into live JSON after deploy reset / boot.
+
+    Always late-binds when the callback is missing so the Docker watcher
+    (which reloads hooks and never runs bootstrap) still heals after
+    ``reset --hard``.
+    """
+    if _auto_deploy_map_heal is None:
+        ensure_auto_deploy_map_heal(reload_impl=True)
     if _auto_deploy_map_heal is not None:
         return _auto_deploy_map_heal(root)
     return []
+
+
+# --- Two-repo purity hooks (engine never imports supers) -------------------
+# Games register real implementations in supers/bootstrap.py register_all_hooks.
+
+_is_gm_spirit = None
+_resolve_gm_body = None
+_stamp_input_activity = None
+_blob_codec_reload = None
+_taxi_mode_saver = None
+_map_snapshot_write_all = None
+_map_snapshot_daily_archive = None
+
+_containers_resolve_loot_bag = None
+_containers_find_in_loot_bag = None
+_containers_unstow_from_loot_bag = None
+_containers_unstow_all_from_loot_bag = None
+
+_after_floor_drop = None
+
+_say_strip_tone_prefix = None
+_say_drunk_meter = None
+_say_slur_text = None
+_say_drunk_tag = None
+_say_maybe_stumble_tell = None
+_deliver_say = None
+
+_autoloot_is_combat_zone = None
+_autosplit_wallet_cash = None
+_autosplit_distribute_items = None
+_autosplit_is_splitable_item = None
+
+_config_handlers = {}
+
+_on_hidden_exit_revealed = None
+
+_on_virtual_room_created = None
+_blocked_foot_step = None
+
+_character_atmos_tick = None
+_utility_delay_begin = None
+
+
+def set_is_gm_spirit(fn):
+    """Register fn(character) -> bool for GM staff spirits."""
+    global _is_gm_spirit
+    _is_gm_spirit = fn
+
+
+def is_gm_spirit(character):
+    """True when character is a GM staff spirit (not a playable body)."""
+    if _is_gm_spirit is not None:
+        return _is_gm_spirit(character)
+    return False
+
+
+def set_resolve_gm_body(fn):
+    """Register fn(spirit, game) -> Character | None for gm off / logout."""
+    global _resolve_gm_body
+    _resolve_gm_body = fn
+
+
+def resolve_gm_body(spirit, game=None):
+    """Return the Cadence Echo body linked to a GM spirit, or None."""
+    if _resolve_gm_body is not None:
+        return _resolve_gm_body(spirit, game)
+    return None
+
+
+def set_stamp_input_activity(fn):
+    """Register fn(character, game) to stamp AFK / autoidle input time."""
+    global _stamp_input_activity
+    _stamp_input_activity = fn
+
+
+def stamp_input_activity(character, game):
+    """Stamp last player input for autoidle (monotonic fallback when unset)."""
+    if _stamp_input_activity is not None:
+        _stamp_input_activity(character, game)
+        return
+    import time
+    character.last_input_monotonic = time.monotonic()
+
+
+def set_blob_codec_reload(fn):
+    """Register fn() -> None to reload persist blob + re-register codec."""
+    global _blob_codec_reload
+    _blob_codec_reload = fn
+
+
+def reload_blob_codec():
+    """Reload game blob codec from disk before copyover snapshot."""
+    if _blob_codec_reload is not None:
+        _blob_codec_reload()
+
+
+def set_taxi_mode_saver(fn):
+    """Register fn(conn, game) -> None to persist game.taxi_mode meta."""
+    global _taxi_mode_saver
+    _taxi_mode_saver = fn
+
+
+def save_taxi_mode_meta(conn, game):
+    """Persist taxi pacing mode when a game registered a saver."""
+    if _taxi_mode_saver is not None:
+        _taxi_mode_saver(conn, game)
+
+
+def set_map_snapshot_hooks(write_all=None, daily_archive=None):
+    """Register world-backup snapshot hooks (write_all, daily_archive)."""
+    global _map_snapshot_write_all, _map_snapshot_daily_archive
+    _map_snapshot_write_all = write_all
+    _map_snapshot_daily_archive = daily_archive
+
+
+def write_map_backup_all(root=None):
+    """Staff snapshot all maps/zones (no-op without a registered hook)."""
+    if _map_snapshot_write_all is not None:
+        _map_snapshot_write_all(root=root)
+
+
+def write_map_daily_archive(root=None, confirmed_by=""):
+    """Daily map archive line (None when unset or nothing archived)."""
+    if _map_snapshot_daily_archive is not None:
+        return _map_snapshot_daily_archive(
+            root=root, confirmed_by=confirmed_by,
+        )
+    return None
+
+
+def set_containers_resolve_loot_bag(fn):
+    global _containers_resolve_loot_bag
+    _containers_resolve_loot_bag = fn
+
+
+def containers_resolve_loot_bag(character, query):
+    if _containers_resolve_loot_bag is not None:
+        return _containers_resolve_loot_bag(character, query)
+    return None
+
+
+def set_containers_find_in_loot_bag(fn):
+    global _containers_find_in_loot_bag
+    _containers_find_in_loot_bag = fn
+
+
+def containers_find_in_loot_bag(character, needle, loot_bag=None):
+    if _containers_find_in_loot_bag is not None:
+        return _containers_find_in_loot_bag(
+            character, needle, loot_bag=loot_bag,
+        )
+    return None
+
+
+def set_containers_unstow_from_loot_bag(fn):
+    global _containers_unstow_from_loot_bag
+    _containers_unstow_from_loot_bag = fn
+
+
+def containers_unstow_from_loot_bag(character, item, loot_bag=None):
+    if _containers_unstow_from_loot_bag is not None:
+        return _containers_unstow_from_loot_bag(
+            character, item, loot_bag=loot_bag,
+        )
+    return False, "You don't have a loot bag."
+
+
+def set_containers_unstow_all_from_loot_bag(fn):
+    global _containers_unstow_all_from_loot_bag
+    _containers_unstow_all_from_loot_bag = fn
+
+
+def containers_unstow_all_from_loot_bag(character, loot_bag=None):
+    if _containers_unstow_all_from_loot_bag is not None:
+        return _containers_unstow_all_from_loot_bag(
+            character, loot_bag=loot_bag,
+        )
+    return False, "You don't have a loot bag."
+
+
+def set_after_floor_drop(fn):
+    global _after_floor_drop
+    _after_floor_drop = fn
+
+
+def after_floor_drop(game, item):
+    if _after_floor_drop is not None:
+        _after_floor_drop(game, item)
+
+
+def set_say_strip_tone_prefix(fn):
+    global _say_strip_tone_prefix
+    _say_strip_tone_prefix = fn
+
+
+def say_strip_tone_prefix(message):
+    if _say_strip_tone_prefix is not None:
+        return _say_strip_tone_prefix(message)
+    return None, message
+
+
+def set_say_drunk_meter(fn):
+    global _say_drunk_meter
+    _say_drunk_meter = fn
+
+
+def say_drunk_meter(character):
+    if _say_drunk_meter is not None:
+        return _say_drunk_meter(character)
+    return 0.0
+
+
+def set_say_slur_text(fn):
+    global _say_slur_text
+    _say_slur_text = fn
+
+
+def say_slur_text(text, level):
+    if _say_slur_text is not None:
+        return _say_slur_text(text, level)
+    return text
+
+
+def set_say_drunk_tag(fn):
+    global _say_drunk_tag
+    _say_drunk_tag = fn
+
+
+def say_drunk_tag(level):
+    if _say_drunk_tag is not None:
+        return _say_drunk_tag(level)
+    return ""
+
+
+def set_say_maybe_stumble_tell(fn):
+    global _say_maybe_stumble_tell
+    _say_maybe_stumble_tell = fn
+
+
+def say_maybe_stumble_tell(character, level):
+    if _say_maybe_stumble_tell is not None:
+        return _say_maybe_stumble_tell(character, level)
+    return None
+
+
+def set_deliver_say(fn):
+    global _deliver_say
+    _deliver_say = fn
+
+
+def deliver_say(character, spoken, game, **kwargs):
+    """Broadcast say text; lean default is a simple room broadcast."""
+    if _deliver_say is not None:
+        return _deliver_say(character, spoken, game, **kwargs)
+    room = kwargs.get("speak_room") or character.location
+    you_verb = kwargs.get("you_verb") or "say"
+    they_verb = kwargs.get("they_verb") or "says"
+    tone = kwargs.get("tone")
+    drunk_tag = kwargs.get("drunk_tag") or ""
+    from engine.command_support import _display_name, _presence_face
+    face = _presence_face(character)
+    tag = f" {drunk_tag}" if drunk_tag else ""
+    tone_bit = f" {tone}" if tone else ""
+    character.session.send(
+        f"You {you_verb},{tone_bit} \"{spoken}\"{tag}"
+    )
+    if room is not None:
+        room.broadcast(
+            f'{_display_name(character)} {they_verb},{tone_bit} "{spoken}"{tag}',
+            exclude=character,
+        )
+
+
+def set_autoloot_is_combat_zone(fn):
+    global _autoloot_is_combat_zone
+    _autoloot_is_combat_zone = fn
+
+
+def autoloot_is_combat_zone(room, game):
+    if _autoloot_is_combat_zone is not None:
+        return _autoloot_is_combat_zone(room, game)
+    return False
+
+
+def set_autosplit_wallet_cash(fn):
+    global _autosplit_wallet_cash
+    _autosplit_wallet_cash = fn
+
+
+def autosplit_wallet_cash(game, character, defender, amount):
+    if _autosplit_wallet_cash is not None:
+        return _autosplit_wallet_cash(game, character, defender, amount)
+    return []
+
+
+def set_autosplit_distribute_items(fn):
+    global _autosplit_distribute_items
+    _autosplit_distribute_items = fn
+
+
+def autosplit_distribute_items(game, character, defender, items):
+    if _autosplit_distribute_items is not None:
+        return _autosplit_distribute_items(
+            game, character, defender, items,
+        )
+    return []
+
+
+def set_autosplit_is_splitable_item(fn):
+    global _autosplit_is_splitable_item
+    _autosplit_is_splitable_item = fn
+
+
+def autosplit_is_splitable_item(item):
+    if _autosplit_is_splitable_item is not None:
+        return _autosplit_is_splitable_item(item)
+    return False
+
+
+def set_config_handler(key, fn):
+    """Register cmd_config handler for one pref key (autokill, autoloot, …)."""
+    if fn is None:
+        _config_handlers.pop(key, None)
+    else:
+        _config_handlers[key] = fn
+
+
+def set_config_handlers(mapping):
+    """Replace the full config-handler map (key -> handler)."""
+    global _config_handlers
+    _config_handlers = dict(mapping or {})
+
+
+def config_handler(key):
+    """Return registered cmd_config handler for key, or None."""
+    return _config_handlers.get(key)
+
+
+def set_on_hidden_exit_revealed(fn):
+    global _on_hidden_exit_revealed
+    _on_hidden_exit_revealed = fn
+
+
+def on_hidden_exit_revealed(character, room):
+    if _on_hidden_exit_revealed is not None:
+        _on_hidden_exit_revealed(character, room)
+
+
+def set_on_virtual_room_created(fn):
+    global _on_virtual_room_created
+    _on_virtual_room_created = fn
+
+
+def on_virtual_room_created(game, room):
+    if _on_virtual_room_created is not None:
+        _on_virtual_room_created(game, room)
+
+
+def set_blocked_foot_step(fn):
+    global _blocked_foot_step
+    _blocked_foot_step = fn
+
+
+def blocked_foot_step(game, macro, micro):
+    if _blocked_foot_step is not None:
+        return _blocked_foot_step(game, macro, micro)
+    return None
+
+
+def set_character_atmos_tick(fn):
+    global _character_atmos_tick
+    _character_atmos_tick = fn
+
+
+def character_atmos_tick(character):
+    if _character_atmos_tick is not None:
+        _character_atmos_tick(character)
+
+
+def set_utility_delay_begin(fn):
+    global _utility_delay_begin
+    _utility_delay_begin = fn
+
+
+def utility_delay_begin(character, game, action_key):
+    if _utility_delay_begin is not None:
+        return _utility_delay_begin(character, game, action_key)
+    return None
+
+
+# --- Peeled framework peers (two-repo Track 2) -----------------------------
+
+_item_catalog_get = None
+_weapon_grip_for_fn = None
+
+_map_restore_hot_reload = None
+
+_floor_loot_artifact_exclude_ids = None
+_lost_item_vault_room_key = None
+_orphan_item_room_for_game = None
+
+_containers_is_gear_item = None
+_containers_ensure_gear_bag = None
+_containers_on_body_carry_refusal = None
+_containers_item_worn_on_body = None
+_containers_surface_inventory_items = None
+_containers_stacked_carry_lines = None
+_containers_gear_acquire_refusal = None
+_containers_relic_acquire_refusal = None
+_containers_room_is_character_home = None
+_containers_heal_folded_kit_bags = None
+
+
+def set_item_catalog_get(fn):
+    global _item_catalog_get
+    _item_catalog_get = fn
+
+
+def get_item_spec(catalog_id):
+    if _item_catalog_get is not None:
+        return _item_catalog_get(catalog_id)
+    return None
+
+
+def set_weapon_grip_for(fn):
+    global _weapon_grip_for_fn
+    _weapon_grip_for_fn = fn
+
+
+def weapon_grip_for(item):
+    if _weapon_grip_for_fn is not None:
+        return _weapon_grip_for_fn(item)
+    return None
+
+
+def set_map_restore_hot_reload(fn):
+    global _map_restore_hot_reload
+    _map_restore_hot_reload = fn
+
+
+def map_restore_hot_reload(game, map_id):
+    if _map_restore_hot_reload is not None:
+        return _map_restore_hot_reload(game, map_id)
+    return None
+
+
+def set_floor_loot_artifact_exclude_ids(fn):
+    global _floor_loot_artifact_exclude_ids
+    _floor_loot_artifact_exclude_ids = fn
+
+
+def floor_loot_artifact_exclude_ids():
+    if _floor_loot_artifact_exclude_ids is not None:
+        return _floor_loot_artifact_exclude_ids()
+    return frozenset()
+
+
+def set_lost_item_vault_room_key(key):
+    global _lost_item_vault_room_key
+    _lost_item_vault_room_key = key
+
+
+def lost_item_vault_room_key():
+    return _lost_item_vault_room_key or ""
+
+
+def set_orphan_item_room_for_game(fn):
+    global _orphan_item_room_for_game
+    _orphan_item_room_for_game = fn
+
+
+def orphan_item_room_for_game(game):
+    if _orphan_item_room_for_game is not None:
+        return _orphan_item_room_for_game(game)
+    return None
+
+
+def set_containers_is_gear_item(fn):
+    global _containers_is_gear_item
+    _containers_is_gear_item = fn
+
+
+def containers_is_gear_item(item):
+    if _containers_is_gear_item is not None:
+        return _containers_is_gear_item(item)
+    return False
+
+
+def set_containers_ensure_gear_bag(fn):
+    global _containers_ensure_gear_bag
+    _containers_ensure_gear_bag = fn
+
+
+def containers_ensure_gear_bag(character):
+    if _containers_ensure_gear_bag is not None:
+        return _containers_ensure_gear_bag(character)
+    return []
+
+
+def set_containers_on_body_carry_refusal(fn):
+    global _containers_on_body_carry_refusal
+    _containers_on_body_carry_refusal = fn
+
+
+def containers_on_body_carry_refusal(character, item):
+    if _containers_on_body_carry_refusal is not None:
+        return _containers_on_body_carry_refusal(character, item)
+    return None
+
+
+def set_containers_item_worn_on_body(fn):
+    global _containers_item_worn_on_body
+    _containers_item_worn_on_body = fn
+
+
+def containers_item_worn_on_body(character, item):
+    if _containers_item_worn_on_body is not None:
+        return _containers_item_worn_on_body(character, item)
+    return False
+
+
+def set_containers_surface_inventory_items(fn):
+    global _containers_surface_inventory_items
+    _containers_surface_inventory_items = fn
+
+
+def containers_surface_inventory_items(character):
+    if _containers_surface_inventory_items is not None:
+        return _containers_surface_inventory_items(character)
+    inv = getattr(character, "inventory", None) or []
+    return list(inv)
+
+
+def set_containers_stacked_carry_lines(fn):
+    global _containers_stacked_carry_lines
+    _containers_stacked_carry_lines = fn
+
+
+def containers_stacked_carry_lines(items, character):
+    if _containers_stacked_carry_lines is not None:
+        return _containers_stacked_carry_lines(items, character)
+    return [str(x) for x in items or []]
+
+
+def set_containers_gear_acquire_refusal(fn):
+    global _containers_gear_acquire_refusal
+    _containers_gear_acquire_refusal = fn
+
+
+def containers_gear_acquire_refusal(character, item):
+    if _containers_gear_acquire_refusal is not None:
+        return _containers_gear_acquire_refusal(character, item)
+    return None
+
+
+def set_containers_relic_acquire_refusal(fn):
+    global _containers_relic_acquire_refusal
+    _containers_relic_acquire_refusal = fn
+
+
+def containers_relic_acquire_refusal(character, item):
+    if _containers_relic_acquire_refusal is not None:
+        return _containers_relic_acquire_refusal(character, item)
+    return None
+
+
+def set_containers_room_is_character_home(fn):
+    global _containers_room_is_character_home
+    _containers_room_is_character_home = fn
+
+
+def containers_room_is_character_home(character, room, game):
+    if _containers_room_is_character_home is not None:
+        return _containers_room_is_character_home(character, room, game)
+    return False
+
+
+def set_containers_heal_folded_kit_bags(fn):
+    global _containers_heal_folded_kit_bags
+    _containers_heal_folded_kit_bags = fn
+
+
+def containers_heal_folded_kit_bags(game):
+    if _containers_heal_folded_kit_bags is not None:
+        return _containers_heal_folded_kit_bags(game)
+    return 0
+
+
+# Content kind profiles (OLC / content_new / Area Studio) — game registers
+# profile dirs, domain validators, and catalog save paths.
+_content_kinds_dirs: list[str] = []
+_content_kind_domain_validate = None
+_content_kind_save_entity = None
+_olc_authorizer = None
+
+
+def set_content_kinds_dirs(dirs):
+    """Register one or more directories of *.json kind profiles.
+
+    Call before listing kinds or validating entities. Later registrations
+    replace the list and invalidate the profile cache.
+    """
+    global _content_kinds_dirs
+    _content_kinds_dirs = [str(d) for d in (dirs or [])]
+    try:
+        from engine.content_kinds.engine import _clear_profiles_for_tests
+        _clear_profiles_for_tests()
+    except ImportError:
+        pass
+
+
+def content_kinds_dirs():
+    """Absolute paths to kind-profile JSON directories."""
+    return list(_content_kinds_dirs)
+
+
+def set_content_kind_domain_validator(fn):
+    """Register fn(kind_id, obj, *, where) for boot-aligned domain checks.
+
+    Pass None to skip domain validation (bare engine / lint-only profiles).
+    """
+    global _content_kind_domain_validate
+    _content_kind_domain_validate = fn
+
+
+def content_kind_domain_validate(kind_id, obj, *, where=None):
+    """Run game-registered domain validation after profile checks."""
+    if _content_kind_domain_validate is not None:
+        _content_kind_domain_validate(kind_id, obj, where=where)
+
+
+def set_content_kind_save_entity(fn):
+    """Register fn(kind_id, entity_id, obj, **kwargs) -> str save message."""
+    global _content_kind_save_entity
+    _content_kind_save_entity = fn
+
+
+def content_kind_save_entity(kind_id, entity_id, obj, **kwargs):
+    """Persist a validated entity through the game hook."""
+    if _content_kind_save_entity is None:
+        raise RuntimeError(
+            "content_kind_save_entity hook not registered "
+            "(game must call set_content_kind_save_entity at boot)"
+        )
+    return _content_kind_save_entity(kind_id, entity_id, obj, **kwargs)
+
+
+def set_olc_authorizer(fn):
+    """Register fn(character) -> bool for in-game OLC access."""
+    global _olc_authorizer
+    _olc_authorizer = fn
+
+
+def olc_authorizer(character):
+    """True when character may use menu OLC wizards."""
+    if _olc_authorizer is not None:
+        return bool(_olc_authorizer(character))
+    return False
