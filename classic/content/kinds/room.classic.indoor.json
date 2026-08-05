@@ -1,0 +1,19 @@
+{
+  "id": "room.classic.indoor",
+  "label": "Classic indoor room",
+  "extends": "room.engine",
+  "writes_to": "classic/content/zones rooms[]",
+  "fields": {
+    "outdoor": {
+      "type": "bool",
+      "required": true,
+      "default": false,
+      "doc": "Indoor room."
+    },
+    "zone": {
+      "type": "string",
+      "required": true,
+      "doc": "Zone id (e.g. millbrook)."
+    }
+  }
+}

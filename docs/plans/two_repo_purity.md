@@ -5,13 +5,18 @@ anyone can download, and a **private SUPERS game** that depends on it.
 Authoritative short status still lives in [`HANDOFF.md`](../../HANDOFF.md);
 hook API details grow in [`../ENGINE_CONSUMER.md`](../ENGINE_CONSUMER.md).
 
-**Status:** Phases 0–6 **done** for the remote split. Public
-[`riftforge-engine`](https://github.com/capnknives/riftforge-engine)
-(`v0.4.0` pin); private `capnknives/RiftForge` (SUPERS). **Phase 7**
+**Status:** Phases 0–6 **done** for the remote split. **Phase 7**
 (engine framework extraction + `basegame/` + Stage G root glue) is
-**complete** — Stages **1–9**, A1/A2, Plan B, Stage G, and the public
-`v0.2.0`/`v0.3.0`/`v0.4.0` tags. Ongoing: export discipline when engine
-changes; dual-mount hack when editing both trees. Gateway:
+**complete** — Stages **1–10**, A1/A2, Plan B, Stage G, and public tags
+`v0.2.0`–`v0.5.0`. Public
+[`riftforge-engine`](https://github.com/capnknives/riftforge-engine) at
+**`v0.5.0`**; private `capnknives/RiftForge` (SUPERS) pins **`@v0.5.0`**.
+**Post–`v0.4.0` hygiene track (H1–H10)** **complete** (2026-08-05) —
+execution SoT: [`two_repo_purity_extractions_plan.md`](two_repo_purity_extractions_plan.md);
+closeout inventory: [`two_repo_purity_audit_2026-08-05.md`](two_repo_purity_audit_2026-08-05.md).
+Ongoing: export discipline when engine APIs change; dual-mount hack when
+editing both trees; next public tag **`v0.5.1`** when score-sheet /
+`python -m engine` MVP ships. Gateway:
 [`connection_gateway.md`](connection_gateway.md) (shipped).
 T3 hygiene peels (`persistence-api` / `lean-demo` / dirty-saves **bench**)
 are done in [`refactor_plan.md`](refactor_plan.md); full incremental
@@ -31,16 +36,28 @@ plans.
 
 ## Locked decisions
 
+- **Three layers:** `engine/` (public core) · `basegame/` (public proof
+  consumer of engine APIs) · `supers/` (private production game). Detail:
+  [`../ENGINE_CONSUMER.md`](../ENGINE_CONSUMER.md).
+- **One game per process:** `game_select.py` + `RIFTFORGE_GAME`
+  (`supers` | `basegame` | `none`) — never import both game packages in one
+  process (hooks would clobber). Live auto-selects SUPERS.
 - **Dependency:** SUPERS → Riftforge only. Never `engine` → `supers`
-  (lazy imports count as violations).
+  (lazy imports count as violations). `basegame` → engine only (never
+  `supers`).
 - **End state:** Two GitHub remotes — public
   **`capnknives/riftforge-engine`**, private **`capnknives/RiftForge`**
-  (SUPERS; this monorepo).
+  (SUPERS; this monorepo). Public tree includes `engine/` + `basegame/`.
 - **Wiring:** SUPERS `pyproject.toml` pins Riftforge via **GitHub version
   tags** on `riftforge-engine` (pip). Local hacking: editable path install.
   Live Docker: dual bind-mount while editing; tagged pin for clean ship.
 - **Purity gate:** `import` / minimal server boot works with SUPERS
   **uninstalled**. No Origins, Cadence, or game content in the public tree.
+- **Firearm / combat cross-wire:** SUPERS `firearm_ammo` + narrative swing
+  shoot + melee `aim` are **not** the engine active-combat gun loop
+  (`engine/systems/firearms.py`, `load`/`aim`/`fire` telegraphs). Do not
+  merge verb handlers or state attrs — see
+  [`fast_paced_combat_engine.md`](fast_paced_combat_engine.md) decision #21.
 - **Live Docker loop preserved:** bind-mount + `watch_and_run` +
   auto-deploy on **SUPERS** `origin/main` (see
   [`../UPGRADING_RIFTFORGE.md`](../UPGRADING_RIFTFORGE.md) /
@@ -445,11 +462,19 @@ weather/travel demo + **`@v0.3.0`** shipped after. Root `server.py` /
 `tools/persist_save_bench.py` (or live lag) shows GO + explicit unpark.
 Further public tags when engine APIs change.
 
-### Next purity pass (post-v0.4.0) — inventory in fresh audit
+### Post–`v0.4.0` hygiene track (H1–H10) — **complete**
 
-**Living inventory:** [`two_repo_purity_audit_2026-08-04.md`](two_repo_purity_audit_2026-08-04.md)
-— Tier 1 peels, Tier 2 forks, `basegame/` proof gaps. **Execution plan
-(H1–H9):** [`two_repo_purity_extractions_plan.md`](two_repo_purity_extractions_plan.md).
+**Execution plan (closed):** [`two_repo_purity_extractions_plan.md`](two_repo_purity_extractions_plan.md)
+— H1a–H1c (`engine/world_maps.py`), H2 vehicles, H3 lodging/paced travel,
+H4 clinic/justice wiring, H5 quests, H6 `engine/map_store.py`, H7a–H7d
+phone/appearance/personas/relationships, H8 generic kind grandparents, H9
+public **`v0.5.0`** tag + pin bump, H10 `procedural_build` peel. Root
+`maps.py` is a thin facade (~119 lines); loader/minimap/city-paint live in
+`engine/world_maps.py` (~3.1k).
+
+**Closeout audit:** [`two_repo_purity_audit_2026-08-05.md`](two_repo_purity_audit_2026-08-05.md)
+— refreshed metrics, what stays in SUPERS, optional future peels.
+**Pre-H1 inventory (historical):** [`two_repo_purity_audit_2026-08-04.md`](two_repo_purity_audit_2026-08-04.md).
 
 Legacy notes (post-v0.3.0 overland cleanup — **done**):
 
@@ -512,4 +537,5 @@ Stages **4** / **7** / **8** → Sonnet lead (**done**). Stages **5** /
 - [`tools/export_public_engine.py`](../../tools/export_public_engine.py) — `PUBLIC_PATHS` (includes `basegame`)
 - [`tools/basegame_smoke.py`](../../tools/basegame_smoke.py) / [`tools/engine_smoke.py`](../../tools/engine_smoke.py)
 - Archive: `docs/archive/HANDOFF_HISTORY.md` (“Engine/SUPERS folder split”)
-- Archive: [`../archive/phase7_a1_a2_plan_b_complete.md`](../archive/phase7_a1_a2_plan_b_complete.md)
+- [`two_repo_purity_audit_2026-08-05.md`](two_repo_purity_audit_2026-08-05.md) — **closeout** (H1–H10 + `v0.5.0`)
+- [`two_repo_purity_audit_2026-08-04.md`](two_repo_purity_audit_2026-08-04.md) — pre-track inventory (historical)

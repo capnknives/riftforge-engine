@@ -39,6 +39,12 @@ def register_core_hooks():
     hooks.set_map_room_stamper(stamp_basegame_map_room)
     hooks.set_blob_codec(character_to_blob, apply_character_blob)
     stats_module.register_hooks()
+    from basegame import body_parts as body_parts_module
+
+    body_parts_module.register_hooks()
+    from engine.calendars.gregorian import GregorianCalendar
+
+    hooks.set_calendar_provider(GregorianCalendar())
     _register_content_kinds_hooks()
 
 
@@ -86,6 +92,9 @@ def register_all_hooks():
     from basegame import quests as quests_mod
     quests_mod.register_quest_hooks()
 
+    from basegame import procedural_build as procedural_build_mod
+    procedural_build_mod.register_populate_hooks()
+
     # Combat backends: register + load swing + active_combat (default swing).
     from engine.systems import combat_runtime as combat_runtime_mod
     from basegame import combat_backends as combat_backends_mod
@@ -98,6 +107,8 @@ def register_all_hooks():
     from engine.systems import active_combat as active_combat_mod
 
     def _on_session_disconnect(character, game, *, to_echo=True):
+        from engine.systems import grapple as grapple_mod
+        grapple_mod.break_grapple(character)
         active_combat_mod.on_disconnect_clear_offense(character)
 
     hooks.set_on_session_disconnect(_on_session_disconnect)
@@ -211,3 +222,40 @@ def register_all_hooks():
     # Spawn peel demo: bestiary registry + critter nest AI (no SUPERS).
     from basegame import bestiary as _bestiary_mod  # noqa: F401
     from basegame import spawn_nests as _spawn_nests_mod  # noqa: F401
+
+    from basegame.sheet_score import register_score_sheet_hooks
+
+    register_score_sheet_hooks()
+
+    _register_appearance_hooks()
+    from basegame import personas as personas_mod
+    personas_mod.register_persona_hooks()
+    _register_phone_hooks()
+
+
+def _register_appearance_hooks():
+    """H7b: mortal appearance catalog for basegame chargen / appearance verb."""
+    import json
+    from engine import hooks
+    from engine.systems import appearance as appearance_mod
+
+    catalog_path = os.path.join(_CONTENT_DIR, "appearance.json")
+    hooks.set_appearance_content_path(lambda: catalog_path)
+    with open(catalog_path, encoding="utf-8") as handle:
+        catalog = json.load(handle)
+    hooks.set_appearance_kits({"mortal": catalog})
+
+
+def _register_phone_hooks():
+    """H7a: payphone fee + Operator alias for the dial demo."""
+    from engine import hooks
+
+    def _phone_alias_resolver(raw, character, game):
+        del character
+        if (raw or "").strip().lower() == "operator":
+            from basegame import personas as personas_mod
+            return personas_mod.operator_phone_number(game)
+        return None
+
+    hooks.set_phone_dial_alias_resolver(_phone_alias_resolver)
+    hooks.set_phone_payphone_fee(lambda: 1)

@@ -11,8 +11,8 @@ should ship as a fully functional generic game, with several hookable combat
 merely a bare mechanism waiting for a game to fill in.
 
 A "combat engine" here is just an id plus three functions a game (or the
-engine's own shipped defaults -- see `combat_mundane.py` /
-`combat_martial_arts.py`) registers under that id:
+engine's own shipped defaults -- see `combat_mundane.py`,
+`combat_martial_arts.py`, and `combat_osr.py`) registers under that id:
 
   * ``build_brief(attacker, defender, game=None, *, rng=None, **ctx) -> brief``
     Pure computation, no mutation -- decide what *would* happen (who got hit,

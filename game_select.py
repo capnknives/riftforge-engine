@@ -1,35 +1,28 @@
 """game_select.py -- resolves which game package (if any) runs on the engine.
 
-RiftForge is the engine; SUPERS and basegame are two mutually exclusive
-game packages that can sit on top of it. Both register hooks at import
-time (see supers/__init__.py, basegame/__init__.py), so importing both in
-one process would let the second one silently clobber the first's hooks.
-This module is the single choke point every other root module (server.py,
-commands.py) goes through to pick a game -- nothing else should import
-`supers` or `basegame` directly at module scope.
+RiftForge is the engine; SUPERS, basegame, and classic are mutually
+exclusive game packages. Each registers hooks at import time (see
+supers/__init__.py, basegame/__init__.py, classic/__init__.py), so
+importing more than one in a process would clobber hooks. This module is
+the single choke point (server.py, commands.py) -- nothing else should
+import game packages directly at module scope.
 
 ``RIFTFORGE_GAME`` environment variable selects the active game:
 
     supers    -- the production game. Must be importable or this raises.
     basegame  -- the reference demo game. Must be importable or this raises.
-    none      -- lean engine only, no game package (even if supers/basegame
-                 are both installed).
-    unset     -- auto: supers if importable, else lean engine. This is
-                 today's live behavior, unchanged by basegame's existence --
-                 basegame is never auto-selected; it must be requested
-                 explicitly. (Auto-falling into basegame the moment supers
-                 fails to import would be surprising, and would break the
-                 existing two-repo-purity engine-only-smoke gate, which
-                 renames only supers/ aside and expects a truly lean
-                 engine, not a silent basegame pickup.)
+    classic   -- OSR fantasy MVP (Millbrook + wilds). Must be importable.
+    none      -- lean engine only, no game package.
+    unset     -- auto: supers if importable, else lean engine. basegame and
+                 classic are never auto-selected.
 
 Resolution happens once per process and is cached; call `_reset_for_tests()`
-to clear the cache (smoke / basegame_smoke rebuild Game wiring per run).
+to clear the cache (smoke tests rebuild Game wiring per run).
 """
 
 import os
 
-_GAME_NAME = None  # "supers" | "basegame" | "none", once resolved
+_GAME_NAME = None  # "supers" | "basegame" | "classic" | "none", once resolved
 
 
 def _reset_for_tests():
@@ -45,9 +38,10 @@ def _resolve():
         return _GAME_NAME
 
     choice = (os.environ.get("RIFTFORGE_GAME") or "auto").strip().lower()
-    if choice not in ("supers", "basegame", "none", "auto"):
+    if choice not in ("supers", "basegame", "classic", "none", "auto"):
         raise ValueError(
-            f"RIFTFORGE_GAME={choice!r} must be one of: supers, basegame, none"
+            f"RIFTFORGE_GAME={choice!r} must be one of: "
+            "supers, basegame, classic, none"
         )
 
     if choice == "supers":
@@ -56,9 +50,11 @@ def _resolve():
     elif choice == "basegame":
         import basegame  # noqa: F401 -- import triggers core hook registration
         _GAME_NAME = "basegame"
+    elif choice == "classic":
+        import classic  # noqa: F401 -- import triggers core hook registration
+        _GAME_NAME = "classic"
     elif choice == "none":
         _GAME_NAME = "none"
-        # Lean demo: one-room map, not the full monorepo content/maps tree.
         from engine.lean_boot import configure_lean_maps
         configure_lean_maps()
     else:  # auto
@@ -74,7 +70,7 @@ def _resolve():
 
 
 def game_name():
-    """"supers", "basegame", or "none" -- the resolved active game."""
+    """"supers", "basegame", "classic", or "none" -- resolved active game."""
     return _resolve()
 
 
@@ -87,6 +83,9 @@ def game_commands():
     if name == "basegame":
         from basegame.verbs import BASEGAME_COMMANDS
         return BASEGAME_COMMANDS
+    if name == "classic":
+        from classic.verbs import CLASSIC_COMMANDS
+        return CLASSIC_COMMANDS
     return {}
 
 
@@ -102,6 +101,9 @@ def register_all_hooks():
     elif name == "basegame":
         from basegame.bootstrap import register_all_hooks as fn
         fn()
+    elif name == "classic":
+        from classic.bootstrap import register_all_hooks as fn
+        fn()
 
 
 def register_default_ticks(game):
@@ -113,15 +115,13 @@ def register_default_ticks(game):
     elif name == "basegame":
         from basegame.tick_bootstrap import register_default_ticks as fn
         fn(game)
+    elif name == "classic":
+        from classic.tick_bootstrap import register_default_ticks as fn
+        fn(game)
 
 
 def seed_content(game):
-    """Idempotent game-package world backfill, called once at Game boot.
-
-    SUPERS: ``supers.boot_seed.seed_content`` (Cadence, immersion, heals,
-    ``register_default_ticks``). Basegame: ``basegame.seed.seed_content``
-    plus tick registration. Lean engine (``none``): no-op.
-    """
+    """Idempotent game-package world backfill, called once at Game boot."""
     name = _resolve()
     if name == "supers":
         from supers.boot_seed import seed_content as fn
@@ -130,3 +130,6 @@ def seed_content(game):
         from basegame.seed import seed_content as fn
         fn(game)
         register_default_ticks(game)
+    elif name == "classic":
+        from classic.seed import seed_content as fn
+        fn(game)

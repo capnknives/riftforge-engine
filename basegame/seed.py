@@ -26,3 +26,6 @@ def seed_content(game):
         bed.need = "sleep"
         inn.contents.append(bed)
         lodging_mod.stamp_home_basics(inn)
+
+    from basegame import personas as personas_mod
+    personas_mod.ensure_demo_npc(game)

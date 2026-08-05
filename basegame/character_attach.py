@@ -19,7 +19,9 @@ there's no ``bg_stats`` here.
 
 from basegame import needs as needs_module
 from basegame import stats as stats_module
+from basegame import body_parts as body_parts_module
 import engine.systems.economy as economy_wallet
+from engine.systems import firearms as firearms_mod
 
 
 def attach_basegame(character):
@@ -56,6 +58,8 @@ def attach_basegame(character):
     character.bg_stellar = False
     character.solar_charge = 1.0
     character.stellar_flight_tier = "ground"
+    character.room_hover = False
+    character.is_flying = False
     character.stellar_globe_lon = None
     character.stellar_globe_lat = None
     character.stellar_flight_macro = None
@@ -68,6 +72,7 @@ def attach_basegame(character):
     character.umbral_shrouded = False
     character.alien_path = None
     needs_module.attach_character(character)
+    body_parts_module.attach_character(character)
     character.downed = False
     character.downed_until_tick = 0
     character.hospitalized = False
@@ -76,3 +81,16 @@ def attach_basegame(character):
     character.fine_owed_cents = 0
     character.jail_until_tick = None
     character.hp_cap = stats_module.max_hp(character)
+    # H7b appearance slots (engine/systems/appearance.py).
+    from engine.systems import appearance as appearance_mod
+    character.appearance = appearance_mod.default_appearance()
+    character.desc_override = False
+    # H7d relationship tags (engine/systems/relationships.py).
+    from engine.systems import relationships as relationships_mod
+    relationships_mod.ensure_defaults(character)
+    # H7a phonebook aliases (engine/systems/phone.py).
+    character.phone_contacts = {}
+    # H7c persona traits (engine/systems/persona_registry.py).
+    character.traits = []
+    # Demo sidearm for active-combat firearm verbs (load / aim / fire).
+    firearms_mod.ensure_firearm(character)

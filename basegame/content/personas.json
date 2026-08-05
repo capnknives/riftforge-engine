@@ -1,0 +1,16 @@
+{
+    "traits": {
+        "chatty": {
+            "chatter": 1.6,
+            "assertiveness": 0.3
+        }
+    },
+    "lines": {
+        "greet": [
+            "{name} nods politely."
+        ],
+        "greet_chatty": [
+            "{name} grins and says, \"Welcome to Notbigville -- don't be a stranger!\""
+        ]
+    }
+}

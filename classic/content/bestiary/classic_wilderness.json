@@ -1,0 +1,42 @@
+{
+  "kind": "creature.classic.catalog",
+  "category": "classic-wilderness",
+  "creatures": [
+    {
+      "id": "wolf",
+      "name": "a grey wolf",
+      "description": "A lean grey wolf with bared teeth.",
+      "tier": 0,
+      "hp": 12,
+      "ac": 12,
+      "attack_bonus": 2,
+      "damage_die": 6,
+      "stat_ranges": {
+        "POW": [4, 8],
+        "VIT": [4, 8],
+        "FOC": [3, 6],
+        "FIN": [6, 10],
+        "RES": [3, 6],
+        "PRE": [3, 6]
+      }
+    },
+    {
+      "id": "goblin",
+      "name": "a goblin",
+      "description": "A scrawny goblin clutching a rusty knife.",
+      "tier": 0,
+      "hp": 8,
+      "ac": 11,
+      "attack_bonus": 1,
+      "damage_die": 4,
+      "stat_ranges": {
+        "POW": [3, 7],
+        "VIT": [3, 7],
+        "FOC": [3, 6],
+        "FIN": [5, 9],
+        "RES": [3, 6],
+        "PRE": [2, 5]
+      }
+    }
+  ]
+}

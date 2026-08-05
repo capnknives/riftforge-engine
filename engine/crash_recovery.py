@@ -27,6 +27,11 @@ from engine import boot_failure
 
 STATE_FILENAME = ".crash_recovery_state.json"
 HOLD_FILENAME = ".crash_revert_hold"
+# Records the HEAD SHA at the moment a revert hold was set, so
+# ``maybe_auto_resume_hold`` can tell "a fix landed on origin/main since
+# then" from "nothing has changed" without staff needing to remember a
+# manual `gm recover clearhold` every single time.
+HOLD_META_FILENAME = ".crash_revert_hold_meta.json"
 DB_HOLD_FILENAME = ".db_corruption_hold"
 PLANNED_RESTART_FILENAME = ".planned_restart"
 GATEWAY_OUTAGE_FILENAME = ".gateway_outage.json"
@@ -47,6 +52,10 @@ def _state_path(root=None):
 
 def _hold_path(root=None):
     return os.path.join(root or _repo_root(), HOLD_FILENAME)
+
+
+def _hold_meta_path(root=None):
+    return os.path.join(root or _repo_root(), HOLD_META_FILENAME)
 
 
 def _planned_restart_path(root=None):
@@ -253,8 +262,48 @@ def hold_active(*, root=None):
     return os.path.isfile(_hold_path(root))
 
 
+def _dominant_signature(recent):
+    """Most common ``(exc_type, message-prefix)`` among boot-error rows.
+
+    Returns ``None`` when no exit in ``recent`` carried a boot-failure
+    signature (hang-kills, or ordinary exits with no ``.game_boot_error.json``
+    to read). Used by the revert-thrash guard to recognize "the exact same
+    boot failure came right back after a revert" -- a git reset cannot fix
+    a bug that predates (or does not depend on) the reverted-to commit, so
+    repeating it forever just burns cycles without ever recovering.
+    """
+    from collections import Counter
+
+    sigs = [
+        (row.get("boot_exc_type") or "", str(row.get("boot_error"))[:160])
+        for row in recent
+        if row.get("boot_error")
+    ]
+    if not sigs:
+        return None
+    return Counter(sigs).most_common(1)[0][0]
+
+
+def read_hold_sha(*, root=None):
+    """HEAD SHA recorded when the current (or most recent) hold was set."""
+    path = _hold_meta_path(root)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    if isinstance(data, dict):
+        return (data.get("sha") or "").strip()
+    return ""
+
+
 def set_revert_hold(*, reason="", root=None):
-    """Pause auto-deploy after an automatic code revert."""
+    """Pause auto-deploy after an automatic code revert.
+
+    Also stamps the current HEAD SHA into ``.crash_revert_hold_meta.json``
+    so ``maybe_auto_resume_hold`` can later tell whether a real fix has
+    landed on ``origin/main`` since this hold began.
+    """
     from engine import auto_deploy
 
     path = _hold_path(root)
@@ -267,6 +316,26 @@ def set_revert_hold(*, reason="", root=None):
         pass
     auto_deploy.set_override("off", root=root, queue_catchup=False)
 
+    sha = boot_stability.current_head_sha(root)
+    if sha:
+        meta_path = _hold_meta_path(root)
+        tmp = meta_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {
+                        "sha": sha,
+                        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    },
+                    handle,
+                )
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, meta_path)
+        except OSError:
+            pass
+
 
 def clear_revert_hold(*, root=None):
     """Head GM clears hold so auto-deploy may resume."""
@@ -274,16 +343,93 @@ def clear_revert_hold(*, root=None):
         os.remove(_hold_path(root))
     except OSError:
         pass
+    try:
+        os.remove(_hold_meta_path(root))
+    except OSError:
+        pass
 
 
 def resume_after_crash_hold(*, root=None):
-    """Clear revert/db holds and queue auto-deploy catch-up."""
+    """Clear revert/db holds and queue auto-deploy catch-up.
+
+    Deliberately does **not** forget the thrash-guard failure signature
+    (``last_revert_signature``). Resuming — whether via staff
+    ``gm recover clearhold`` or ``maybe_auto_resume_hold`` — only clears
+    the *hold*; it is not proof the underlying bug is fixed. If the same
+    failure signature comes right back after this resume, ``should_revert``
+    must still recognize it as a repeat and hold again immediately instead
+    of reverting a second time — that repeated "clearhold, crash again,
+    clearhold again" cycle was the actual "auto recovery doesn't work"
+    complaint. The signature only moves forward when a *different* revert
+    actually happens (see ``revert_to_last_stable``), or ages out
+    naturally once the real fix keeps the game running long enough that
+    ``recent_exits`` no longer holds any matching failure.
+    """
     root = root or _repo_root()
     clear_revert_hold(root=root)
     clear_db_hold(root=root)
     from engine import auto_deploy
 
     auto_deploy.set_override("on", root=root)
+
+
+def maybe_auto_resume_hold(*, root=None):
+    """Auto-clear a stale revert hold once a real fix lands on origin/main.
+
+    Without this, a revert hold (and the forced auto-deploy pause it
+    implies) only ever comes back with a *manual* ``gm recover clearhold``
+    -- if staff fix the underlying bug, push it, and forget that separate
+    step (or a second unrelated crash re-arms the hold first), auto-deploy
+    stays paused indefinitely even though a fix is sitting unused on
+    ``origin/main``. That was the actual "auto recovery doesn't work"
+    complaint: the safety pause was working as designed, but nothing ever
+    automatically re-validated it and resumed.
+
+    While a hold is active, fetch ``origin/main`` and compare it to the SHA
+    that was checked out when the hold began (``read_hold_sha``). If a
+    *newer* commit exists, treat it as a candidate fix: clear the hold and
+    queue the normal catch-up sync (exactly what a manual clearhold does).
+    If the new code still crashes, the crash budget / thrash guard simply
+    re-arms the hold on the next failure -- no worse than a premature
+    manual clearhold, but a real fix now self-heals without anyone
+    remembering an extra step.
+
+    Never touches a DB-corruption hold (needs an explicit restore, not a
+    code fix) and never guesses when no baseline SHA was recorded (a hold
+    file left over from before this existed) -- stay conservative and
+    require a manual clearhold rather than resume against an unknown
+    baseline.
+
+    Returns ``(resumed: bool, detail: str)``.
+    """
+    root = root or _repo_root()
+    if not hold_active(root=root):
+        return False, "no hold active"
+    if db_hold_active(root=root):
+        return False, "db corruption hold active (needs manual restore)"
+    baseline = read_hold_sha(root=root)
+    if not baseline:
+        return False, "no recorded hold baseline SHA (clear manually)"
+
+    from engine import auto_deploy
+
+    if not auto_deploy._fetch_origin(root):
+        return False, "git fetch failed"
+    try:
+        remote_sha = auto_deploy._origin_main_sha(root)
+    except subprocess.CalledProcessError:
+        return False, "could not read origin/main"
+    if not remote_sha or remote_sha == baseline:
+        return False, "origin/main unchanged since hold began"
+
+    print(
+        f"[crash_recovery] origin/main advanced past hold baseline "
+        f"{baseline[:12]} -> {remote_sha[:12]} -- auto-resuming "
+        "(clearing hold, queuing catch-up sync)",
+        flush=True,
+    )
+    resume_after_crash_hold(root=root)
+    return True, f"origin advanced {baseline[:12]} -> {remote_sha[:12]}"
 
 
 def read_hold_reason(*, root=None):
@@ -322,10 +468,17 @@ def record_exit(*, returncode, hang_kill=False, root=None):
         "code": int(returncode) if returncode is not None else None,
         "hang": bool(hang_kill),
     }
-    if db_corrupt:
-        row["db_corrupt"] = True
+    # Capture a failure signature for ANY boot error (not just DB corruption)
+    # so the thrash guard in ``should_revert`` can recognize "the same crash
+    # came right back after a revert" instead of reverting to the same
+    # broken state over and over (see ``_dominant_signature``).
+    if boot_err:
         if boot_err.get("message"):
             row["boot_error"] = str(boot_err.get("message"))[:200]
+        if boot_err.get("exc_type"):
+            row["boot_exc_type"] = str(boot_err.get("exc_type"))[:80]
+    if db_corrupt:
+        row["db_corrupt"] = True
     recent.append(row)
     state["recent_exits"] = recent
     save_state(state, root=root)
@@ -420,6 +573,37 @@ def should_revert(*, root=None, now=None):
         return False, "db corruption pattern (code revert skipped)"
 
     if len(recent) >= crash_max_exits():
+        # Thrash guard: if the LAST revert already tried to fix this exact
+        # failure and it came right back, a second git reset cannot help —
+        # this is a runtime-state-dependent / content bug, not a code
+        # regression the reverted-to commit introduced (2026-08-04
+        # postmortem: 52 reverts against the same hillside_sanctuary boot
+        # crash, none of which could possibly have fixed it). Hold directly
+        # with a loud, specific reason instead of reverting again.
+        signature = _dominant_signature(recent)
+        last_signature = state.get("last_revert_signature")
+        if (
+            signature is not None
+            and last_signature is not None
+            and list(signature) == list(last_signature)
+        ):
+            set_revert_hold(
+                reason=(
+                    f"repeated boot failure after revert ({signature[0]}: "
+                    f"{signature[1]}) -- this looks like a data/boot-order "
+                    "bug a code revert cannot fix; needs a real fix + "
+                    "gm recover clearhold (or origin/main advance for "
+                    "auto-resume)"
+                )[:500],
+                root=root,
+            )
+            print(
+                f"[crash_recovery] THRASH GUARD: identical boot failure "
+                f"after a revert ({signature[0]}) -- holding without "
+                "further reverts.",
+                flush=True,
+            )
+            return False, "repeated failure signature after revert (thrash guard)"
         return True, f"{len(recent)} exits in {crash_window_seconds():.0f}s"
 
     # Continuous failure: no stable stamp refresh within window while failing.
@@ -541,6 +725,16 @@ def revert_to_last_stable(*, root=None, reason=""):
     set_revert_hold(reason=reason or "crash budget exceeded", root=root)
 
     state = load_state(root)
+    # Remember what we were trying to fix (if the boot failures carried a
+    # signature) so the thrash guard in ``should_revert`` can recognize a
+    # second identical failure after THIS revert as "reverting again will
+    # not help" instead of resetting to the same broken state forever.
+    pre_revert_recent = _prune_exits(
+        state.get("recent_exits") or [], now=time.time(), window=crash_window_seconds(),
+    )
+    pre_revert_signature = _dominant_signature(pre_revert_recent)
+    if pre_revert_signature is not None:
+        state["last_revert_signature"] = list(pre_revert_signature)
     state["revert_count"] = int(state.get("revert_count") or 0) + 1
     state["last_revert"] = {
         "sha": sha,
@@ -578,9 +772,20 @@ def status_text(*, root=None):
     reason = read_hold_reason(root=root)
     if reason:
         lines.append(f"  hold reason: {reason}")
+    if hold_active(root=root):
+        baseline = read_hold_sha(root=root)
+        lines.append(
+            "  hold baseline SHA: "
+            + (f"{baseline[:12]} (auto-resumes past this)" if baseline else "(none -- auto-resume needs manual clearhold)")
+        )
     db_reason = read_db_hold_reason(root=root)
     if db_reason:
         lines.append(f"  db hold reason: {db_reason}")
+    if state.get("last_revert_signature"):
+        sig = state["last_revert_signature"]
+        lines.append(
+            f"  thrash guard armed for: {sig[0]}: {str(sig[1])[:120]}"
+        )
     recent = state.get("recent_exits") or []
     lines.append(f"  recent exits ({len(recent)} in window): {recent[-5:]}")
     last = state.get("last_revert") or {}

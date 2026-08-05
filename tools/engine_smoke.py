@@ -539,9 +539,10 @@ def main():
     from engine.systems import combat_engine
     from engine.systems import combat_martial_arts
     from engine.systems import combat_mundane
+    from engine.systems import combat_osr
 
     known = combat_engine.known_combat_engines()
-    assert {"mundane", "martial_arts"}.issubset(known), known
+    assert {"mundane", "martial_arts", "osr"}.issubset(known), known
 
     class _SwingPair:
         """Throwaway attacker/defender stand-ins for engine combat smokes."""
@@ -593,6 +594,30 @@ def main():
     assert combat_engine.resolve_swing(
         "totally-unknown-id", mundane_attacker, mundane_defender,
     ) is None
+
+    osr_attacker = _SwingPair("OsrA")
+    osr_defender = _SwingPair("OsrD", hp=100.0)
+    osr_attacker.osr_attack_bonus = 5
+    osr_attacker.osr_damage_die = 6
+    osr_attacker.osr_damage_bonus = 2
+    osr_defender.armor_class = 10
+    # rng=0.95 -> d20=20 (nat 20 crit) on a 20-sided roll.
+    osr_res = combat_engine.resolve_swing(
+        "osr", osr_attacker, osr_defender, rng=lambda: 0.95,
+    )
+    assert osr_res is not None, osr_res
+    assert osr_res["brief"]["engine"] == "osr", osr_res
+    assert osr_res["result"]["outcome"] == "critical", osr_res
+    assert osr_res["result"]["damage"] >= 4, osr_res
+    assert osr_defender.hp < 100.0
+
+    osr_defender.hp = 100.0
+    miss_osr = combat_engine.resolve_swing(
+        "osr", osr_attacker, osr_defender, rng=lambda: 0.0,
+    )
+    assert miss_osr["result"]["outcome"] == "miss", miss_osr
+    assert miss_osr["result"]["damage"] == 0.0
+    assert osr_defender.hp == 100.0
 
     # ---- civic shop framework ----
     from engine.systems import civic_shop
@@ -803,6 +828,19 @@ def main():
     umbral_mod.tick(night)
     assert umbral_char.umbral_shrouded is False
     assert umbral_char.stealth_active is False
+
+    from engine.systems import sheet as sheet_mod
+
+    profile = sheet_mod.sheet_profile()
+    assert profile.get("id") == "sheet.engine"
+    sheet_mod.register_field_hook(
+        "hp",
+        lambda ctx: f"  HP: {getattr(ctx.target, 'hp', 0)}",
+    )
+    text = sheet_mod.render_score(
+        sheet_mod.SheetContext(target=c, viewer=c)
+    )
+    assert "POW" in text and "HP:" in text
 
     print("engine_smoke_ok")
     return 0

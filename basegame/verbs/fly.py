@@ -7,5 +7,9 @@ def cmd_fly(character, args, game):
     aerial_mod.cmd_fly(character, args, game)
 
 
+def cmd_hover(character, args, game):
+    aerial_mod.cmd_hover(character, args, game)
+
+
 def cmd_descend(character, args, game):
     aerial_mod.cmd_descend(character, args, game)

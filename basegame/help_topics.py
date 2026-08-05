@@ -6,13 +6,21 @@ shape (topic id -> page string; categories -> ordered (heading, [topic
 ids]) list) but scoped to just what basegame ships -- AGENTS.md rule 11
 ("ship help with the feature") applies to basegame verbs the same as
 SUPERS ones.
+
+Engine-generic verbs (``bug``, ``hedit``, …) ship topic pages from
+``help_engine_topics.py`` so ``RIFTFORGE_GAME=basegame`` does not depend
+on SUPERS for ``help <topic>``. Detail: ``docs/ENGINE_CONSUMER.md``.
 """
 
 from basegame.chargen import PATHS, PATH_ORDER
+from basegame.help_engine_topics import (
+    HELP_ENGINE_CATEGORIES,
+    HELP_ENGINE_TOPICS,
+)
 
 _paths_lines = "\n".join(f"  {path_id} -- {PATHS[path_id]}" for path_id in PATH_ORDER)
 
-HELP_TOPICS = {
+_HELP_TOPICS_BASEGAME = {
     "paths": f"""RiftForge reference town -- paths
 
 Every resident starts Mundane by default. Your path is the work you do:
@@ -33,9 +41,15 @@ help stellar for flight tiers.
 """,
     "score": """RiftForge reference town -- score
 
-Shows your Path, your six primary stats (the same POW/VIT/FOC/FIN/RES/PRE
-spine every game on the engine shares), your Tier, and your HP. `sc` is a
-shorthand alias.
+How you play:
+  1. score              compact sheet (path, stats, HP, urgent needs/injuries)
+  2. score vitals       lifeforce / HP focus
+  3. score combat       Balance, Equilibrium, aim zone, per-limb injuries
+  4. score needs        hunger and thirst meters
+  5. score full         verbose whole sheet
+
+Regional injuries from active combat persist across reboots. Disabled limbs
+need clinic care. See help active-combat for strikes, aim, and grapple.
 """,
     "mail": """RiftForge reference town -- mail
 
@@ -98,11 +112,16 @@ See also: help work | help paths
     "stellar": """Notbigville -- Stellar flight demo
 
 Pick Alien → Stellar at chargen (yellow-sun Bloodline). Then:
-  1. fly from an outdoor room (Observatory knoll works)
-  2. fly again to reach the brass globe layer; n/s/e/w to bank
-  3. fly again for low orbit; descend steps back down
+  1. hover              lift off inside your current room (works indoors)
+  2. fly from an outdoor room (Observatory knoll works) -- climbs map layers
+  3. fly again to reach the brass globe layer; n/s/e/w to bank
+  4. fly again for low orbit; descend steps back down
 
-See also: help origins | help travel
+hover = airborne in the room you are in (active combat sweeps miss you).
+fly = Stellar map-layer ascent (macro → globe → orbit). Descend lands or
+steps down one layer.
+
+See also: help origins | help travel | help active-combat
 """,
     "origins": """Notbigville -- origins (Mundane / Alien)
 
@@ -110,7 +129,7 @@ How you play:
   1. At chargen, pick Mundane (default -- your path is the work you do)
      or Alien (extraterrestrial Bloodline).
   2. Alien then picks Stellar or Umbral:
-       - Stellar: yellow-sun flight -- see help stellar (fly / descend).
+       - Stellar: yellow-sun flight -- see help stellar (hover / fly / descend).
        - Umbral: night shroud -- type shroud at dusk or night to fade
          from ordinary look / presence; unshroud to step back into sight.
          Shroud drains Umbral Charge each heartbeat and collapses at 0.
@@ -171,23 +190,92 @@ Arena rooms (e.g. Grain Elevator Shed) force active combat even when the
 game default is swing.
 
 How you play (active combat):
-  1. jab / punch / kick / sweep / uppercut / headbutt <name>
-     Queues a strike. Balance recovers between swings (FIN helps).
-  2. aim <zone>        spend Equilibrium to aim the next hit (head, torso, ...)
-  3. dodge / block / parry [name]
+  1. skills              list every strike, grapple move, and defense verb
+  2. jab / punch / kick / uppercut / sweep / headbutt / grab <name>
+     Your first strike before a fight starts launches immediately.
+     Later strikes queue (Balance recovers between swings -- FIN helps).
+  3. grab <name>         seize them; then throw <dir> or slam [surface]
+  4. throw <direction>   hurl held foe (wall = extra damage; open exit = toss)
+  5. slam [surface]      slam held foe into a hard surface
+  6. When your fight target flees, is thrown, or is slammed into another
+     room, you auto-chase them (bare follow stops trailing).
+  Firearms (demo sidearm):
+  7. reload              fill the magazine
+  8. load                chamber one round
+  9. aim <name> [zone]   sight on target (head, torso, ...); aim clear to drop
+ 10. fire                discharge at your sight line (after load + aim)
+  Defense:
+ 11. dodge / block / parry [name]
      Manual defense during the telegraph window -- better than auto.
      Parry is manual-only (high risk / high reward).
-  4. autodefense dodge|block on|off
+ 12. autodefense dodge|block on|off
      Turn off a type to train the other (auto never picks parry).
-  5. --                clear your pending strike/aim queue
+ 13. --                clear your pending action queue
+ 14. hover / descend   lift off inside the room (sweeps miss) or land
 
-You type instantly; the heartbeat resolves queued actions by timestamp.
+You type instantly; after the opener, queued actions resolve by timestamp.
 Auto-dodge/block still fire if you never type a defense.
 
-See also: help score
+See also: help breach, help score
+""",
+    "dig": """Notbigville -- runtime room carving (map_store demo)
+
+How you play:
+  1. Stand in a layout-stamped room (Saloon works).
+  2. dig <direction> <ROOM NAME…>   carve and link a new room live.
+  3. walk the new exit to confirm the live graph updated.
+
+This writes the owning zone JSON on disk (builder demo for engine OLC).
+""",
+    "phone": """Notbigville -- payphone + dial demo
+
+How you play:
+  1. Walk to the Post Office (east from General Store).
+  2. Keep a dollar in your wallet for the coin payphone.
+  3. dial operator        ring the desk clerk (alias for their handset).
+  4. answer / hangup      when someone rings your phone.
+
+The Post Office description mentions the payphone; Operator NPC seeds at boot.
+""",
+    "appearance": """Notbigville -- appearance slots demo
+
+How you play:
+  1. appearance                 list your slots
+  2. appearance <slot>          list valid option ids
+  3. appearance <slot> <id>       set hair/eyes/etc. and rebuild look self
+
+Fill every core slot, then look self to see the assembled description.
+""",
+    "relationships": """Notbigville -- relationship tags demo
+
+How you play:
+  1. relate                     list your one-sided tags
+  2. relate <name> friend       tag someone in the world
+  3. friend <name>              shortcut for the same
+  4. relate clear <name>        drop your tag toward them
+
+Tags are one-sided; reciprocity is flavor only.
+""",
+    "personas": """Notbigville -- persona traits demo
+
+The Post Office Operator carries the ``chatty`` trait from personas.json.
+
+How you play:
+  1. Walk to the Post Office.
+  2. greet Operator             hear trait-colored flavor text.
 """,
 }
 
+# Engine-generic pages (bug, hedit, …) merge on top so a game never has to
+# duplicate them in its own topic dict unless it wants to override flavor.
+HELP_TOPICS = {**_HELP_TOPICS_BASEGAME, **HELP_ENGINE_TOPICS}
+
 HELP_CATEGORIES = [
-    ("Basegame", ["basegame", "paths", "origins", "score", "mail", "shop", "clinic", "justice", "breach", "active-combat", "weather", "travel", "tornado-hunter", "reporter", "stellar"]),
+    ("Basegame", [
+        "basegame", "paths", "origins", "score", "mail", "shop", "clinic",
+        "justice", "breach", "active-combat", "weather", "travel",
+        "tornado-hunter", "reporter", "stellar", "dig", "phone",
+        "appearance", "relationships", "personas",
+    ]),
+    *HELP_ENGINE_CATEGORIES,
 ]

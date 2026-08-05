@@ -17,8 +17,9 @@ parts region state machine).
 1. Land engine-only changes on `riftforge-engine` `main` (or export from
    the monorepo via `python tools/export_public_engine.py` and push).
 2. In that tree: `pip install -e .` then
-   `python tools/engine_smoke.py` (no `supers/` present) and
-   `python tools/basegame_smoke.py`.
+   `python tools/engine_smoke.py` (no `supers/` present),
+   `python tools/basegame_smoke.py`, and
+   `python tools/classic_smoke.py`.
 3. Tag `vX.Y.Z` (semver; breaking hook API = major)::
 
        git tag -a v0.5.0 -m "riftforge-engine v0.5.0 — map-store OLC + phone/appearance/persona/relationship frameworks"
@@ -40,7 +41,15 @@ parts region state machine).
 - No `content/npcs`, Origins catalogs, or SUPERS help pages
 - Demo map: export writes `content/maps/demo.json` from canonical
   `engine/demo/content/maps/demo.json`; monorepo lean boot uses
-  `python -m engine` / `RIFTFORGE_GAME=none` (`engine.lean_boot`)
-- `tools/engine_smoke.py` / `tools/basegame_smoke.py` pass
+  `RIFTFORGE_GAME=none` (`engine.lean_boot`). ``python -m engine`` boots
+  **basegame** when that package ships (MVP demo); CI still forces ``none``.
+- Score sheet: ``engine/content/sheet_profile.json`` +
+  ``engine/systems/sheet.py``; games extend via
+  ``register_sheet_field`` / ``register_sheet_contributor``.
+- Optional env: ``RIFTFORGE_DB`` (SQLite path), ``RIFTFORGE_PORT`` (telnet)
+- Next public tag after merge: **v0.5.1+** (classic OSR demo, `combat_osr`, combat docs map).
+- Export includes `classic/`, `tools/classic_smoke.py`, and updated `docs/ENGINE_CONSUMER.md`.
+- `tools/engine_smoke.py` / `tools/basegame_smoke.py` /
+  `tools/classic_smoke.py` pass
 
 See [`plans/two_repo_purity.md`](plans/two_repo_purity.md).

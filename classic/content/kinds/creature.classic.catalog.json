@@ -1,0 +1,17 @@
+{
+  "id": "creature.classic.catalog",
+  "label": "Classic bestiary catalog file",
+  "writes_to": "classic/content/bestiary/*.json",
+  "fields": {
+    "category": {
+      "type": "string",
+      "required": true,
+      "doc": "Spawn category tag for wilderness rooms."
+    },
+    "creatures": {
+      "type": "list",
+      "required": true,
+      "doc": "creature.classic.hostile rows."
+    }
+  }
+}

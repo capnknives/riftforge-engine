@@ -1,0 +1,55 @@
+{
+  "id": "catalog.classic.spell",
+  "label": "Classic spell row",
+  "writes_to": "classic/content/catalog/spells.json spells[]",
+  "fields": {
+    "id": {
+      "type": "string",
+      "required": true,
+      "doc": "Spell command id (cast bolt)."
+    },
+    "name": {
+      "type": "string",
+      "required": true,
+      "doc": "Display name."
+    },
+    "classes": {
+      "type": "list",
+      "required": true,
+      "doc": "Class ids that may cast this spell."
+    },
+    "min_level": {
+      "type": "int",
+      "required": true,
+      "default": 1,
+      "doc": "Minimum character level."
+    },
+    "spell_kind": {
+      "type": "enum",
+      "required": true,
+      "values": ["attack", "heal"],
+      "doc": "Resolver branch (attack vs heal)."
+    },
+    "ability": {
+      "type": "enum",
+      "required": true,
+      "values": ["STR", "DEX", "CON", "INT", "WIS", "CHA"],
+      "doc": "Casting ability for mod."
+    },
+    "damage_die": {
+      "type": "int",
+      "required": false,
+      "doc": "Attack spell damage die."
+    },
+    "heal_die": {
+      "type": "int",
+      "required": false,
+      "doc": "Heal spell die."
+    },
+    "help": {
+      "type": "string",
+      "required": true,
+      "doc": "Player-facing help line."
+    }
+  }
+}

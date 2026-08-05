@@ -1,29 +1,48 @@
-"""verbs/character.py -- basegame's `score` command.
+"""verbs/character.py -- basegame's `score` command (engine sheet schema)."""
 
-Mirrors the shape of supers/verbs/character.py's cmd_score, at basegame's
-scale: no GM caste here, so `score` only ever shows the caller's own sheet
-(no viewer/target split). Body content is Path/stats/Tier/HP -- everything
-this reference game actually tracks on a character.
-"""
+from engine.systems import sheet as sheet_mod
 
-from basegame.chargen import PATHS
-from basegame import stats as stats_module
-from engine import stats as engine_stats
-from engine.style import format_sheet
+_SELF_PANES = frozenset({
+    "vitals", "combat", "needs", "full",
+})
 
 
 def cmd_score(character, args, game):
-    """Show the caller's own sheet: path, the six shared primaries, Tier,
-    and HP."""
-    body = []
-    path_label = PATHS.get(character.bg_path, "Path: (none chosen)")
-    body.append(path_label.split(" -- ")[0])
-    body.append("")
-    for name in engine_stats.STAT_NAMES:
-        body.append(f"{name}: {character.stats[name]:g}")
-    body.append(f"Tier: {character.tier}")
-    body.append(f"HP: {character.hp}/{stats_module.max_hp(character)}")
+    """Show the caller's sheet via the engine score schema + basegame hooks.
 
-    screenreader = bool(getattr(character, "screenreader", False))
-    for line in format_sheet("Score", body, screenreader=screenreader):
-        character.session.send(line)
+    bare score          -- compact sheet + urgent needs/injuries
+    score vitals        -- HP-focused slice
+    score combat        -- readiness, aim, per-limb injuries
+    score needs         -- hunger/thirst meters
+    score full          -- verbose whole sheet
+    """
+    raw = (args or "").strip().lower()
+    viewer_sr = bool(getattr(character, "screenreader", False))
+    if raw and raw not in _SELF_PANES:
+        character.session.send(
+            "Usage: score  -- or score vitals / combat / needs / full "
+            "(see 'help score')."
+        )
+        return
+    pane = "default"
+    compact = True
+    filter_mode = None
+    if raw == "full":
+        pane = "full"
+        compact = False
+    elif raw:
+        pane = raw
+        compact = False
+        filter_mode = raw
+    ctx = sheet_mod.SheetContext(
+        target=character,
+        game=game,
+        viewer=character,
+        pane=pane,
+        compact=compact,
+        filter_mode=filter_mode,
+        screenreader=viewer_sr,
+    )
+    character.session.send(sheet_mod.render_score(ctx))
+    if not compact:
+        character.session.send("")

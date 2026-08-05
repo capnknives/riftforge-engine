@@ -1,0 +1,35 @@
+{
+  "kind": "catalog.classic.spells_file",
+  "spells": [
+    {
+      "id": "bolt",
+      "name": "Bolt",
+      "classes": ["mage"],
+      "min_level": 1,
+      "spell_kind": "attack",
+      "damage_die": 6,
+      "ability": "INT",
+      "help": "Arcane bolt -- d20 + INT mod vs AC, 1d6 on hit."
+    },
+    {
+      "id": "heal",
+      "name": "Heal",
+      "classes": ["cleric"],
+      "min_level": 1,
+      "spell_kind": "heal",
+      "heal_die": 8,
+      "ability": "WIS",
+      "help": "Restore 1d8 + WIS mod HP to a living target."
+    },
+    {
+      "id": "smite",
+      "name": "Smite",
+      "classes": ["cleric"],
+      "min_level": 1,
+      "spell_kind": "attack",
+      "damage_die": 8,
+      "ability": "WIS",
+      "help": "Divine strike -- d20 + WIS mod vs AC, 1d8 on hit."
+    }
+  ]
+}

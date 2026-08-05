@@ -207,6 +207,9 @@ def dispatch(character, raw, game, *, force_actor=None):
     if not verb:                       # blank line -- do nothing
         return
 
+    import game_select
+    _active_game = game_select.game_name()
+
     # Bloodrite chapel tithe (two-word player phrase).
     if verb == "consume" and (args or "").strip().lower() == "tithe":
         verb = "consumetithe"
@@ -218,11 +221,17 @@ def dispatch(character, raw, game, *, force_actor=None):
         getattr(character, "session", None) is not None
         and not isinstance(character.session, SilentSession)
     ):
-        try:
-            from supers.verbs import engine_flavor as _idle_flavor
-            _idle_flavor.stamp_input_activity(character, game)
-        except ImportError:
-            # Lean engine: stamp the AFK clock without SUPERS helpers.
+        import game_select
+        if _active_game == "supers":
+            try:
+                from supers.verbs import engine_flavor as _idle_flavor
+                _idle_flavor.stamp_input_activity(character, game)
+            except ImportError:
+                pass
+        else:
+            # Lean engine / basegame: never import supers here -- that
+            # package's __init__ re-registers hooks and clobbers the
+            # active game's appearance / persona catalogs.
             import time
             character.last_input_monotonic = time.monotonic()
 
@@ -267,11 +276,13 @@ def dispatch(character, raw, game, *, force_actor=None):
         "inventory", "i", "time", "who", "quit", "logout", "bug", "suggest",
         "say", "'", "gm", "ooc",
     })
-    try:
-        from supers import magic as _magic_cage
-        _cage_held = _magic_cage.cage_holds_actor(character)
-    except Exception:
-        _cage_held = False
+    _cage_held = False
+    if _active_game == "supers":
+        try:
+            from supers import magic as _magic_cage
+            _cage_held = _magic_cage.cage_holds_actor(character)
+        except Exception:
+            _cage_held = False
     if _cage_held and verb not in _CAGE_ALLOWED:
         if resolve_walk_direction(verb, getattr(character, "location", None)):
             character.session.send(
@@ -296,30 +307,32 @@ def dispatch(character, raw, game, *, force_actor=None):
         return
 
     # Vessel shared-wheel passenger gate (movement/combat vs mind/wheel).
-    try:
-        from supers import vessel_passenger as _vp_gate
-        blocked, gate_msg = _vp_gate.dispatch_gate(character, verb, game)
-        if blocked:
-            character.session.send(gate_msg)
-            return
-    except ImportError:
-        pass
+    if _active_game == "supers":
+        try:
+            from supers import vessel_passenger as _vp_gate
+            blocked, gate_msg = _vp_gate.dispatch_gate(character, verb, game)
+            if blocked:
+                character.session.send(gate_msg)
+                return
+        except ImportError:
+            pass
 
     # Combat KO / immortal incap / headless containment -- full freeze except
     # look and sheet panes (bug #322: west/east while [KO] must not work).
-    try:
-        from supers import combat_ko as _ko_gate
-        blocked, gate_msg = _ko_gate.dispatch_gate(character, verb, game)
-        if blocked:
-            if resolve_walk_direction(
-                verb, getattr(character, "location", None),
-            ):
-                character.session.send(_ko_gate.COMBAT_KO_MOVE_BLOCKED_MSG)
-            else:
-                character.session.send(gate_msg)
-            return
-    except ImportError:
-        pass
+    if _active_game == "supers":
+        try:
+            from supers import combat_ko as _ko_gate
+            blocked, gate_msg = _ko_gate.dispatch_gate(character, verb, game)
+            if blocked:
+                if resolve_walk_direction(
+                    verb, getattr(character, "location", None),
+                ):
+                    character.session.send(_ko_gate.COMBAT_KO_MOVE_BLOCKED_MSG)
+                else:
+                    character.session.send(gate_msg)
+                return
+        except ImportError:
+            pass
 
     # Manual cardinals / aggression cancel a paced walk (say/emote keep it).
     # ``walk`` itself manages focus inside cmd_walk.
@@ -329,16 +342,17 @@ def dispatch(character, raw, game, *, force_actor=None):
         or resolve_walk_direction(verb, getattr(character, "location", None))
         is not None
     ):
-        try:
-            from supers import walk as walk_mod
-            if walk_mod.has_walk_focus(character):
-                from engine.npc_act import SilentSession
-                if not isinstance(
-                    getattr(character, "session", None), SilentSession
-                ):
-                    walk_mod.clear_walk_focus(character)
-        except ImportError:
-            pass
+        if _active_game == "supers":
+            try:
+                from supers import walk as walk_mod
+                if walk_mod.has_walk_focus(character):
+                    from engine.npc_act import SilentSession
+                    if not isinstance(
+                        getattr(character, "session", None), SilentSession
+                    ):
+                        walk_mod.clear_walk_focus(character)
+            except ImportError:
+                pass
 
     # Idlemode: only walking / aggressive verbs reclaim presence (then run).
     # Say, get, train, sheet panes, OOC, etc. keep watching Cadence.
@@ -392,29 +406,30 @@ def dispatch(character, raw, game, *, force_actor=None):
     if force_actor is not None:
         actor = force_actor
     else:
-        try:
-            from supers import god_omnipresence as go
-            if go.should_redirect_to_twin(character, verb):
-                twin = go.resolve_twin(character, game)
-                if (
-                    twin is not None
-                    and getattr(twin, "location", None) is not None
-                ):
-                    actor = twin
-        except ImportError:
-            pass
-        if actor is character:
+        if _active_game == "supers":
             try:
-                from supers import ghost as _ghost_inhabit
-                if (
-                    _ghost_inhabit.is_inhabiting(character)
-                    and verb not in _ghost_inhabit.GHOST_INHABIT_SELF_VERBS
-                ):
-                    host = _ghost_inhabit.inhabited_host(character, game)
-                    if host is not None:
-                        actor = host
+                from supers import god_omnipresence as go
+                if go.should_redirect_to_twin(character, verb):
+                    twin = go.resolve_twin(character, game)
+                    if (
+                        twin is not None
+                        and getattr(twin, "location", None) is not None
+                    ):
+                        actor = twin
             except ImportError:
                 pass
+            if actor is character:
+                try:
+                    from supers import ghost as _ghost_inhabit
+                    if (
+                        _ghost_inhabit.is_inhabiting(character)
+                        and verb not in _ghost_inhabit.GHOST_INHABIT_SELF_VERBS
+                    ):
+                        host = _ghost_inhabit.inhabited_host(character, game)
+                        if host is not None:
+                            actor = host
+                except ImportError:
+                    pass
 
     def _loan_session_to_actor(fn):
         """Run *fn* with the login Session on *actor* when steering a host."""
@@ -518,18 +533,19 @@ def dispatch(character, raw, game, *, force_actor=None):
             return
         handler, _help_text = entry
         _twin_owner = None
-        try:
-            from supers import god_omnipresence as _go_kit
-            if _go_kit.is_god_twin(actor):
-                _twin_owner = _go_kit.resolve_owner(actor, game)
-                if _twin_owner is not None:
-                    _go_kit.sync_twin_kit(_twin_owner, actor)
-        except ImportError:
-            pass
+        if _active_game == "supers":
+            try:
+                from supers import god_omnipresence as _go_kit
+                if _go_kit.is_god_twin(actor):
+                    _twin_owner = _go_kit.resolve_owner(actor, game)
+                    if _twin_owner is not None:
+                        _go_kit.sync_twin_kit(_twin_owner, actor)
+            except ImportError:
+                pass
         def _run_handler():
             handler(actor, args, game)  # call whichever function we found
         _loan_session_to_actor(_run_handler)
-        if _twin_owner is not None:
+        if _twin_owner is not None and _active_game == "supers":
             try:
                 from supers import god_omnipresence as _go_kit
                 _go_kit.pull_twin_kit_to_owner(_twin_owner, actor)

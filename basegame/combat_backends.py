@@ -20,6 +20,7 @@ def _load_swing():
     """Import swing engines so they self-register on combat_engine."""
     from engine.systems import combat_martial_arts  # noqa: F401
     from engine.systems import combat_mundane  # noqa: F401
+    from engine.systems import combat_osr  # noqa: F401
 
 
 def _tick_swing(game):
@@ -43,7 +44,7 @@ def register_backends():
         load_fn=_load_swing,
         tick_fn=_tick_swing,
         fight_mode=fight_mod.MODE_NARRATIVE,
-        label="round-based swing combat (combat_engine: mundane, martial_arts, …)",
+        label="round-based swing combat (combat_engine: mundane, martial_arts, osr, …)",
     )
     cr.register_combat_backend(
         cr.BACKEND_ACTIVE,

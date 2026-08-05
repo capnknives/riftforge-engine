@@ -969,6 +969,20 @@ def group_sheet_extra(character, game=None):
     return str(result)
 
 
+def register_sheet_field(field_id, fn):
+    """Register a ``hook:<field_id>`` row in ``engine/content/sheet_profile.json``."""
+    from engine.systems import sheet as sheet_mod
+
+    sheet_mod.register_field_hook(field_id, fn)
+
+
+def register_sheet_contributor(section_id, fn, *, priority=100):
+    """Register fn(ctx) -> SheetSection | list | None for score assembly."""
+    from engine.systems import sheet as sheet_mod
+
+    sheet_mod.register_contributor(section_id, fn, priority=priority)
+
+
 def set_look_quirk(fn):
     """Register fn(viewer, target) -> str or None for the look/examine quirk."""
     global _look_quirk
@@ -3432,6 +3446,23 @@ def content_kind_save_entity(kind_id, entity_id, obj, **kwargs):
     return _content_kind_save_entity(kind_id, entity_id, obj, **kwargs)
 
 
+# Pluggable calendar (Gregorian default; games may swap at boot).
+
+
+def set_calendar_provider(provider):
+    """Register the active CalendarProvider (see engine/calendar_provider.py)."""
+    from engine import game_calendar
+
+    game_calendar.set_calendar_provider(provider)
+
+
+def get_calendar_provider():
+    """Return the active calendar provider (Gregorian when unset)."""
+    from engine import game_calendar
+
+    return game_calendar.get_calendar_provider()
+
+
 def set_olc_authorizer(fn):
     """Register fn(character) -> bool for in-game OLC access."""
     global _olc_authorizer
@@ -3861,3 +3892,95 @@ def phone_payphone_fee():
         return int(_phone_payphone_fee_fn())
     except (TypeError, ValueError):
         return 0
+
+
+# --- Procedural build hooks (populate peel) --------------------------------
+
+_populate_room_title = None
+_populate_city_label = None
+_populate_city_for_map_id = None
+_populate_neighborhood_names = None
+_populate_lodging_entry_stamper = None
+
+_DEFAULT_NEIGHBORHOOD_NAMES = (
+    "Stevenson", "Ferguson", "Ash", "Cedar", "Maple",
+    "Oak", "Elm", "Willow", "Pine", "Birch",
+    "Harper", "Miller", "Baker", "Cooper", "Parker",
+    "Sullivan", "Brennan", "Callahan", "Donovan", "Murphy",
+    "Ridge", "Valley", "Meadow", "Harbor", "Summit",
+    "Liberty", "Madison", "Jefferson", "Lincoln", "Washington",
+    "Prairie", "Cottonwood", "Hickory", "Sycamore", "Magnolia",
+)
+
+
+def set_populate_room_namer(fn):
+    """Register fn(city, main, sub=None) -> structured ROOM NAME string."""
+    global _populate_room_title
+    _populate_room_title = fn
+
+
+def populate_room_title(city, main, sub=None):
+    """Build a structured room title (default: engine.room_naming)."""
+    if _populate_room_title is not None:
+        return _populate_room_title(city, main, sub)
+    from engine.room_naming import structured_title
+
+    return structured_title(city, main, sub)
+
+
+def set_populate_city_label(fn):
+    """Register fn(room) -> city label for procedural builders."""
+    global _populate_city_label
+    _populate_city_label = fn
+
+
+def populate_city_label(room):
+    """City label for a standing room (default: city_name or map_id title-case)."""
+    if _populate_city_label is not None:
+        return _populate_city_label(room)
+    stamped = str(getattr(room, "city_name", None) or "").strip()
+    if stamped:
+        return stamped
+    map_id = str(getattr(room, "map_id", None) or "").strip()
+    return populate_city_for_map_id(map_id)
+
+
+def set_populate_city_for_map_id(fn):
+    """Register fn(map_id) -> city label string."""
+    global _populate_city_for_map_id
+    _populate_city_for_map_id = fn
+
+
+def populate_city_for_map_id(map_id):
+    """Map/zone id → city label (default: title-cased id)."""
+    if _populate_city_for_map_id is not None:
+        return _populate_city_for_map_id(map_id)
+    mid = str(map_id or "").strip()
+    if not mid:
+        return "Town"
+    return mid.replace("_", " ").title()
+
+
+def set_populate_neighborhood_names(fn):
+    """Register fn() -> sequence of name tokens for neighborhood titles."""
+    global _populate_neighborhood_names
+    _populate_neighborhood_names = fn
+
+
+def populate_neighborhood_names():
+    """Name pool for ``populate neighborhood`` (generic engine default)."""
+    if _populate_neighborhood_names is not None:
+        return _populate_neighborhood_names()
+    return _DEFAULT_NEIGHBORHOOD_NAMES
+
+
+def set_populate_lodging_entry_stamper(fn):
+    """Register fn(entry, unit_kind) -> None to stamp game lodging flags."""
+    global _populate_lodging_entry_stamper
+    _populate_lodging_entry_stamper = fn
+
+
+def populate_lodging_entry_stamper(entry, unit_kind):
+    """Apply game lodging entry stamp hook, or no-op."""
+    if _populate_lodging_entry_stamper is not None:
+        _populate_lodging_entry_stamper(entry, unit_kind)

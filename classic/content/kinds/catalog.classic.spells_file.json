@@ -1,0 +1,12 @@
+{
+  "id": "catalog.classic.spells_file",
+  "label": "Classic spells catalog file",
+  "writes_to": "classic/content/catalog/spells.json",
+  "fields": {
+    "spells": {
+      "type": "list",
+      "required": true,
+      "doc": "catalog.classic.spell rows."
+    }
+  }
+}

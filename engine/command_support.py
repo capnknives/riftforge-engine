@@ -688,6 +688,10 @@ def _move_one(character, direction, dest, game, auto_look=True):
     if train_msg and character.session:
         character.session.send(train_msg)
     character.move_to(dest)
+    from engine.systems import combat_pursuit as combat_pursuit_mod
+    combat_pursuit_mod.notify_character_relocated(
+        character, room, dest, game,
+    )
     # Game-specific post-arrival effects: stop work if the job site was
     # left behind, drag a carried body along via cadence, and the lodging
     # owner-walks-in-on-a-stranger check.

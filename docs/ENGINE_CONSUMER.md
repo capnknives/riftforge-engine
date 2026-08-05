@@ -1,18 +1,34 @@
 # Engine consumer guide — how a game uses Riftforge
 
-Games (today: **SUPERS**) sit on top of the Riftforge engine. They must
-**register** their behavior at boot; the engine never imports the game.
+Four layers in this monorepo (and after the public/private remote split):
+
+| Layer | Path | Role |
+|-------|------|------|
+| **Engine** | `engine/` | Public Riftforge — generic MUD core. Zero game imports. |
+| **Basegame** | `basegame/` | Shipped **proof consumer** — Notbigville demos every new engine API without SUPERS lore. Ships with public `riftforge-engine`. |
+| **Classic** | `classic/` | Second public **OSR demo** — Millbrook village + wilds; schema-first catalogs; `RIFTFORGE_GAME=classic`. |
+| **SUPERS** | `supers/` | Private production game — Origins, Cadence, catalogs, live play. Pins the engine via GitHub tags. |
+
+Games **register** behavior at boot through `engine.hooks`; the engine never
+imports a game. Exactly **one** game package runs per process —
+`game_select.py` + `RIFTFORGE_GAME` (`supers` | `basegame` | `classic` | `none`).
+Live defaults to SUPERS; `python -m engine` prefers basegame when present, else
+lean demo. Never co-import game packages in one process (hooks would clobber).
 
 Full purity roadmap: [`plans/two_repo_purity.md`](plans/two_repo_purity.md).
 
 ## Dependency direction
 
 ```
-SUPERS (game)  -->  Riftforge (engine)
+SUPERS (private game)  ──┐
+                         ├──►  Riftforge engine
+basegame (public proof)  ──┤
+classic (public OSR demo) ─┘
 ```
 
 Never the reverse. Lazy `from supers import …` inside `engine/` is a
-violation of the purity gate.
+violation of the purity gate. Game packages may import `engine` only — never
+each other (`supers`, `basegame`, `classic` are mutually exclusive at runtime).
 
 ## Hook registry (`engine.hooks`)
 
@@ -99,27 +115,164 @@ lean stubs under the same verb names for a bare engine install; SUPERS'
 richer versions win at the `{**ENGINE_COMMANDS, **SUPERS_COMMANDS}` merge in
 `commands.py`. See `docs/plans/two_repo_purity.md`'s "Phase 2 notes".
 
+## Help files (engine vs game)
+
+The engine owns **help machinery**; each game owns **help text**.
+
+| Layer | What ships | Where |
+|-------|------------|--------|
+| Engine | `cmd_help`, `help_db` SQLite overlay, `hedit` / `helpsubmit`, `ENGINE_COMMANDS` one-liners | `engine/verbs/basic.py`, `engine/help_db.py`, `engine/connection.py` |
+| Game | `HELP_TOPICS` pages + `HELP_CATEGORIES` bare-`help` index | `supers/help_topics.py` + `help/topics/*.py`, `basegame/help_topics.py`, or `classic/help_topics.py` |
+
+**Registration:** `hooks.set_help(topics, categories)` before players connect
+(see table above). A bare `python -m engine` install has an empty topic map;
+`help <verb>` still falls back to the `ENGINE_COMMANDS` one-liner.
+
+**Lookup order** (`cmd_help`): DB overlay exact/alias → static
+`HELP_TOPICS` → DB full-text search → `COMMANDS` one-liner → fuzzy
+"Did you mean?" (`docs/plans/helpfile_editing_system.md`).
+
+**Rule of thumb for engine promotions:** hook-only frameworks
+(`combat_core`, `needs` decay, planes registry, …) document in this file
+and plan docs — no player `HELP_TOPICS` unless the **game** exposes a
+player loop. Player-facing engine verbs (`bug`, `follow`, `group`, …)
+always get a `COMMANDS` one-liner from `ENGINE_COMMANDS`; the **game**
+ships full topic pages when the verb needs more than one sentence
+(AGENTS.md rule 11). GM/staff engine verbs (`hedit`, `reports`,
+`resolve`) ship GM topic pages in the game layer (SUPERS: `help/topics/gm.py`;
+basegame: `basegame/help_engine_topics.py`).
+
+**HEDIT** is engine-based end-to-end; hot-edited pages live in
+`riftforge.db` (`helpfiles` / `help_fts`) and override static pages at
+lookup time without a deploy. Git-tracked `HELP_TOPICS` remains the
+PR-reviewed source of truth for canon pages.
+
 ### Example (game boot)
 
 ```python
-from engine import hooks
-from supers.bootstrap import register_all_hooks
+# Prefer game_select so only one package registers hooks:
+#   RIFTFORGE_GAME=supers|basegame|classic|none
+# Or call the active package's bootstrap explicitly:
+
+from supers.bootstrap import register_all_hooks  # or basegame.bootstrap / classic.bootstrap
 
 register_all_hooks()   # attach, blob, chargen, help
 # then build Game / accept connections
 ```
 
-## Lean engine demo
+## Combat systems — what runs where
+
+Three **independent** combat paths share one design rule (hard rule 5): resolve
+**math → brief (data) → apply → narrate prose** — never merge math and text.
+They are **not** interchangeable backends inside SUPERS.
+
+| Path | Code | Who uses it | Feel |
+|------|------|-------------|------|
+| **SUPERS narrative combat** | `supers/combat.py` → `supers/combat_prose.py` (+ lexicon) | Live game (`162.243.50.82`) | Full Structured Battle Brief — Momentum, Disciplines, signatures, incap, spar, … |
+| **Swing combat** | `engine/systems/combat_engine.py` registry | `basegame/`, `classic/` | Heartbeat `resolve_round` + per-character `combat_engine` id |
+| **Active (twitch) combat** | `engine/systems/active_combat.py` + `combat_runtime.py` | `basegame/` demo only today | Timestamp queues, telegraphs, Balance/Equilibrium, `punch`/`dodge`/… |
+
+### Swing engines (`character.combat_engine`)
+
+Registered on import of each module under `engine/systems/`:
+
+| Id | Module | Purpose |
+|----|--------|---------|
+| `mundane` | `combat_mundane.py` | Generic demo brawl — weighted hit/crit/miss (basegame default) |
+| `martial_arts` | `combat_martial_arts.py` | Second demo style — stance RPS + combo counter |
+| `osr` | `combat_osr.py` | Generic d20 + attack bonus vs ascending AC; games register `register_osr_*` hooks |
+
+**Classic** sets `combat_engine = "osr"` and registers class/BAB/AC math via
+`classic/rules/osr_resolvers.py`. **Basegame** defaults to `mundane`; set
+`character.combat_engine = "martial_arts"` to try the second style.
+
+These are **not** lite copies of SUPERS prose combat — tiny briefs and one-line
+`narrate()` strings for the public engine demo. Same *pattern*, different product.
+
+### Active combat backend (optional second tick path)
+
+`combat_runtime.py` loads backends:
+
+- `swing` — basegame `resolve_round` (mundane/martial_arts/osr per character)
+- `active_combat` — `active_combat.tick_active_combat` (kinetic engine id)
+
+Rooms or NPCs with `active_combat=True` force new fights to
+`fight.combat_mode = "active"`. SUPERS does **not** use this stack. Detail:
+[`plans/fast_paced_combat_engine.md`](plans/fast_paced_combat_engine.md).
+
+### Firearms / combat backends (do not cross-wire)
+
+SUPERS and engine **active combat** both have gun-shaped verbs, but they are
+**different systems**. Do not merge handlers, state attrs, or ammo models.
+
+| | SUPERS (narrative swing) | Engine active combat (basegame demo) |
+|--|--------------------------|--------------------------------------|
+| Ammo | `supers/firearm_ammo.py` on wielded **Items** | `engine/systems/firearms.py` (`engine_firearm` / `firearm_sight`) |
+| Verbs | `load` / `reload` / `unload`; shoot via **attack swing** | `reload` → `load` → `aim <name>` → `fire` (queue + telegraph) |
+| `aim` | Melee **called shot** (`combat_aim` + anatomy) | Firearm **sight line** only |
+| Backend | `supers/combat.py` round briefs | Detachable `active_combat` backend (`combat_runtime`) |
+
+Detail: [`plans/fast_paced_combat_engine.md`](plans/fast_paced_combat_engine.md)
+§ “Firearm boundary vs SUPERS”.
+
+## Engine demo (`python -m engine`)
 
 ```text
 python -m engine
-# or: RIFTFORGE_GAME=none python server.py
+# explicit lean one-room boot (CI / purity gate):
+#   RIFTFORGE_GAME=none python server.py
+# OSR fantasy MVP (Millbrook + wilds):
+#   RIFTFORGE_GAME=classic python server.py
+# side-by-side with Docker on :4000:
+#   RIFTFORGE_PORT=5000 RIFTFORGE_DB=riftforge_engine.db python -m engine
 ```
 
-Forces lean mode when unset, points `maps` at
-`engine/demo/content/maps/` (one-room `demo.json`), and skips game-package
-hooks. Opaque SQLite extras use `persistence.load_meta_json` /
+When ``RIFTFORGE_GAME`` is unset, ``python -m engine`` boots the shipped
+**basegame** MVP (Notbigville, jobs, weather, America atlas) if ``basegame/``
+is present — never auto-picks SUPERS from the monorepo. With no game package
+on disk it falls back to ``engine/demo/content/maps/demo.json`` (one room).
+
+### ``RIFTFORGE_GAME`` (hosting)
+
+| Value | Game |
+|-------|------|
+| ``supers`` | Production SUPERS (monorepo only) |
+| ``basegame`` | Notbigville reference demo (public engine default for ``python -m engine``) |
+| ``classic`` | OSR Millbrook demo (public engine; explicit only) |
+| ``none`` | Lean one-room engine boot |
+| unset / ``auto`` | ``supers`` if importable, else lean (monorepo); public tree uses ``basegame`` via ``python -m engine`` |
+
+``RIFTFORGE_DB`` selects the SQLite file (default ``riftforge.db``).
+``RIFTFORGE_PORT`` selects the telnet listen port (default ``4000``; set
+``RIFTFORGE_GATEWAY=0`` for a direct bind when the Docker gateway owns
+``4000``).
+
+Opaque SQLite extras use `persistence.load_meta_json` /
 `save_meta_json`; game-shaped Tide/Cadence meta stays in the game codec.
+
+## Character sheet (`score`)
+
+The engine owns sheet **schema**, **assembly**, and **framing**:
+
+| Piece | Location |
+|-------|----------|
+| Field catalog | `engine/content/sheet_profile.json` |
+| Assembly | `engine/systems/sheet.py` (`SheetContext`, `render_score`, `format_assembled`) |
+| Game rows | `hooks.register_sheet_field(id, fn)` — `fn(ctx) -> str \| None` |
+| Game sections | `hooks.register_sheet_contributor(id, fn, priority=…)` — `fn(ctx) -> SheetSection \| list \| None` |
+
+Basegame registers Path + HP field hooks in `basegame/sheet_score.py`.
+SUPERS body rows still build in `supers/verbs/character.py`; framing
+routes through `engine.systems.sheet.format_assembled`. Peel SUPERS
+blocks into `supers/sheet_score.py` contributors over time.
+
+```python
+from engine.systems.sheet import SheetContext, render_score
+from engine import hooks
+
+hooks.register_sheet_field("hp", lambda ctx: f"  HP: {ctx.target.hp}/…")
+text = render_score(SheetContext(target=character, game=game, viewer=character))
+```
 
 ## What still lives in the monorepo root
 
@@ -156,7 +309,8 @@ as its phase lands; listed here now so a bundle name isn't picked twice.
 | Gates | 1 | `register_gate_network(GateNetwork, room_predicate)` |
 | Needs | 3 | `register_meter`, `register_fuel_meter`, `tick_needs`, decay policy hook — extends existing `engine/systems/needs.py`, not a new module |
 | Cadence | 4 | `cadence_tick`, `register_need_pursuer`, `register_job_behavior` |
-| Combat | 5 | `register_combat_engine(id, build_brief, apply_brief)`, `register_combat_narrator` — wraps existing `engine/systems/combat_core.py`, not a new roll implementation |
+| Combat swing registry | 1 **DONE** | `register_combat_engine` in `engine/systems/combat_engine.py`; shipped `mundane`, `martial_arts`, `osr` |
+| Active twitch combat | separate track | `engine/systems/active_combat.py` + `combat_runtime` — basegame demo; SUPERS unchanged |
 | Body parts | 5b | `register_anatomy_regions`, `body_parts_heal_mult`, brief `target_region`/limb fields |
 | Room env | 5c | `register_slam_target_pipeline`, `stamp_breach_pick`/`apply_breach`, layout-direction neighbor resolver |
 | Spawn | 6 | `register_nest_ai`, bestiary table loader hooks |

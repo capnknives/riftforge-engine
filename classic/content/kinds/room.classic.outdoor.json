@@ -1,0 +1,19 @@
+{
+  "id": "room.classic.outdoor",
+  "label": "Classic outdoor room",
+  "extends": "room.engine",
+  "writes_to": "classic/content/zones rooms[] | classic/content/maps rooms[]",
+  "fields": {
+    "outdoor": {
+      "type": "bool",
+      "required": true,
+      "default": true,
+      "doc": "Outdoor room."
+    },
+    "zone": {
+      "type": "string",
+      "required": false,
+      "doc": "Zone id when room belongs to a pocket zone."
+    }
+  }
+}

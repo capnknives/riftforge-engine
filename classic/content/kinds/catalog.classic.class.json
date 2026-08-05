@@ -1,0 +1,59 @@
+{
+  "id": "catalog.classic.class",
+  "label": "Classic PC class row",
+  "writes_to": "classic/content/catalog/classes.json classes[]",
+  "fields": {
+    "id": {
+      "type": "string",
+      "required": true,
+      "doc": "Class id (war, cleric, mage, rogue)."
+    },
+    "name": {
+      "type": "string",
+      "required": true,
+      "doc": "Player-facing class name."
+    },
+    "summary": {
+      "type": "string",
+      "required": true,
+      "doc": "Chargen / help one-liner."
+    },
+    "hit_die": {
+      "type": "int",
+      "required": true,
+      "doc": "Hit die sides (4-10)."
+    },
+    "bab": {
+      "type": "enum",
+      "required": true,
+      "values": ["full", "three_quarters", "half"],
+      "doc": "Base attack bonus progression."
+    },
+    "saves": {
+      "type": "object",
+      "required": true,
+      "doc": "Fort/ref/will good or poor."
+    },
+    "armor_bonus": {
+      "type": "int",
+      "required": true,
+      "doc": "Starting armor bonus at chargen."
+    },
+    "weapon_die": {
+      "type": "int",
+      "required": true,
+      "doc": "Default weapon damage die."
+    },
+    "attack_ability": {
+      "type": "enum",
+      "required": true,
+      "values": ["STR", "DEX", "CON", "INT", "WIS", "CHA"],
+      "doc": "Ability for to-hit and damage."
+    },
+    "class_skills": {
+      "type": "list",
+      "required": true,
+      "doc": "Class skill ids (see catalog.classic.skill vocabulary)."
+    }
+  }
+}

@@ -1,0 +1,43 @@
+{
+    "_comment": "Minimal mortal appearance catalog for basegame H7b demo.",
+    "hair_style": [
+        {"id": "short", "name": "Short"},
+        {"id": "wavy", "name": "Wavy"},
+        {"id": "buzzed", "name": "Buzzed"}
+    ],
+    "hair_color": [
+        {"id": "brown", "name": "Brown"},
+        {"id": "blonde", "name": "Blonde"},
+        {"id": "black", "name": "Black"}
+    ],
+    "eye_color": [
+        {"id": "brown", "name": "Brown"},
+        {"id": "blue", "name": "Blue"},
+        {"id": "green", "name": "Green"}
+    ],
+    "height": [
+        {"id": "average", "name": "Average"},
+        {"id": "tall", "name": "Tall"},
+        {"id": "short", "name": "Short"}
+    ],
+    "physique": [
+        {"id": "average", "name": "Average"},
+        {"id": "lean", "name": "Lean"},
+        {"id": "stocky", "name": "Stocky"}
+    ],
+    "skin_tone": [
+        {"id": "medium", "name": "Medium"},
+        {"id": "fair", "name": "Fair"},
+        {"id": "deep", "name": "Deep"}
+    ],
+    "facial_hair": [
+        {"id": "none", "name": "None"},
+        {"id": "stubble", "name": "Stubble"}
+    ],
+    "scars": [
+        {"id": "none", "name": "None"}
+    ],
+    "voice": [
+        {"id": "warm", "name": "Warm"}
+    ]
+}

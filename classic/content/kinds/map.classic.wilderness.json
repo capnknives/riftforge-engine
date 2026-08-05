@@ -1,0 +1,19 @@
+{
+  "id": "map.classic.wilderness",
+  "label": "Classic hand-room wilderness map file",
+  "extends": "map.earth",
+  "writes_to": "classic/content/maps/*.json",
+  "fields": {
+    "wilderness": {
+      "type": "bool",
+      "required": true,
+      "default": true,
+      "doc": "Wilderness encounter stamp for the map file."
+    },
+    "rooms": {
+      "type": "list",
+      "required": true,
+      "doc": "Linked outdoor rooms."
+    }
+  }
+}

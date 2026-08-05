@@ -1,0 +1,12 @@
+{
+  "id": "catalog.classic.classes_file",
+  "label": "Classic classes catalog file",
+  "writes_to": "classic/content/catalog/classes.json",
+  "fields": {
+    "classes": {
+      "type": "list",
+      "required": true,
+      "doc": "catalog.classic.class rows."
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+    "_guide": "Generated from classic/content/kinds/zone.classic.pocket.json. Use content_new.py lint.",
+    "kind": "zone.classic.pocket",
+    "id": "millbrook",
+    "plane": "earth",
+    "realm": "prime",
+    "autoload": true,
+    "city_name": "Millbrook",
+    "city_color": "gold",
+    "sub_color": "silver",
+    "rooms": []
+}

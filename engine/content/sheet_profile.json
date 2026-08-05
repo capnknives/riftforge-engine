@@ -1,0 +1,47 @@
+{
+  "id": "sheet.engine",
+  "version": 1,
+  "title": "SCORE",
+  "description": "Engine character-sheet field catalog. Games register hook providers for hook:* sources; engine:* rows are generic.",
+  "fields": [
+    {
+      "id": "header",
+      "slot": "header",
+      "source": "hook:header",
+      "panes": ["default", "vitals", "combat", "full"]
+    },
+    {
+      "id": "primaries_row1",
+      "slot": "body",
+      "source": "hook:primaries_row1",
+      "panes": ["default", "combat", "full"]
+    },
+    {
+      "id": "primaries_row2",
+      "slot": "body",
+      "source": "hook:primaries_row2",
+      "panes": ["default", "combat", "full"]
+    },
+    {
+      "id": "tier",
+      "slot": "body",
+      "source": "engine:tier",
+      "panes": ["default", "vitals", "full"]
+    },
+    {
+      "id": "hp",
+      "slot": "body",
+      "source": "hook:hp",
+      "panes": ["default", "vitals", "full"]
+    }
+  ],
+  "panes": {
+    "default": {"title": "SCORE", "compact": true},
+    "vitals": {"title": "VITALS", "compact": false},
+    "combat": {"title": "COMBAT", "compact": false},
+    "full": {"title": "SCORE", "compact": false},
+    "lineage": {"title": "LINEAGE", "compact": false},
+    "needs": {"title": "NEEDS", "compact": false},
+    "relationships": {"title": "RELATIONSHIPS", "compact": false}
+  }
+}

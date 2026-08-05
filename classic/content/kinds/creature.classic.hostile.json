@@ -1,0 +1,54 @@
+{
+  "id": "creature.classic.hostile",
+  "label": "Classic OSR hostile creature",
+  "extends": "creature.generic",
+  "writes_to": "classic/content/bestiary/*.json creatures[]",
+  "fields": {
+    "id": {
+      "type": "string",
+      "required": true,
+      "doc": "Creature id within category file."
+    },
+    "name": {
+      "type": "string",
+      "required": true,
+      "doc": "Spawn display name."
+    },
+    "description": {
+      "type": "string",
+      "required": true,
+      "doc": "Look text."
+    },
+    "tier": {
+      "type": "int",
+      "required": true,
+      "default": 0,
+      "doc": "Tier band (classic MVP uses 0)."
+    },
+    "hp": {
+      "type": "int",
+      "required": true,
+      "doc": "Fixed HP for classic combat."
+    },
+    "ac": {
+      "type": "int",
+      "required": true,
+      "doc": "Ascending armor class."
+    },
+    "attack_bonus": {
+      "type": "int",
+      "required": true,
+      "doc": "To-hit bonus before ability."
+    },
+    "damage_die": {
+      "type": "int",
+      "required": true,
+      "doc": "Damage die sides."
+    },
+    "stat_ranges": {
+      "type": "object",
+      "required": true,
+      "doc": "Engine spine ranges for spawn roll (POW..PRE)."
+    }
+  }
+}

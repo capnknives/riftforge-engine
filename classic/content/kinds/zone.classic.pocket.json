@@ -1,0 +1,35 @@
+{
+  "id": "zone.classic.pocket",
+  "label": "Classic pocket village zone file",
+  "extends": "map.earth",
+  "writes_to": "classic/content/zones/*.json",
+  "fields": {
+    "city_name": {
+      "type": "string",
+      "required": true,
+      "doc": "Village name for ROOM NAME stamping."
+    },
+    "city_color": {
+      "type": "string",
+      "required": true,
+      "default": "gold",
+      "doc": "ANSI role for city segment."
+    },
+    "sub_color": {
+      "type": "string",
+      "required": true,
+      "default": "silver",
+      "doc": "ANSI role for sub segment."
+    },
+    "main_colors": {
+      "type": "object",
+      "required": false,
+      "doc": "Per-street color roles."
+    },
+    "rooms": {
+      "type": "list",
+      "required": true,
+      "doc": "Hand-authored rooms (non-empty)."
+    }
+  }
+}

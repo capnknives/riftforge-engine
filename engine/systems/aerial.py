@@ -9,6 +9,7 @@ from __future__ import annotations
 ORBIT_ROOM_KEY = "LM00002"
 ORBIT_ZONE = "stellar-orbit"
 GLOBE_CHARGE_STEP = 0.05
+TIER_HOVER = "hover"  # airborne inside the current room (not map layers)
 
 
 def ensure_stellar_defaults(character):
@@ -21,6 +22,8 @@ def ensure_stellar_defaults(character):
         character.stellar_flight_tier = "ground"
     if not hasattr(character, "is_flying"):
         character.is_flying = False
+    if not hasattr(character, "room_hover"):
+        character.room_hover = False
     if not hasattr(character, "stellar_hovering"):
         character.stellar_hovering = False
     if not hasattr(character, "stellar_flight_macro"):
@@ -43,7 +46,7 @@ def flight_tier(character):
     """Return ground | macro | globe | orbit."""
     ensure_stellar_defaults(character)
     tier = getattr(character, "stellar_flight_tier", "ground") or "ground"
-    if tier not in ("ground", "macro", "globe", "orbit"):
+    if tier not in ("ground", TIER_HOVER, "macro", "globe", "orbit"):
         return "ground"
     room = getattr(character, "location", None)
     if tier == "ground" and room is not None and getattr(room, "zone", None) == ORBIT_ZONE:
@@ -54,22 +57,61 @@ def flight_tier(character):
 def set_flight_tier(character, tier):
     """Set altitude tier and sync legacy flags."""
     ensure_stellar_defaults(character)
-    if tier not in ("ground", "macro", "globe", "orbit"):
+    if tier not in ("ground", TIER_HOVER, "macro", "globe", "orbit"):
         tier = "ground"
     character.stellar_flight_tier = tier
-    character.is_flying = tier != "ground"
-    character.stellar_hovering = tier in ("macro", "globe")
+    character.room_hover = tier == TIER_HOVER
+    character.is_flying = tier not in ("ground",)
+    character.stellar_hovering = tier == TIER_HOVER
 
 
 def clear_hover(character):
     """Drop sustained flight without messaging."""
     ensure_stellar_defaults(character)
     character.stellar_hovering = False
+    character.room_hover = False
     character.is_flying = False
     character.stellar_flight_tier = "ground"
     character.stellar_flight_macro = None
     character.stellar_globe_lon = None
     character.stellar_globe_lat = None
+
+
+def _broadcast_room(character, message):
+    """Room-visible flight line when the room supports broadcast."""
+    room = getattr(character, "location", None)
+    if room is not None and hasattr(room, "broadcast"):
+        try:
+            room.broadcast(message, exclude=character)
+        except TypeError:
+            room.broadcast(message)
+
+
+def cmd_hover(character, args, game):
+    """Lift off inside the current room -- map position unchanged.
+
+    Sets ``is_flying`` for active combat (ground sweeps miss) without
+    climbing to macro / globe / orbit. Anyone can hover; ``fly`` remains
+    the Stellar map-layer ascent.
+    """
+    ensure_stellar_defaults(character)
+    tier = flight_tier(character)
+    if tier in ("macro", "globe", "orbit"):
+        character.session.send(
+            "You are already at map altitude. Type descend to step down."
+        )
+        return
+    if tier == TIER_HOVER:
+        character.session.send(
+            "You are already hovering here. Type descend to land."
+        )
+        return
+    set_flight_tier(character, TIER_HOVER)
+    _broadcast_room(character, f"{character.key} lifts off the ground.")
+    character.session.send(
+        "You hover above the floor, still in the room. "
+        "Type descend to land, or fly (Stellar) to climb map layers."
+    )
 
 
 def add_solar_charge(character, delta):
@@ -93,6 +135,16 @@ def cmd_fly(character, args, game):
         character.session.send("Only Stellar characters can fly in this demo.")
         return
     tier = flight_tier(character)
+    if tier == TIER_HOVER:
+        room = getattr(character, "location", None)
+        if not getattr(room, "outdoor", False):
+            character.session.send(
+                "You need open sky above to climb to map altitude."
+            )
+            return
+        character.room_hover = False
+        character.stellar_flight_tier = "ground"
+        tier = "ground"
     if tier == "orbit":
         character.session.send("You are already in orbit. Type descend.")
         return
@@ -142,6 +194,12 @@ def cmd_descend(character, args, game):
     from engine.systems import overland as overland_mod
 
     ensure_stellar_defaults(character)
+    tier = flight_tier(character)
+    if tier == TIER_HOVER:
+        set_flight_tier(character, "ground")
+        _broadcast_room(character, f"{character.key} settles back to the ground.")
+        character.session.send("You land.")
+        return
     if not is_stellar(character):
         character.session.send("You are not airborne.")
         return
@@ -165,7 +223,7 @@ def cmd_descend(character, args, game):
     if tier == "macro":
         macro = overland_mod._parse_pos_pair(character.stellar_flight_macro) or (35, 10)
         overland_mod.place_on_overland(character, game, macro, overland_mod.LANDMARK_MICRO)
-        clear_hover()
+        clear_hover(character)
         character.session.send("You settle back to the ground.")
         return
     character.session.send("You are already on the ground.")

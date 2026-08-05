@@ -99,13 +99,17 @@ def breach_eject(character, room, target, *, game=None):
     )
     if neighbor is None:
         return False
+    old_room = room
     mover = getattr(character, "move_to", None)
     if callable(mover):
         mover(neighbor)
     else:
         character.location = neighbor
+    from engine.systems import combat_pursuit as combat_pursuit_mod
+    combat_pursuit_mod.notify_character_relocated(
+        character, old_room, neighbor, game,
+    )
     label = target.get("label") or target.get("id") or "the wall"
-    old_room = room
     if old_room is not None and hasattr(old_room, "broadcast"):
         old_room.broadcast(
             f"{getattr(character, 'key', 'Someone')} crashes through {label}.",

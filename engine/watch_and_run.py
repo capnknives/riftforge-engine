@@ -646,33 +646,41 @@ def main():
                 "evaluating auto-revert",
                 flush=True,
             )
-            # Hold already on (prior failed/skipped revert): clear the
-            # stale outage flag and do NOT kill the game again. Hang-check
-            # / exit paths still respawn a dead child.
+            # Hold already on (prior failed/skipped revert, or the thrash
+            # guard): clear the stale outage flag but do NOT `continue` --
+            # the exit-check / hang-check / auto-deploy poll below must
+            # still run every tick even while held, otherwise a dead game
+            # child that never opens gateway IPC (a boot-crash loop) is
+            # never respawned again once this file trips once. This
+            # `continue` used to skip that (2026-08-04 hang postmortem):
+            # the watcher stayed "alive" (still PID 1, still looping) but
+            # never checked `proc.poll()` again, so a crashed child was
+            # never respawned and the game looked hung from the outside.
             if crash_recovery.hold_active(root=root):
                 print(
                     "[watch] revert hold active -- clearing stale "
-                    "gateway outage (not stopping game)",
+                    "gateway outage (game respawn / auto-deploy checks "
+                    "still run this tick)",
                     flush=True,
                 )
                 crash_recovery.clear_gateway_outage()
-                continue
-            # Attempt tree revert FIRST. Only stop+respawn when the reset
-            # succeeds — otherwise a git failure used to leave the game
-            # dead (or kill PID 1) while ``.gateway_outage.json`` survived
-            # and re-tripped every restart.
-            reverted = _maybe_auto_revert(reason_prefix="gateway: ")
-            if reverted:
-                if proc.poll() is None:
-                    _stop_game(proc)
-                proc, game_spawn_wall = _spawn_game()
-                before = _snapshot()
-                pending_copyover = False
-                continue
-            # Failed/skipped: hold + outage clear already done inside
-            # revert path. Leave a live game child alone; a dead one is
-            # handled by the normal poll()/hang-check branches below.
-            continue
+            else:
+                # Attempt tree revert FIRST. Only stop+respawn when the reset
+                # succeeds — otherwise a git failure used to leave the game
+                # dead (or kill PID 1) while ``.gateway_outage.json`` survived
+                # and re-tripped every restart.
+                reverted = _maybe_auto_revert(reason_prefix="gateway: ")
+                if reverted:
+                    if proc.poll() is None:
+                        _stop_game(proc)
+                    proc, game_spawn_wall = _spawn_game()
+                    before = _snapshot()
+                    pending_copyover = False
+                    continue
+                # Failed/skipped: hold + outage clear already done inside
+                # revert path (or the thrash guard just armed a fresh
+                # hold). Fall through -- a dead child still needs the
+                # normal poll()/hang-check handling below, every tick.
 
         if not backup_running and world_backup.backup_due():
             backup_running = True
@@ -854,6 +862,16 @@ def main():
                 # not stuck behind a stale one-shot import (live map wipe).
                 auto_deploy = reload_auto_deploy()
                 deploy_every = auto_deploy.poll_interval_seconds()
+                # A revert hold forces auto-deploy off (see auto_deploy._enabled)
+                # so a fix pushed while held would otherwise sit unused until
+                # someone remembers `gm recover clearhold`. Check on the same
+                # cadence as the deploy poll so a real fix self-heals.
+                if crash_recovery.hold_active(root=root):
+                    resumed, detail = crash_recovery.maybe_auto_resume_hold(
+                        root=root
+                    )
+                    if resumed:
+                        print(f"[watch] auto-resume: {detail}", flush=True)
                 auto_deploy.try_auto_deploy()
             except Exception as exc:
                 print(f"[watch] auto_deploy error (will retry): {exc}", flush=True)

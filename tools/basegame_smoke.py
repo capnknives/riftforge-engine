@@ -78,6 +78,9 @@ async def _run_chargen_for_path(game, path_index, path_id):
 def main():
     """Run the Phase 7 basegame assertions; exit 0 on success."""
     _ensure_repo_on_path()
+    from engine.__main__ import default_entry_game
+
+    assert default_entry_game() == "basegame"
     os.environ["RIFTFORGE_GAME"] = "basegame"
 
     import game_select
@@ -98,6 +101,11 @@ def main():
     assert "shop" in topics
     assert "clinic" in topics
     assert "origins" in topics
+    assert "bug" in topics
+    assert "hedit" in topics
+    assert "helpsubmit" in topics
+    assert "How you play" not in topics["bug"]  # engine meta pages are lean
+    assert "hedit <keyword>" in topics["hedit"]
     assert "shroud" in commands_mod.COMMANDS
     assert "unshroud" in commands_mod.COMMANDS
 
@@ -472,6 +480,17 @@ def main():
         "Only Stellar" in line for line in mundane.session.lines
     ), mundane.session.lines
 
+    # Room hover: anyone can lift off in place; fly still Stellar-only.
+    mundane.move_to(indoor)
+    mundane.session = _FakeSession([])
+    dispatch(mundane, "hover", game)
+    assert aerial_mod.flight_tier(mundane) == aerial_mod.TIER_HOVER
+    assert mundane.is_flying is True
+    assert mundane.location is indoor
+    dispatch(mundane, "descend", game)
+    assert aerial_mod.flight_tier(mundane) == "ground"
+    assert mundane.is_flying is False
+
     umbral = placed[2]
     umbral.origin = "alien"
     umbral.alien_path = "umbral"
@@ -538,17 +557,31 @@ def main():
 
     rider = placed[0]
     plaza = game.rooms["NB00001"]
-    rider.move_to(plaza)
     rider.session = _FakeSession([])
     vehicles_mod.ensure_game_vehicles(game)
     cart = vehicles_mod.vehicle_by_id(game, "cart")
     assert cart is not None, game.vehicles
+    # Ignore stale parking_state.json from prior local smokes.
+    cart["parked_room"] = plaza.key
+    park_room = plaza
+    rider.move_to(park_room)
     park_before = cart["parked_room"]
     dispatch(rider, "board cart", game)
     assert rider.in_vehicle == "cart", rider.session.lines
     assert rider.location.key == cart["interior_key"]
     rider.session = _FakeSession([])
-    dispatch(rider, "drive north", game)
+    drive_dir = None
+    for direction, dest in park_room.exits.items():
+        dest_room = dest if not isinstance(dest, str) else game.rooms.get(dest)
+        if dest_room and vehicles_mod.room_is_valid_park_spot(
+            dest_room, game, character=rider,
+        ):
+            drive_dir = direction
+            break
+    assert drive_dir, (
+        f"cart park room {park_room.key!r} needs a driveable neighbor exit"
+    )
+    dispatch(rider, f"drive {drive_dir}", game)
     assert cart["parked_room"] != park_before, (
         cart["parked_room"], park_before, rider.session.lines
     )
@@ -591,6 +624,135 @@ def main():
     assert walker.location is post, (
         f"walk post should arrive at post office, got {walker.location.key!r}"
     )
+
+    # ---- H6: engine.map_store dig demo ----
+    from engine import map_store as map_store_mod
+
+    saloon = game.rooms.get("NB00011")
+    assert saloon is not None
+    zone_path, _kind, _filename, _map_id = map_store_mod.resolve_map_path(
+        game, saloon,
+    )
+    with open(zone_path, "rb") as zone_handle:
+        zone_backup = zone_handle.read()
+    dig_name = "H9 Demo Alcove"
+    walker.move_to(saloon)
+    walker.session = _FakeSession([])
+    before_keys = set(game.rooms.keys())
+    try:
+        dispatch(walker, f"dig up {dig_name}", game)
+        assert any(
+            "dug" in line.lower() or "room" in line.lower()
+            for line in walker.session.lines
+        ), walker.session.lines
+        new_keys = set(game.rooms.keys()) - before_keys
+        assert new_keys, "dig should add a live room to game.rooms"
+        new_key = next(iter(new_keys))
+        dispatch(walker, "up", game)
+        assert walker.location.key == new_key, (
+            walker.location.key, new_key, walker.session.lines
+        )
+    finally:
+        with open(zone_path, "wb") as zone_handle:
+            zone_handle.write(zone_backup)
+
+    # ---- H7a: phone payphone + dial handset ----
+    from engine.systems import phone as phone_mod
+    from basegame import personas as personas_mod
+    from world import Item
+
+    operator = personas_mod.ensure_demo_npc(game)
+    assert operator is not None
+    assert personas_mod.operator_phone_number(game), "Operator handset number"
+    assert phone_mod.room_has_payphone(post), "Post Office should have payphone"
+    caller = placed[0]
+    callee = placed[1]
+    caller.move_to(post)
+    callee.move_to(post)
+    handset = Item("a flip phone", "A scratched demo handset.")
+    handset.is_phone = True
+    phone_mod.stamp_phone_on_spawn(handset, game)
+    callee.inventory.append(handset)
+    callee_number = handset.phone_number
+    economy_mod.credit_wallet(caller, dollars=5)
+    caller.session = _FakeSession([])
+    dispatch(caller, f"dial {callee_number}", game)
+    assert any("ring" in line.lower() for line in caller.session.lines), (
+        caller.session.lines
+    )
+    callee.session = _FakeSession([])
+    dispatch(callee, "answer", game)
+    assert phone_mod.active_call(caller) is not None
+    caller.session = _FakeSession([])
+    dispatch(caller, "hangup", game)
+    assert phone_mod.active_call(caller) is None
+
+    # ---- H7b: appearance slots ----
+    from engine.systems import appearance as appearance_mod
+
+    model = placed[2]
+    model.session = _FakeSession([])
+    for slot, option in (
+        ("hair_style", "short"),
+        ("hair_color", "brown"),
+        ("eye_color", "blue"),
+        ("height", "average"),
+        ("physique", "lean"),
+        ("skin_tone", "fair"),
+    ):
+        dispatch(model, f"appearance {slot} {option}", game)
+    assert appearance_mod.is_complete(model.appearance)
+    assert "blue" in (model.description or "").lower(), model.description
+
+    # ---- H7c: persona trait flavor ----
+    greeter = placed[3]
+    greeter.move_to(post)
+    greeter.session = _FakeSession([])
+    dispatch(greeter, "greet Operator", game)
+    assert any(
+        "stranger" in line.lower() or "welcome" in line.lower()
+        for line in greeter.session.lines
+    ), greeter.session.lines
+
+    # ---- H7d: relationships ----
+    from engine.systems import relationships as relationships_mod
+
+    tagger = placed[0]
+    buddy = placed[1]
+    tagger.session = _FakeSession([])
+    dispatch(tagger, f"friend {buddy.key}", game)
+    assert relationships_mod.get_kind(tagger, buddy) == "friend"
+    tagger.session = _FakeSession([])
+    dispatch(tagger, "relate", game)
+    assert any(buddy.key in line for line in tagger.session.lines), (
+        tagger.session.lines
+    )
+
+    # ---- H10: procedural street-home shell (engine/systems/procedural_build) ----
+    from engine.systems import procedural_build as proc_mod
+
+    class _StreetHub:
+        key = "notbigville:Demo Street"
+        area_type = "city"
+        zone = "notbigville"
+        map_id = "notbigville"
+        city_name = "Notbigville"
+        title = "Notbigville - Demo Street"
+        wilderness = False
+        outdoor = True
+        exits = {}
+        layout = {"x": 0, "y": 0, "z": 0}
+
+    hub = _StreetHub()
+    rooms, patch = proc_mod._build_generic_home(
+        hub, "Demo Street", 12501, rng=__import__("random").Random(7),
+    )
+    proc_mod.validate_home_shell(rooms, patch, street_key=hub.key)
+    porch = next(r for r in rooms if r["key"].endswith(" Porch"))
+    living = next(r for r in rooms if r["key"].endswith(" Living"))
+    assert porch["outdoor"] and porch["private_home"]
+    assert living["is_house"] and not living.get("outdoor")
+    assert porch["title"] == "Notbigville - 12501 Demo Street - Porch"
 
     game.on_tick()
     game.db.close()

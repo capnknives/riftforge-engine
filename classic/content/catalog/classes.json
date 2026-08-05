@@ -1,0 +1,53 @@
+{
+  "kind": "catalog.classic.classes_file",
+  "classes": [
+    {
+      "id": "war",
+      "name": "War",
+      "summary": "War -- front-line fighter; heavy armor and strong melee.",
+      "hit_die": 10,
+      "bab": "full",
+      "saves": {"fort": "good", "ref": "poor", "will": "poor"},
+      "armor_bonus": 4,
+      "weapon_die": 8,
+      "attack_ability": "STR",
+      "class_skills": ["athletics", "intimidate", "perception", "survival"]
+    },
+    {
+      "id": "cleric",
+      "name": "Cleric",
+      "summary": "Cleric -- armored healer; mace, shield, and divine spells.",
+      "hit_die": 8,
+      "bab": "three_quarters",
+      "saves": {"fort": "good", "ref": "poor", "will": "good"},
+      "armor_bonus": 3,
+      "weapon_die": 6,
+      "attack_ability": "STR",
+      "class_skills": ["religion", "medicine", "persuade", "perception"]
+    },
+    {
+      "id": "mage",
+      "name": "Mage",
+      "summary": "Mage -- arcane caster; staff and bolt cantrips.",
+      "hit_die": 4,
+      "bab": "half",
+      "saves": {"fort": "poor", "ref": "poor", "will": "good"},
+      "armor_bonus": 0,
+      "weapon_die": 4,
+      "attack_ability": "STR",
+      "class_skills": ["arcana", "lore", "perception", "persuade"]
+    },
+    {
+      "id": "rogue",
+      "name": "Rogue",
+      "summary": "Rogue -- skirmisher; leather, finesse, and stealth skills.",
+      "hit_die": 6,
+      "bab": "three_quarters",
+      "saves": {"fort": "poor", "ref": "good", "will": "poor"},
+      "armor_bonus": 2,
+      "weapon_die": 6,
+      "attack_ability": "DEX",
+      "class_skills": ["sneak", "pick_lock", "climb", "perception", "persuade"]
+    }
+  ]
+}

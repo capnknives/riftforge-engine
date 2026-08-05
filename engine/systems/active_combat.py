@@ -74,21 +74,31 @@ VERB_PROFILES = {
         "requires_ground": False,
         "status": "staggered",
     },
+    "grab": {
+        "balance_cost": 2.0,
+        "damage": 2.0,
+        "requires_ground": False,
+        "status": "grabbed",
+    },
+    "fire": {
+        "balance_cost": 2.0,
+        "damage": 14.0,
+        "requires_ground": False,
+        "status": None,
+    },
 }
 
 AIM_EQUILIBRIUM_COST = 1.5
-AIM_ZONES = frozenset({
-    "head", "neck", "torso", "arms", "hands", "legs", "feet",
-    "left_arm", "right_arm", "left_leg", "right_leg",
-})
+LOAD_BALANCE_COST = 1.2
 
 QUEUE_ATTR = "active_combat_queue"
 TELEGRAPHS_ATTR = "open_telegraphs"
-AIM_ZONE_ATTR = "active_aim_zone"
 
 _KIND_OFFENSE = "offense"
 _KIND_MANUAL_DEFENSE = "manual_defense"
-_KIND_AIM = "aim"
+_KIND_AIM = "aim"       # firearm sight line only (not melee)
+_KIND_LOAD = "load"     # chamber a round
+_KIND_FIRE = "fire"     # discharge chambered round
 _KIND_CLEAR = "clear_queue"
 
 _telegraph_ids = itertools.count(1)
@@ -138,8 +148,6 @@ def ensure_defaults(character):
         setattr(character, QUEUE_ATTR, [])
     if getattr(character, TELEGRAPHS_ATTR, None) is None:
         setattr(character, TELEGRAPHS_ATTR, {})
-    if not hasattr(character, AIM_ZONE_ATTR):
-        setattr(character, AIM_ZONE_ATTR, None)
     readiness_mod.ensure_defaults(character)
     defense_mod.ensure_defaults(character)
 
@@ -174,7 +182,7 @@ def enqueue(character, command, *, now_fn=None):
     ensure_defaults(character)
     kind = command.get("kind")
     queue = get_queue(character)
-    if kind in (_KIND_OFFENSE, _KIND_AIM):
+    if kind in (_KIND_OFFENSE, _KIND_AIM, _KIND_LOAD, _KIND_FIRE):
         if len(queue) >= OFFENSE_QUEUE_CAP:
             return False, (
                 f"[QUEUE FULL] At most {OFFENSE_QUEUE_CAP} pending actions "
@@ -183,6 +191,34 @@ def enqueue(character, command, *, now_fn=None):
     if "timestamp" not in command:
         command["timestamp"] = _now(now_fn)
     queue.append(command)
+    return True, None
+
+
+def launch_offense_immediately(character, verb, target, *, game=None,
+                               now_fn=None):
+    """Fire an opener offense now -- skip FIFO (first strike out of combat).
+
+    Spends Balance and opens a telegraph immediately. Subsequent strikes
+    should use ``enqueue`` so the queue + cooldown loop applies.
+    """
+    ensure_defaults(character)
+    profile = VERB_PROFILES.get(verb, VERB_PROFILES["punch"])
+    if not readiness_mod.is_ready(character, "balance", now_fn=now_fn):
+        return enqueue(character, {
+            "kind": _KIND_OFFENSE,
+            "verb": verb,
+            "target": target,
+            "readiness_track": "balance",
+        }, now_fn=now_fn)
+    readiness_mod.spend_balance(
+        character, profile["balance_cost"], now_fn=now_fn,
+    )
+    open_telegraph(
+        character, target, verb,
+        now_fn=now_fn,
+        zone=None,
+        profile=profile,
+    )
     return True, None
 
 
@@ -367,12 +403,31 @@ def kinetic_build_brief(attacker, defender, game=None, *, rng=None,
 
 def kinetic_apply_brief(brief, game=None):
     """Mutate HP (and optional parry Balance strip) from a frozen brief."""
+    from engine.systems import grapple as grapple_mod
+
     defender = brief["defender"]
     attacker = brief["attacker"]
     damage = float(brief.get("damage") or 0.0)
     if damage:
+        agg_damage = damage
+        zone = brief.get("zone")
+        outcome = brief.get("outcome")
+        if zone and outcome in ("hit", "blocked", "parry_fail"):
+            from engine.systems import body_parts as body_parts_mod
+
+            agg_damage = float(
+                body_parts_mod.apply_incoming_damage(
+                    defender,
+                    int(damage),
+                    zone,
+                    limb_actor_check=lambda c: not getattr(c, "is_npc", False),
+                )
+            )
         current = float(getattr(defender, "hp", 0.0) or 0.0)
-        defender.hp = max(0.0, current - damage)
+        defender.hp = max(0.0, current - agg_damage)
+        damage = agg_damage
+    if brief.get("verb") == "grab" and brief.get("outcome") == "hit":
+        grapple_mod.apply_hold(attacker, defender)
     if "BALANCE_STRIP" in (brief.get("outcome_tags") or []):
         # Force the attacker off Balance immediately (parry payoff).
         readiness_mod.spend_balance(attacker, 2.5)
@@ -395,6 +450,8 @@ def kinetic_narrate(brief, result):
 
     if outcome == "airborne_miss":
         return f"[MISS] {atk}'s {verb} can't reach airborne {dfn}."
+    if outcome == "hit" and verb == "grab":
+        return f"[GRAB] {atk} seizes {dfn}."
     if outcome == "dodged":
         return f"[DODGED] {dfn} dodges {atk}'s {verb}{zone_bit}."
     if outcome == "blocked":
@@ -530,11 +587,46 @@ def _resolve_command(character, cmd, *, game=None, rng=None, now_fn=None,
         return True
 
     if kind == _KIND_AIM:
+        from engine.systems import firearms as firearms_mod
+        target = cmd.get("target")
         zone = cmd.get("zone")
-        if zone in AIM_ZONES:
-            setattr(character, AIM_ZONE_ATTR, zone)
-        readiness_mod.spend_equilibrium(
-            character, AIM_EQUILIBRIUM_COST, now_fn=now_fn,
+        if target is None:
+            return True
+        ok, _msg = firearms_mod.set_sight(character, target, zone=zone)
+        if ok:
+            readiness_mod.spend_equilibrium(
+                character, AIM_EQUILIBRIUM_COST, now_fn=now_fn,
+            )
+        return True
+
+    if kind == _KIND_LOAD:
+        from engine.systems import firearms as firearms_mod
+        ok, _msg = firearms_mod.load_chamber(character)
+        if ok:
+            readiness_mod.spend_balance(
+                character, LOAD_BALANCE_COST, now_fn=now_fn,
+            )
+        return True
+
+    if kind == _KIND_FIRE:
+        from engine.systems import firearms as firearms_mod
+        if not firearms_mod.can_fire(character):
+            return True
+        sight = firearms_mod.get_sight(character) or {}
+        target = sight.get("target")
+        zone = sight.get("zone")
+        if target is None:
+            return True
+        profile = VERB_PROFILES["fire"]
+        readiness_mod.spend_balance(
+            character, profile["balance_cost"], now_fn=now_fn,
+        )
+        firearms_mod.consume_chamber(character)
+        open_telegraph(
+            character, target, "fire",
+            now_fn=now_fn,
+            zone=zone,
+            profile=profile,
         )
         return True
 
@@ -576,14 +668,10 @@ def _resolve_command(character, cmd, *, game=None, rng=None, now_fn=None,
         readiness_mod.spend_balance(
             character, profile["balance_cost"], now_fn=now_fn,
         )
-        zone = getattr(character, AIM_ZONE_ATTR, None)
-        # Aim is one-shot -- clear after the strike that consumed it.
-        if zone is not None:
-            setattr(character, AIM_ZONE_ATTR, None)
         open_telegraph(
             character, target, verb,
             now_fn=now_fn,
-            zone=zone,
+            zone=None,
             profile=profile,
         )
         return True

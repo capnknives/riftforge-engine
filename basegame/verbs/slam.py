@@ -1,6 +1,7 @@
-"""slam.py -- slam/throw environmental breach verbs (engine breach kit)."""
+"""slam.py -- slam/throw environmental breach + grapple throw/slam."""
 
 from engine.systems import breach as breach_mod
+from engine.systems import grapple as grapple_mod
 
 DEFAULT_SLAM_DAMAGE = 8
 
@@ -13,7 +14,11 @@ def _pick_target(room, args):
 
 
 def cmd_slam(character, args, game):
-    """Slam a wall/floor prop; wreck it to burst through."""
+    """Slam a held victim into a surface, or chip a wall/floor prop."""
+    if grapple_mod.get_held_victim(character) is not None:
+        ok, msg = grapple_mod.slam_held(character, args, game)
+        character.session.send(msg)
+        return
     room = getattr(character, "location", None)
     if room is None:
         character.session.send("You are nowhere.")
@@ -39,14 +44,18 @@ def cmd_slam(character, args, game):
 
 
 def cmd_throw(character, args, game):
-    """Throw someone into a breachable surface; wreck ejects them through."""
+    """Throw a held victim in a direction, or hurl someone into a wall."""
+    if grapple_mod.get_held_victim(character) is not None:
+        ok, msg = grapple_mod.throw_held(character, args, game)
+        character.session.send(msg)
+        return
     room = getattr(character, "location", None)
     if room is None:
         character.session.send("You are nowhere.")
         return
     parts = (args or "").strip().split(maxsplit=1)
     if not parts:
-        character.session.send("Throw whom?")
+        character.session.send("Throw whom? (or grab someone, then throw <dir>)")
         return
     name = parts[0]
     fragment = parts[1] if len(parts) > 1 else ""

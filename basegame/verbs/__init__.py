@@ -15,7 +15,7 @@ from basegame.verbs.character import cmd_score
 from basegame.verbs.mail import cmd_mail
 from basegame.verbs.weather import cmd_forecast, cmd_weather
 from basegame.verbs.work import cmd_work
-from basegame.verbs.fly import cmd_descend, cmd_fly
+from basegame.verbs.fly import cmd_descend, cmd_fly, cmd_hover
 from basegame.verbs.slam import cmd_slam, cmd_throw
 from basegame.verbs.justice import cmd_arrest, cmd_payfine, cmd_steal
 from basegame.verbs.treat import cmd_treat
@@ -46,18 +46,29 @@ from basegame.verbs.press_beat import (
 from basegame.verbs.lodging import cmd_rent_bed, cmd_sleep, cmd_wake
 from basegame.verbs.walk import cmd_jog, cmd_run, cmd_walk
 from basegame.verbs.loadcombat import cmd_loadcombat
+from basegame.verbs.dig import cmd_dig
+from basegame.verbs.phone import cmd_answer, cmd_call, cmd_dial, cmd_hangup
+from basegame.verbs.appearance import cmd_appearance
+from basegame.verbs.relate import cmd_friend, cmd_relate
+from basegame.verbs.greet import cmd_greet
 from engine.systems.active_combat_verbs import (
     cmd_aim,
     cmd_autodefense,
     cmd_block,
     cmd_clear_combat_queue,
     cmd_dodge,
+    cmd_fire,
+    cmd_grab,
     cmd_headbutt,
     cmd_jab,
     cmd_kick,
     cmd_legkick,
+    cmd_load,
     cmd_parry,
     cmd_punch,
+    cmd_pursuit,
+    cmd_reload,
+    cmd_skills,
     cmd_sweep,
     cmd_uppercut,
 )
@@ -163,7 +174,11 @@ BASEGAME_COMMANDS = {
     ),
     "fly": (
         cmd_fly,
-        "Stellar flight: macro / globe / orbit (see 'help stellar')",
+        "Stellar flight: climb macro / globe / orbit layers (see 'help stellar')",
+    ),
+    "hover": (
+        cmd_hover,
+        "lift off inside this room -- map layers unchanged (see 'help stellar')",
     ),
     "descend": (
         cmd_descend,
@@ -199,11 +214,11 @@ BASEGAME_COMMANDS = {
     ),
     "slam": (
         cmd_slam,
-        "slam a breachable wall or floor (see 'help breach')",
+        "slam a wall, or slam someone you are holding (see 'help active-combat')",
     ),
     "throw": (
         cmd_throw,
-        "throw someone into a breachable surface (see 'help breach')",
+        "throw held foe <dir>, or throw <name> into a wall (see 'help breach')",
     ),
     "shroud": (
         cmd_shroud,
@@ -260,9 +275,33 @@ BASEGAME_COMMANDS = {
         cmd_headbutt,
         "active combat: headbutt (see 'help active-combat')",
     ),
+    "grab": (
+        cmd_grab,
+        "active combat: grab a target (see 'help active-combat')",
+    ),
+    "pursuit": (
+        cmd_pursuit,
+        "active combat: auto chase when your target leaves (see 'help active-combat')",
+    ),
+    "skills": (
+        cmd_skills,
+        "list strikes, grapple, and defense verbs (see 'help active-combat')",
+    ),
     "aim": (
         cmd_aim,
-        "active combat: aim <zone>|clear (see 'help active-combat')",
+        "active combat: sight firearm on <name> [zone] (see 'help active-combat')",
+    ),
+    "load": (
+        cmd_load,
+        "active combat: chamber a round (see 'help active-combat')",
+    ),
+    "reload": (
+        cmd_reload,
+        "fill firearm magazine from reserve (see 'help active-combat')",
+    ),
+    "fire": (
+        cmd_fire,
+        "active combat: discharge chambered round (see 'help active-combat')",
     ),
     "dodge": (
         cmd_dodge,
@@ -287,5 +326,41 @@ BASEGAME_COMMANDS = {
     "loadcombat": (
         cmd_loadcombat,
         "load swing or active_combat backend (see 'help active-combat')",
+    ),
+    "dig": (
+        cmd_dig,
+        "carve a new room off here (see 'help dig')",
+    ),
+    "dial": (
+        cmd_dial,
+        "dial a phone number or alias (see 'help phone')",
+    ),
+    "call": (
+        cmd_call,
+        "alias for dial (see 'help phone')",
+    ),
+    "answer": (
+        cmd_answer,
+        "answer a ringing phone (see 'help phone')",
+    ),
+    "hangup": (
+        cmd_hangup,
+        "hang up the active call (see 'help phone')",
+    ),
+    "appearance": (
+        cmd_appearance,
+        "list or set look slots (see 'help appearance')",
+    ),
+    "relate": (
+        cmd_relate,
+        "list or set relationship tags (see 'help relationships')",
+    ),
+    "friend": (
+        cmd_friend,
+        "shortcut: relate <name> friend (see 'help relationships')",
+    ),
+    "greet": (
+        cmd_greet,
+        "greet someone here for persona flavor (see 'help personas')",
     ),
 }

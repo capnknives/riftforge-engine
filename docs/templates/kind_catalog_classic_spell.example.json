@@ -1,0 +1,11 @@
+{
+    "_guide": "Generated from classic/content/kinds/catalog.classic.spell.json. Use content_new.py lint.",
+    "id": "bolt",
+    "name": "Bolt",
+    "classes": ["mage"],
+    "min_level": 1,
+    "spell_kind": "attack",
+    "damage_die": 6,
+    "ability": "INT",
+    "help": "Arcane bolt -- d20 + INT mod vs AC, 1d6 on hit."
+}

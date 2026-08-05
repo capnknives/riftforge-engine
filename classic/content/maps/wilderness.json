@@ -1,0 +1,122 @@
+{
+    "kind": "map.classic.wilderness",
+    "id": "wilderness",
+    "plane": "earth",
+    "realm": "prime",
+    "autoload": true,
+    "_comment": "Classic MVP wilds -- simple linked rooms, no America atlas.",
+    "wilderness": true,
+    "rooms": [
+        {
+            "key": "WL00001",
+            "title": "Wild Country - Forest Trail",
+            "vnum": "WL00001",
+            "description": "A packed dirt trail winds between oaks and scrub. Millbrook's walls lie east; deeper forest waits west and north.",
+            "area_type": "forest",
+            "outdoor": true,
+            "exits": {
+                "east": "MB00010",
+                "west": "WL00002",
+                "north": "WL00003"
+            }
+        },
+        {
+            "key": "WL00002",
+            "title": "Wild Country - Rocky Knoll",
+            "vnum": "WL00002",
+            "description": "Weathered granite breaks through thin soil. You can see crows wheeling over the treeline.",
+            "area_type": "mountains",
+            "outdoor": true,
+            "exits": {
+                "east": "WL00001",
+                "south": "WL00004"
+            }
+        },
+        {
+            "key": "WL00003",
+            "title": "Wild Country - Creek Bed",
+            "vnum": "WL00003",
+            "description": "A shallow creek cuts through mossy stones. Tracks in the mud might be deer -- or something hungrier.",
+            "area_type": "forest",
+            "outdoor": true,
+            "exits": {
+                "south": "WL00001",
+                "north": "WL00005"
+            }
+        },
+        {
+            "key": "WL00004",
+            "title": "Wild Country - Wolf Run",
+            "vnum": "WL00004",
+            "description": "Torn fur snags on brambles. A lean wolf watches from the shadows if you linger.",
+            "area_type": "forest",
+            "outdoor": true,
+            "wilderness": true,
+            "no_random_spawn": false,
+            "exits": {
+                "north": "WL00002",
+                "west": "WL00006"
+            }
+        },
+        {
+            "key": "WL00005",
+            "title": "Wild Country - Goblin Camp",
+            "vnum": "WL00005",
+            "description": "A crude fire pit and stolen crates mark a goblin camp. Green ears twitch at every snapped twig.",
+            "area_type": "forest",
+            "outdoor": true,
+            "wilderness": true,
+            "exits": {
+                "south": "WL00003"
+            }
+        },
+        {
+            "key": "WL00006",
+            "title": "Wild Country - Pine Stand",
+            "vnum": "WL00006",
+            "description": "Tall pines choke the light. The wind sounds like distant howling.",
+            "area_type": "forest",
+            "outdoor": true,
+            "exits": {
+                "east": "WL00004",
+                "west": "WL00007"
+            }
+        },
+        {
+            "key": "WL00007",
+            "title": "Wild Country - Old Road",
+            "vnum": "WL00007",
+            "description": "Cobbles peek through grass on a forgotten imperial road. Millbrook traders rarely come this far.",
+            "area_type": "plains",
+            "outdoor": true,
+            "exits": {
+                "east": "WL00006",
+                "south": "WL00008"
+            }
+        },
+        {
+            "key": "WL00008",
+            "title": "Wild Country - Meadow Edge",
+            "vnum": "WL00008",
+            "description": "Wildflowers give way to open meadow. Good camping, if the wolves agree.",
+            "area_type": "plains",
+            "outdoor": true,
+            "exits": {
+                "north": "WL00007",
+                "east": "WL00009"
+            }
+        },
+        {
+            "key": "WL00009",
+            "title": "Wild Country - Hunter's Rest",
+            "vnum": "WL00009",
+            "description": "A ring of cold ash and a broken arrow shaft. Someone rested here recently.",
+            "area_type": "forest",
+            "outdoor": true,
+            "exits": {
+                "west": "WL00008",
+                "north": "WL00002"
+            }
+        }
+    ]
+}

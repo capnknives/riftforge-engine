@@ -364,6 +364,40 @@ def origin_heal_mult(character):
     return mult
 
 
+def apply_incoming_damage(
+    character,
+    amount,
+    region=None,
+    *,
+    limb_actor_check=None,
+):
+    """Limb-first routing for one located hit.
+
+    When ``set_max_hp_resolver`` is registered and ``region`` is a valid
+    logical aim zone (``head``, ``torso``, ``arms``, …), soaks damage on
+    the struck pool and returns only the overflow for aggregate HP.
+    Otherwise returns the full ``amount`` unchanged.
+
+    ``limb_actor_check(character)`` may veto routing (basegame: non-NPC
+    only). When omitted, NPCs are skipped.
+    """
+    amount = max(0, int(amount))
+    if amount <= 0 or _max_hp_resolver is None or not region:
+        return amount
+    if limb_actor_check is not None:
+        if not limb_actor_check(character):
+            return amount
+    elif getattr(character, "is_npc", False):
+        return amount
+    weights = character_region_weights(character)
+    if region not in weights and region not in BILATERAL_PAIRS:
+        return amount
+    struck = resolve_struck_region(character, region)
+    plan = plan_region_damage(character, struck, amount)
+    apply_region_damage(character, plan)
+    return int(plan.get("limb_bleed_to_agg") or 0)
+
+
 def apply_region_damage(character, plan):
     """Commit a frozen `plan_region_damage`-shaped result onto `character`.
 

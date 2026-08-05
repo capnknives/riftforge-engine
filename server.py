@@ -62,6 +62,12 @@ TICKS_PER_GAME_DAY = 9600
 AUTOSAVE_INTERVAL_SECONDS = 60.0
 
 
+def db_path_from_env(default="riftforge.db"):
+    """SQLite path for this process (``RIFTFORGE_DB``), or *default* when unset."""
+    raw = (os.environ.get("RIFTFORGE_DB") or "").strip()
+    return raw or default
+
+
 class Game:
     """Holds all shared game state: the world, the database, and live sessions."""
 
@@ -800,7 +806,7 @@ async def main():
 
     game_heartbeat.touch_heartbeat("main_enter")
     try:
-        game = Game()
+        game = Game(db_path=db_path_from_env())
     except Exception as exc:
         # Watcher reads this on child exit to spot DB corruption loops.
         try:
@@ -818,7 +824,7 @@ async def main():
         # SIGUSR1 still runs copyover._perform: announce Veil line, save, exit
         # so watch_and_run can respawn (clients stay on the gateway).
         print(
-            "SUPERS engine behind gateway "
+            f"Riftforge ({game_select.game_name()}) behind gateway "
             f"(IPC {os.environ.get('RIFTFORGE_GATEWAY_IPC', '127.0.0.1:4001')})",
             flush=True,
         )
@@ -852,7 +858,10 @@ async def main():
         host="0.0.0.0",                   # accept connections on any network interface
         port=port,
     )
-    print(f"SUPERS engine listening on port {port}  (telnet localhost {port})")
+    print(
+        f"Riftforge ({game_select.game_name()}) listening on port {port}  "
+        f"(telnet localhost {port})"
+    )
 
     # Copyover (see copyover.py): SIGUSR1 triggers a hot in-place reload that
     # keeps every connected client's socket open across it -- distinct from

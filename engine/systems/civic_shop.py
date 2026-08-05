@@ -68,6 +68,179 @@ def find_ware(wares, name_fragment):
     return None
 
 
+def stock_price_cents(ware):
+    """Shelf price in cents from civic ``price_cents`` or dollar ``price``."""
+    if not isinstance(ware, dict):
+        return 0
+    if WARE_PRICE in ware:
+        try:
+            return int(ware.get(WARE_PRICE) or 0)
+        except (TypeError, ValueError):
+            return 0
+    return economy_mod.money_to_cents(ware.get("price", 0))
+
+
+def stock_qty(ware):
+    """Finite stock count, or ``None`` when unlimited."""
+    if not isinstance(ware, dict) or WARE_QTY not in ware:
+        return None
+    qty = ware.get(WARE_QTY)
+    if qty is None:
+        return None
+    try:
+        return int(qty)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_finite_stock(ware):
+    """True when ``ware`` carries a finite ``qty`` field."""
+    return stock_qty(ware) is not None
+
+
+def consume_stock(ware, stock_list=None):
+    """Decrement finite ``qty``; drop from ``stock_list`` when depleted.
+
+    Unlimited wares (no ``qty`` key) are unchanged. When ``stock_list`` is
+    omitted the row may remain at qty 0 (civic ``shop_stock``). When a list
+    is passed, sold-out rows are removed (SUPERS ``vendor_stock``).
+  """
+    if not is_finite_stock(ware):
+        return True
+    qty = int(ware[WARE_QTY])
+    ware[WARE_QTY] = qty - 1
+    if ware[WARE_QTY] <= 0:
+        if stock_list is not None:
+            try:
+                stock_list.remove(ware)
+            except ValueError:
+                pass
+        return False
+    return True
+
+
+def increment_stock(ware):
+    """Raise finite ``qty`` by one; unlimited rows unchanged."""
+    if not is_finite_stock(ware):
+        return
+    ware[WARE_QTY] = int(ware[WARE_QTY]) + 1
+
+
+def transfer_purchase_payment(
+    buyer,
+    price_cents,
+    *,
+    debit_reason,
+    tick=None,
+    payee=None,
+    credit_reason=None,
+):
+    """Debit ``buyer``; optionally credit ``payee`` (shopkeeper).
+
+    Returns ``(ok, error_code)`` where ``error_code`` is ``cant_afford``,
+    ``payment_failed``, or ``None`` on success.
+    """
+    price_cents = int(price_cents or 0)
+    if not economy_mod.can_afford(buyer, 0, cents=price_cents):
+        return False, "cant_afford"
+    if not economy_mod.debit_wallet(
+        buyer,
+        0,
+        cents=price_cents,
+        reason=debit_reason,
+        tick=tick,
+    ):
+        return False, "payment_failed"
+    if payee is not None and payee is not buyer:
+        d, c = economy_mod.cents_to_parts(price_cents)
+        economy_mod.credit_wallet(
+            payee,
+            d,
+            c,
+            reason=credit_reason or debit_reason,
+            tick=tick,
+        )
+    return True, None
+
+
+def transfer_sale_payout(
+    seller,
+    price_cents,
+    *,
+    credit_reason,
+    tick=None,
+    payer=None,
+    debit_reason=None,
+):
+    """Credit ``seller``; optionally debit ``payer`` (vendor buy-back).
+
+    When the payer cannot cover the payout, their wallet is zeroed (pawn
+    shops still take the goods). Always credits the seller.
+    """
+    price_cents = int(price_cents or 0)
+    d, c = economy_mod.cents_to_parts(price_cents)
+    economy_mod.credit_wallet(
+        seller,
+        d,
+        c,
+        reason=credit_reason,
+        tick=tick,
+    )
+    if payer is not None and payer is not seller:
+        if not economy_mod.debit_wallet(
+            payer,
+            d,
+            c,
+            reason=debit_reason or credit_reason,
+            tick=tick,
+        ):
+            economy_mod.set_wallet(payer, 0, 0)
+    return True
+
+
+def purchase_at_stock(
+    buyer,
+    ware,
+    price_cents,
+    *,
+    stock_list=None,
+    spawn_item,
+    debit_reason,
+    tick=None,
+    payee=None,
+    credit_reason=None,
+):
+    """Debit wallet, consume stock, spawn item, append to inventory.
+
+    ``spawn_item(ware)`` builds the purchased ``Item``. Returns
+    ``(ok, error_code, item)`` where ``error_code`` is ``out_of_stock``,
+    ``cant_afford``, ``payment_failed``, or ``None`` on success.
+    """
+    qty = stock_qty(ware)
+    if qty is not None and qty <= 0:
+        return False, "out_of_stock", None
+
+    ok, err = transfer_purchase_payment(
+        buyer,
+        price_cents,
+        debit_reason=debit_reason,
+        tick=tick,
+        payee=payee,
+        credit_reason=credit_reason,
+    )
+    if not ok:
+        return False, err, None
+
+    consume_stock(ware, stock_list)
+    item = spawn_item(ware)
+    inventory = getattr(buyer, "inventory", None)
+    if inventory is None:
+        buyer.inventory = []
+        inventory = buyer.inventory
+    inventory.append(item)
+    return True, None, item
+
+
 def _spawn_purchased_item(ware):
     """Build an inventory Item for a bought ware."""
     normalized = _normalize_ware(ware)
@@ -87,41 +260,33 @@ def buy(character, wares, ware, *, game=None):
     when stock is finite. ``game`` is accepted for tick/reason parity with
     economy helpers but is optional.
     """
-    del game  # reserved for ledger tick stamps via economy when wired
+    del wares, game  # civic list unused; tick reserved for ledger wiring
     try:
         normalized = _normalize_ware(ware)
     except ValueError as exc:
         return False, str(exc)
 
     price = normalized[WARE_PRICE]
-    qty = normalized[WARE_QTY]
-    if qty is not None and qty <= 0:
-        return False, "That item is out of stock."
-
-    if not economy_mod.can_afford(character, 0, cents=price):
-        d, c = economy_mod.cents_to_parts(price)
-        return False, (
-            f"You cannot afford {normalized[WARE_KEY]} "
-            f"({economy_mod.format_money(d, c)})."
-        )
-
-    if not economy_mod.debit_wallet(
+    ok, err, item = purchase_at_stock(
         character,
-        0,
-        cents=price,
-        reason=f"Buy {normalized[WARE_KEY]}",
-    ):
+        ware,
+        price,
+        stock_list=None,
+        spawn_item=_spawn_purchased_item,
+        debit_reason=f"Buy {normalized[WARE_KEY]}",
+    )
+    if not ok:
+        if err == "out_of_stock":
+            return False, "That item is out of stock."
+        if err == "cant_afford":
+            d, c = economy_mod.cents_to_parts(price)
+            return False, (
+                f"You cannot afford {normalized[WARE_KEY]} "
+                f"({economy_mod.format_money(d, c)})."
+            )
         return False, "Payment failed."
 
-    if qty is not None:
-        ware[WARE_QTY] = qty - 1
-
-    item = _spawn_purchased_item(ware)
-    inventory = getattr(character, "inventory", None)
-    if inventory is None:
-        character.inventory = []
-        inventory = character.inventory
-    inventory.append(item)
+    del item  # spawned and appended inside purchase_at_stock
     d, c = economy_mod.cents_to_parts(price)
     return True, (
         f"You buy {normalized[WARE_KEY]} for "
@@ -161,18 +326,15 @@ def sell(character, wares, ware_key, price_cents, *, game=None):
 
     inventory.remove(sold_item)
     character.inventory = inventory
-    economy_mod.credit_wallet(
+    transfer_sale_payout(
         character,
-        0,
-        cents=payout,
-        reason=f"Sell {getattr(sold_item, 'key', 'item')}",
+        payout,
+        credit_reason=f"Sell {getattr(sold_item, 'key', 'item')}",
     )
 
     restocked = find_ware(wares, getattr(sold_item, "key", ""))
     if restocked is not None:
-        rqty = restocked.get(WARE_QTY)
-        if rqty is not None:
-            restocked[WARE_QTY] = int(rqty) + 1
+        increment_stock(restocked)
 
     return True, (
         f"You sell {sold_item.key} for "

@@ -20,3 +20,5 @@ jobs:
         run: python tools/engine_smoke.py
       - name: Basegame smoke
         run: python tools/basegame_smoke.py
+      - name: Classic smoke
+        run: python tools/classic_smoke.py

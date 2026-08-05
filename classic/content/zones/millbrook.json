@@ -1,0 +1,148 @@
+{
+    "kind": "zone.classic.pocket",
+    "id": "millbrook",
+    "plane": "earth",
+    "realm": "prime",
+    "autoload": true,
+    "_comment": "Classic MVP village -- exactly ten rooms. Hub MB00001 Millbrook Square.",
+    "city_name": "Millbrook",
+    "city_color": "gold",
+    "sub_color": "silver",
+    "main_colors": {
+        "street": "silver",
+        "civic": "absinthe_green",
+        "default": "silver"
+    },
+    "rooms": [
+        {
+            "key": "MB00001",
+            "title": "Millbrook - Village Square",
+            "vnum": "MB00001",
+            "description": "A worn fountain anchors the square. Villagers gossip by the well; the trailhead south leads to the wild country.",
+            "area_type": "city",
+            "zone": "millbrook",
+            "outdoor": true,
+            "is_start": true,
+            "exits": {
+                "north": "MB00002",
+                "east": "MB00007",
+                "west": "MB00008",
+                "south": "MB00010"
+            }
+        },
+        {
+            "key": "MB00002",
+            "title": "Millbrook - Village Gate",
+            "vnum": "MB00002",
+            "description": "A timber palisade and a guard's bench face the road north. The square opens south.",
+            "area_type": "city",
+            "zone": "millbrook",
+            "outdoor": true,
+            "exits": {
+                "south": "MB00001",
+                "north": "MB00009"
+            }
+        },
+        {
+            "key": "MB00003",
+            "title": "Millbrook - Rusty Tankard Inn",
+            "vnum": "MB00003",
+            "description": "Smoke and stew steam in the common room. A bard's lute case hangs above the bar.",
+            "area_type": "city",
+            "zone": "millbrook",
+            "outdoor": false,
+            "exits": {
+                "west": "MB00007"
+            }
+        },
+        {
+            "key": "MB00004",
+            "title": "Millbrook - Smithy",
+            "vnum": "MB00004",
+            "description": "The forge hammer rings steady. Horseshoes and short swords line the wall.",
+            "area_type": "city",
+            "zone": "millbrook",
+            "outdoor": false,
+            "exits": {
+                "south": "MB00008"
+            }
+        },
+        {
+            "key": "MB00005",
+            "title": "Millbrook - Temple of the Dawn",
+            "vnum": "MB00005",
+            "description": "Sun motifs cover the altar cloth. Clerics tend the sick in quiet alcoves.",
+            "area_type": "city",
+            "zone": "millbrook",
+            "outdoor": false,
+            "exits": {
+                "east": "MB00008"
+            }
+        },
+        {
+            "key": "MB00006",
+            "title": "Millbrook - Mage Tower",
+            "vnum": "MB00006",
+            "description": "Scroll tubes and chalk diagrams clutter a narrow stair. The air smells of ozone.",
+            "area_type": "city",
+            "zone": "millbrook",
+            "outdoor": false,
+            "exits": {
+                "north": "MB00007"
+            }
+        },
+        {
+            "key": "MB00007",
+            "title": "Millbrook - Market Row",
+            "vnum": "MB00007",
+            "description": "Canvas awnings shade stalls of grain, cloth, and iron pots. The inn lies west; the tower north.",
+            "area_type": "city",
+            "zone": "millbrook",
+            "outdoor": true,
+            "exits": {
+                "west": "MB00001",
+                "east": "MB00003",
+                "north": "MB00006"
+            }
+        },
+        {
+            "key": "MB00008",
+            "title": "Millbrook - Town Well",
+            "vnum": "MB00008",
+            "description": "A stone well rope creaks in the breeze. Buckets and gossip gather here at dusk.",
+            "area_type": "city",
+            "zone": "millbrook",
+            "outdoor": true,
+            "exits": {
+                "east": "MB00001",
+                "west": "MB00005",
+                "north": "MB00004"
+            }
+        },
+        {
+            "key": "MB00009",
+            "title": "Millbrook - Barracks",
+            "vnum": "MB00009",
+            "description": "Bunks and weapon racks for the village guard. A duty roster lists wolf sightings.",
+            "area_type": "city",
+            "zone": "millbrook",
+            "outdoor": false,
+            "exits": {
+                "south": "MB00002"
+            }
+        },
+        {
+            "key": "MB00010",
+            "title": "Millbrook - Trailhead",
+            "vnum": "MB00010",
+            "description": "A signpost reads 'Wild Country -- mind the wolves.' The forest trail runs west; the square is north.",
+            "area_type": "city",
+            "zone": "millbrook",
+            "outdoor": true,
+            "exits": {
+                "north": "MB00001",
+                "west": "WL00001"
+            }
+        }
+    ]
+}
