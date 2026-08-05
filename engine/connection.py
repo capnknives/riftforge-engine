@@ -1086,6 +1086,13 @@ class Session:
             char.move_to(start_room)
             self._promote_to_sessions()  # register for 'who' and broadcasts
             start_room.broadcast(f"{legal} materializes.", exclude=char)
+            from engine import gm_notify
+            gm_notify.ping_gms(
+                self.game,
+                f"{legal} finished chargen and entered the world{{from}}.",
+                exclude=char,
+                peer_session=self,
+            )
             self.send(
                 f"\r\nWelcome, {legal}! Type 'help newbie' to get started "
                 f"(or 'help' for the topic list)."

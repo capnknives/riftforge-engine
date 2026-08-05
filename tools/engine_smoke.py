@@ -30,7 +30,6 @@ import importlib.util
 import os
 import re
 import sys
-import engine.systems.economy as economy_wallet
 
 
 def _repo_root():
@@ -45,6 +44,12 @@ def _ensure_repo_on_path():
         sys.path.insert(0, root)
     # Always chdir to the repo so maps.py finds content/maps relative paths.
     os.chdir(root)
+
+
+# Repo root must win over any unrelated ``engine`` install on sys.path before
+# the module-level economy import below (CI has no collision; local dev may).
+_ensure_repo_on_path()
+import engine.systems.economy as economy_wallet
 
 
 def _require_supers_absent():
@@ -126,7 +131,7 @@ def main():
 
     c = Character("LeanEngine")
     assert c.key == "LeanEngine"
-    assert not hasattr(c, "origin"), c.__dict__.keys()
+    assert c.origin == "mundane", c.origin
     # stats/tier are generic engine content now (engine/stats.py) -- a bare
     # Character gets the real default spine, not a SUPERS-only extra.
     assert c.stats == {
@@ -529,6 +534,275 @@ def main():
         find_item=lambda _n, cands: cands[0] if cands else None,
     )
     assert ok and removed is tee and tee.worn is False, msg
+
+    # ---- combat engine plugin architecture ----
+    from engine.systems import combat_engine
+    from engine.systems import combat_martial_arts
+    from engine.systems import combat_mundane
+
+    known = combat_engine.known_combat_engines()
+    assert {"mundane", "martial_arts"}.issubset(known), known
+
+    class _SwingPair:
+        """Throwaway attacker/defender stand-ins for engine combat smokes."""
+
+        def __init__(self, key, hp=100.0):
+            self.key = key
+            self.hp = hp
+
+    mundane_attacker = _SwingPair("MundaneA")
+    mundane_defender = _SwingPair("MundaneD", hp=100.0)
+    # rng=0.0 lands the first weighted bucket -> critical (16 damage).
+    mundane_res = combat_engine.resolve_swing(
+        "mundane", mundane_attacker, mundane_defender, rng=lambda: 0.0,
+    )
+    assert mundane_res is not None, mundane_res
+    assert mundane_res["result"]["outcome"] == "critical", mundane_res
+    assert mundane_res["result"]["damage"] == combat_mundane.DAMAGE_PER_CRITICAL
+    assert mundane_defender.hp == (
+        100.0 - combat_mundane.DAMAGE_PER_CRITICAL
+    ), mundane_defender.hp
+
+    # rng=1.0 falls past every weighted bucket -> miss, zero damage.
+    mundane_defender.hp = 100.0
+    miss_res = combat_engine.resolve_swing(
+        "mundane", mundane_attacker, mundane_defender, rng=lambda: 1.0,
+    )
+    assert miss_res["result"]["outcome"] == "miss", miss_res
+    assert miss_res["result"]["damage"] == 0.0
+    assert mundane_defender.hp == 100.0
+
+    ma_attacker = _SwingPair("MaA")
+    ma_defender = _SwingPair("MaD", hp=100.0)
+    ma_attacker.martial_stance = "strike"
+    ma_defender.martial_stance = "grapple"
+    ma_res = combat_engine.resolve_swing(
+        "martial_arts", ma_attacker, ma_defender, rng=lambda: 0.0,
+    )
+    assert ma_res is not None, ma_res
+    assert ma_res["result"]["outcome"] == "advantage", ma_res
+    expected_ma_damage = (
+        combat_martial_arts.BASE_DAMAGE
+        + combat_martial_arts.COMBO_BONUS_PER_STACK * 1
+    )
+    assert ma_res["result"]["damage"] == expected_ma_damage, ma_res
+    assert ma_res["result"]["combo"] == 1
+    assert ma_attacker.martial_combo == 1
+    assert ma_defender.hp == 100.0 - expected_ma_damage
+
+    assert combat_engine.resolve_swing(
+        "totally-unknown-id", mundane_attacker, mundane_defender,
+    ) is None
+
+    # ---- civic shop framework ----
+    from engine.systems import civic_shop
+
+    wares = [
+        {
+            "key": "a bolt",
+            "description": "A hex bolt.",
+            "price_cents": 199,
+            "qty": 2,
+        },
+        {
+            "key": "a nail",
+            "description": "A box of nails.",
+            "price_cents": 50,
+            "qty": None,
+        },
+    ]
+    assert civic_shop.find_ware(wares, "bolt") is wares[0]
+    assert civic_shop.find_ware(wares, "nail") is wares[1]
+    assert civic_shop.find_ware(wares, "missing") is None
+
+    class _Shopper:
+        pass
+
+    shopper = _Shopper()
+    economy_wallet.set_wallet(shopper, 1, 0)
+    shopper.inventory = []
+    ok, msg = civic_shop.buy(shopper, wares, wares[0])
+    assert ok is False and "afford" in msg.lower(), (ok, msg)
+
+    economy_wallet.set_wallet(shopper, 5, 0)
+    ok, msg = civic_shop.buy(shopper, wares, wares[0])
+    assert ok and shopper.inventory and wares[0]["qty"] == 1, (ok, msg, wares[0])
+
+    wares[0]["qty"] = 0
+    ok, msg = civic_shop.buy(shopper, wares, wares[0])
+    assert ok is False and "stock" in msg.lower(), (ok, msg)
+
+    ok, msg = civic_shop.sell(shopper, wares, "bolt", 99)
+    assert ok, (ok, msg)
+    assert economy_wallet.wallet_total_cents(shopper) == 301 + 99, (
+        economy_wallet.wallet_total_cents(shopper)
+    )
+    assert wares[0]["qty"] == 1, wares[0]
+
+    # ---- clinic framework ----
+    from engine.systems import clinic
+    from world import Room
+
+    class _Patient:
+        pass
+
+    patient = _Patient()
+    patient.key = "Patient"
+    patient.hp = 0.0
+    patient.hp_cap = 10.0
+    patient.location = Room("street")
+    patient.hospitalized = False
+    patient.hospital_until_tick = 0
+    patient.downed = False
+    patient.downed_until_tick = 0
+
+    ward = Room("ward")
+    ward.hospital = True
+
+    class _ClinicGame:
+        game_time_ticks = 0
+        rooms = {"ward": ward}
+
+    clinic.enter_ko(patient, game=_ClinicGame())
+    assert clinic.is_ko(patient)
+    assert clinic.admit(patient, ward, game=_ClinicGame())
+    assert patient.hospitalized and patient.location is ward
+    clinic.discharge(patient)
+    assert not patient.hospitalized
+
+    from world import Character
+
+    cg = _ClinicGame()
+    cg.characters = set()
+    tick_patient = Character("TickPatient")
+    tick_patient.hp = 0.0
+    tick_patient.hp_cap = 10.0
+    tick_patient.location = Room("street")
+    clinic.enter_ko(tick_patient, until_tick=1, game=cg)
+    cg.characters.add(tick_patient)
+    cg.game_time_ticks = 2
+    clinic.tick(cg)
+    assert tick_patient.hospitalized, tick_patient.__dict__
+
+    # ---- justice framework ----
+    from engine.systems import justice
+    from engine import hooks
+
+    class _Suspect:
+        pass
+
+    suspect = _Suspect()
+    suspect.key = "Suspect"
+    suspect.wanted = False
+    suspect.fine_owed_cents = 0
+    suspect.jail_until_tick = None
+    suspect.location = Room("cell")
+    suspect.location.is_cell = True
+    economy_wallet.set_wallet(suspect, 10, 0)
+
+    class _JusticeGame:
+        game_time_ticks = 0
+        rooms = {"cell": suspect.location}
+
+    justice.mark_wanted(suspect)
+    assert justice.is_wanted(suspect)
+    assert justice.jail(suspect, suspect.location, until_tick=5, game=_JusticeGame())
+    assert justice.is_jailed(suspect, _JusticeGame())
+    block = justice.move_gate_block(
+        suspect, suspect.location, Room("outside"), _JusticeGame(),
+    )
+    assert block
+    ok, _msg = justice.pay_fine(suspect, game=_JusticeGame())
+    assert ok
+    jg = _JusticeGame()
+    jg.game_time_ticks = 6
+    justice.tick(jg)
+    assert not justice.is_jailed(suspect, jg)
+
+    # ---- breach framework ----
+    from engine.systems import breach
+
+    saloon = Room("saloon")
+    saloon.layout_x = 0
+    saloon.layout_y = 0
+    saloon.layout_z = 0
+    saloon.slam_targets = [
+        {
+            "id": "wall",
+            "label": "the wall",
+            "direction": "east",
+            "hp_max": 8,
+            "tags": ["wall"],
+        }
+    ]
+    alley = Room("alley")
+    alley.layout_x = 1
+    alley.layout_y = 0
+    alley.layout_z = 0
+
+    class _BreachGame:
+        rooms = {"saloon": saloon, "alley": alley}
+
+    bg = _BreachGame()
+    picked = breach.pick_slam_target(saloon, rng=lambda: 0.0)
+    assert picked and picked["id"] == "wall"
+    res = breach.apply_slam_damage(bg, saloon, "wall", 8)
+    assert res["wrecked"], res
+    from world import Character
+    bruiser = Character("Bruiser")
+    bruiser.location = saloon
+    assert breach.breach_eject(bruiser, saloon, picked, game=bg)
+    assert bruiser.location is alley
+
+    # ---- origin registry + Alien self-registration ----
+    from engine.systems import origin_registry
+    from engine.systems import origin_alien  # noqa: F401 -- self-registers
+    from engine.systems import umbral as umbral_mod
+
+    assert "alien" in origin_registry.known_origins(), (
+        origin_registry.known_origins()
+    )
+    alien = origin_registry.get_origin("alien")
+    assert alien is not None
+    assert alien["name"] == "Alien"
+    assert callable(alien["chargen_step"])
+    assert callable(alien["on_attach"])
+    # Mundane is never registered -- it is the engine default only.
+    assert "mundane" not in origin_registry.known_origins()
+
+    umbral_char = Character("UmbralSmoke")
+    assert umbral_char.origin == "mundane"
+    umbral_mod.ensure_umbral_defaults(umbral_char)
+    umbral_char.bg_umbral = True
+    assert umbral_mod.is_umbral(umbral_char)
+    umbral_char.session = _FakeSession()
+    umbral_char.umbral_charge = 1.0
+
+    class _NightGame:
+        game_time_ticks = 0  # midnight -> night on the calendar
+
+        def __init__(self):
+            # iter_characters prefers a set roster when present.
+            self.characters = {umbral_char}
+
+    night = _NightGame()
+    umbral_mod.cmd_shroud(umbral_char, "", night)
+    assert umbral_char.umbral_shrouded is True
+    assert umbral_char.stealth_active is True
+    # Daylight refusal.
+    day = _NightGame()
+    day.game_time_ticks = 12 * 400  # noon (TICKS_PER_HOUR = 400)
+    umbral_char.umbral_shrouded = False
+    umbral_char.stealth_active = False
+    umbral_mod.cmd_shroud(umbral_char, "", day)
+    assert umbral_char.umbral_shrouded is False
+    # Night again, then drain-to-clear via tick.
+    umbral_mod.cmd_shroud(umbral_char, "", night)
+    assert umbral_char.umbral_shrouded is True
+    umbral_char.umbral_charge = umbral_mod.UMBRAL_CHARGE_STEP
+    umbral_mod.tick(night)
+    assert umbral_char.umbral_shrouded is False
+    assert umbral_char.stealth_active is False
 
     print("engine_smoke_ok")
     return 0

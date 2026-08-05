@@ -72,6 +72,8 @@ class Account:
         # ``Accountname(GM)`` -- a deliberate staff reveal. Parked spirits
         # (`gm off`) are always invisible regardless of this flag.
         self.wizinvis = True
+        # Playtester diagnostic tools (``playtest`` / ``playtester add``).
+        self.playtester = False
 
     def to_blob(self):
         """JSON-serializable extras for the accounts.data column."""
@@ -88,6 +90,7 @@ class Account:
             ),
             "gm_see_accounts": bool(self.gm_see_accounts),
             "wizinvis": bool(self.wizinvis),
+            "playtester": bool(self.playtester),
         }
 
     def apply_blob(self, data):
@@ -121,6 +124,7 @@ class Account:
         self.gm_see_accounts = bool(data.get("gm_see_accounts", False))
         # Missing key = default staff-invisible (old saves keep prior behavior).
         self.wizinvis = bool(data.get("wizinvis", True))
+        self.playtester = bool(data.get("playtester", False))
 
 
 def normalize_account_name(raw):

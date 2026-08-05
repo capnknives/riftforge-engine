@@ -400,6 +400,10 @@ def heal_region(character, region, amount):
     before = min(part_hp(character, region), cap)
     old_tier = tier_for_ratio(before / max(1, cap))
     after = min(cap, before + max(0, int(amount)))
+    # Rest / treat / knit drips must not leave a 1-HP sliver that still
+    # tiers as bruised while score rounds the limb to 100% (bug #337).
+    if after > before and after < cap and (cap - after) <= 1:
+        after = cap
     parts = ensure_body_parts(character)
     parts[region] = {"hp": after}
     healed = after - before

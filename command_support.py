@@ -44,6 +44,7 @@ from engine.command_support import (
     is_linked_self,
     is_folded,
     is_staff_stealth_presence,
+    resolve_fight_target,
     resolve_named_character,
     resolve_walk_direction,
     sort_character_target_matches,

@@ -708,6 +708,13 @@ class Character(GameObject):
         from engine import stats as stats_module
         self.stats = stats_module.new_stats()
         self.tier = 0
+        # Origin / archetype id -- generic engine spine (Phase 5 of
+        # riftforge_engine_game_shell.md). Default is the zero-config
+        # "mundane" human; registered origins (see
+        # engine/systems/origin_registry.py) overwrite this at chargen.
+        # SUPERS' attach_supers unconditionally sets "human" afterward,
+        # so this default is a no-op there.
+        self.origin = "mundane"
         # Current hit points -- generic engine vitals, not game-composed:
         # every game needs *some* notion of "how hurt is this character",
         # and combat/KO/recovery machinery (engine.hooks.recompute_hp,

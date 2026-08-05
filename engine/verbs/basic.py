@@ -2627,6 +2627,15 @@ def cmd_account(character, args, game):
             f"{_presence_face(link_body)}. "
             "Type 'account' to review."
         )
+        from engine import gm_notify
+        who = gm_notify.public_who(link_body, game)
+        gm_notify.ping_gms(
+            game,
+            f"{who} created account {new_acct.display_name} and linked "
+            f"{_presence_face(link_body)}.",
+            exclude=character,
+            peer_session=character.session,
+        )
         return
 
     if sub == "link":
@@ -2668,6 +2677,14 @@ def cmd_account(character, args, game):
             f"Linked {_presence_face(link_body)} to account "
             f"'{existing.display_name}'. "
             "Type 'account' to review."
+        )
+        from engine import gm_notify
+        who = gm_notify.public_who(link_body, game)
+        gm_notify.ping_gms(
+            game,
+            f"{who} linked to account {existing.display_name}.",
+            exclude=character,
+            peer_session=character.session,
         )
         return
 
@@ -2858,10 +2875,24 @@ def cmd_date(character, args, game):
 
 
 # Undated Unreleased bullets keep a sentinel date for display only.
-# Player-facing sort is date descending, then hidden ``#N`` id, then
-# file_index -- dates must read newest-first even when parallel PRs
-# reused or raced the same ``#N`` (id-only sort made the list look
-# scrambled). Same-day ties still use ``#N`` so merges stay stable.
+# Player-facing sort is date descending, then ``#N`` id, then file_index.
+#
+# A same-day sort keyed on the hidden ship timestamp (``sort_ts``) instead
+# of ``#N`` shipped briefly (2026-08-04) to fix a theoretical same-day
+# merge-race, but made the *visible* ``[n]`` stamps look scrambled in
+# practice: ``#N`` is allocated per-worktree at authoring time (parallel
+# feature branches each fetch "next id" from their own stale snapshot of
+# ``main``), so id order was never a reliable proxy for real ship order in
+# the first place -- sorting by the truth (``sort_ts``) just made that
+# pre-existing unreliability visible as ids bouncing around non-
+# monotonically in the list, which players found confusing/slow to skim
+# ("neat but time-consuming to go through"). Reverted: ``#N`` id is once
+# again the same-day tie-break, so what a player sees is always
+# monotonically descending top to bottom. ``sort_ts`` is still parsed and
+# still used to break genuine id *collisions* at load time (two different
+# bullets that reused the same ``#N``) -- see
+# ``_dedupe_changelog_entries_by_id`` -- just not as the primary display
+# order.
 _CHANGELOG_UNDATED = "0001-01-01"
 
 # Hidden change id at the start of a bold lead-in: ``#042 2026-07-16 — …``.
@@ -2873,36 +2904,52 @@ _CHANGELOG_ID_PREFIX_RE = re.compile(
 )
 
 # Leading date inside a bold lead-in: ``2026-07-16 — Summary`` or
-# ``2026-07-16 -- Summary``. Em dash, en dash, ASCII ``--``, or a lone
-# hyphen after the date are all accepted so merge conflict punctuation
-# does not drop the stamp.
+# ``2026-07-16T14:30:00Z — Summary``. The optional ``T…Z`` tail is a
+# hidden sort timestamp (UTC); players only see ``YYYY-MM-DD``. Em dash,
+# en dash, ASCII ``--``, or a lone hyphen after the stamp are all accepted.
 _CHANGELOG_DATE_PREFIX_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2})"
+    r"(?:T(\d{2}:\d{2}:\d{2})(?:\.\d+)?Z)?"
     r"(?:\s*[—–]\s*|\s+--\s+|\s+-\s+)"
     r"(.*)$",
     re.DOTALL,
 )
 
 
-def _strip_changelog_date_prefix(text):
-    """Pull a leading ``YYYY-MM-DD —`` stamp off *text*.
+def _changelog_sort_ts_from_date(date, time_hms=None):
+    """Build a normalized UTC sort key from display date + optional ``HH:MM:SS``."""
+    if not date or date == _CHANGELOG_UNDATED:
+        return _CHANGELOG_UNDATED + "T00:00:00Z"
+    if time_hms:
+        return f"{date}T{time_hms}Z"
+    return f"{date}T00:00:00Z"
 
-    Returns ``(date_or_None, remainder)``. Used for both the short summary
-    and the first ``full`` line so ``changes detail`` does not print the
-    date twice (once from the parsed field, once from the markdown body).
+
+def _strip_changelog_date_prefix(text):
+    """Pull a leading date stamp off *text*.
+
+    Returns ``(date_or_None, sort_ts_or_None, remainder)``. ``sort_ts`` is
+    the hidden UTC ISO key (``YYYY-MM-DDTHH:MM:SSZ``) used for ordering;
+    ``date`` is the player-facing ``YYYY-MM-DD`` only. Used for both the
+    short summary and the first ``full`` line so ``changes detail`` does not
+    print the date twice (once from the parsed field, once from the markdown
+    body).
     """
     match = _CHANGELOG_DATE_PREFIX_RE.match(text or "")
     if not match:
-        return None, text or ""
-    return match.group(1), match.group(2)
+        return None, None, text or ""
+    date = match.group(1)
+    time_hms = match.group(2)
+    sort_ts = _changelog_sort_ts_from_date(date, time_hms)
+    return date, sort_ts, match.group(3)
 
 
 def _strip_changelog_stamps(text):
-    """Pull a leading ``#N`` id and optional ``YYYY-MM-DD —`` off *text*.
+    """Pull a leading ``#N`` id and optional date/sort stamp off *text*.
 
-    Returns ``(id_int, date_or_None, remainder)``. ``id_int`` is ``0`` when
-    the bullet has no id stamp (sorts to the bottom). The id becomes the
-    visible ``[n]`` stamp in ``changes`` listings.
+    Returns ``(id_int, date_or_None, sort_ts_or_None, remainder)``.
+    ``id_int`` is ``0`` when the bullet has no id stamp (sorts to the
+    bottom). The id becomes the visible ``[n]`` stamp in ``changes`` listings.
     """
     remainder = text or ""
     change_id = 0
@@ -2911,16 +2958,19 @@ def _strip_changelog_stamps(text):
         # int() drops leading zeros so ``#042`` and ``#42`` compare equal.
         change_id = int(id_match.group(1))
         remainder = id_match.group(2)
-    date, remainder = _strip_changelog_date_prefix(remainder)
-    return change_id, date, remainder
+    date, sort_ts, remainder = _strip_changelog_date_prefix(remainder)
+    return change_id, date, sort_ts, remainder
 
 
 def _changelog_sort_key(entry):
     """Sort key for ``changes``: newest date, then highest ``#N``, then file.
 
-    Returns a tuple suitable for ``sort(..., reverse=True)``. Undated
-    entries use ``_CHANGELOG_UNDATED`` (``0001-01-01``) so they sink.
-    Missing ids use ``0`` so they lose same-day ties to stamped bullets.
+    Returns a tuple suitable for ``sort(..., reverse=True)``. Calendar
+    ``date`` is the primary key (not the hidden ``sort_ts`` -- see the
+    comment above ``_CHANGELOG_UNDATED`` for why); ``#N`` id is the
+    same-day tie-break, which keeps every visible ``[n]`` stamp
+    monotonically descending top to bottom. Undated entries sink via
+    ``_CHANGELOG_UNDATED``.
     """
     date = entry.get("date") or _CHANGELOG_UNDATED
     change_id = entry.get("id") or 0
@@ -2939,14 +2989,14 @@ def _changelog_entry_by_id(entries, change_id):
 def _dedupe_changelog_entries_by_id(entries):
     """Keep one in-game row per stamped ``#N`` when parallel PRs raced the id.
 
-    Load-time safety net: the **newest** bullet date wins so a fresh ship that
+    Load-time safety net: the **newest** ``sort_ts`` wins so a fresh ship that
     accidentally reused an older ``#N`` still appears in ``changes`` (older
-    keepers are not silently preferred). Same-day ties break on highest
-    ``file_index``. Entries without an id (``0``) are kept as-is.
+    keepers are not silently preferred). Ties break on highest ``file_index``.
 
     On-disk repair still uses ``tools/changelog_dedupe_ids.py --apply``
-    (earliest date keeps the shared id; losers get fresh high ids) so both
-    ships remain listable after a hygiene pass.
+    (earliest ``sort_ts`` keeps the shared id; losers get fresh high ids) so
+    both ships remain listable after a hygiene pass. Entries without an id
+    (``0``) are kept as-is.
     """
     if not entries:
         return entries
@@ -2957,9 +3007,11 @@ def _dedupe_changelog_entries_by_id(entries):
         if not change_id:
             no_id.append(entry)
             continue
-        # Newest date first; later file_index breaks same-day ties.
+        # Newest sort_ts first; later file_index breaks ties.
         keeper_key = (
-            entry.get("date") or _CHANGELOG_UNDATED,
+            entry.get("sort_ts") or _changelog_sort_ts_from_date(
+                entry.get("date") or _CHANGELOG_UNDATED,
+            ),
             entry.get("file_index") or 0,
         )
         existing = by_id.get(change_id)
@@ -2967,7 +3019,9 @@ def _dedupe_changelog_entries_by_id(entries):
             by_id[change_id] = entry
             continue
         existing_key = (
-            existing.get("date") or _CHANGELOG_UNDATED,
+            existing.get("sort_ts") or _changelog_sort_ts_from_date(
+                existing.get("date") or _CHANGELOG_UNDATED,
+            ),
             existing.get("file_index") or 0,
         )
         if keeper_key > existing_key:
@@ -2995,19 +3049,21 @@ def _parse_unreleased_entries(lines, *, fragment=False, file_index_start=0):
 
     Each entry is a dict::
 
-        {"category", "id", "date", "summary", "full", "file_index"}
+        {"category", "id", "date", "sort_ts", "summary", "full", "file_index"}
 
     ``id`` is the hidden monotonic ``#N`` stamp (``0`` if missing).
     ``date`` is ``YYYY-MM-DD`` for player display (or ``_CHANGELOG_UNDATED``).
+    ``sort_ts`` is ``YYYY-MM-DDTHH:MM:SSZ``, parsed but not used for the
+    primary display order (see ``_changelog_sort_key``); it still breaks
+    genuine ``#N`` collisions at load time.
 
     When ``fragment`` is True, the whole file is treated as Unreleased body
     (no ``## [Unreleased]`` heading required) so parallel PR fragment files
     can hold one bullet each without editing CHANGELOG.md.
 
-    Entries are sorted newest date first, then ``id`` descending. The
-    date-primary key keeps the in-game list reading chronologically even
-    when parallel PRs raced or reused ``#N``; same-day ties still use
-    ``#N`` so Keep-a-Changelog reshuffles do not renumber ``[n]``.
+    Entries are sorted newest ``date`` first, then ``id`` descending, so
+    every visible ``[n]`` stamp in ``changes`` reads monotonically top to
+    bottom.
     """
     entries = []
     # Fragments are Unreleased-only files; the monolith uses a section gate.
@@ -3059,11 +3115,12 @@ def _parse_unreleased_entries(lines, *, fragment=False, file_index_start=0):
                 # silently cutting a sentence off mid-word. 'full' below
                 # still carries the whole thing for 'changes detail'.
                 lead = bullet + " ..."
-            change_id, date, summary = _strip_changelog_stamps(lead)
+            change_id, date, sort_ts, summary = _strip_changelog_stamps(lead)
             current = {
                 "category": category,
                 "id": change_id,
                 "date": date or _CHANGELOG_UNDATED,
+                "sort_ts": sort_ts,
                 "summary": summary,
                 "full": [bullet],
                 "file_index": file_index,
@@ -3079,7 +3136,7 @@ def _parse_unreleased_entries(lines, *, fragment=False, file_index_start=0):
         if current is not None and stripped:
             current["full"].append(stripped)
 
-    # Newest date first; highest id wins same-day ties; id 0 / undated sink.
+    # Newest date first; highest id wins same-day ties; undated sink.
     entries.sort(key=_changelog_sort_key, reverse=True)
     return entries
 
@@ -3161,14 +3218,14 @@ def _changelog_detail_body(entry):
         first = parts[0]
         bold = re.match(r"\*\*(.+?)\*\*(.*)$", first, re.DOTALL)
         if bold:
-            _id, _date, rest_lead = _strip_changelog_stamps(bold.group(1))
+            _id, _date, _sort_ts, rest_lead = _strip_changelog_stamps(bold.group(1))
             rebuilt = rest_lead + bold.group(2)
             parts[0] = rebuilt.strip() or rest_lead
         elif first.startswith("**"):
-            _id, _date, remainder = _strip_changelog_stamps(first[2:])
+            _id, _date, _sort_ts, remainder = _strip_changelog_stamps(first[2:])
             parts[0] = remainder
         else:
-            _id, _date, remainder = _strip_changelog_stamps(first)
+            _id, _date, _sort_ts, remainder = _strip_changelog_stamps(first)
             parts[0] = remainder
     body = " ".join(parts).strip()
     date = entry.get("date") or _CHANGELOG_UNDATED
@@ -3783,14 +3840,20 @@ def cmd_drop(character, args, game):
         character.session.send(refuse)
         return
 
+    from engine.systems import containers as containers_mod
+
+    unit = containers_mod.peel_one_carried_unit(character, item)
+    if unit is None:
+        character.session.send("You aren't carrying that.")
+        return
+
     # The reverse of get: out of inventory, into the room.
-    character.inventory.remove(item)
-    character.location.add(item)
+    character.location.add(unit)
     from engine import hooks
-    hooks.after_floor_drop(game, item)
-    character.session.send(f"You drop {item.key}.")
+    hooks.after_floor_drop(game, unit)
+    character.session.send(f"You drop {unit.key}.")
     character.location.broadcast(
-        f"{_presence_face(character)} drops {item.key}.", exclude=character
+        f"{_presence_face(character)} drops {unit.key}.", exclude=character
     )
 
 
@@ -3865,17 +3928,23 @@ def cmd_give(character, args, game):
         character.session.send(refusal)
         return
 
-    character.inventory.remove(item)
-    target.inventory.append(item)
-    stow_msg = hooks.after_acquire_item(target, item)
+    from engine.systems import containers as containers_mod
+
+    unit = containers_mod.peel_one_carried_unit(character, item)
+    if unit is None:
+        character.session.send("You aren't carrying that.")
+        return
+
+    target.inventory.append(unit)
+    stow_msg = hooks.after_acquire_item(target, unit)
 
     giver_face = _presence_face(character)
     target_face = _presence_face(target)
-    character.session.send(f"You give {item.key} to {target_face}.")
+    character.session.send(f"You give {unit.key} to {target_face}.")
     if getattr(target, "session", None):
-        target.session.send(f"{giver_face} gives you {item.key}.")
+        target.session.send(f"{giver_face} gives you {unit.key}.")
     room.broadcast(
-        f"{giver_face} gives {item.key} to {target_face}.",
+        f"{giver_face} gives {unit.key} to {target_face}.",
         exclude=[character, target],
     )
     if stow_msg and getattr(target, "session", None):
@@ -4127,6 +4196,13 @@ def cmd_setpass(character, args, game):
 
     character.password_hash = auth.hash_password(new_password)
     character.session.send("Password updated.")
+    from engine import gm_notify
+    gm_notify.ping_gms(
+        game,
+        f"{gm_notify.public_who(character, game)} changed their password{{from}}.",
+        exclude=character,
+        peer_session=character.session,
+    )
     # Persist now so a crash before the next autosave cannot lose setpass.
     save = getattr(game, "save", None)
     if callable(save):

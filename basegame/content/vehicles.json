@@ -1,0 +1,10 @@
+{
+  "cart": {
+    "key": "cart",
+    "aliases": ["cart", "wagon"],
+    "parked_room": "NB00001",
+    "interior_key": "Inside the Cart",
+    "seats": 2,
+    "interior_description": "A small wooden cart with rough bench seating. Type 'drive <direction>' to roll along the street, or 'unboard' to climb out."
+  }
+}

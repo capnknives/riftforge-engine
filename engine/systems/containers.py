@@ -539,14 +539,91 @@ def _find_matching_stack_item(items, item, viewer):
     return None
 
 
+def _remove_carried_item(character, item):
+    """Drop ``item`` from open inventory, a worn bag, or the gear bag list."""
+    if character is None or item is None:
+        return
+    inv = getattr(character, "inventory", None) or []
+    if item in inv:
+        inv.remove(item)
+        return
+    for bag in worn_bags(character):
+        contents = bag_contents(bag)
+        if item in contents:
+            contents.remove(item)
+            return
+    gear = hooks_mod.containers_ensure_gear_bag(character)
+    if item in gear:
+        gear.remove(item)
+
+
+def _spawn_single_stack_unit(item):
+    """Fresh one-unit Item cloned from a stacked row (sell/drop peel)."""
+    catalog_id = getattr(item, "catalog_id", None)
+    if catalog_id:
+        unit = hooks_mod.make_world_item(
+            {"item": str(catalog_id).strip()},
+            where="stack peel",
+        )
+        hooks_mod.enrich_loaded_item(unit)
+        if getattr(item, "stack_charges", None) is not None:
+            unit.stack_charges = 1
+        return unit
+    from world import Item
+
+    unit = Item(item.key, getattr(item, "description", item.key))
+    for attr in (
+        "catalog_id",
+        "slot",
+        "equipped",
+        "need",
+        "aliases",
+        "weapon_voice",
+        "grip",
+        "relic",
+        "color",
+    ):
+        if hasattr(item, attr):
+            val = getattr(item, attr)
+            if val is not None:
+                setattr(unit, attr, val)
+    unit.stack_charges = 1
+    return unit
+
+
+def peel_one_carried_unit(character, item):
+    """Remove one logical unit from a carried row; return the detached Item.
+
+    When ``stack_charges`` is greater than one, decrement the source row and
+    return a single-unit clone so ``sell`` / ``drop`` / ``give`` only move
+    one piece (bug report 329: merged equipment must not vanish in one verb).
+    """
+    if character is None or item is None:
+        return None
+    if _item_resting_place(character, item) is None:
+        return None
+    count = _stack_unit_count(item)
+    if count <= 1:
+        _remove_carried_item(character, item)
+        return item
+    item.stack_charges = count - 1
+    return _spawn_single_stack_unit(item)
+
+
 def try_merge_carried_stack(character, item, *, dest=None):
     """Merge a duplicate-stack pickup into an existing row.
 
     Returns True when ``item`` was absorbed (caller must not append a new
     row). Used by ``get``, autoloot, and loot routing so the open stack cap
     cannot be bypassed by duplicate catalog ids.
+
+    Equipment and other medium/large pieces stay separate rows so each copy
+    can be sold or dropped on its own (bug report 329).
     """
     if character is None or item is None:
+        return False
+    # Small reagents / gather crumbs stack; weapons and armor do not.
+    if item_carry_size(item) != "small":
         return False
     if open_inventory_would_add_stack(character, item):
         return False

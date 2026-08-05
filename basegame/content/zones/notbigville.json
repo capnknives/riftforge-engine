@@ -68,6 +68,20 @@
             "zone": "notbigville",
             "outdoor": false,
             "resources": ["vendor"],
+            "shop_stock": [
+                {
+                    "key": "a storm lantern",
+                    "description": "A sturdy kerosene lantern with a storm-glass chimney.",
+                    "price_cents": 1250,
+                    "qty": 5
+                },
+                {
+                    "key": "a trail ration",
+                    "description": "Vacuum-sealed biscuits and jerky for long drives.",
+                    "price_cents": 350,
+                    "qty": null
+                }
+            ],
             "exits": {
                 "west": "NB00002",
                 "down": "NB00003",
@@ -97,7 +111,61 @@
             "outdoor": false,
             "resources": ["mail"],
             "exits": {
-                "west": "NB00004"
+                "west": "NB00004",
+                "east": "NB00011",
+                "north": "NB00013"
+            }
+        },
+        {
+            "key": "NB00013",
+            "title": "Notbigville - News Office - Desk",
+            "vnum": "NB00013",
+            "legacy_key": "notbigville:News Office",
+            "description": "A cramped weekly paper office: coffee-stained storyboard, a wire basket of undeveloped shots, and a editor's desk buried under town gossip.",
+            "area_type": "city",
+            "zone": "notbigville",
+            "outdoor": false,
+            "jobs": ["news_reporter"],
+            "resources": ["work"],
+            "exits": {
+                "south": "NB00006"
+            }
+        },
+        {
+            "key": "NB00011",
+            "title": "Notbigville - Saloon - Bar",
+            "vnum": "NB00011",
+            "description": "A narrow saloon with a scuffed bar and a plank wall that looks like it has taken a beating before.",
+            "area_type": "city",
+            "zone": "notbigville",
+            "outdoor": false,
+            "layout": {"x": 0, "y": 0, "z": 0},
+            "slam_targets": [
+                {
+                    "id": "saloon_wall",
+                    "label": "the saloon wall",
+                    "direction": "east",
+                    "hp_max": 8,
+                    "tags": ["wall"],
+                    "materials": ["wood"]
+                }
+            ],
+            "exits": {
+                "west": "NB00006",
+                "east": "NB00012"
+            }
+        },
+        {
+            "key": "NB00012",
+            "title": "Notbigville - Back Alley - Gravel",
+            "vnum": "NB00012",
+            "description": "Trash bins and gravel behind the saloon. The plank wall still rattles from the last brawl.",
+            "area_type": "city",
+            "zone": "notbigville",
+            "outdoor": true,
+            "layout": {"x": 1, "y": 0, "z": 0},
+            "exits": {
+                "west": "NB00011"
             }
         },
         {
@@ -110,21 +178,36 @@
             "outdoor": true,
             "exits": {
                 "north": "NB00001",
-                "west": "NB00009"
+                "west": "NB00009",
+                "south": "NB00010"
             }
         },
         {
             "key": "NB00009",
             "title": "Notbigville - Grain Elevator - Shed",
             "vnum": "NB00009",
-            "description": "A lean-to beside the grain elevator where prairie critters nest in the chaff. The door hangs open on one hinge.",
+            "description": "A lean-to beside the grain elevator where prairie critters nest in the chaff. The door hangs open on one hinge. Scuffed dirt and a chalk circle mark a local sparring spot.",
             "area_type": "city",
             "zone": "notbigville",
             "outdoor": false,
+            "active_combat": true,
             "spawn_nest": "critter",
             "bestiary_categories": ["prairie-critter"],
             "exits": {
                 "east": "NB00007"
+            }
+        },
+        {
+            "key": "NB00010",
+            "title": "Notbigville - Sheriff - Holding Cell",
+            "vnum": "NB00010",
+            "description": "A bare concrete cell with a bench bolted to the wall. The sheriff's desk is just outside the bars.",
+            "area_type": "city",
+            "zone": "notbigville",
+            "outdoor": false,
+            "is_cell": true,
+            "exits": {
+                "north": "NB00007"
             }
         },
         {
@@ -136,7 +219,22 @@
             "zone": "notbigville",
             "outdoor": true,
             "exits": {
-                "south": "NB00001"
+                "south": "NB00001",
+                "north": "NB00014"
+            }
+        },
+        {
+            "key": "NB00014",
+            "title": "Notbigville - Prairie Inn - Lobby",
+            "vnum": "NB00014",
+            "description": "A tidy lobby with a check-in desk and a creaky staircase. A chalkboard lists nightly rates.",
+            "area_type": "city",
+            "zone": "notbigville",
+            "outdoor": false,
+            "is_hotel_room": true,
+            "resources": ["sleep", "water"],
+            "exits": {
+                "south": "NB00008"
             }
         }
     ]

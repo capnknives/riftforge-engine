@@ -1037,6 +1037,40 @@ def resolve_named_character(actor, query, game=None, candidates=None):
     return None
 
 
+def resolve_fight_target(
+    actor,
+    query,
+    candidates,
+    *,
+    usage_msg=None,
+    missing_msg="You don't see them here.",
+    clear_stale_target=True,
+):
+    """Resolve a combat-verb target from typed args or the current fight.
+
+    When ``query`` is empty, returns ``actor.target`` if still co-located.
+    Clears a stale ``actor.target`` when the partner left the room.
+    Returns ``(target, error_message)``; on success the error is ``None``.
+    """
+    raw = (query or "").strip()
+    if raw:
+        target = _find_character(raw, candidates, self_character=actor)
+        if target is None:
+            return None, missing_msg
+        return target, None
+
+    target = getattr(actor, "target", None)
+    if target is None:
+        return None, usage_msg or "You need a target."
+    room = getattr(actor, "location", None)
+    if getattr(target, "location", None) is not room:
+        if clear_stale_target:
+            actor.target = None
+        gone = getattr(target, "key", "them")
+        return None, f"{gone} is no longer here."
+    return target, None
+
+
 def verb_target_token(actor, target, game=None):
     """Build an npc_do / snoop-safe target string that resolves to ``target``.
 

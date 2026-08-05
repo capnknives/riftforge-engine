@@ -1,0 +1,99 @@
+{
+  "id": "map.earth",
+  "label": "Earth map/zone file header (abstract parent)",
+  "abstract": true,
+  "fields": {
+    "id": {
+      "type": "string",
+      "required": true,
+      "doc": "Map or zone id (usually filename stem)."
+    },
+    "plane": {
+      "type": "enum",
+      "required": false,
+      "doc": "Cosmology plane stamp (earth-tier only).",
+      "default": "earth",
+      "values": [
+        "earth",
+        "prime",
+        "pocket"
+      ]
+    },
+    "realm": {
+      "type": "string",
+      "required": false,
+      "doc": "Realm family derived from plane (prime|elemental|spirit|void)."
+    },
+    "region": {
+      "type": "string",
+      "required": false,
+      "doc": "Optional atlas region label."
+    },
+    "city_name": {
+      "type": "string",
+      "required": false,
+      "doc": "City header for ROOM NAME stamping (zones)."
+    },
+    "city_color": {
+      "type": "string",
+      "required": false,
+      "doc": "ANSI role for city segment in ROOM NAME."
+    },
+    "sub_color": {
+      "type": "string",
+      "required": false,
+      "doc": "ANSI role for sub segment in ROOM NAME."
+    },
+    "main_colors": {
+      "type": "object",
+      "required": false,
+      "doc": "Per-street color roles for zone maps."
+    },
+    "autoload": {
+      "type": "bool",
+      "required": false,
+      "doc": "When false, deferred until gm maps load.",
+      "default": true
+    },
+    "dungeon": {
+      "type": "bool",
+      "required": false,
+      "doc": "Zone-wide dungeon stamp for all rooms unless overridden."
+    },
+    "no_random_spawn": {
+      "type": "bool",
+      "required": false,
+      "doc": "Suppress random wilderness spawns for zone rooms."
+    },
+    "runtime_hub": {
+      "type": "string",
+      "required": false,
+      "doc": "Hot-load hub room key for deferred zones."
+    },
+    "runtime_enter_as": {
+      "type": "list",
+      "required": false,
+      "doc": "Hot-load enter aliases for deferred zones."
+    },
+    "runtime_visible_as": {
+      "type": "string",
+      "required": false,
+      "doc": "Hot-load distant look name for deferred zones."
+    },
+    "rooms": {
+      "type": "list",
+      "required": false,
+      "doc": "Hand-authored rooms (validated separately as room.*)."
+    },
+    "pockets": {
+      "type": "list",
+      "required": false,
+      "doc": "Overland pocket links (validated as map.pocket.link)."
+    },
+    "grid": {
+      "type": "object",
+      "required": false,
+      "doc": "Procedural grid block (validated as map.grid)."
+    }
+  }
+}

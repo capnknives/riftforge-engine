@@ -12,4 +12,17 @@ hang their one-time setup on.
 def seed_content(game):
     """Stamp overland atlas + pocket exits after maps load."""
     from engine import hooks
+    from engine.systems import lodging as lodging_mod
+    from world import Item
+
     hooks.ensure_game_defaults(game)
+    inn = game.rooms.get("NB00014")
+    if inn is not None and not lodging_mod.beds_in_room(inn):
+        bed = Item(
+            "a bunk bed",
+            "A simple bunk with a thin mattress.",
+            furniture=True,
+        )
+        bed.need = "sleep"
+        inn.contents.append(bed)
+        lodging_mod.stamp_home_basics(inn)

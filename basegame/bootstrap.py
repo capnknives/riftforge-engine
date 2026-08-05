@@ -83,6 +83,25 @@ def register_all_hooks():
     hooks.set_weather_look_clause(regional_weather_module.look_clause)
     hooks.set_weather_look_vision(regional_weather_module.assess_look_vision)
 
+    from basegame import quests as quests_mod
+    quests_mod.register_quest_hooks()
+
+    # Combat backends: register + load swing + active_combat (default swing).
+    from engine.systems import combat_runtime as combat_runtime_mod
+    from basegame import combat_backends as combat_backends_mod
+    combat_backends_mod.bootstrap_combat(
+        default_backend=combat_runtime_mod.BACKEND_SWING,
+    )
+
+    # Twitch combat: drop queued offense on logout -> Echo (§10.7); keep
+    # open telegraphs so auto-defense still fires against the Echo body.
+    from engine.systems import active_combat as active_combat_mod
+
+    def _on_session_disconnect(character, game, *, to_echo=True):
+        active_combat_mod.on_disconnect_clear_offense(character)
+
+    hooks.set_on_session_disconnect(_on_session_disconnect)
+
     # Dual-layer America overland (engine/systems/overland.py).
     from engine.systems import overland as overland_mod
 
@@ -92,6 +111,11 @@ def register_all_hooks():
         overland_mod.ensure_game_overland(game)
         overland_mod.stamp_pocket_overland_exits(game)
         gates_mod.ensure_initialized(game)
+        from basegame import vehicles as vehicles_mod
+        vehicles_mod.ensure_basegame_vehicles(game)
+        combat_runtime_mod.ensure_game_combat_backend(
+            game, default=combat_runtime_mod.get_default_combat_backend(),
+        )
 
     hooks.set_ensure_game_defaults(_ensure_game_defaults)
 
@@ -138,12 +162,51 @@ def register_all_hooks():
 
     hooks.set_storm_chase_is_on_duty(_storm_on_duty)
 
+    def _press_on_duty(character, game=None):
+        return bool(getattr(character, "on_duty", False))
+
+    hooks.set_press_beat_is_on_duty(_press_on_duty)
+
     from engine.systems import mail as mail_mod
 
     def _after_session_attach(character, game):
         mail_mod.notify_inbox(character, game)
 
     hooks.set_after_session_attach(_after_session_attach)
+
+    def _after_arrive(character, dest, game, was_working=False):
+        from engine.systems import quests as quests_mod
+        quests_mod.notify(
+            character, "enter_room", room_key=dest.key, game=game,
+        )
+
+    hooks.set_after_arrive(_after_arrive)
+
+    from engine.systems import justice as justice_mod
+    justice_mod.register_move_gate()
+
+    # Origin registry: importing origin_alien self-registers "alien" --
+    # this one import is the entire on/off-per-game switch (SUPERS must
+    # never add it). See docs/plans/riftforge_engine_game_shell.md Phase 5.
+    from engine.systems import origin_alien as _origin_alien_mod  # noqa: F401
+
+    def _can_notice_umbral_stealth(viewer, other, game=None):
+        """Hide Umbral-shrouded characters from look / presence.
+
+        Returns False (hidden) while ``other.umbral_shrouded`` is set;
+        otherwise True (visible). Deterministic demo shell -- no
+        perception roll. ``command_support._is_presence_hidden`` already
+        gates on ``stealth_active`` before calling this hook.
+        """
+        del viewer, game
+        if getattr(other, "umbral_shrouded", False):
+            return False
+        return True
+
+    hooks.set_can_notice_stealth(_can_notice_umbral_stealth)
+
+    from basegame import vehicles as _vehicles_mod
+    _vehicles_mod.register_vehicle_hooks()
 
     # Spawn peel demo: bestiary registry + critter nest AI (no SUPERS).
     from basegame import bestiary as _bestiary_mod  # noqa: F401

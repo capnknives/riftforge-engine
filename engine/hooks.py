@@ -106,6 +106,12 @@ _look_extra_lines = None
 # decides whether the game's rules allow walking through it right now.
 # fn(character, room, dest, game) -> block message str, or None to allow.
 _move_gate = None
+_clinic_on_admit = None
+_clinic_on_discharge = None
+_clinic_casualty_meter = None
+_clinic_ko_clear = None
+_justice_on_robbery = None
+_justice_fine_schedule = None
 _follow_pull_skip = None
 _report_context_extra = None
 _room_broadcast_deliver = None
@@ -129,6 +135,24 @@ _look_exit_dest_label = None
 # Cancel any in-progress "awake rest" state -- movement/combat interrupts it.
 # fn(character) -> None (side-effecting only; no return value used).
 _cancel_rest = None
+
+# Lodging (H3a): bed sharing family check; safe-sleep policy; post-stamp hook.
+_lodging_are_family = None
+_lodging_sleep_policy = None
+_lodging_room_stamper = None
+
+# Paced travel (H3b): overland handler, player hop, cadence step, edge_ok, …
+_paced_travel_overland_handler = None
+_paced_travel_overland_advance = None
+_paced_travel_player_hop = None
+_paced_travel_cadence_step = None
+_paced_travel_edge_ok = None
+_paced_travel_enter_alias = None
+_paced_travel_drive_to = None
+_paced_travel_gait_of = None
+_paced_travel_engaged_refuse = None
+_paced_travel_list_destinations = None
+_paced_travel_zone_rooms = None
 
 # Room broadcast line for `get <item> from <body>` (nested loot leaving a
 # body). fn(actor_key, body_key, item) -> str.
@@ -499,7 +523,7 @@ def attach_room(room):
 def set_map_room_stamper(fn):
     """Register fn(room, room_data, *, filename=None) for map JSON overrides.
 
-    Called from ``maps._add_room`` after engine-generic fields are stamped
+    Called from ``engine.world_maps._add_room`` after engine-generic fields are stamped
     onto the Room. ``room_data`` is the hand-room dict or grid cell
     override (may be empty). Pass None to clear (lean engine / basegame
     ignore SUPERS-only keys).
@@ -512,6 +536,99 @@ def stamp_map_room(room, room_data, *, filename=None):
     """Apply the registered map-JSON stamper, or do nothing if none is set."""
     if _map_room_stamper is not None:
         _map_room_stamper(room, room_data or {}, filename=filename)
+
+
+# Map JSON loader hooks (two-repo purity H1a -- engine/world_maps.py).
+_map_json_validator = None
+_map_area_types = None
+_map_room_city_stamper = None
+
+# Lean / basegame default until a game registers its full vocabulary.
+_DEFAULT_MAP_AREA_TYPES = {
+    "ruins": [],
+    "city": [],
+    "city_street": [],
+    "mountains": [],
+    "ocean": [],
+    "lake": [],
+    "forest": [],
+    "plains": [],
+    "furnace": [],
+}
+
+
+def set_map_json_validator(validator):
+    """Register map JSON validation helpers (require_keys, …).
+
+    SUPERS registers ``content_validate`` at boot. When unset,
+    ``engine/world_maps`` falls back to ``engine.content_validate``.
+    Pass None to clear.
+    """
+    global _map_json_validator
+    _map_json_validator = validator
+
+
+def map_json_validator():
+    """Return the registered map JSON validator module, or None."""
+    return _map_json_validator
+
+
+def set_map_area_types(area_types):
+    """Register area_type vocabulary for map loader validation.
+
+    Accepts a dict (area_type -> default bestiary_categories) or a
+    ``frozenset`` of allowed keys (empty bestiary defaults). Pass None
+    to restore engine defaults.
+    """
+    global _map_area_types
+    if area_types is None:
+        _map_area_types = None
+    elif isinstance(area_types, frozenset):
+        _map_area_types = {key: [] for key in area_types}
+    else:
+        _map_area_types = dict(area_types)
+
+
+def map_area_types():
+    """Return registered area_type dict (never None)."""
+    if _map_area_types is not None:
+        return _map_area_types
+    return dict(_DEFAULT_MAP_AREA_TYPES)
+
+
+def set_map_room_city_stamper(fn):
+    """Register fn(room, map_data) for city_name / color header stamps.
+
+    Called from ``engine.world_maps`` after hand rooms are created.
+    Pass None to clear (lean engine ignores city header fields).
+    """
+    global _map_room_city_stamper
+    _map_room_city_stamper = fn
+
+
+def stamp_map_room_city_meta(room, data):
+    """Apply the registered city-meta stamper, or do nothing if unset."""
+    if _map_room_city_stamper is not None:
+        _map_room_city_stamper(room, data or {})
+
+
+# Enter-alias preference order (H1b -- engine/world_maps._best_player_enter_alias).
+_map_enter_alias_pref = None
+
+
+def set_map_enter_alias_preference(prefs):
+    """Register the full ordered ``enter <alias>`` preference tuple used to
+    pick one label for a hub's look footer / gossip line. Pass None to
+    restore the generic engine default (``engine.world_maps
+    ._LOOK_ENTER_ALIAS_PREF``).
+    """
+    global _map_enter_alias_pref
+    _map_enter_alias_pref = tuple(prefs) if prefs else None
+
+
+def map_enter_alias_preference():
+    """Registered preference tuple, or None to use the engine default."""
+    return _map_enter_alias_pref
 
 
 def set_blob_codec(to_blob, from_blob):
@@ -909,6 +1026,80 @@ def move_gate_block(character, room, dest, game):
     if _move_gate is not None:
         return _move_gate(character, room, dest, game)
     return None
+
+
+def set_clinic_on_admit(fn):
+    """Register fn(character, room, game, reason, attacker=None) for post-admit side effects."""
+    global _clinic_on_admit
+    _clinic_on_admit = fn
+
+
+def clinic_on_admit(character, room, game, reason, attacker=None):
+    """Run game hook after a successful clinic admit (side effects only)."""
+    if _clinic_on_admit is not None:
+        _clinic_on_admit(character, room, game, reason, attacker=attacker)
+
+
+def set_clinic_on_discharge(fn):
+    """Register fn(character, game) for post-discharge side effects."""
+    global _clinic_on_discharge
+    _clinic_on_discharge = fn
+
+
+def clinic_on_discharge(character, game):
+    """Run game hook after a clinic discharge (side effects only)."""
+    if _clinic_on_discharge is not None:
+        _clinic_on_discharge(character, game)
+
+
+def set_clinic_casualty_meter(fn):
+    """Register fn(character, game) for balance / casualty-meter notes."""
+    global _clinic_casualty_meter
+    _clinic_casualty_meter = fn
+
+
+def clinic_note_casualty(character, game):
+    """Note a clinic casualty when a game registers the meter hook."""
+    if _clinic_casualty_meter is not None:
+        _clinic_casualty_meter(character, game)
+
+
+def set_clinic_ko_clear(fn):
+    """Register fn(character, game) when KO clears without a normal admit."""
+    global _clinic_ko_clear
+    _clinic_ko_clear = fn
+
+
+def clinic_ko_clear(character, game):
+    """Run game hook after generic KO clear (not via admit)."""
+    if _clinic_ko_clear is not None:
+        _clinic_ko_clear(character, game)
+
+
+def set_justice_on_robbery(fn):
+    """Register fn(actor, game, amount) after a successful robbery."""
+    global _justice_on_robbery
+    _justice_on_robbery = fn
+
+
+def justice_on_robbery(actor, game, amount):
+    """Run game hook after robbery succeeds (telemetry / side effects)."""
+    if _justice_on_robbery is not None:
+        _justice_on_robbery(actor, game, amount)
+
+
+def set_justice_fine_schedule(fn):
+    """Register fn(offense_type) -> fine cents for default sentencing."""
+    global _justice_fine_schedule
+    _justice_fine_schedule = fn
+
+
+def justice_fine_schedule(offense_type):
+    """Return scheduled fine cents; engine default when no hook registered."""
+    from engine.systems import justice as justice_mod
+    if _justice_fine_schedule is not None:
+        return int(_justice_fine_schedule(offense_type))
+    return justice_mod.DEFAULT_FINE_CENTS
 
 
 def set_follow_pull_skip(fn):
@@ -1912,6 +2103,72 @@ def try_vehicle_enter_as_house_in(character, args, game):
     return False
 
 
+# Boarded-vehicle catalog loaders and park-spot gates (engine/systems/vehicles.py).
+_vehicle_catalog_loader = None
+_travel_hub_catalog_loader = None
+_vehicle_catalog_extra_validator = None
+_vehicle_park_spot_extra_gate = None
+
+
+def register_vehicle_catalog(loader_fn):
+    """Register fn() -> {vehicle_id: spec_dict} for ensure_game_vehicles.
+
+  Pass None to clear. When unset, ensure_game_vehicles uses an empty catalog.
+    """
+    global _vehicle_catalog_loader
+    _vehicle_catalog_loader = loader_fn
+
+
+def vehicle_catalog_loader():
+    """Return the registered vehicle catalog loader, or None."""
+    return _vehicle_catalog_loader
+
+
+def register_travel_hub_catalog(loader_fn):
+    """Register fn() -> {hub_id: hub_dict} for ensure_game_vehicles.
+
+  Pass None to clear. When unset, travel_hubs defaults to {}.
+    """
+    global _travel_hub_catalog_loader
+    _travel_hub_catalog_loader = loader_fn
+
+
+def travel_hub_catalog_loader():
+    """Return the registered travel-hub catalog loader, or None."""
+    return _travel_hub_catalog_loader
+
+
+def set_vehicle_catalog_extra_validator(fn):
+    """Register fn(vehicle_id, spec, *, where) for extra catalog row checks.
+
+  Games layer IMPALA-style required keys here. Pass None to clear.
+    """
+    global _vehicle_catalog_extra_validator
+    _vehicle_catalog_extra_validator = fn
+
+
+def vehicle_catalog_extra_validator(vehicle_id, spec, *, where=None):
+    """Run game-registered extra vehicle/hub validation after engine defaults."""
+    if _vehicle_catalog_extra_validator is not None:
+        _vehicle_catalog_extra_validator(vehicle_id, spec, where=where)
+
+
+def set_vehicle_park_spot_extra_gate(fn):
+    """Register fn(room, game, character) -> bool; True means park blocked.
+
+  SUPERS registers evil-ward / driveability gates here. Pass None to clear.
+    """
+    global _vehicle_park_spot_extra_gate
+    _vehicle_park_spot_extra_gate = fn
+
+
+def vehicle_park_spot_blocked_extra(room, game, character):
+    """True when the game hook blocks parking in ``room``."""
+    if _vehicle_park_spot_extra_gate is not None:
+        return bool(_vehicle_park_spot_extra_gate(room, game, character))
+    return False
+
+
 def set_try_vehicle_nested_in_out(fn):
     """Register fn(character, game, *, direction) -> bool for boarded in/out.
 
@@ -2154,6 +2411,65 @@ def storm_chase_is_on_duty(character, game=None):
     if _storm_chase_is_on_duty is not None:
         return bool(_storm_chase_is_on_duty(character, game=game))
     return bool(getattr(character, "on_duty", False))
+
+
+_press_beat_is_reporter = None
+_press_beat_is_on_duty = None
+_press_beat_room_excitement = None
+_press_beat_interview_line = None
+
+
+def set_press_beat_is_reporter(fn):
+    """Register fn(character, game) -> bool for Reporter path / job gate."""
+    global _press_beat_is_reporter
+    _press_beat_is_reporter = fn
+
+
+def press_beat_is_reporter(character, game=None):
+    """True when character has Reporter path or equivalent."""
+    if _press_beat_is_reporter is not None:
+        return bool(_press_beat_is_reporter(character, game=game))
+    path = (getattr(character, "bg_path", None) or "").strip().lower()
+    return path == "reporter"
+
+
+def set_press_beat_is_on_duty(fn):
+    """Register fn(character, game) -> bool for Gazette desk duty gate."""
+    global _press_beat_is_on_duty
+    _press_beat_is_on_duty = fn
+
+
+def press_beat_is_on_duty(character, game=None):
+    """True when character may run on-duty Gazette desk verbs."""
+    if _press_beat_is_on_duty is not None:
+        return bool(_press_beat_is_on_duty(character, game=game))
+    return bool(getattr(character, "on_duty", False))
+
+
+def set_press_beat_room_excitement(fn):
+    """Register fn(room, game) -> (score, label) | dict | None."""
+    global _press_beat_room_excitement
+    _press_beat_room_excitement = fn
+
+
+def press_beat_room_excitement(room, game):
+    """Optional hook: return excitement override or None for engine default."""
+    if _press_beat_room_excitement is not None:
+        return _press_beat_room_excitement(room, game)
+    return None
+
+
+def set_press_beat_interview_line(fn):
+    """Register fn(character, target, game) -> str for interview flavor."""
+    global _press_beat_interview_line
+    _press_beat_interview_line = fn
+
+
+def press_beat_interview_line(character, target, game):
+    """Optional hook: custom interview quote line."""
+    if _press_beat_interview_line is not None:
+        return _press_beat_interview_line(character, target, game)
+    return None
 
 
 def set_is_consciousness_exile(fn):
@@ -2421,6 +2737,13 @@ _taxi_mode_saver = None
 _map_snapshot_write_all = None
 _map_snapshot_daily_archive = None
 
+# H6 map_store: rset_field bool/text catalogs + populate helpers.
+_rset_bool_flags = frozenset()
+_rset_text_fields = frozenset()
+_rset_reference_lines_fn = None
+_map_store_apply_entry_fields = None
+_map_store_place_seed_items = None
+
 _containers_resolve_loot_bag = None
 _containers_find_in_loot_bag = None
 _containers_unstow_from_loot_bag = None
@@ -2536,6 +2859,60 @@ def write_map_daily_archive(root=None, confirmed_by=""):
             root=root, confirmed_by=confirmed_by,
         )
     return None
+
+
+def set_rset_flag_catalog(bool_flags, text_fields):
+    """Register (frozenset, frozenset) of field names the game wants
+    bool/text-coerced by rset_field; anything else falls back to naive
+    inference (try bool 'true'/'false' literal, else keep as string)."""
+    global _rset_bool_flags, _rset_text_fields
+    _rset_bool_flags = frozenset(bool_flags or ())
+    _rset_text_fields = frozenset(text_fields or ())
+
+
+def rset_flag_catalog():
+    """Return the registered (bool_flags, text_fields) tuple."""
+    return _rset_bool_flags, _rset_text_fields
+
+
+def set_rset_reference_lines(fn):
+    """Register fn() -> list[str] for bare ``room rset`` / help body."""
+    global _rset_reference_lines_fn
+    _rset_reference_lines_fn = fn
+
+
+def rset_reference_lines():
+    """Return registered rset reference lines, or a minimal default."""
+    if _rset_reference_lines_fn is not None:
+        return list(_rset_reference_lines_fn())
+    return ["Usage: room rset <field|flag> <value…>"]
+
+
+def set_map_store_apply_entry_fields(fn):
+    """Register fn(live, entry) to stamp JSON rooms[] onto a live Room."""
+    global _map_store_apply_entry_fields
+    _map_store_apply_entry_fields = fn
+
+
+def map_store_apply_entry_fields(live, entry):
+    """Stamp authored rooms[] fields onto a live Room when registered."""
+    if _map_store_apply_entry_fields is not None:
+        _map_store_apply_entry_fields(live, entry)
+
+
+def set_map_store_place_seed_items(fn):
+    """Register fn(game, room_key, seed_specs, where=...) -> int placed."""
+    global _map_store_place_seed_items
+    _map_store_place_seed_items = fn
+
+
+def map_store_place_seed_items(game, room_key, seed_specs, *, where):
+    """Place seed items when a game registered a catalog hook."""
+    if _map_store_place_seed_items is not None:
+        return _map_store_place_seed_items(
+            game, room_key, seed_specs, where=where,
+        )
+    return 0
 
 
 def set_containers_resolve_loot_bag(fn):
@@ -3066,3 +3443,421 @@ def olc_authorizer(character):
     if _olc_authorizer is not None:
         return bool(_olc_authorizer(character))
     return False
+
+
+# --- Lodging hooks (H3a) ---------------------------------------------------
+
+
+def set_lodging_are_family(fn):
+    """Register fn(a, b) -> bool for bed-sharing (lover / family)."""
+    global _lodging_are_family
+    _lodging_are_family = fn
+
+
+def lodging_are_family(a, b):
+    """True when ``a`` and ``b`` may share a bed (default: False)."""
+    if _lodging_are_family is not None:
+        return bool(_lodging_are_family(a, b))
+    return False
+
+
+def set_lodging_sleep_policy(fn):
+    """Register fn(room, character, game) -> bool or None for safe sleep."""
+    global _lodging_sleep_policy
+    _lodging_sleep_policy = fn
+
+
+def lodging_sleep_policy(room, character=None, game=None):
+    """Game sleep policy, or None to use engine defaults."""
+    if _lodging_sleep_policy is not None:
+        return _lodging_sleep_policy(room, character, game)
+    return None
+
+
+def set_lodging_room_stamper(fn):
+    """Register fn(room) called after engine ``stamp_home_basics``."""
+    global _lodging_room_stamper
+    _lodging_room_stamper = fn
+
+
+def stamp_lodging_room(room):
+    """Apply game lodging room stamp hook, or no-op."""
+    if _lodging_room_stamper is not None:
+        _lodging_room_stamper(room)
+
+
+# --- Paced travel hooks (H3b) --------------------------------------------
+
+
+def set_paced_travel_overland_handler(fn):
+    """Register fn(character, args, game, pace) -> True when handled."""
+    global _paced_travel_overland_handler
+    _paced_travel_overland_handler = fn
+
+
+def paced_travel_overland_handler(character, args, game, pace):
+    """True when the overland walk handler consumed this command."""
+    if _paced_travel_overland_handler is not None:
+        return bool(_paced_travel_overland_handler(character, args, game, pace))
+    return False
+
+
+def set_paced_travel_overland_advance(fn):
+    """Register fn(character, game, focus) -> True while still walking."""
+    global _paced_travel_overland_advance
+    _paced_travel_overland_advance = fn
+
+
+def paced_travel_overland_advance(character, game, focus):
+    """Advance one overland foot hop; default clears focus (unhandled)."""
+    if _paced_travel_overland_advance is not None:
+        return bool(_paced_travel_overland_advance(character, game, focus))
+    clear_walk_focus = None  # noqa: F841 -- avoid import cycle at load
+    from engine.systems.paced_travel import clear_walk_focus as _clear
+
+    _clear(
+        character,
+        notice="Overland walk cancelled -- not available here.",
+    )
+    return False
+
+
+def set_paced_travel_player_hop(fn):
+    """Register fn(character, hop, game, quiet) -> bool for one player hop."""
+    global _paced_travel_player_hop
+    _paced_travel_player_hop = fn
+
+
+def paced_travel_player_hop(character, hop, game, quiet=True):
+    """Apply one paced-travel hop (default: engine cardinal/enter/exit)."""
+    if _paced_travel_player_hop is not None:
+        return bool(_paced_travel_player_hop(character, hop, game, quiet))
+    from engine.systems.paced_travel import _default_player_hop
+
+    return _default_player_hop(character, hop, game, quiet=quiet)
+
+
+def set_paced_travel_cadence_step(fn):
+    """Register fn(actor, dest, game) -> bool for Cadence one-step pathing."""
+    global _paced_travel_cadence_step
+    _paced_travel_cadence_step = fn
+
+
+def paced_travel_cadence_step(actor, dest, game):
+    """Cadence seek one-hop; False when unregistered."""
+    if _paced_travel_cadence_step is not None:
+        return bool(_paced_travel_cadence_step(actor, dest, game))
+    return False
+
+
+def set_paced_travel_edge_ok(fn):
+    """Register fn(from_room, neighbor, *, actor, game) -> bool."""
+    global _paced_travel_edge_ok
+    _paced_travel_edge_ok = fn
+
+
+def paced_travel_edge_ok(from_room, neighbor, *, actor=None, game=None):
+    """May this cardinal / pocket edge be used for player walk BFS?"""
+    if _paced_travel_edge_ok is not None:
+        return bool(
+            _paced_travel_edge_ok(
+                from_room, neighbor, actor=actor, game=game,
+            )
+        )
+    return neighbor is not from_room
+
+
+def set_paced_travel_enter_alias(fn):
+    """Register fn(entries, hub) -> enter alias str or None."""
+    global _paced_travel_enter_alias
+    _paced_travel_enter_alias = fn
+
+
+def paced_travel_enter_alias(entries, hub):
+    """Best enter alias for a zone_entries hub (default: first match)."""
+    if _paced_travel_enter_alias is not None:
+        return _paced_travel_enter_alias(entries, hub)
+    if not entries or hub is None:
+        return None
+    for alias, target in entries.items():
+        if target is hub:
+            return alias
+    return None
+
+
+def set_paced_travel_drive_to(fn):
+    """Register fn(character, dest_room, game) -> str message or None."""
+    global _paced_travel_drive_to
+    _paced_travel_drive_to = fn
+
+
+def paced_travel_drive_to(character, dest_room, game):
+    """When aboard a vehicle, return drive status; None if not applicable."""
+    if _paced_travel_drive_to is not None:
+        return _paced_travel_drive_to(character, dest_room, game)
+    return None
+
+
+def set_paced_travel_gait_of(fn):
+    """Register fn(character) -> gait verb for hop lines (go/walk/jog/run)."""
+    global _paced_travel_gait_of
+    _paced_travel_gait_of = fn
+
+
+def paced_travel_gait_of(character):
+    """Gait word for paced-hop room traffic (default ``go``)."""
+    if _paced_travel_gait_of is not None:
+        return _paced_travel_gait_of(character)
+    return "go"
+
+
+def set_paced_travel_engaged_refuse(fn):
+    """Register fn(character) -> refuse message or None."""
+    global _paced_travel_engaged_refuse
+    _paced_travel_engaged_refuse = fn
+
+
+def paced_travel_engaged_refuse(character):
+    """Refuse line when walking away mid-fight; None for engine default."""
+    if _paced_travel_engaged_refuse is not None:
+        return _paced_travel_engaged_refuse(character)
+    return None
+
+
+def set_paced_travel_list_destinations(fn):
+    """Register fn(character, game, pace) -> True when list was sent."""
+    global _paced_travel_list_destinations
+    _paced_travel_list_destinations = fn
+
+
+def paced_travel_list_destinations(character, game, pace):
+    """Send bare-verb destination list; False when unhandled."""
+    if _paced_travel_list_destinations is not None:
+        return bool(_paced_travel_list_destinations(character, game, pace))
+    return False
+
+
+def set_paced_travel_zone_rooms(fn):
+    """Register fn(game, zone) -> list of rooms in a settlement zone."""
+    global _paced_travel_zone_rooms
+    _paced_travel_zone_rooms = fn
+
+
+def paced_travel_zone_rooms(game, zone):
+    """Rooms sharing ``zone``; default scans ``game.rooms``."""
+    if _paced_travel_zone_rooms is not None:
+        return list(_paced_travel_zone_rooms(game, zone) or ())
+    if not zone or game is None:
+        return []
+    return [
+        room for room in (getattr(game, "rooms", None) or {}).values()
+        if getattr(room, "zone", None) == zone
+    ]
+
+
+# --- Appearance catalog hooks (two-repo purity H7b) -----------------------
+_appearance_content_path = None
+_appearance_kits = None
+_appearance_kit_person_words = {}
+_appearance_kit_short_nouns = {}
+_appearance_no_crown_styles = {}
+_kit_for_character_resolver = None
+_appearance_age_phrase_fn = None
+
+
+def set_appearance_content_path(fn):
+    """Register fn() -> str absolute path to the appearance catalog JSON.
+
+    Mirrors ``set_maps_dir``'s pattern from H1. No default -- engine raises
+    a clear error if a caller needs the catalog before this is registered.
+    Pass None to clear.
+    """
+    global _appearance_content_path
+    _appearance_content_path = fn
+
+
+def appearance_content_path():
+    """Return the registered mortal appearance catalog path."""
+    if _appearance_content_path is None:
+        raise RuntimeError(
+            "appearance catalog path not registered -- call "
+            "hooks.set_appearance_content_path() at game boot "
+            "(supers/bootstrap.py or basegame bootstrap)."
+        )
+    return _appearance_content_path()
+
+
+def set_appearance_kits(kits):
+    """Register kit_id -> slot catalog dict for ``catalog_for`` / validate.
+
+    Pass None to clear.
+    """
+    global _appearance_kits
+    _appearance_kits = kits
+
+
+def appearance_kits():
+    """Return the registered appearance kit registry."""
+    if _appearance_kits is None:
+        raise RuntimeError(
+            "appearance kits not registered -- call "
+            "hooks.set_appearance_kits() when loading game catalogs."
+        )
+    return _appearance_kits
+
+
+def set_appearance_kit_person_words(mapping):
+    """Register kit_id -> {pronoun: noun} overrides for look prose."""
+    global _appearance_kit_person_words
+    _appearance_kit_person_words = dict(mapping or {})
+
+
+def appearance_kit_person_words():
+    """Return kit-specific person-word maps (may be empty)."""
+    return _appearance_kit_person_words
+
+
+def set_appearance_kit_short_nouns(mapping):
+    """Register kit_id -> room-face noun for non-mortal kits."""
+    global _appearance_kit_short_nouns
+    _appearance_kit_short_nouns = dict(mapping or {})
+
+
+def appearance_kit_short_nouns():
+    """Return kit-specific short-desc nouns (empty when unset)."""
+    return _appearance_kit_short_nouns
+
+
+def set_appearance_no_crown_styles(mapping):
+    """Register hair_style id -> (short_bit, full_bit) for no-crown styles."""
+    global _appearance_no_crown_styles
+    _appearance_no_crown_styles = dict(mapping or {})
+
+
+def appearance_no_crown_styles():
+    """Return registered no-crown style tuples (may be empty)."""
+    return _appearance_no_crown_styles
+
+
+def set_kit_for_character_resolver(fn):
+    """Register fn(character) -> kit_id or None for inferred kits.
+
+    SUPERS registers Cosmic Elemental Aspect inference here. Pass None to
+    clear.
+    """
+    global _kit_for_character_resolver
+    _kit_for_character_resolver = fn
+
+
+def kit_for_character_resolver():
+    """Return the registered kit inference hook, or None."""
+    return _kit_for_character_resolver
+
+
+def set_appearance_age_phrase_fn(fn):
+    """Register fn(age_years:int) -> decade phrase str for build_description."""
+    global _appearance_age_phrase_fn
+    _appearance_age_phrase_fn = fn
+
+
+def appearance_age_phrase_fn():
+    """Return the registered age-phrase hook, or None."""
+    return _appearance_age_phrase_fn
+
+
+# --- Persona registry hooks (H7c) ------------------------------------------
+
+_persona_content_path_fn = None
+
+
+def set_persona_content_path(fn):
+    """Register callable returning absolute path to personas.json."""
+    global _persona_content_path_fn
+    _persona_content_path_fn = fn
+
+
+def persona_content_path():
+    """Return the registered personas.json path (raises if unset)."""
+    if _persona_content_path_fn is None:
+        raise RuntimeError(
+            "persona content path not registered -- call "
+            "hooks.set_persona_content_path at game boot."
+        )
+    return _persona_content_path_fn()
+
+
+# --- Phone hooks (H7a) -----------------------------------------------------
+
+_phone_dial_alias_resolver = None
+_phone_paint_fn = lambda character, role, text: text  # noqa: E731
+_phone_tag_fn = lambda character=None: ""  # noqa: E731
+_phone_call_tag_fn = None
+_phone_voicemail_line_fn = None
+_phone_payphone_fee_fn = lambda: 0  # noqa: E731
+
+
+def set_phone_dial_alias_resolver(fn):
+    """Register fn(raw, character, game) -> str|None for dial alias override."""
+    global _phone_dial_alias_resolver
+    _phone_dial_alias_resolver = fn
+
+
+def phone_dial_alias_resolver(raw, character, game):
+    """Game dial alias (WKNZ, phonebook); None = engine default lookup."""
+    if _phone_dial_alias_resolver is not None:
+        return _phone_dial_alias_resolver(raw, character, game)
+    return None
+
+
+def set_phone_room_emote_style(paint_fn, tag_fn, call_tag_fn=None):
+    """Register paint/tag helpers for phone room emotes and line tags."""
+    global _phone_paint_fn, _phone_tag_fn, _phone_call_tag_fn
+    _phone_paint_fn = paint_fn
+    _phone_tag_fn = tag_fn
+    _phone_call_tag_fn = call_tag_fn if call_tag_fn is not None else tag_fn
+
+
+def phone_paint(character, role, text):
+    """Optional ANSI paint for phone lines (default passthrough)."""
+    return _phone_paint_fn(character, role, text)
+
+
+def phone_tag(character=None):
+    """Plain + painted [PHONE] tag (default empty)."""
+    return _phone_tag_fn(character)
+
+
+def phone_call_tag(character=None):
+    """Plain + painted [CALL] tag (default matches phone_tag)."""
+    fn = _phone_call_tag_fn if _phone_call_tag_fn is not None else _phone_tag_fn
+    return fn(character)
+
+
+def set_phone_voicemail_line(fn):
+    """Register fn(caller, callee_number) -> str for Echo voicemail stub."""
+    global _phone_voicemail_line_fn
+    _phone_voicemail_line_fn = fn
+
+
+def phone_voicemail_line(caller, callee_number):
+    """Voicemail refusal line when callee declines pickup."""
+    if _phone_voicemail_line_fn is not None:
+        return _phone_voicemail_line_fn(caller, callee_number)
+    return (
+        f"{phone_tag(caller)} {callee_number} — voicemail. "
+        "The line is not taking calls."
+    )
+
+
+def set_phone_payphone_fee(fn):
+    """Register fn() -> int dollars per outbound payphone call."""
+    global _phone_payphone_fee_fn
+    _phone_payphone_fee_fn = fn
+
+
+def phone_payphone_fee():
+    """Outbound payphone fee in dollars (default 0)."""
+    try:
+        return int(_phone_payphone_fee_fn())
+    except (TypeError, ValueError):
+        return 0

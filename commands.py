@@ -403,6 +403,35 @@ def dispatch(character, raw, game, *, force_actor=None):
                     actor = twin
         except ImportError:
             pass
+        if actor is character:
+            try:
+                from supers import ghost as _ghost_inhabit
+                if (
+                    _ghost_inhabit.is_inhabiting(character)
+                    and verb not in _ghost_inhabit.GHOST_INHABIT_SELF_VERBS
+                ):
+                    host = _ghost_inhabit.inhabited_host(character, game)
+                    if host is not None:
+                        actor = host
+            except ImportError:
+                pass
+
+    def _loan_session_to_actor(fn):
+        """Run *fn* with the login Session on *actor* when steering a host."""
+        loaned = False
+        prev_session = None
+        if (
+            actor is not character
+            and getattr(character, "session", None) is not None
+        ):
+            prev_session = getattr(actor, "session", None)
+            actor.session = character.session
+            loaned = True
+        try:
+            fn()
+        finally:
+            if loaned:
+                actor.session = prev_session
 
     # Awake rest cancels on most active verbs (not look/help/score/wake).
     if getattr(character, "resting", False) and not getattr(
@@ -429,8 +458,7 @@ def dispatch(character, raw, game, *, force_actor=None):
     # Same layer as asleep/frozen -- not a pre-parser black hole.
     _quest_gate = None
     try:
-        from supers import quests as _quests_gate
-        _quest_gate = _quests_gate
+        from engine.systems import quests as _quest_gate
     except ImportError:
         pass
 
@@ -442,13 +470,15 @@ def dispatch(character, raw, game, *, force_actor=None):
     walk_room = getattr(actor, "location", None)
     if getattr(actor, "in_vehicle", None):
         try:
-            from supers import vehicles as _veh_walk
+            from engine.systems import vehicles as _veh_walk
             _veh = _veh_walk.vehicle_by_id(
                 game, getattr(actor, "in_vehicle", None),
             )
-            _curb = _veh_walk.vehicle_curb_room(game, _veh) if _veh else None
-            if _curb is not None:
-                walk_room = _curb
+            park_key = _veh.get("parked_room") if _veh else None
+            if park_key:
+                _curb = (getattr(game, "rooms", None) or {}).get(park_key)
+                if _curb is not None:
+                    walk_room = _curb
         except ImportError:
             pass
     walk_dir = resolve_walk_direction(verb, walk_room)
@@ -457,11 +487,13 @@ def dispatch(character, raw, game, *, force_actor=None):
             allowed, nudge = _quest_gate.pre_dispatch_allowed(
                 actor, verb, is_move=True,
             )
-            if not allowed:
-                character.session.send(nudge)
-                display_prefs.send_prompt(character, game)
-                return
-        cmd_move(actor, walk_dir, game)
+        if not allowed:
+            character.session.send(nudge)
+            display_prefs.send_prompt(character, game)
+            return
+        def _do_move():
+            cmd_move(actor, walk_dir, game)
+        _loan_session_to_actor(_do_move)
         display_prefs.send_prompt(character, game)
         return
 
@@ -494,7 +526,9 @@ def dispatch(character, raw, game, *, force_actor=None):
                     _go_kit.sync_twin_kit(_twin_owner, actor)
         except ImportError:
             pass
-        handler(actor, args, game)  # call whichever function we found
+        def _run_handler():
+            handler(actor, args, game)  # call whichever function we found
+        _loan_session_to_actor(_run_handler)
         if _twin_owner is not None:
             try:
                 from supers import god_omnipresence as _go_kit

@@ -50,10 +50,33 @@ Call these **before** constructing `Character`s or loading a save:
 | After classic zone enter | `set_after_zone_enter(fn)` | no-op | clear overland coords + dungeon hub soft-stamp |
 | Special zone exit | `set_try_exit_zone(fn)` | False | `supers.overland.try_exit_to_overland` |
 | After HELP_TOPICS page | `set_after_help_topic(fn)` | no-op | `supers.quests.notify(…, "help_topic")` |
+| Quest grant / rewards | `engine.systems.quests.set_quest_grant_handler` / `set_quest_completion_reward_handler` | cash + flags only | `supers.quests.policy` (favor, catalog items) |
+| Quest spawns / inventory | `set_quest_spawn_handler`, `set_quest_inventory_has`, `set_quest_inventory_consume` | no-op / plain inventory | `supers.quests.policy` |
+| Quest predicates | `engine.systems.quests.register_quest_predicate` | built-in `complete_when` types | game-specific extensions |
+| Quest predicate *type names* | `engine.systems.quests_loader.register_complete_when_types` | 13 generic types (`enter_room`, `has_item`, …) | `supers.quests.policy.SUPERS_COMPLETE_WHEN_TYPES` (`true_form`, `takehunt`, `rent`, …) |
+| Quest catalog dirs | `engine.systems.quests_loader.set_quests_dirs` (additive) | `[]` | `supers/content/quests/` via loader facade |
+| Quest empty-log / no-offers flavor | `engine.systems.quests.set_quest_empty_log_hint`, `set_quest_no_offers_hint` | generic SUPERS-free line | `supers.quests.policy` (chargen opener pointers) |
 | Kind profile dirs | `set_content_kinds_dirs(dirs)` | `[]` (no kinds) | `supers/content/kinds/` via `register_core_hooks` |
 | Kind domain validate | `set_content_kind_domain_validator(fn)` | skip | `supers.content_kinds.validators.validate_domain` |
 | Kind catalog save | `set_content_kind_save_entity(fn)` | raises if OLC save | `supers.content_kinds.persist.save_entity` |
 | Menu OLC auth | `set_olc_authorizer(fn)` | deny | GM check via `register_all_hooks` |
+| Map JSON validator | `set_map_json_validator(validator)` | `engine.content_validate` fallback | `supers.content_validate` |
+| Map area_type vocabulary | `set_map_area_types(dict_or_frozenset)` | 9-entry lean default (`ruins`, `city`, …) | `supers.maps_room_json.MAP_AREA_TYPES` |
+| Map room city-meta stamper | `set_map_room_city_stamper(fn)` | no-op (lean engine ignores city header fields) | `supers.maps_room_json.stamp_map_room_city_meta` |
+| Map-store OLC entry fields | `set_map_store_apply_entry_fields(fn)` | no-op | `supers.map_store` field catalogs (rset flags/text) |
+| Map-store seed-item placement | `set_map_store_place_seed_items(fn)` | no-op | `supers.map_store` (lodging home-link + nest stamping) |
+| Persona catalog path | `set_persona_content_path(fn)` | raises if unset | `supers.personas` (`supers/content/personas.json`) |
+| Phone dial alias | `set_phone_dial_alias_resolver(fn)` | `None` (engine default lookup) | `supers.phone` (WKNZ / phonebook aliases) |
+| Phone room-emote style | `set_phone_room_emote_style(paint_fn, tag_fn, call_tag_fn=None)` | passthrough / empty tags | `supers.phone` (styled `[PHONE]`/`[CALL]` tags) |
+| Phone voicemail line | `set_phone_voicemail_line(fn)` | generic voicemail refusal | `supers.phone` (Echo auto-answer/asks text) |
+| Phone payphone fee | `set_phone_payphone_fee(fn)` | `0` | `supers.phone` (`$1` per outbound call) |
+| Appearance catalog path | `set_appearance_content_path(fn)` | raises if unset | `supers.appearance` (`supers/content/appearance.json`) |
+| Appearance kit registry | `set_appearance_kits(kits)` | raises if unset | `supers.appearance.APPEARANCE_KITS` |
+| Appearance kit person-words | `set_appearance_kit_person_words(mapping)` | `{}` | `supers.appearance._KIT_PERSON_WORD` |
+| Appearance kit short nouns | `set_appearance_kit_short_nouns(mapping)` | `{}` | `supers.appearance._KIT_SHORT_NOUN` |
+| Appearance no-crown hair styles | `set_appearance_no_crown_styles(mapping)` | `{}` | `supers.appearance._NO_CROWN_STYLES` |
+| Appearance kit inference | `set_kit_for_character_resolver(fn)` | `None` | `supers.appearance` (Cosmic Elemental Aspect inference) |
+| Appearance age phrase | `set_appearance_age_phrase_fn(fn)` | `None` | `supers.appearance` (decade phrase for `build_description`) |
 
 SUPERS auto-registers attach + blob when the `supers` package is imported
 (`supers.bootstrap.register_core_hooks`). Everything else (chargen, help,

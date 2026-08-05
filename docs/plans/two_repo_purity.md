@@ -7,21 +7,23 @@ hook API details grow in [`../ENGINE_CONSUMER.md`](../ENGINE_CONSUMER.md).
 
 **Status:** Phases 0–6 **done** for the remote split. Public
 [`riftforge-engine`](https://github.com/capnknives/riftforge-engine)
-(`v0.2.0` pin); private `capnknives/RiftForge` (SUPERS). **Phase 7**
+(`v0.4.0` pin); private `capnknives/RiftForge` (SUPERS). **Phase 7**
 (engine framework extraction + `basegame/` + Stage G root glue) is
 **complete** — Stages **1–9**, A1/A2, Plan B, Stage G, and the public
-`v0.2.0` tag. Ongoing: export discipline when engine changes; dual-mount
-hack when editing both trees. Gateway:
+`v0.2.0`/`v0.3.0`/`v0.4.0` tags. Ongoing: export discipline when engine
+changes; dual-mount hack when editing both trees. Gateway:
 [`connection_gateway.md`](connection_gateway.md) (shipped).
 T3 hygiene peels (`persistence-api` / `lean-demo` / dirty-saves **bench**)
 are done in [`refactor_plan.md`](refactor_plan.md); full incremental
 dirty-saves stay parked until measured GO.
 
-**Follow-on expansion (unparked plan):** phased engine framework promotion
+**Follow-on expansion (done 2026-08-04):** phased engine framework promotion
 (planes/gates, schemas/OLC, needs/Cadence/combat peels, body parts, slam/breach,
 civic shops, spawn/missions, clinic/crime, Studio bridge) —
-[`riftforge_core_expansion.md`](riftforge_core_expansion.md). Not product `#1`
-unless scheduled.
+[`riftforge_core_expansion.md`](riftforge_core_expansion.md). Phases 0-8
+landed (several resolved as DEFERRED after investigation, not left open);
+Phase 9 (this tag) closes the charter. Was maintainer-directed, not an
+invented product `#1`.
 
 **Naming:** two-repo **Phase 7** (this file) is **not** combat
 “Phase 7” template-blend weaving — that stays parked under combat prose
@@ -254,6 +256,7 @@ Archive of the A1/A2/Plan B design note:
 | **9** — mail / socials / clothing + basegame proof | ✅ Done | [#864](https://github.com/capnknives/RiftForge/pull/864) |
 | **G** — root `server.py` / `maps.py` / chargen/help | ✅ Done | Maps stamper [#865](https://github.com/capnknives/RiftForge/pull/865); boot seed / chargen / help [#867](https://github.com/capnknives/RiftForge/pull/867) |
 | **10** — content kind engine + menu OLC → `engine/` | ✅ Done | [#1247](https://github.com/capnknives/RiftForge/pull/1247) — `engine/content_kinds/`, `engine/olc.py`; SUPERS profiles/validators/persist/guess/inspect stay private |
+| **Core expansion 1-8** — planes/gates, dual-dir kinds, needs registry, spawn/bestiary + nest AI, instance-room teardown, Studio bridge, anatomy/body_parts | ✅ Done | [`riftforge_core_expansion.md`](riftforge_core_expansion.md) Phases 1-8; public **`v0.4.0`** tag — SUPERS pin bumped |
 
 ### Boundary rule (locked)
 
@@ -442,11 +445,13 @@ weather/travel demo + **`@v0.3.0`** shipped after. Root `server.py` /
 `tools/persist_save_bench.py` (or live lag) shows GO + explicit unpark.
 Further public tags when engine APIs change.
 
-### Next purity pass (post-v0.3.0) — parked until explicit unpark
+### Next purity pass (post-v0.4.0) — inventory in fresh audit
 
-Hygiene follow-on after the Notbigville peel. **Do not** treat as free
-backlog or invent #1 (`AGENTS.md` rules 15 / 17). Unpark with an
-explicit “start overland purity” (or similar) ask.
+**Living inventory:** [`two_repo_purity_audit_2026-08-04.md`](two_repo_purity_audit_2026-08-04.md)
+— Tier 1 peels, Tier 2 forks, `basegame/` proof gaps. **Execution plan
+(H1–H9):** [`two_repo_purity_extractions_plan.md`](two_repo_purity_extractions_plan.md).
+
+Legacy notes (post-v0.3.0 overland cleanup — **done**):
 
 | Item | Why it exists | Suggested fix when unparked |
 |------|---------------|-----------------------------|

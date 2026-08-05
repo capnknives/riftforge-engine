@@ -1,0 +1,108 @@
+{
+  "id": "npc.generic",
+  "label": "Town NPC roster row (abstract parent)",
+  "abstract": true,
+  "fields": {
+    "given_name": {
+      "type": "string",
+      "required": false,
+      "doc": "In-game display name (who / needs targeting); falls back to key."
+    },
+    "surname": {
+      "type": "string",
+      "required": false,
+      "doc": "Optional family name appended to given_name."
+    },
+    "pronoun": {
+      "type": "enum",
+      "required": false,
+      "values": ["he", "she", "they"],
+      "doc": "Third-person pronoun for look prose."
+    },
+    "appearance": {
+      "type": "object",
+      "required": false,
+      "doc": "Look slots from appearance catalog (all CORE_SLOTS when set)."
+    },
+    "cents": {
+      "type": "int",
+      "required": false,
+      "default": 0,
+      "doc": "Wallet cents (paired with dollars)."
+    },
+    "coins": {
+      "type": "int",
+      "required": false,
+      "doc": "Legacy wallet field; prefer dollars + cents."
+    },
+    "workplace": {
+      "type": "string",
+      "required": false,
+      "doc": "Shift / vendor room key (vendors require this on npc.vendor)."
+    },
+    "shift_start": {
+      "type": "int",
+      "required": false,
+      "doc": "Shift start hour 0-23 (omit for always-on duty)."
+    },
+    "shift_end": {
+      "type": "int",
+      "required": false,
+      "doc": "Shift end hour 0-23 (omit for always-on duty)."
+    },
+    "family": {
+      "type": "string",
+      "required": false,
+      "doc": "Household / family tag for social hooks."
+    },
+    "favorite_job": {
+      "type": "string",
+      "required": false,
+      "doc": "Preferred jobs.json id when picking gig work."
+    },
+    "tier": {
+      "type": "int",
+      "required": false,
+      "doc": "Combat tier (non-negative int)."
+    },
+    "stats": {
+      "type": "object",
+      "required": false,
+      "doc": "Primary stat overrides: POW, VIT, FOC, FIN, RES, PRE -> number."
+    },
+    "kit": {
+      "type": "enum",
+      "required": false,
+      "values": ["mortal"],
+      "doc": "Appearance kit override (mortal only at engine tier)."
+    },
+    "essential": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "True = cannot die / despawn (mentors, plane agents)."
+    },
+    "stay_home": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "True = never leave home for leisure (mission_giver also pins)."
+    },
+    "spar_only": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "True = sparring partner only; townsfolk default lethal-capable."
+    },
+    "role": {
+      "type": "string",
+      "required": false,
+      "doc": "Optional staff role tag (reserved for job-role hooks)."
+    },
+    "intro_lines": {
+      "type": "list",
+      "required": false,
+      "doc": "First-meet hail lines (mission intro; usually on giver catalog)."
+    }
+  }
+}

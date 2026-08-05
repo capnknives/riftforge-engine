@@ -30,6 +30,10 @@ DEFAULT_DELAY_TICKS = {
     "thievery_lock": 15,
     "electronics_bypass": 15,
     "first_aid_treat": 12,
+    # Ally KO revive (aid) -- slightly longer hands than treat-stabilize.
+    "first_aid_aid": 12,
+    # Per-body cool-down after a successful aid stand (scoped via stamp).
+    "aid_stood": 10,
     "stealth": 8,
     "mechanic_mend": 20,
     "mechanic_roadside": 25,
@@ -61,6 +65,8 @@ VERB_LABELS = {
     "thievery_lock": "lock work",
     "electronics_bypass": "electronics bypass",
     "first_aid_treat": "first aid",
+    "first_aid_aid": "aiding a fallen ally",
+    "aid_stood": "another field revive",
     "stealth": "stealth",
     "mechanic_mend": "gear repair",
     "mechanic_roadside": "roadside repair",

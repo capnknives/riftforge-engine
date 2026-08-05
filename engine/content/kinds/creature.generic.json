@@ -1,0 +1,13 @@
+{
+  "id": "creature.generic",
+  "label": "Creature template row (abstract parent)",
+  "abstract": true,
+  "fields": {
+    "spar_only": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "Non-lethal warden: redirects attack to sparring."
+    }
+  }
+}

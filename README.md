@@ -10,14 +10,14 @@ briefs, body parts, content kinds, travel, economy, …). Game-specific lore,
 catalogs, and prose live in a **separate** consumer repo and pin **tagged
 releases** of this package.
 
-**Current release: [`v0.4.0`](https://github.com/capnknives/riftforge-engine/releases/tag/v0.4.0)** — core expansion frameworks (planes/gates, dual-root content kinds, needs registry, spawn/bestiary + nest AI, instance-room teardown, anatomy/body parts, and more). A larger follow-on slice is planned; pin `@v0.4.0` until the next tag ships.
+**Current release: [`v0.5.0`](https://github.com/capnknives/riftforge-engine/releases/tag/v0.5.0)** — map-authoring OLC helpers, plus generic phone, appearance-builder, persona-trait, and relationship-tag frameworks peeled out of a private game's policy layer; dual-root content kind profiles gained abstract item/NPC/creature/map grandparents. Builds on `v0.4.0`'s core expansion frameworks (planes/gates, needs registry, spawn/bestiary + nest AI, instance-room teardown, anatomy/body parts). Pin `@v0.5.0` until the next tag ships.
 
 ## Install
 
 ```bash
 pip install -e .
 # or pin from another project:
-#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.4.0
+#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.5.0
 ```
 
 Requires **Python 3.11+**.
@@ -38,7 +38,7 @@ RIFTFORGE_GAME=basegame python server.py
 telnet localhost 4000
 ```
 
-## What's in v0.4.0
+## What's in v0.5.0
 
 ### Core runtime (`engine/`)
 
@@ -49,7 +49,7 @@ telnet localhost 4000
 | **Hooks** | Registration surface so games wire chargen, persist, help, dispatch, and domain behavior without engine imports of game code |
 | **Persistence** | Character/world save helpers; lean `Character` surface games extend via attach hooks |
 | **Tick loop** | Ordered tick registry — games register heartbeat callbacks at boot |
-| **Content** | JSON content store + validation; dual-root **kind profiles** (`engine/content_kinds/`) with `extends` merge, templates, and lint |
+| **Content** | JSON content store + validation; dual-root **kind profiles** (`engine/content_kinds/`) with `extends` merge, templates, and lint; abstract `item.generic` / `npc.generic` / `creature.generic` / `map.earth` grandparents in `engine/content/kinds/` for games to `extends` |
 | **OLC** | In-game menu wizard (`engine/olc.py`) for authoring entities through kind profiles |
 | **Stats** | Shared six-primary spine (`POW` / `VIT` / `FOC` / `FIN` / `RES` / `PRE`) + Tier helpers |
 | **Verbs** | Lean engine command stubs; games override via merged `COMMANDS` tables |
@@ -75,6 +75,11 @@ Reusable opt-in systems another MUD can adopt through hooks and registration:
 | **Social & gear** | `mail`, `social_catalog`, `wearables`, `containers`, `floor_loot` | Letters, emote catalog, clothing slots, containers |
 | **Civic** | `clinic`, `justice`, `player_site` | Injury intake, crime case shell, player-owned site hooks |
 | **Quests** | `quests`, `quests_loader` | Quest state machine + JSON loader |
+| **Map authoring** | `map_store` | OLC dig/link/room-field helpers; games register field catalogs + seed-item placement via hooks |
+| **Phone** | `phone` | Numbers, contacts, ring/answer/hangup, plane-local dial, payphone fee hook |
+| **Appearance** | `appearance` | Generic look-slot catalog, short/long description builder; games register kits + catalogs |
+| **Persona traits** | `persona_registry` | Trait catalog load/validate/save, need multipliers, conflict + traveler APIs |
+| **Relationships** | `relationships` | Directed-tag relationship core: kind ladder, CRUD, asymmetry codes, favorite-person resolution |
 | **Studio bridge** | `studio_bridge` | Hot-reload hook for Area Studio content edits (monorepo tool; bridge API ships in engine) |
 | **Other** | `pathfind` (BFS), `languages`, `umbral`, `utility_delay`, `press_beat`, `origin_registry` | Pathfinding, language tags, umbral shroud shell, timed actions, press-beat pacing |
 
@@ -118,7 +123,7 @@ CI runs both on every push.
 
 ## Building your own game
 
-1. `pip install -e .` (or pin `@v0.4.0`).
+1. `pip install -e .` (or pin `@v0.5.0`).
 2. Read [`docs/ENGINE_CONSUMER.md`](docs/ENGINE_CONSUMER.md) — hooks for chargen, persist, help, `register_all_hooks()`.
 3. Copy `basegame/` as a skeleton, or register your package via `RIFTFORGE_GAME=yourgame`.
 4. Put catalogs in your repo (`content/kinds/`, maps, NPCs); register kind dirs with `set_content_kinds_dirs`.

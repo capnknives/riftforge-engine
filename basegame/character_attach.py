@@ -48,6 +48,11 @@ def attach_basegame(character):
     character.chase_id = None
     character.chase_brief = None
     character.chase_flags = {}
+    character.press_photos = []
+    character.press_story_id = None
+    character.press_story_brief = None
+    character.press_story_flags = {}
+    character.press_stories_filed = 0
     character.bg_stellar = False
     character.solar_charge = 1.0
     character.stellar_flight_tier = "ground"
@@ -55,4 +60,19 @@ def attach_basegame(character):
     character.stellar_globe_lat = None
     character.stellar_flight_macro = None
     character.orbit_return_room = None
+    # Umbral Alien path lean defaults (engine/systems/umbral.py). Chargen
+    # flips bg_umbral True when the player picks Umbral; character.origin
+    # itself is engine-owned ("mundane" until chargen overwrites it).
+    character.bg_umbral = False
+    character.umbral_charge = 1.0
+    character.umbral_shrouded = False
+    character.alien_path = None
     needs_module.attach_character(character)
+    character.downed = False
+    character.downed_until_tick = 0
+    character.hospitalized = False
+    character.hospital_until_tick = 0
+    character.wanted = False
+    character.fine_owed_cents = 0
+    character.jail_until_tick = None
+    character.hp_cap = stats_module.max_hp(character)

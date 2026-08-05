@@ -250,6 +250,15 @@ async def _prompt_create_and_link(session, character):
         f"{_presence_face(character)}. "
         "Next time you can type 'account' at the name prompt."
     )
+    from engine import gm_notify
+    who = gm_notify.public_who(character, game)
+    gm_notify.ping_gms(
+        game,
+        f"{who} created account {account.display_name} and linked "
+        f"{_presence_face(character)}{{from}}.",
+        exclude=character,
+        peer_session=session,
+    )
     return True
 
 
@@ -289,5 +298,13 @@ async def _prompt_link_existing(session, character):
     session.send(
         f"Linked {_presence_face(character)} to account "
         f"'{account.display_name}'."
+    )
+    from engine import gm_notify
+    who = gm_notify.public_who(character, game)
+    gm_notify.ping_gms(
+        game,
+        f"{who} linked to account {account.display_name}{{from}}.",
+        exclude=character,
+        peer_session=session,
     )
     return True

@@ -1,9 +1,16 @@
 # Releasing Riftforge (public engine)
 
-**Status:** Phase 6 remotes **done**; Phase 7 framework peels **done**.
-Public remote **`capnknives/riftforge-engine`**. Current SUPERS pin:
-**`v0.2.0`** (Phase 7 engines: stats, needs, economy, pathfind,
-combat_core, mail/socials/wearables, Stage G hooks).
+**Status:** Phase 6 remotes **done**; Phase 7 framework peels **done**;
+`riftforge_core_expansion.md` Phases 1-8 **done**; two-repo purity H1-H9
+extraction track (`docs/plans/two_repo_purity_extractions_plan.md`)
+**done**. Public remote **`capnknives/riftforge-engine`**. Current SUPERS
+pin: **`v0.5.0`** (adds map-authoring OLC helpers plus generic phone,
+appearance-builder, persona-trait, and relationship-tag frameworks, and
+abstract item/NPC/creature/map generic kind grandparents, on top of
+`v0.4.0`'s elemental planes + rotating gates, dual-root content-kind
+profiles, needs-meter registry, spawn bestiary + nest-AI dispatch,
+instance-room teardown, Area Studio reload bridge, and the anatomy/body-
+parts region state machine).
 
 ## Cut a release
 
@@ -14,10 +21,10 @@ combat_core, mail/socials/wearables, Stage G hooks).
    `python tools/basegame_smoke.py`.
 3. Tag `vX.Y.Z` (semver; breaking hook API = major)::
 
-       git tag -a v0.2.0 -m "riftforge-engine v0.2.0 — Phase 7 frameworks"
-       git push origin v0.2.0
+       git tag -a v0.5.0 -m "riftforge-engine v0.5.0 — map-store OLC + phone/appearance/persona/relationship frameworks"
+       git push origin v0.5.0
 
-   Prefer **`v0.2.0`** over older `v0.1.x` tags for new consumers.
+   Prefer **`v0.5.0`** over older tags for new consumers.
    Re-exports via `tools/export_public_engine.py` ignore `__pycache__` /
    `*.pyc` and rewrite a lean root `help_topics.py` facade + public README +
    `.github/workflows/ci.yml` (player help content stays in private SUPERS:

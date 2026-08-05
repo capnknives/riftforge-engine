@@ -33,3 +33,34 @@ def stamp_basegame_map_room(room, data, *, filename=None):
     spawn_nest = data.get("spawn_nest")
     if spawn_nest is not None and str(spawn_nest).strip():
         room.spawn_nest = str(spawn_nest).strip().lower()
+
+    hospital = data.get("hospital")
+    if hospital is not None:
+        room.hospital = bool(hospital)
+
+    is_cell = data.get("is_cell")
+    if is_cell is not None:
+        room.is_cell = bool(is_cell)
+
+    shop_stock = data.get("shop_stock")
+    if shop_stock is not None:
+        if not isinstance(shop_stock, list):
+            where = f"{filename}: " if filename else ""
+            raise ValueError(
+                f"{where}room {room.key!r}: shop_stock must be a list"
+            )
+        room.shop_stock = [dict(entry) for entry in shop_stock]
+
+    is_hotel_room = data.get("is_hotel_room")
+    if is_hotel_room is not None:
+        room.is_hotel_room = bool(is_hotel_room)
+
+    resources = data.get("resources")
+    if resources is not None:
+        room.resources = list(resources)
+
+    # Twitch / active combat arena flag -- Fight.combat_mode locks to
+    # "active" when engagement starts here (docs/plans/fast_paced_combat_engine.md).
+    active_combat = data.get("active_combat")
+    if active_combat is not None:
+        room.active_combat = bool(active_combat)

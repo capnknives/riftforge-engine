@@ -25,6 +25,11 @@ FLOOR_SCAVENGE_AGE_SECONDS = 300.0
 # forever.
 VAULT_ITEM_DECAY_SECONDS = 1800.0
 
+# Backup clear for severed-head trophies left on ordinary floors when
+# scavengers miss (~45 real minutes after drop). Does not apply to the
+# lost-item vault (that uses VAULT_ITEM_DECAY_SECONDS).
+SEVERED_HEAD_FLOOR_DECAY_SECONDS = 2700.0
+
 # Authored plaza seed and similar props scavengers must never pocket.
 _SKIP_ITEM_KEYS = frozenset({
     "a rusted sword",
@@ -163,6 +168,17 @@ def is_lost_item_vault(room):
     return False
 
 
+def is_severed_head_floor_item(item):
+    """True when ``item`` is a severed-head trophy on a floor (TTL backup)."""
+    if item is None:
+        return False
+    cat = _catalog_id(item)
+    if cat.startswith("severed_"):
+        return True
+    key = str(getattr(item, "key", "") or "").strip().lower()
+    return "severed head" in key
+
+
 def tick_vault_item_decay(game):
     """Crumble expired floor Items in the lost-item vault only.
 
@@ -199,4 +215,50 @@ def tick_vault_item_decay(game):
             "Forgotten things crumble into dust and are gone.",
             exclude=None,
         )
+    return removed
+
+
+def tick_severed_head_floor_decay(game):
+    """Crumble abandoned severed-head trophies on ordinary floors.
+
+    Backup when scavengers miss the pile. Skips the lost-item vault (vault
+    TTL owns that room). Uses ``floor_dropped_tick``; unstamped legacy heads
+    get stamped on first sight so they clear after one window. Returns how
+    many Items were removed.
+    """
+    from world import Item
+
+    if game is None:
+        return 0
+    rooms = getattr(game, "rooms", None) or {}
+    if not isinstance(rooms, dict):
+        return 0
+    now = int(getattr(game, "game_time_ticks", 0) or 0)
+    from engine import game_clock_tuning as clock_mod
+    age = clock_mod.ticks_for_wall_seconds(
+        SEVERED_HEAD_FLOOR_DECAY_SECONDS, game,
+    )
+    removed = 0
+    for room in list(rooms.values()):
+        if room is None or is_lost_item_vault(room):
+            continue
+        for obj in list(getattr(room, "contents", None) or []):
+            if not isinstance(obj, Item):
+                continue
+            if not is_severed_head_floor_item(obj):
+                continue
+            dropped = getattr(obj, "floor_dropped_tick", None)
+            if dropped is None:
+                # Legacy pile -- start the clock so it clears once.
+                stamp_floor_drop(game, obj)
+                continue
+            if now < int(dropped) + age:
+                continue
+            room.remove(obj)
+            removed += 1
+            if room.characters():
+                room.broadcast(
+                    "A discarded trophy softens into the wet brick and is gone.",
+                    exclude=None,
+                )
     return removed

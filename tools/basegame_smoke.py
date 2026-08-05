@@ -48,8 +48,13 @@ class _FakeSession:
 
 
 def _chargen_replies_for(path_index):
+    """Scripted chargen answers: path + zero stat bonuses + Mundane origin.
+
+    Origin menu is Mundane (1) plus sorted registered origins; Mundane is
+    always option 1 so existing path-smoke characters stay ordinary humans.
+    """
     from engine import stats as engine_stats
-    return [str(path_index)] + ["0"] * len(engine_stats.STAT_NAMES) + ["0"]
+    return [str(path_index)] + ["0"] * len(engine_stats.STAT_NAMES) + ["1"]
 
 
 async def _run_chargen_for_path(game, path_index, path_id):
@@ -90,6 +95,11 @@ def main():
     from engine import hooks
     topics = hooks.get_help_topics()
     assert "paths" in topics
+    assert "shop" in topics
+    assert "clinic" in topics
+    assert "origins" in topics
+    assert "shroud" in commands_mod.COMMANDS
+    assert "unshroud" in commands_mod.COMMANDS
 
     game = server_mod.Game(db_path=":memory:")
     assert game.start_room is not None
@@ -115,7 +125,7 @@ def main():
     for index, path_id in enumerate(PATH_ORDER, start=1):
         char = asyncio.run(_run_chargen_for_path(game, index, path_id))
         placed.append(char)
-    assert len(placed) == 4
+    assert len(placed) == len(PATH_ORDER)
 
     walker = placed[0]
     walker.session = _FakeSession([])
@@ -204,6 +214,29 @@ def main():
     dispatch(walker, f"mail send {peer.key} hello from square", game)
     assert peer.mail_inbox and peer.mail_inbox[0]["text"] == "hello from square"
 
+    from engine.systems import economy as economy_mod
+    from engine.systems import civic_shop as civic_shop_mod
+
+    store = game.rooms.get("NB00004")
+    assert store is not None and getattr(store, "shop_stock", None), (
+        "General Store should load shop_stock from zone JSON"
+    )
+    walker.move_to(store)
+    economy_mod.credit_wallet(walker, dollars=20)
+    lantern = civic_shop_mod.find_ware(store.shop_stock, "lantern")
+    assert lantern is not None
+    before_qty = lantern["qty"]
+    before_wallet = economy_mod.wallet_total_cents(walker)
+    walker.session = _FakeSession([])
+    dispatch(walker, "buy lantern", game)
+    assert walker.inventory, walker.session.lines
+    assert lantern["qty"] == before_qty - 1, lantern
+    assert economy_mod.wallet_total_cents(walker) == (
+        before_wallet - lantern["price_cents"]
+    ), (
+        economy_mod.wallet_total_cents(walker), before_wallet, lantern
+    )
+
     from engine.systems import needs as needs_engine
     from basegame import needs as basegame_needs
 
@@ -278,7 +311,288 @@ def main():
     assert dummy.hp == 100.0, "guaranteed-miss round should not damage dummy"
     walker.target = None
 
-    server_mod.run_ticks(game)
+    # Mixed combat_engine dispatch: mundane default vs martial_arts + fallback.
+    from engine.systems import combat_martial_arts
+    from engine.systems import combat_mundane
+    from basegame import stats as stats_module
+
+    mundane_fighter = placed[0]
+    martial_fighter = placed[3]
+    mundane_fighter.combat_engine = None
+    martial_fighter.combat_engine = "martial_arts"
+    mundane_fighter.hp = stats_module.max_hp(mundane_fighter)
+    martial_fighter.hp = stats_module.max_hp(martial_fighter)
+    mundane_fighter.martial_combo = 0
+    martial_fighter.martial_combo = 0
+    martial_fighter.martial_stance = "strike"
+    mundane_fighter.martial_stance = "grapple"
+    mundane_fighter.move_to(game.rooms["NB00001"])
+    martial_fighter.move_to(game.rooms["NB00001"])
+    mundane_fighter.target = martial_fighter
+    martial_fighter.target = mundane_fighter
+
+    mundane_hp_before = mundane_fighter.hp
+    martial_hp_before = martial_fighter.hp
+    combat_mod.resolve_round(game, rng=lambda: 0.0)
+    # Martial fighter swings at mundane (strike beats grapple -> advantage).
+    expected_ma_dmg = (
+        combat_martial_arts.BASE_DAMAGE
+        + combat_martial_arts.COMBO_BONUS_PER_STACK * 1
+    )
+    assert martial_fighter.martial_combo == 1, (
+        f"martial_combo should persist on character, got {martial_fighter.martial_combo!r}"
+    )
+    assert mundane_fighter.hp == mundane_hp_before - expected_ma_dmg, (
+        f"mundane victim hp {mundane_fighter.hp!r} vs expected "
+        f"{mundane_hp_before - expected_ma_dmg!r}"
+    )
+    # Mundane fighter swings back (rng=0.0 -> critical on mundane engine).
+    assert martial_fighter.hp == (
+        martial_hp_before - combat_mundane.DAMAGE_PER_CRITICAL
+    ), martial_fighter.hp
+
+    garbage_fighter = placed[1]
+    garbage_fighter.combat_engine = "nonsense"
+    garbage_fighter.hp = stats_module.max_hp(garbage_fighter)
+    garbage_victim = placed[2]
+    garbage_victim.hp = 100.0
+    garbage_fighter.target = garbage_victim
+    garbage_victim.target = None
+    result = combat_mod.resolve_swing(
+        garbage_fighter, garbage_victim, rng=lambda: 0.0,
+    )
+    assert result["outcome"] == "critical", result
+    assert garbage_victim.hp == (
+        100.0 - combat_mod.DAMAGE_PER_CRITICAL
+    ), garbage_victim.hp
+
+    mundane_fighter.target = None
+    martial_fighter.target = None
+    garbage_fighter.target = None
+
+    from engine.systems import clinic as clinic_mod
+
+    brawler = placed[2]
+    medic = placed[1]
+    assert medic.bg_path == "medic"
+    brawler.hp = 1.0
+    brawler.hp_cap = stats_module.max_hp(brawler)
+    walker.target = brawler
+    brawler.target = walker
+    combat_mod.resolve_round(game, rng=lambda: 0.0)
+    assert clinic_mod.is_ko(brawler), getattr(brawler, "downed", None)
+    for _ in range(15):
+        if getattr(brawler, "hospitalized", False):
+            break
+        game.on_tick()
+    ward = game.rooms.get("NB00005")
+    assert ward is not None
+    assert getattr(brawler, "hospitalized", False), (
+        brawler.location.key if brawler.location else None
+    )
+    medic.move_to(ward)
+    medic.session = _FakeSession([])
+    dispatch(medic, f"treat {brawler.key}", game)
+    assert not getattr(brawler, "hospitalized", False), medic.session.lines
+
+    from engine.systems import justice as justice_mod
+    from engine import hooks
+
+    crook = placed[2]
+    ranger = placed[3]
+    assert ranger.bg_path == "ranger"
+    crook.move_to(walker.location)
+    crook.session = _FakeSession([])
+    walker_cash_before = economy_mod.wallet_total_cents(walker)
+    dispatch(crook, f"steal {walker.key}", game)
+    assert justice_mod.is_wanted(crook), crook.session.lines
+    assert economy_mod.wallet_total_cents(walker) < walker_cash_before
+    cell = game.rooms.get("NB00010")
+    assert cell is not None and getattr(cell, "is_cell", False)
+    ranger.move_to(cell)
+    crook.move_to(cell)
+    ranger.session = _FakeSession([])
+    dispatch(ranger, f"arrest {crook.key}", game)
+    assert justice_mod.is_jailed(crook, game)
+    dest = cell.exits.get("north")
+    assert hooks.move_gate_block(crook, cell, dest, game)
+    jail_until = int(getattr(crook, "jail_until_tick", 0) or 0)
+    assert jail_until > int(game.game_time_ticks)
+    game.game_time_ticks = jail_until + 1
+    justice_mod.tick(game)
+    assert not justice_mod.is_jailed(crook, game), (
+        f"jail_until_tick={getattr(crook, 'jail_until_tick', None)!r} "
+        f"game_time_ticks={game.game_time_ticks}"
+    )
+    economy_mod.credit_wallet(crook, dollars=20)
+    crook.session = _FakeSession([])
+    dispatch(crook, "payfine", game)
+    assert not justice_mod.is_wanted(crook)
+
+    saloon = game.rooms.get("NB00011")
+    alley = game.rooms.get("NB00012")
+    assert saloon is not None and alley is not None
+    walker.move_to(saloon)
+    walker.session = _FakeSession([])
+    for _ in range(2):
+        dispatch(walker, "slam wall", game)
+    assert walker.location.key == "NB00012", walker.location.key
+
+    # ---- Phase 5: origin registry + Alien Stellar / Umbral ----
+    from engine.systems import aerial as aerial_mod
+    from engine.systems import origin_registry
+    from engine.systems import umbral as umbral_mod
+    from engine import hooks as hooks_mod
+
+    assert "alien" in origin_registry.known_origins()
+
+    # Shortcut convention (same as clinic/justice smokes): stamp fields
+    # directly rather than re-running full interactive chargen for every
+    # Bloodline. Stellar flight gate must still honor bg_stellar.
+    stellar = placed[0]
+    stellar.origin = "alien"
+    stellar.alien_path = "stellar"
+    aerial_mod.ensure_stellar_defaults(stellar)
+    stellar.bg_stellar = True
+    assert aerial_mod.is_stellar(stellar)
+    stellar.session = _FakeSession([])
+    # Indoor refusal still works (Main Street is indoor-ish -- Observatory
+    # is outdoor; use an indoor room to prove the gate, not the climb).
+    indoor = game.rooms.get("NB00001")
+    stellar.move_to(indoor)
+    dispatch(stellar, "fly", game)
+    # Either outdoor takeoff or an open-sky refusal -- never a crash, and
+    # non-Stellar still refused. Prove the non-Stellar gate separately:
+    mundane = placed[1]
+    mundane.bg_stellar = False
+    mundane.session = _FakeSession([])
+    mundane.move_to(indoor)
+    dispatch(mundane, "fly", game)
+    assert any(
+        "Only Stellar" in line for line in mundane.session.lines
+    ), mundane.session.lines
+
+    umbral = placed[2]
+    umbral.origin = "alien"
+    umbral.alien_path = "umbral"
+    umbral_mod.ensure_umbral_defaults(umbral)
+    umbral.bg_umbral = True
+    umbral.umbral_charge = 1.0
+    umbral.session = _FakeSession([])
+    watcher = placed[3]
+    watcher.session = _FakeSession([])
+    shared = game.rooms.get("NB00001")
+    umbral.move_to(shared)
+    watcher.move_to(shared)
+
+    # Daylight blocks shroud (noon).
+    from engine.game_calendar import TICKS_PER_HOUR
+    game.game_time_ticks = 12 * TICKS_PER_HOUR
+    dispatch(umbral, "shroud", game)
+    assert not umbral.umbral_shrouded, umbral.session.lines
+
+    # Night allows shroud; presence hook hides the actor.
+    game.game_time_ticks = 0  # midnight -> night
+    umbral.session = _FakeSession([])
+    dispatch(umbral, "shroud", game)
+    assert umbral.umbral_shrouded is True, umbral.session.lines
+    assert umbral.stealth_active is True
+    assert hooks_mod.can_notice_stealth(watcher, umbral, game) is False
+
+    umbral.session = _FakeSession([])
+    dispatch(umbral, "unshroud", game)
+    assert umbral.umbral_shrouded is False
+    assert umbral.stealth_active is False
+    assert hooks_mod.can_notice_stealth(watcher, umbral, game) is True
+
+    # Charge drain auto-clears shroud.
+    umbral.session = _FakeSession([])
+    dispatch(umbral, "shroud", game)
+    assert umbral.umbral_shrouded is True
+    umbral.umbral_charge = umbral_mod.UMBRAL_CHARGE_STEP
+    game.on_tick()
+    assert umbral.umbral_shrouded is False
+    assert umbral.stealth_active is False
+
+    # ---- H5: fetch_pebble authored quest demo ----
+    from engine.systems import quests as quests_mod
+    from engine.systems import economy as economy_mod
+
+    quester = placed[0]
+    quester.move_to(game.rooms["NB00001"])
+    quester.session = _FakeSession([])
+    dispatch(quester, "questaccept fetch_pebble", game)
+    assert quests_mod.has_active_quest(quester, "fetch_pebble")
+    dispatch(quester, "south", game)
+    assert quester.location.key == "NB00007"
+    quests_mod.notify(quester, "has_item", game=game)
+    assert not quests_mod.has_active_quest(quester, "fetch_pebble"), (
+        quester.quest_progress
+    )
+    assert economy_mod.wallet_total_cents(quester) >= 500, (
+        economy_mod.wallet_total_cents(quester)
+    )
+
+    # ---- H2: generic boarded cart (engine/systems/vehicles.py) ----
+    from engine.systems import vehicles as vehicles_mod
+
+    rider = placed[0]
+    plaza = game.rooms["NB00001"]
+    rider.move_to(plaza)
+    rider.session = _FakeSession([])
+    vehicles_mod.ensure_game_vehicles(game)
+    cart = vehicles_mod.vehicle_by_id(game, "cart")
+    assert cart is not None, game.vehicles
+    park_before = cart["parked_room"]
+    dispatch(rider, "board cart", game)
+    assert rider.in_vehicle == "cart", rider.session.lines
+    assert rider.location.key == cart["interior_key"]
+    rider.session = _FakeSession([])
+    dispatch(rider, "drive north", game)
+    assert cart["parked_room"] != park_before, (
+        cart["parked_room"], park_before, rider.session.lines
+    )
+    rider.session = _FakeSession([])
+    dispatch(rider, "unboard", game)
+    assert rider.in_vehicle is None, rider.in_vehicle
+    assert rider.location.key == cart["parked_room"]
+
+    game.on_tick()
+
+    # ---- H3: lodging rent + paced walk ----
+    from engine.systems import lodging as lodging_mod
+    from engine.systems import paced_travel as paced_mod
+
+    inn = game.rooms.get("NB00014")
+    assert inn is not None and lodging_mod.is_lodging_unit(inn)
+    assert lodging_mod.beds_in_room(inn), "inn should have a seeded bunk bed"
+    guest = placed[0]
+    guest.move_to(inn)
+    guest.session = _FakeSession([])
+    economy_mod.credit_wallet(guest, dollars=10)
+    dispatch(guest, "rent bed", game)
+    assert guest.home_room_key == "NB00014", guest.home_room_key
+    assert lodging_mod.claimants_of(game, "NB00014"), "rent should claim the room"
+    bed, err = lodging_mod.pick_bed(inn, guest)
+    assert bed is not None and err is None, (bed, err)
+    assert lodging_mod.bed_available_to(guest, bed, inn)
+
+    walker = placed[1]
+    walker.move_to(game.rooms["NB00001"])
+    walker.session = _FakeSession([])
+    post = game.rooms.get("NB00006")
+    dispatch(walker, "walk post", game)
+    if walker.location is not post:
+        assert paced_mod.has_walk_focus(walker), walker.session.lines
+        hops = 0
+        while paced_mod.has_walk_focus(walker) and hops < 30:
+            game.on_tick()
+            hops += 1
+    assert walker.location is post, (
+        f"walk post should arrive at post office, got {walker.location.key!r}"
+    )
+
+    game.on_tick()
     game.db.close()
 
     print("basegame_smoke_ok")

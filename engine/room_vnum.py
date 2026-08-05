@@ -585,6 +585,83 @@ def rekey_hand_rooms_to_vnum(rooms: dict) -> tuple[dict, dict]:
     return new_rooms, aliases
 
 
+def merge_map_additive(
+    rooms: dict, filename: str, data: dict,
+) -> tuple[dict, list]:
+    """Filter a map/zone JSON doc down to rooms genuinely missing from
+    ``rooms``.
+
+    On-demand loaders (easter-egg homesteads, runtime hot-loads) that call
+    ``world_maps.create_rooms_from_map_data`` straight into a staging copy
+    of an already-populated ``game.rooms`` dict crash with "already used
+    by another map file" the moment *any* room in the doc was loaded
+    before -- including a room this very same file put there on an
+    earlier boot pass (e.g. the file also ``autoload``s normally, and a
+    caller's own index of "did my chambers load" went stale for some
+    unrelated reason). That is the same additive-merge problem
+    ``engine.map_heal.merge_missing_from_backup`` solves for on-disk
+    backup JSON, just for an in-memory ``rooms`` dict.
+
+    A JSON room is treated as "already loaded" (silently dropped from the
+    result) when its ``key`` or ``vnum`` already resolves to a live Room
+    whose ``legacy_key`` (or bare ``key``) matches this room's own
+    ``legacy_key`` -- i.e. it is the *same* authored chamber, not a
+    coincidence. A ``key``/``vnum`` claimed by a live Room that does
+    **not** match is a genuine authoring collision (two different rooms
+    wanting the same identity) and is reported back as a conflict string
+    instead of being silently dropped -- callers should raise loud with
+    those, the same "fail loud on a real collision" spirit as
+    ``world_maps._add_room``.
+
+    Returns ``(filtered_data, conflicts)``. ``filtered_data`` is a shallow
+    copy of ``data`` whose ``rooms[]`` holds only the missing entries (safe
+    to pass straight to ``create_rooms_from_map_data`` / ``link_map_data``);
+    ``conflicts`` is empty on a clean merge. Grid cells (``data["grid"]``)
+    are not touched -- this only guards hand-authored ``rooms[]`` entries.
+    Never raises itself; the caller decides how to report ``conflicts``.
+    """
+    live_vnum_owner: dict[str, object] = {}
+    for room in (rooms or {}).values():
+        raw_v = getattr(room, "vnum", None)
+        if raw_v and str(raw_v).strip():
+            live_vnum_owner[str(raw_v).strip().upper()] = room
+
+    missing = []
+    conflicts = []
+    for room_data in data.get("rooms", []) or []:
+        key = str(room_data.get("key") or "").strip()
+        vnum = str(room_data.get("vnum") or "").strip().upper()
+        legacy = str(room_data.get("legacy_key") or "").strip()
+        existing = rooms.get(key) if key else None
+        if existing is None and vnum:
+            existing = live_vnum_owner.get(vnum)
+        if existing is None:
+            missing.append(room_data)
+            continue
+        existing_legacy = str(
+            getattr(existing, "legacy_key", "") or "",
+        ).strip()
+        existing_key = str(getattr(existing, "key", "") or "").strip()
+        if legacy:
+            same_room = legacy in (existing_legacy, existing_key)
+        else:
+            # Neither side authored a legacy_key -- only an exact key match
+            # is safe to call "the same room" (matches the common case of
+            # an idempotent reload of an unchanged file).
+            same_room = bool(key) and key == existing_key
+        if same_room:
+            continue
+        ident = key or vnum
+        conflicts.append(
+            f"{filename}: room {ident!r} collides with "
+            f"{staff_room_label(existing)!r} ({existing_key!r}) -- "
+            "different content wants the same key/vnum"
+        )
+    filtered = dict(data)
+    filtered["rooms"] = missing
+    return filtered, conflicts
+
+
 def lookup_room(game, key):
     """Find a Room by VNUM identity key or legacy storage key.
 

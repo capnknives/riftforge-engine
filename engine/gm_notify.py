@@ -2,7 +2,9 @@
 gm_notify.py -- dark-green GM staff channel for ops events.
 
 Classic MUD feel: online staff GMs get short absinthe-green lines when
-someone starts chargen, connects, disconnects, or files a bug/suggest.
+someone starts or finishes chargen, connects, disconnects, deletes a
+character, changes password, links an account, breaks Tier, or files a
+bug/suggest.
 Never the only signal -- every line keeps a plain ``[GM]`` prefix so
 ``color off`` still reads clearly (docs/SYSTEMS_DESIGN.md section 8).
 
@@ -77,6 +79,29 @@ def format_from(session, viewer=None):
     if host:
         return f" from {host}"
     return ""
+
+
+def public_who(character, game=None, *, force_surname=True):
+    """Legal public name for staff pings, with optional ``(account)`` suffix.
+
+    When ``game`` is omitted, uses ``character.session.game`` when attached.
+    """
+    from engine.char_identity import legal_public_name
+
+    who = legal_public_name(character, force_surname=force_surname)
+    if game is None:
+        session = getattr(character, "session", None)
+        game = getattr(session, "game", None) if session is not None else None
+    if game is not None:
+        try:
+            from engine import accounts as accounts_mod
+
+            account = accounts_mod.account_for_character(game, character)
+            if account is not None:
+                who = f"{who}({account.display_name})"
+        except Exception:
+            pass
+    return who
 
 
 def paint_gm_line(message):

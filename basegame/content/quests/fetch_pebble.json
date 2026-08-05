@@ -1,0 +1,34 @@
+{
+  "id": "fetch_pebble",
+  "title": "Fetch the Pebble",
+  "summary": "Walk south to the lane and pick up the training pebble for a few dollars.",
+  "offer_rooms": ["NB00001"],
+  "intro": [
+    "A chalk note on the town board reads: south lane, pebble, coin."
+  ],
+  "complete": [
+    "You pocket the pebble stipend. Case closed."
+  ],
+  "rewards": [
+    {"type": "dollars", "amount": 5}
+  ],
+  "steps": [
+    {
+      "id": "go_south",
+      "narrate": [
+        "Head south along Main Street to the south lane."
+      ],
+      "hint": "south",
+      "complete_when": {"type": "enter_room", "room": "NB00007"},
+      "grant": {"item": "demo_pebble"}
+    },
+    {
+      "id": "pick_pebble",
+      "narrate": [
+        "You spot the pebble in the lane."
+      ],
+      "hint": "carry the pebble to finish",
+      "complete_when": {"type": "has_item", "item": "demo_pebble"}
+    }
+  ]
+}

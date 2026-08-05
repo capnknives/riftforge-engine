@@ -1,0 +1,131 @@
+{
+  "id": "item.generic",
+  "label": "Generic catalog item (abstract parent)",
+  "abstract": true,
+  "fields": {
+    "key": {
+      "type": "string",
+      "required": true,
+      "doc": "Player-facing item name."
+    },
+    "description": {
+      "type": "string",
+      "required": true,
+      "doc": "Look / examine prose."
+    },
+    "need": {
+      "type": "enum",
+      "required": false,
+      "values": ["food", "water"],
+      "doc": "Consumable need tag (food/water only at engine tier)."
+    },
+    "locked": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "If true, players cannot pick it up."
+    },
+    "furniture": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "Floor furniture (beds, counters)."
+    },
+    "provides_light": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "Emits light in dark rooms."
+    },
+    "aliases": {
+      "type": "list",
+      "required": false,
+      "doc": "Alternate match strings for get/buy."
+    },
+    "color": {
+      "type": "string",
+      "required": false,
+      "doc": "engine.style.COLORS role for painted names."
+    },
+    "slot": {
+      "type": "enum",
+      "required": false,
+      "values": [
+        "weapon", "offhand", "shield", "head", "body", "arms", "hands",
+        "legs", "feet", "about", "neck", "finger", "ring_left", "ring_right",
+        "earring_left", "earring_right", "bracelet_left", "bracelet_right",
+        "waist", "belt", "light_belt"
+      ],
+      "doc": "Combat equip slot (legacy armor/accessory normalize at load)."
+    },
+    "mods": {
+      "type": "object",
+      "required": false,
+      "doc": "Combat modifiers: accuracy, crit_chance, crit_damage, block_chance, evasion, armor, initiative, stealth, damage."
+    },
+    "materials": {
+      "type": "list",
+      "required": false,
+      "doc": "Folklore bane tags: salt, iron, silver, wood."
+    },
+    "grip": {
+      "type": "enum",
+      "required": false,
+      "values": ["one_hand", "two_hand"],
+      "doc": "Weapon grip for dual-wield rules."
+    },
+    "two_hand": {
+      "type": "bool",
+      "required": false,
+      "deprecated": true,
+      "doc": "Deprecated — use grip=two_hand."
+    },
+    "two_handed": {
+      "type": "bool",
+      "required": false,
+      "deprecated": true,
+      "doc": "Deprecated — use grip=two_hand."
+    },
+    "weapon_voice": {
+      "type": "string",
+      "required": false,
+      "doc": "Combat prose voice family (firearm, bow, blade, …)."
+    },
+    "artifact_lexicon": {
+      "type": "string",
+      "required": false,
+      "doc": "Unique artifact combat lexicon pool id."
+    },
+    "max_ammo": {
+      "type": "int",
+      "required": false,
+      "doc": "Magazine capacity for ranged weapons."
+    },
+    "spawn_loaded_ammo": {
+      "type": "string",
+      "required": false,
+      "doc": "Ammo catalog id to preload in the magazine at spawn."
+    },
+    "ammo_kind": {
+      "type": "string",
+      "required": false,
+      "doc": "Ammo stack kind id for reload/matching."
+    },
+    "stack_charges": {
+      "type": "int",
+      "required": false,
+      "doc": "Consumable stack charges (ammo boxes, etc.)."
+    },
+    "is_bag": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "General-purpose inventory bag."
+    },
+    "bag_capacity": {
+      "type": "int",
+      "required": false,
+      "doc": "Max items held when is_bag."
+    }
+  }
+}

@@ -4,3 +4,4 @@ __pycache__/
 *.db
 .game_heartbeat
 _public_engine_export/
+vehicle_parking.json
