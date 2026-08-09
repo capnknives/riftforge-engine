@@ -148,6 +148,26 @@ def _resolve_engine_field(field_id: str, ctx: SheetContext) -> str | None:
     return None
 
 
+def _resolve_default_hook_field(hook_id: str, ctx: SheetContext) -> str | None:
+    """Engine fallback rows for hook fields when no game package is wired."""
+    if hook_id in {"primaries_row1", "primaries_row2"}:
+        stats = getattr(ctx.target, "stats", None) or {}
+        names = list(engine_stats.STAT_NAMES)
+        if hook_id == "primaries_row1":
+            names = names[:3]
+        else:
+            names = names[3:]
+        parts = []
+        for name in names:
+            val = stats.get(name, 0.0)
+            try:
+                parts.append(f"{name} {float(val):.1f}")
+            except (TypeError, ValueError):
+                parts.append(f"{name} ?")
+        return "  " + "  ".join(parts)
+    return None
+
+
 def _resolve_field(field: dict, ctx: SheetContext) -> str | None:
     source = str(field.get("source") or "")
     if source.startswith("engine:"):
@@ -156,7 +176,7 @@ def _resolve_field(field: dict, ctx: SheetContext) -> str | None:
         hook_id = source.split(":", 1)[1]
         fn = _FIELD_HOOKS.get(hook_id)
         if fn is None:
-            return None
+            return _resolve_default_hook_field(hook_id, ctx)
         try:
             return fn(ctx)
         except TypeError:
