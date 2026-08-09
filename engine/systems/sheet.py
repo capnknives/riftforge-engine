@@ -168,6 +168,19 @@ def _resolve_default_hook_field(hook_id: str, ctx: SheetContext) -> str | None:
     return None
 
 
+def _call_hook_with_legacy_arity(fn, ctx: SheetContext):
+    """Call hook with ctx, then legacy character/game shapes on arity mismatch."""
+    try:
+        return fn(ctx)
+    except TypeError:
+        pass
+    try:
+        return fn(ctx.target, ctx.game)
+    except TypeError:
+        pass
+    return fn(ctx.target)
+
+
 def _resolve_field(field: dict, ctx: SheetContext) -> str | None:
     source = str(field.get("source") or "")
     if source.startswith("engine:"):
@@ -177,10 +190,7 @@ def _resolve_field(field: dict, ctx: SheetContext) -> str | None:
         fn = _FIELD_HOOKS.get(hook_id)
         if fn is None:
             return _resolve_default_hook_field(hook_id, ctx)
-        try:
-            return fn(ctx)
-        except TypeError:
-            return fn(ctx)  # pragma: no cover -- legacy arity
+        return _call_hook_with_legacy_arity(fn, ctx)
     return None
 
 
@@ -219,10 +229,7 @@ def assemble_body(ctx: SheetContext) -> tuple[list[str], str]:
                 body.append(line)
 
     for _prio, _sid, fn in list(_CONTRIBUTORS):
-        try:
-            raw = fn(ctx)
-        except TypeError:
-            raw = fn(ctx)  # pragma: no cover
+        raw = _call_hook_with_legacy_arity(fn, ctx)
         for section in _normalize_sections(raw):
             if not section.applies(pane):
                 continue

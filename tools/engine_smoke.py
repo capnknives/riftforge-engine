@@ -831,16 +831,33 @@ def main():
 
     from engine.systems import sheet as sheet_mod
 
+    score_target = Character("LeanEngine")
     profile = sheet_mod.sheet_profile()
     assert profile.get("id") == "sheet.engine"
     sheet_mod.register_field_hook(
         "hp",
         lambda ctx: f"  HP: {getattr(ctx.target, 'hp', 0)}",
     )
+    sheet_mod.register_field_hook(
+        "header",
+        lambda character, _game: f"  {character.key}",
+    )
+    sheet_mod.register_contributor(
+        "legacy_arity",
+        lambda character, _game: sheet_mod.SheetSection(
+            id="legacy_arity",
+            lines=[f"  Legacy hook for {character.key}"],
+        ),
+        priority=10,
+    )
     text = sheet_mod.render_score(
-        sheet_mod.SheetContext(target=c, viewer=c)
+        sheet_mod.SheetContext(target=score_target, viewer=score_target)
     )
     assert "POW" in text and "HP:" in text
+    assert (
+        score_target.key in text
+        and f"Legacy hook for {score_target.key}" in text
+    )
 
     print("engine_smoke_ok")
     return 0
