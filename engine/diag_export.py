@@ -79,6 +79,12 @@ _API_VERSION = "2022-11-28"
 # Cap how many NDJSON lines we parse for the inline stats summary.
 _SUMMARY_MAX_LINES = 5000
 
+# Always-on tick overrun burst capture (bug diagnosis kit slice C).
+# Independent of ``diag_enabled()`` -- rate-limited so lag storms do not
+# fill the disk when staff forgot ``gm diaglog on``.
+AUTO_CAPTURE_RATE_LIMIT_S = 45.0
+AUTO_CAPTURE_MESSAGE = "auto_tick_overrun"
+
 # Print the missing-auth warning at most once per process.
 _warned_missing_webhook_auth = False
 
@@ -162,6 +168,78 @@ def diag_enabled(root=None):
     return env_enabled()
 
 
+def _append_ndjson_line(payload):
+    """Write one NDJSON row; returns True on success."""
+    try:
+        with open(log_path(), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, default=str) + "\n")
+        return True
+    except Exception:
+        return False
+
+
+def auto_capture_allowed(game, *, now=None):
+    """True when the rate limit allows another always-on overrun sample."""
+    if game is None:
+        return True
+    stamp = now if now is not None else time.monotonic()
+    last = float(getattr(game, "_diag_auto_capture_last_at", 0.0) or 0.0)
+    return (stamp - last) >= AUTO_CAPTURE_RATE_LIMIT_S
+
+
+def append_auto_capture_event(game, data, *, reason="tick_overrun"):
+    """Always-on NDJSON burst when tick/Cadence budget overruns (rate limited).
+
+    Unlike ``append_event``, this does **not** require ``diag_enabled()``.
+    Staff still use ``gm diaglog analyze`` to push and inspect the same log.
+    """
+    if game is not None and not auto_capture_allowed(game):
+        return False
+    now = time.monotonic()
+    if game is not None:
+        game._diag_auto_capture_last_at = now
+    payload = {
+        "sessionId": DEFAULT_SESSION_ID,
+        "runId": "auto-capture",
+        "hypothesisId": "AUTO",
+        "location": "diag_export.py:auto_capture",
+        "message": AUTO_CAPTURE_MESSAGE,
+        "data": {
+            "auto": True,
+            "reason": reason,
+            **(data or {}),
+        },
+        "timestamp": int(time.time() * 1000),
+    }
+    return _append_ndjson_line(payload)
+
+
+def maybe_notify_auto_capture(game, total_ms):
+    """Optional head-GM [GM] ping when an auto-capture row lands."""
+    if game is None:
+        return
+    try:
+        from world import Character
+    except Exception:
+        return
+    msg = (
+        f"[GM] auto-diag captured (tick {total_ms:.0f}ms) -- "
+        "see gm diaglog analyze"
+    )
+    for session in list(getattr(game, "sessions", None) or ()):
+        body = getattr(session, "character", None)
+        if body is None or not isinstance(body, Character):
+            continue
+        if getattr(body, "gm_rank", None) != "head_gm":
+            continue
+        send = getattr(session, "send", None)
+        if callable(send):
+            try:
+                send(msg)
+            except Exception:
+                pass
+
+
 def append_event(
     hypothesis_id,
     location,
@@ -188,9 +266,7 @@ def append_event(
             "data": data,
             "timestamp": int(time.time() * 1000),
         }
-        with open(log_path(), "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload, default=str) + "\n")
-        return True
+        return _append_ndjson_line(payload)
     except Exception:
         return False
 
@@ -336,7 +412,7 @@ def _http_json(method, url, payload, token):
 
 
 def build_tick_summary(game):
-    """Compact text from ``game._tick_stats`` + Cadence budget meta."""
+    """Compact text from ``game._tick_stats`` + Cadence budget + autosave."""
     ring = list(getattr(game, "_tick_stats", ()) or ())
     meta = getattr(game, "_cadence_budget_meta", None) or {}
     lines = [
@@ -353,17 +429,67 @@ def build_tick_summary(game):
         )
     if not ring:
         lines.append("tick samples: (none yet)")
-        return "\n".join(lines)
-    totals = [s.get("total_ms", 0) for s in ring]
-    last = ring[-1]
-    slow = last.get("slow") or []
-    slow_txt = ", ".join(f"{n}={ms:.1f}ms" for n, ms in slow[:8]) or "(none)"
-    lines.append(
-        f"tick last={last.get('total_ms', 0):.1f}ms "
-        f"avg={sum(totals) / len(totals):.1f} "
-        f"worst={max(totals):.1f} (n={len(ring)})"
-    )
-    lines.append(f"last slow=[{slow_txt}]")
+    else:
+        totals = [s.get("total_ms", 0) for s in ring]
+        last = ring[-1]
+        slow = last.get("slow") or []
+        slow_txt = ", ".join(f"{n}={ms:.1f}ms" for n, ms in slow[:8]) or "(none)"
+        lines.append(
+            f"tick last={last.get('total_ms', 0):.1f}ms "
+            f"avg={sum(totals) / len(totals):.1f} "
+            f"worst={max(totals):.1f} (n={len(ring)})"
+        )
+        lines.append(f"last slow=[{slow_txt}]")
+        fuel_in_slow = any(name == "fuel" for name, _ms in slow)
+        fuel_bd = getattr(game, "_last_fuel_phase_breakdown", None) or {}
+        if fuel_in_slow and fuel_bd:
+            from engine import hooks
+            phase_txt = hooks.fuel_phase_summary_line(fuel_bd)
+            if phase_txt:
+                lines.append(f"fuel_phases={phase_txt}")
+    # Autosave is outside run_ticks -- surface it so lag dumps cannot hide
+    # multi-second SQLite freezes behind a healthy tick avg.
+    autosave = getattr(game, "_last_autosave_stats", None) or {}
+    if autosave:
+        parts = [f"save_ms={autosave.get('save_ms')}"]
+        if autosave.get("collect_ms") is not None:
+            parts.append(f"collect={autosave.get('collect_ms')}")
+        if autosave.get("apply_ms") is not None:
+            parts.append(f"apply={autosave.get('apply_ms')}")
+        if autosave.get("force_full") is not None:
+            parts.append(f"force_full={autosave.get('force_full')}")
+        if autosave.get("skipped"):
+            parts.append("skipped=1")
+        if autosave.get("n_changed_chars") is not None:
+            parts.append(f"chars={autosave.get('n_changed_chars')}")
+        if autosave.get("n_deferred_chars"):
+            parts.append(f"deferred_chars={autosave.get('n_deferred_chars')}")
+        if autosave.get("game_meta_slices_written") is not None:
+            parts.append(f"meta_wrote={autosave.get('game_meta_slices_written')}")
+        if autosave.get("game_meta_slices_skipped") is not None:
+            parts.append(f"meta_skip={autosave.get('game_meta_slices_skipped')}")
+        if autosave.get("game_meta_slices_throttled"):
+            parts.append(f"meta_throttle={autosave.get('game_meta_slices_throttled')}")
+        if autosave.get("game_meta_skip_tags"):
+            parts.append(f"meta_cold_skip={('meta_cold' in str(autosave.get('game_meta_skip_tags')))}")
+        meta_ms = float(autosave.get("game_meta_ms") or 0.0)
+        meta_tags = autosave.get("game_meta_wrote")
+        if meta_tags and meta_ms > 500.0:
+            parts.append(f"meta_tags={meta_tags}")
+        for slice_key in (
+            "accounts_ms", "game_meta_ms", "homesteads_ms", "gather_ms",
+            "player_shops_ms", "township_ms", "personal_realms_ms",
+            "demesnes_ms",
+        ):
+            if autosave.get(slice_key) is not None:
+                short = slice_key.replace("_ms", "")
+                parts.append(f"{short}={autosave.get(slice_key)}")
+        lines.append("autosave last=" + " ".join(str(p) for p in parts))
+        running = bool(getattr(game, "_autosave_running", False))
+        if running:
+            lines.append("autosave running=1")
+    else:
+        lines.append("autosave last=(none yet)")
     return "\n".join(lines)
 
 
@@ -575,6 +701,8 @@ def summarize_ndjson(text):
     messages = defaultdict(int)
     echo_ms = []
     town_ms = []
+    fuel_total = []
+    fuel_loop_ms = []
     cadence_total = []
     slow_total = []
     handler_ms = defaultdict(list)
@@ -604,6 +732,16 @@ def summarize_ndjson(text):
                 name = h.get("name")
                 if name:
                     handler_ms[name].append(float(h.get("ms") or 0))
+        elif msg == "fuel_phase_breakdown":
+            fuel_total.append(float(data.get("total_ms") or 0))
+            phases = data.get("phases") or {}
+            fuel_loop_ms.append(float(phases.get("fuel_loop_ms") or 0))
+        elif msg == AUTO_CAPTURE_MESSAGE or data.get("auto"):
+            slow_total.append(float(data.get("total_ms") or 0))
+            for h in data.get("top_handlers") or []:
+                name = h.get("name")
+                if name:
+                    handler_ms[name].append(float(h.get("ms") or 0))
 
     def _stat(xs):
         if not xs:
@@ -628,6 +766,8 @@ def summarize_ndjson(text):
         "cadence_total_ms": _stat(cadence_total),
         "echo_ms": _stat(echo_ms),
         "town_ms": _stat(town_ms),
+        "fuel_total_ms": _stat(fuel_total),
+        "fuel_loop_ms": _stat(fuel_loop_ms),
         "slow_tick_total_ms": _stat(slow_total),
         "top_handlers_by_avg": top_handlers,
     }

@@ -374,21 +374,21 @@ def main():
 
     a = Room("a")
     b = Room("b")
-    c = Room("c")
+    room_c = Room("c")
     a.exits = {"north": b}
-    b.exits = {"north": c, "south": a}
-    c.exits = {"south": b}
+    b.exits = {"north": room_c, "south": a}
+    room_c.exits = {"south": b}
 
     def _edge_ok(_from_room, neighbor):
         return neighbor is not None
 
     assert pathfind_engine.path_directions_to(
-        a, lambda r: r is c, edge_ok=_edge_ok,
+        a, lambda r: r is room_c, edge_ok=_edge_ok,
     ) == ["north", "north"]
     assert pathfind_engine.next_step_toward(
-        a, lambda r: r is c, edge_ok=_edge_ok,
+        a, lambda r: r is room_c, edge_ok=_edge_ok,
     ) == "north"
-    assert pathfind_engine.path_to_room(a, c, edge_ok=_edge_ok) == [
+    assert pathfind_engine.path_to_room(a, room_c, edge_ok=_edge_ok) == [
         "north", "north",
     ]
     # Already at goal -> empty path / None first hop.
@@ -399,9 +399,9 @@ def main():
         a, lambda r: r is a, edge_ok=_edge_ok,
     ) is None
     # max_nodes cap: start expands one neighbor (seen=2); limit 2 stops
-    # before reaching c two hops away.
+    # before reaching room_c two hops away.
     assert pathfind_engine.path_directions_to(
-        a, lambda r: r is c, edge_ok=_edge_ok, max_nodes=2,
+        a, lambda r: r is room_c, edge_ok=_edge_ok, max_nodes=2,
     ) == []
 
     # Stage 5 two-repo purity: the wallet / bank ledger is generic engine
@@ -840,7 +840,100 @@ def main():
     text = sheet_mod.render_score(
         sheet_mod.SheetContext(target=c, viewer=c)
     )
-    assert "POW" in text and "HP:" in text
+    assert "HP:" in text and profile.get("title") == "SCORE"
+
+    # ---- Phase 5 protocol: cmdset + fuzzy verb hint -----------------------
+    from engine import cmdset as cmdset_mod
+    from engine.help_db import closest_match
+    from engine.connection import normalize_input_line
+    from world import Room
+
+    assert closest_match("lok", ["look", "help"], max_distance=2) == "look"
+    assert normalize_input_line("\u0410") == "\u0410"  # NFKC stable
+
+    dark_room = Room("dark_demo")
+    dark_room.engine_dark_demo = True
+    c_dark = Character("DarkDemo")
+    c_dark.location = dark_room
+    c_dark.session = _FakeSession()
+
+    def _noop(_a, _b, _g):
+        c_dark.session.lines.append("default look")
+
+    cmdset_mod.clear_cmdsets()
+    cmdset_mod.register_cmdset(
+        "smoke_dark",
+        {"look": (_noop, "dark look")},
+        priority=5,
+        matcher=lambda _ch, room: getattr(room, "engine_dark_demo", False),
+    )
+    assert cmdset_mod.lookup_command(c_dark, dark_room, "look") is not None
+    cmdset_mod.clear_cmdsets()
+
+    # Phase 6 mudlib kits (noticeboard, condition, status, weight, reset).
+    from engine.systems import noticeboard as noticeboard_mod
+    from engine.systems import condition as condition_mod
+    from engine.systems import status_effects as status_effects_mod
+    from engine.systems import containers as containers_mod
+    from engine import accounts as accounts_mod
+
+    board = Room("post")
+    board.resources = ("noticeboard",)
+    poster = Character("Poster")
+    ok, _ = noticeboard_mod.post(board, poster, "hi", now_tick=1)
+    assert ok and noticeboard_mod.notices(board)[0]["text"] == "hi"
+
+    tool = Item("wrench", "A wrench.")
+    tool.max_hp = 10
+    condition_mod.damage(tool, 10)
+    assert condition_mod.is_broken(tool)
+
+    class _StatusGame:
+        game_time_ticks = 0
+        characters = set()
+
+    sg = _StatusGame()
+    mod_char = Character("Mod")
+    sg.characters.add(mod_char)
+    status_effects_mod.apply_status(mod_char, "dex", 1, 3, game=sg)
+    assert status_effects_mod.stat_modifier(mod_char, "dex", game=sg) == 1.0
+
+    heavy = Item("anvil", "iron")
+    heavy.weight = 99
+    lifter = Character("Lifter")
+    lifter.max_weight = 1
+    assert containers_mod.weight_volume_refusal(lifter, heavy)
+
+    from engine.systems import justice_adapter as justice_adapter_mod
+
+    debtor = Character("Debtor")
+    debtor.criminal = True
+    debtor.criminal_fine = 5
+    assert justice_adapter_mod.supers_fine_cents(debtor) == 500
+    assert justice_adapter_mod.is_supers_wanted(debtor)
+    assert justice_adapter_mod.apply_supers_fine_payment(debtor, 500)
+
+    from engine.systems import identity as identity_mod
+    from engine.systems import disguise as disguise_mod
+
+    doc = identity_mod.LegalId(
+        number="KS-LEB-1",
+        legal_name="Sam",
+        home_zone="lebanon",
+        issued_tick=1,
+        appearance_hash=identity_mod.appearance_hash(Character("Sam")),
+    )
+    viewer = Character("Cop")
+    subject = Character("Sam")
+    result = identity_mod.verify_id(viewer, subject, doc, context="local")
+    assert result.ok
+
+    disguise_mod.apply_disguise(
+        subject,
+        label="a drifter",
+        appearance={"hair": "black", "physique": "lean"},
+    )
+    assert disguise_mod.disguise_short_desc(subject)
 
     print("engine_smoke_ok")
     return 0

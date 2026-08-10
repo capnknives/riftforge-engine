@@ -4,7 +4,10 @@
 `riftforge_core_expansion.md` Phases 1-8 **done**; two-repo purity H1-H9
 extraction track (`docs/plans/two_repo_purity_extractions_plan.md`)
 **done**. Public remote **`capnknives/riftforge-engine`**. Current SUPERS
-pin: **`v0.5.0`** (adds map-authoring OLC helpers plus generic phone,
+pin: **`v0.5.1`** (basegame body-parts demo, clinic strangler hooks,
+optional gateway `wss://`, MSSP catalog fields, justice adapter spike,
+instance-room teardown migration for purgatory/rowena). Prior **`v0.5.0`**
+adds map-authoring OLC helpers plus generic phone,
 appearance-builder, persona-trait, and relationship-tag frameworks, and
 abstract item/NPC/creature/map generic kind grandparents, on top of
 `v0.4.0`'s elemental planes + rotating gates, dual-root content-kind
@@ -47,8 +50,10 @@ parts region state machine).
   ``engine/systems/sheet.py``; games extend via
   ``register_sheet_field`` / ``register_sheet_contributor``.
 - Optional env: ``RIFTFORGE_DB`` (SQLite path), ``RIFTFORGE_PORT`` (telnet)
-- Next public tag after merge: **v0.5.1+** (classic OSR demo, `combat_osr`, combat docs map).
-- Export includes `classic/`, `tools/classic_smoke.py`, and updated `docs/ENGINE_CONSUMER.md`.
+- Optional WebSocket TLS: ``RIFTFORGE_WSS_CERT`` + ``RIFTFORGE_WSS_KEY`` (pair)
+- Monorepo engine version / next public tag: **v0.5.1** (strangler pass +
+  basegame body-parts demo). Export via ``tools/export_public_engine.py``,
+  then tag ``riftforge-engine`` remote.
 - `tools/engine_smoke.py` / `tools/basegame_smoke.py` /
   `tools/classic_smoke.py` pass
 

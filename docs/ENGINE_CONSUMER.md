@@ -37,6 +37,7 @@ Call these **before** constructing `Character`s or loading a save:
 | Hook | Setter | Default (no game) | SUPERS registers |
 |------|--------|-------------------|------------------|
 | Character attach | `set_character_attacher(fn)` | no-op | `supers.character_attach.attach_supers` |
+| Load-time normalize | `set_normalize_character_after_load(fn)` | no-op | `supers.character_load_normalize.normalize_character_after_load` |
 | Persist blob | `set_blob_codec(to_blob, from_blob)` | `{}` / no-op apply | `supers.persist_blob` |
 | Game meta load/save | `set_game_meta_codec(load_fn, save_fn)` | no-op | `supers.persist_meta` |
 | Chargen | `set_chargen(async_fn)` | skip (return True) | `chargen.run` |
@@ -107,6 +108,26 @@ Phase 2b (`command_support.py`'s old shared move/spirit-sight helpers) and
 Phase 3 (`world.py`/`persistence.py`'s lean cores) both moved under
 `engine/` this way — see `docs/plans/two_repo_purity.md`'s "Phase 2b" and
 "Phase 3" notes for the file-by-file breakdown.
+
+### Copyover / overlay reload order
+
+Auto-deploy overlays land on disk while the game child still holds older
+bytecode. Before a copyover save, ``engine.copyover.reload_world_save_modules``
+must refresh modules in this order:
+
+1. ``importlib.reload(engine.hooks)`` — persistence imports hook callables at
+   module top; reloading persistence first raises ``ImportError`` on any newly
+   added hook name (bug report 387).
+2. ``importlib.reload(engine.persistence)``
+3. ``game_select.reregister_blob_codec()`` (or ``hooks.reload_blob_codec()``)
+   — ``reload(hooks)`` clears bootstrap callbacks; re-register before
+   ``game.save(copyover=True)``.
+
+If the blob codec is missing after reload, copyover **aborts** the save and
+calls ``game_select.restore_hooks_after_copyover_abort()`` (full
+``register_all_hooks``) so the process stays playable. Regression:
+``py -3.13 tools/copyover_blob_codec_smoke.py`` and
+``py -3.13 tools/boot_lifecycle_phase_d_smoke.py``.
 
 `who`, `time`, and `idlemode` are NOT hooks -- they moved wholesale to
 `supers/verbs/engine_flavor.py` because almost nothing generic was left in
@@ -289,36 +310,72 @@ completely uninstalled, and only touching a SUPERS-only name
 (`make_wilderness_hostile`, `DUNGEON_ENCOUNTER_CHANCE`, ...) needs SUPERS
 on the path.
 
-`server.py`, `commands.py`, and `maps.py` (map JSON loading; SUPERS
+`server.py`, `commands.py`, and `maps.py` (H1a loader in `engine/world_maps.py`,
+H1b/c display in `engine/map_ui.py`; root `maps.py` is a thin facade; SUPERS
 catalog lookups go through the `make_world_item` hook now) remain shared,
 undecomposed root modules — optional hygiene tracked as
 `arch-undecomposed-core` / [`plans/codebase_health_audit_2026-07-20.md`](plans/codebase_health_audit_2026-07-20.md)
 (two-repo remotes Phases 0–6 are already done). Hooks are what let all of
 these stop **hard-coding** SUPERS imports in the meantime.
 
-## Planned hook bundles (Riftforge core expansion)
+## Engine framework modules (core expansion — closed 2026-08-04)
+
+Phases 0–9 of [`plans/riftforge_core_expansion.md`](plans/riftforge_core_expansion.md)
+are **done** (public **`v0.4.0`** tag). Generic frameworks live under
+`engine/systems/` (and `engine/studio_bridge.py`); SUPERS registers game
+flavor in `supers/bootstrap.py` and thin facades — the per-character hook
+table above is unchanged.
+
+| Bundle | Engine module(s) | Status |
+|--------|------------------|--------|
+| **Planes** | `engine/systems/planes/` — `register_plane`, pocket loader | Shipped |
+| **Gates** | `engine/systems/gates/` — `GateNetwork`, rotation | Shipped |
+| **Needs** | `engine/systems/needs.py` — `register_meter`, fuel lane | Shipped |
+| **Combat (swing registry)** | `engine/systems/combat_engine.py`, `combat_core.py`, `combat_mundane.py`, `combat_martial_arts.py`, `combat_osr.py` | Shipped — `mundane` / `martial_arts` / `osr` ids |
+| **Active (twitch) combat** | `engine/systems/active_combat.py`, `combat_runtime.py` | Shipped in engine; basegame/classic demo; SUPERS unchanged |
+| **Body parts** | `engine/systems/anatomy.py`, `body_parts.py` — regions + `register_hook` | Shipped |
+| **Room env** | `engine/systems/room_structure.py`, `breach.py` | Wall-state layer shipped; combat breach pipeline deferred (Phase 5c) |
+| **Spawn** | `engine/systems/spawn/` — bestiary + nest AI | Shipped |
+| **Instance rooms** | `engine/systems/instance_rooms.py` | Shipped |
+| **Studio bridge** | `engine/studio_bridge.py` | Shipped |
+| **Content kinds** | `engine/content_kinds/` + `set_content_kinds_dirs` hooks | Shipped (Phase 2) |
+| **Cadence** | — | **Deferred** — no generic kernel to peel (Phase 4 finding) |
+| **SUPERS narrative combat** | `supers/combat.py` → `supers/combat_prose.py` | Stays in SUPERS (not swing/active backends) |
+| **Civic shops** | `engine/systems/civic_shop.py` (ware shell) | Shell shipped; deep `player_shops` → `civic_shop` wiring **deferred** (Phase 6b / H-track) |
+| **Clinic** | `engine/systems/clinic.py` | Framework shipped + wired (H4); Town Clinic room keys stay SUPERS-branded |
+| **Justice** | `engine/systems/justice.py` | Framework shipped + wired (H4); crime catalog stays SUPERS |
+| **Missions** | partial | Board shell deferred; quest content in SUPERS |
+
+Basegame `aim`/body-parts demo gap: follow-up in
+[`plans/riftforge_core_expansion_followup.md`](plans/riftforge_core_expansion_followup.md).
+
+## Post–core-expansion hygiene (H-track)
+
+Phases **H1–H7** landed on `feature/purity-h-track-remaining` (see
+[`plans/two_repo_purity_extractions_plan.md`](plans/two_repo_purity_extractions_plan.md)):
+`engine/map_ui.py`, `engine/systems/{vehicles,lodging,paced_travel,phone,appearance,persona_registry,relationships}`,
+`engine/map_store.py`, plus **H4** wiring (`hospital`→`clinic`, `crime`→`justice`).
+**Deep `player_shops` → `civic_shop`** remains DEFERRED. **H8** (kind
+grandparents) and **H9** (`v0.5.0` tag) are still open.
+
+
+## Planned hook bundles (engine mudlib unification)
 
 Not yet implemented — tracked in
-[`plans/riftforge_core_expansion.md`](plans/riftforge_core_expansion.md).
+[`plans/python_mud_engine_features_plan.md`](plans/python_mud_engine_features_plan.md)
+and [`plans/supers_engine_overlap_audit.md`](plans/supers_engine_overlap_audit.md).
 Each row below becomes real `set_*`/`register_*` entries in the table above
 as its phase lands; listed here now so a bundle name isn't picked twice.
 
 | Bundle | Phase | Key registrations (planned) |
 |--------|-------|------------------------------|
-| Planes | 1 | `register_plane(plane_id, metadata)`, pocket loader |
-| Gates | 1 | `register_gate_network(GateNetwork, room_predicate)` |
-| Needs | 3 | `register_meter`, `register_fuel_meter`, `tick_needs`, decay policy hook — extends existing `engine/systems/needs.py`, not a new module |
-| Cadence | 4 | `cadence_tick`, `register_need_pursuer`, `register_job_behavior` |
-| Combat swing registry | 1 **DONE** | `register_combat_engine` in `engine/systems/combat_engine.py`; shipped `mundane`, `martial_arts`, `osr` |
-| Active twitch combat | separate track | `engine/systems/active_combat.py` + `combat_runtime` — basegame demo; SUPERS unchanged |
-| Body parts | 5b | `register_anatomy_regions`, `body_parts_heal_mult`, brief `target_region`/limb fields |
-| Room env | 5c | `register_slam_target_pipeline`, `stamp_breach_pick`/`apply_breach`, layout-direction neighbor resolver |
-| Spawn | 6 | `register_nest_ai`, bestiary table loader hooks |
-| Missions | 6 | board accept/abandon/instance portal shell |
-| Civic shops | 6b | `register_civic_fixture`, enter-pocket loader, wholesale order terminal hook, fixture HP/wreck/repair |
-| Clinic | 7 | `register_clinic_rooms`, `can_hospitalize`, ward tick |
-| Justice | 7 | wanted/fines/jail + `register_crime_catalog` |
-| Studio | 8 | `studio_catalog_roots`, kind dirs (extends existing content-kind hooks) |
+| Clinic admit | 1 | `clinic_admit_hooks` — ward pick, discharge threshold, `can_hospitalize` resolver; extends [`engine/systems/clinic.py`](engine/systems/clinic.py) |
+| Justice fines | 2 | `justice_fine_schedule` — wanted/jail/fine timers on safe duplicate seam; extends [`engine/systems/justice.py`](engine/systems/justice.py) |
+| Civic fixtures | 3 | `civic_fixture_state` — shared structural-HP/wreck/repair record; extends [`engine/systems/room_structure.py`](engine/systems/room_structure.py) / [`engine/systems/civic_fixture.py`](engine/systems/civic_fixture.py) |
+| Quest flags | 4a | `quest_flags` — generic `quest_progress` dict accessors; new [`engine/systems/quest_flags.py`](engine/systems/quest_flags.py) (planned) |
+
+All bundles: **not yet implemented** — see
+[`plans/python_mud_engine_features_plan.md`](plans/python_mud_engine_features_plan.md).
 
 ## See also
 

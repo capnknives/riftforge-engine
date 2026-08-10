@@ -103,8 +103,6 @@ def npc_do(character, raw, game):
     # at boot -- see engine/hooks.py's set_dispatch/get_dispatch.
     from engine import hooks
     from engine import snoop
-    dispatch = hooks.get_dispatch()
-
     previous = getattr(character, "session", None)
     silent = SilentSession(character)
     character.session = silent
@@ -116,11 +114,20 @@ def npc_do(character, raw, game):
         except Exception:
             _log_activity_error("logger.do", character)
     try:
+        dispatch = hooks.get_dispatch()
         # GMs snooping this actor see the verb they "typed" (same ] tag as
         # a live player's Session.play path).
         snoop.mirror_input(character, raw)
         if dispatch is not None:
             dispatch(character, raw, game)
+    except Exception as exc:
+        from engine import log_util
+        key = getattr(character, "key", None)
+        log_util.ops(
+            "npc_act",
+            f"dispatch failed actor={key!r} raw={raw!r}",
+            exc=exc,
+        )
     finally:
         character.session = previous
     if logger is not None and silent.lines:

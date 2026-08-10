@@ -166,6 +166,9 @@ def _is_presence_hidden(viewer, other):
     # Soft-shelved player Echo (gm fold) -- same pierce as gm_away.
     if is_folded(other) and not _can_see_gm_away(viewer, other):
         return True
+    # GM staff shell -- wizinvis / parked gate (uses gm_spirit, not spirit).
+    if getattr(other, "gm_spirit", False) and not _can_see_spirit(viewer, other):
+        return True
     if getattr(other, "spirit", False) and not _can_see_spirit(viewer, other):
         return True
     if not _can_perceive_reaper(viewer, other):
@@ -425,6 +428,35 @@ def floor_item_look_lines(items, character=None):
             line = style_mod.paint_for(character, "muted", line)
         lines.append(line)
     return lines
+
+
+def format_floor_items_for_look(lines, character=None):
+    """Optionally collapse stacked floor-item lines into one paragraph.
+
+    ``config items compact on`` keeps sighted look shorter; screenreader
+    keeps the vertical Items list for TTS clarity.
+    """
+    if not lines:
+        return []
+    if character is None:
+        return list(lines)
+    from engine import display_prefs as display_prefs_mod
+    from engine.style import strip_ansi
+
+    if not display_prefs_mod.wants_compact_floor_items(character):
+        return list(lines)
+    if getattr(character, "screenreader", False):
+        return list(lines)
+    plain = []
+    for line in lines:
+        text = strip_ansi(str(line)).strip()
+        if text:
+            plain.append(text)
+    if not plain:
+        return []
+    if len(plain) == 1:
+        return [f"On the ground: {plain[0]}."]
+    return [f"On the ground: {', '.join(plain)}."]
 
 
 def _display_name(obj, viewer=None):
@@ -1061,6 +1093,8 @@ def resolve_fight_target(
         target = _find_character(raw, candidates, self_character=actor)
         if target is None:
             return None, missing_msg
+        if _is_presence_hidden(actor, target):
+            return None, missing_msg
         return target, None
 
     target = getattr(actor, "target", None)
@@ -1070,8 +1104,12 @@ def resolve_fight_target(
     if getattr(target, "location", None) is not room:
         if clear_stale_target:
             actor.target = None
-        gone = getattr(target, "key", "them")
+        gone = _public_label(target)
         return None, f"{gone} is no longer here."
+    if _is_presence_hidden(actor, target):
+        if clear_stale_target:
+            actor.target = None
+        return None, missing_msg
     return target, None
 
 
@@ -1371,7 +1409,7 @@ def _is_gm(character):
                 if account_is_staff(acct):
                     return True
             except Exception:
-                pass
+                _log_hook_error("gm check staff_account", staff_name)
     # When session is on a GM spirit, gm_mode_body may hold the login body
     # whose account we should check; spirit also copies gm_rank.
     if game is not None:
@@ -1385,7 +1423,10 @@ def _is_gm(character):
             if body is not None:
                 return effective_gm_rank(game, body) in ("gm", "head_gm")
         except Exception:
-            pass
+            _log_hook_error(
+                "gm check effective_gm_rank",
+                getattr(character, "key", None),
+            )
     return character.gm_rank in ("gm", "head_gm")
 
 
@@ -1405,7 +1446,7 @@ def _is_head_gm(character):
                 if acct is not None and (acct.gm_rank or "") == "head_gm":
                     return True
             except Exception:
-                pass
+                _log_hook_error("head_gm check staff_account", staff_name)
     if game is not None:
         try:
             from engine.accounts import effective_gm_rank
@@ -1415,7 +1456,10 @@ def _is_head_gm(character):
             if body is not None:
                 return effective_gm_rank(game, body) == "head_gm"
         except Exception:
-            pass
+            _log_hook_error(
+                "head_gm check effective_gm_rank",
+                getattr(character, "key", None),
+            )
     return character.gm_rank == "head_gm"
 
 

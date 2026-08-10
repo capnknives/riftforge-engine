@@ -24,6 +24,23 @@ _ZONES_DIR = os.path.join(_CONTENT_DIR, "zones")
 _CLIMATE_DIR = os.path.join(_CONTENT_DIR, "climate")
 
 
+def reregister_blob_codec():
+    """Re-wire blob + character attacher after ``importlib.reload(engine.hooks)``."""
+    import importlib
+
+    from basegame.character_attach import attach_basegame
+    import basegame.persist_blob as pb
+
+    pb = importlib.reload(pb)
+    hooks.set_character_attacher(attach_basegame)
+    hooks.set_blob_codec(pb.character_to_blob, pb.apply_character_blob)
+    hooks.set_blob_codec_reload(reregister_blob_codec)
+    print(
+        "[copyover] hooks re-registered (blob+attacher) [basegame]",
+        flush=True,
+    )
+
+
 def register_core_hooks():
     """Attach Character composition + persistence blob codec + stat hooks.
 
@@ -86,6 +103,8 @@ def register_all_hooks():
     hooks.set_chargen(chargen.run)
     hooks.set_help(help_topics.HELP_TOPICS, help_topics.HELP_CATEGORIES)
     hooks.set_dispatch(commands.dispatch)
+    from basegame import cmdset_darkness as cmdset_darkness_mod
+    cmdset_darkness_mod.register_darkness_cmdset()
     hooks.set_weather_look_clause(regional_weather_module.look_clause)
     hooks.set_weather_look_vision(regional_weather_module.assess_look_vision)
 
@@ -122,6 +141,11 @@ def register_all_hooks():
         overland_mod.ensure_game_overland(game)
         overland_mod.stamp_pocket_overland_exits(game)
         gates_mod.ensure_initialized(game)
+        from engine.systems import room_reset as room_reset_mod
+        room_reset_mod.register_reset_rooms(game)
+        for room in (getattr(game, "rooms", None) or {}).values():
+            if getattr(room, "reset_item_specs", None):
+                room_reset_mod.reset_room(room, game)
         from basegame import vehicles as vehicles_mod
         vehicles_mod.ensure_basegame_vehicles(game)
         combat_runtime_mod.ensure_game_combat_backend(
@@ -244,6 +268,7 @@ def _register_appearance_hooks():
     with open(catalog_path, encoding="utf-8") as handle:
         catalog = json.load(handle)
     hooks.set_appearance_kits({"mortal": catalog})
+    appearance_mod.register_appearance_kit("mortal", catalog)
 
 
 def _register_phone_hooks():

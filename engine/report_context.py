@@ -13,6 +13,22 @@ import os
 _MAX_OCCUPANTS = 15
 
 
+def _note_context_error(errors, label, exc):
+    """Append a short failure tag for bug-report triage."""
+    if errors is None:
+        return
+    errors.append(f"{label}: {exc!r}")
+
+
+def _context_snap(errors, label, fn, default=None):
+    """Run a snapshot helper; record failure without aborting the report."""
+    try:
+        return fn()
+    except Exception as exc:
+        _note_context_error(errors, label, exc)
+        return default
+
+
 def _safe_str(value, fallback="?"):
     """Plain string for JSON logs -- never None."""
     if value is None:
@@ -53,13 +69,14 @@ def _deploy_sha(report_dir):
     return _safe_str(sha, "") or None
 
 
-def _room_occupants(room, reporter):
+def _room_occupants(room, reporter, context_errors=None):
     """Other bodies in the room (keys), capped for log size."""
     if room is None:
         return [], 0
     try:
         chars = list(room.characters())
-    except Exception:
+    except Exception as exc:
+        _note_context_error(context_errors, "room_occupants", exc)
         return [], 0
     from engine.command_support import strip_ephemeral_storage_prefix
 
@@ -79,11 +96,12 @@ def _room_occupants(room, reporter):
     return names, total
 
 
-def _group_snapshot(character):
+def _group_snapshot(character, context_errors=None):
     """Follow-bond party summary (engine.group)."""
     try:
         from engine import group as group_mod
-    except Exception:
+    except Exception as exc:
+        _note_context_error(context_errors, "group_import", exc)
         return {}
     if not group_mod.in_group(character):
         return {"in_group": False}
@@ -100,8 +118,12 @@ def _group_snapshot(character):
     }
 
 
-def build(character, game):
-    """Return a JSON-serializable dict of triage facts for a filed report."""
+def build(character, game, *, history=None, description=None):
+    """Return a JSON-serializable dict of triage facts for a filed report.
+
+    Optional ``history`` (session command ring) and ``description`` (bug text)
+    select which SUPERS diagnostic modules attach via report_modules.
+    """
     if character is None:
         return {}
 
@@ -112,8 +134,11 @@ def build(character, game):
 
     display_prefs.ensure_display_defaults(character)
 
+    context_errors = []
     room = getattr(character, "location", None)
-    occupants, occupant_count = _room_occupants(room, character)
+    occupants, occupant_count = _room_occupants(
+        room, character, context_errors,
+    )
     report_dir = getattr(game, "report_dir", ".") if game is not None else "."
 
     following = getattr(character, "following", None)
@@ -175,7 +200,7 @@ def build(character, game):
                 getattr(character, "auto_combat_style", None), "",
             ) or None,
         },
-        "group": _group_snapshot(character),
+        "group": _group_snapshot(character, context_errors),
         "display": {
             "screenreader": bool(getattr(character, "screenreader", False)),
             "color_depth": _safe_str(
@@ -219,7 +244,17 @@ def build(character, game):
     if not ctx["room"]["zone"]:
         del ctx["room"]["zone"]
 
-    extra = hooks.report_context_extra(character, game)
+    extra = hooks.report_context_extra(
+        character, game, history=history, description=description,
+    )
     if extra:
-        ctx["gameplay"] = extra
+        if isinstance(extra, dict):
+            gameplay_errors = extra.pop("context_errors", None)
+            if gameplay_errors:
+                context_errors.extend(gameplay_errors)
+            ctx["gameplay"] = extra
+        else:
+            context_errors.append("gameplay: non-dict extra from hook")
+    if context_errors:
+        ctx["context_errors"] = context_errors
     return ctx

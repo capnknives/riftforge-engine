@@ -27,6 +27,7 @@ from engine.command_support import (
     _display_name,
     _maybe_append_account_tag,
     floor_item_look_lines,
+    format_floor_items_for_look,
     _find_character,
     _find_item,
     _find_item_prefer_locked,

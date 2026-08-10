@@ -256,6 +256,33 @@ def _sqlite_backup(src_db, dest_db):
         src.close()
 
 
+def snapshot_live_db_pre_deploy(*, root=None, triggered_by="auto_deploy"):
+    """Copy live ``riftforge.db`` before catch-up / tree sync.
+
+    Same-day restore target when a Veil copyover goes wrong -- does not
+    replace the nightly dated backup tree.
+    """
+    root = root or _repo_root()
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    rel_dir = f"pre-deploy/{stamp}"
+    dest_dir = os.path.join(backups_root(root), rel_dir)
+    os.makedirs(dest_dir, exist_ok=True)
+    src_db = os.path.join(root, "riftforge.db")
+    dest_db = os.path.join(dest_dir, "riftforge.db")
+    if not os.path.isfile(src_db):
+        return None, "live db missing"
+    try:
+        _sqlite_backup(src_db, dest_db)
+    except (OSError, sqlite3.Error) as exc:
+        return None, f"sqlite backup failed: {exc!r}"
+    rel_path = f"backups/{rel_dir}/riftforge.db"
+    print(
+        f"[backup] pre-deploy db snapshot -> {rel_path} (by={triggered_by})",
+        flush=True,
+    )
+    return rel_path, rel_path
+
+
 def _protected_catalog_paths(root):
     from tools.apply_pr_fix import protected_prefixes
 

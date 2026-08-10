@@ -11,11 +11,15 @@ PR), this module:
   4. Overlays only that commit's files onto the bind-mounted checkout
   5. watch_and_run copyovers the running server
 
-Announce policy (player-facing countdown): ONLY intentional fix subjects
-like "Fix bug #N: ..." trigger a deploy announcement. Merge commits,
-feature commits, and subjects that merely mention "bug #N" mid-sentence
-advance origin/main silently so incidental history (changelog merges,
-PR numbers) never fake a second "Bug #N has been fixed" world reset.
+Announce policy (player-facing countdown):
+  - Intentional Fix / Ship suggestion subjects (``Fix bug #N: …``) get the
+    ticket Veil countdown, then a tip-file overlay.
+  - Feature / merge / other tip advances and GM ``autodeploy on`` catch-up
+    still sync the working tree, but first queue a catch-up Veil countdown
+    (default 60s) so players know a copyover is coming — gothic rewrite
+    language without fake Bug #N chrome.
+  - Subjects that merely *mention* ``bug #N`` mid-sentence never use the
+    Fix announce path.
 
 No manual `tools/deploy_bug_fix.py` step. Disable with AUTO_DEPLOY=0, or
 toggle live with GM `autodeploy on|off` (writes `.auto_deploy_override`).
@@ -25,7 +29,7 @@ next watcher poll does a full ``git reset --hard origin/main`` (protected
 live files stashed/restored as usual). That picks up every commit missed
 while overlays were paused — not just the tip's Fix-bug file list. Any
 ``Fix bug #N`` commits in that gap are also queued for in-game resolve
-(reporter credit, no Veil countdown — code is already on disk). Ordinary
+(reporter credit) after the catch-up countdown + tree sync. Ordinary
 advance-only polls stay strict (no silent re-overlay when the tracked SHA
 already matches); catch-up is only the re-enable path.
 
@@ -42,6 +46,8 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 
 STATE_NAME = ".auto_deploy_state.json"
@@ -52,10 +58,22 @@ OVERRIDE_NAME = ".auto_deploy_override"
 # Written by GM `autodeploy on` so the next poll syncs the full working tree
 # to origin/main (commits missed while the override was off).
 CATCHUP_NAME = ".auto_deploy_catchup"
+# After an in-game Veil countdown, skip COPYOVER_SETTLE_SECONDS — players
+# were already warned; the watcher should SIGUSR1 as soon as the tree sync
+# lands (not another ~30s of playable lag).
+ANNOUNCED_COPYOVER_NAME = ".deploy_announced_copyover"
+# Touched right before git reset/overlay; game tick broadcasts once.
+TREE_SYNCING_NAME = ".deploy_tree_syncing"
+# Watcher touches this briefly before killing gateway (safety net if countdown missed).
+DISCONNECT_IMMINENT_NAME = ".deploy_disconnect_imminent"
 
-# Defaults; override via environment (see docker-compose.yml).
+# Defaults; override via environment (see docker-compose.yml / .env.example).
 DEFAULT_POLL_EVERY = 30
 DEFAULT_COUNTDOWN = 20
+# Feature / catch-up tree syncs: longer warning before the mtime copyover.
+# Feature / catch-up tree syncs: warn before mtime copyover (was 60 -- felt
+# like a second full hold after Fix ships; 30s is enough gothic warning).
+DEFAULT_CATCHUP_COUNTDOWN = 30
 DEFAULT_READY_TIMEOUT = 120
 # Cap hung `git fetch` / git-remote-https so a stuck HTTPS helper cannot
 # freeze watch_and_run's 1s loop (gateway + game keep running, but the
@@ -82,6 +100,16 @@ _FIX_SUBJECT_RE = re.compile(
     r"\b",
     re.IGNORECASE,
 )
+# Agent PR bodies: ``Fixes bug report 398`` (no ``#`` — GitHub autolink trap).
+_FIX_BUG_REPORT_SUBJECT_RE = re.compile(
+    r"^(?:fix(?:es|ed)?)\s+"
+    r"bug\s+reports?\s+"
+    r"#?(\d+)"
+    r"(?:\s*[-–—]\s*#?(\d+))?"
+    r"((?:\s*,\s*#?\d+)*)"
+    r"(?:\b|:)",
+    re.IGNORECASE,
+)
 # When a Fix subject closes bug #N, also close these duplicate filings.
 _BUG_RESOLVE_ALIASES: dict[int, tuple[int, ...]] = {
     # Gary: demesne hub ``down`` + ``beasts`` crash filed twice same session.
@@ -104,6 +132,20 @@ _SHIP_SUGGESTION_SUBJECT_RE = re.compile(
     r"\b",
     re.IGNORECASE,
 )
+# Agent PR bodies: ``Ships suggestion report 54`` (no ``#``).
+_SHIP_SUGGESTION_REPORT_SUBJECT_RE = re.compile(
+    r"^(?:ship(?:ped|s)?)\s+"
+    r"suggestion\s+reports?\s+"
+    r"#?(\d+)"
+    r"(?:\s*[-–—]\s*#?(\d+))?"
+    r"((?:\s*,\s*#?\d+)*)"
+    r"(?:\b|:)",
+    re.IGNORECASE,
+)
+# Squash-merge subjects often end with the GitHub PR number, not the bug id.
+_MERGED_PR_REF_RE = re.compile(r"\(#(\d+)\)\s*$")
+_GITHUB_PULL_API = "https://api.github.com/repos/capnknives/RiftForge/pulls"
+_PR_TEXT_CACHE: dict[int, str] = {}
 # Cap range expansion so a typo like #1-9999 cannot flood resolve.
 _MAX_BUG_ID_RANGE = 50
 
@@ -160,6 +202,104 @@ _FALSEY_ENV = ("0", "false", "no", "off")
 
 def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _announced_copyover_path(root):
+    return os.path.join(root, ANNOUNCED_COPYOVER_NAME)
+
+
+def _tree_syncing_path(root):
+    return os.path.join(root, TREE_SYNCING_NAME)
+
+
+def _disconnect_imminent_path(root):
+    return os.path.join(root, DISCONNECT_IMMINENT_NAME)
+
+
+def touch_disconnect_imminent(root):
+    """Watcher touched this before killing gateway — game tick may warn players."""
+    try:
+        with open(_disconnect_imminent_path(root), "w", encoding="utf-8") as fh:
+            fh.write("\n")
+    except OSError as exc:
+        print(
+            f"[auto_deploy] could not touch disconnect-imminent marker: {exc!r}",
+            flush=True,
+        )
+
+
+def clear_disconnect_imminent(root):
+    try:
+        os.remove(_disconnect_imminent_path(root))
+    except OSError:
+        pass
+
+
+def begin_announced_tree_sync(root):
+    """Players were warned in-game — skip watcher settle before copyover."""
+    try:
+        with open(_announced_copyover_path(root), "w", encoding="utf-8") as fh:
+            json.dump({"time": time.time()}, fh)
+    except OSError as exc:
+        print(
+            f"[auto_deploy] could not mark announced copyover: {exc!r}",
+            flush=True,
+        )
+    try:
+        with open(_tree_syncing_path(root), "w", encoding="utf-8") as fh:
+            fh.write("\n")
+    except OSError as exc:
+        print(
+            f"[auto_deploy] could not touch tree-sync marker: {exc!r}",
+            flush=True,
+        )
+
+
+def announced_copyover_pending(root) -> bool:
+    """True when a Veil countdown already warned players (settle bypass)."""
+    return os.path.isfile(_announced_copyover_path(root))
+
+
+def clear_announced_copyover(root):
+    """Drop the settle-bypass marker after copyover is signaled."""
+    try:
+        os.remove(_announced_copyover_path(root))
+    except OSError:
+        pass
+    try:
+        os.remove(_tree_syncing_path(root))
+    except OSError:
+        pass
+
+
+def _files_between_commits(root, old_sha, new_sha):
+    """Git paths that differ between two commits (for gateway-restart detect)."""
+    if not old_sha or not new_sha or old_sha == new_sha:
+        return []
+    try:
+        out = _git("diff", "--name-only", old_sha, new_sha, cwd=root)
+    except subprocess.CalledProcessError:
+        return []
+    return [
+        line.strip()
+        for line in (out or "").splitlines()
+        if line.strip()
+    ]
+
+
+def _advance_touches_gateway(root, target_sha):
+    """True when syncing HEAD → *target_sha* will drop client TCP (gateway or watcher)."""
+    from engine import gateway_watch
+
+    try:
+        head = _git("rev-parse", "HEAD", cwd=root).strip()
+    except subprocess.CalledProcessError:
+        return False
+    if head == target_sha:
+        return False
+    return gateway_watch.paths_touch_gateway_restart(
+        _files_between_commits(root, head, target_sha),
+    )
 
 
 def _state_path(root):
@@ -271,6 +411,89 @@ def env_enabled():
     return os.environ.get("AUTO_DEPLOY", "1").strip().lower() not in _FALSEY_ENV
 
 
+# Throttle poll-skip logs so a long ``autodeploy off`` window does not spam
+# docker logs every AUTO_DEPLOY_POLL_SECONDS tick.
+_SKIP_LOG_INTERVAL = 300.0
+_last_skip_log_at = 0.0
+_last_skip_log_reason = None
+_last_build_lock_log_at = 0.0
+_last_build_lock_log_key = None
+
+
+def poll_skip_reason(root=None):
+    """Why ``try_auto_deploy`` skips this tick, or None when polling would run.
+
+    Order matches ``_enabled()`` — revert hold first, then GM override, then env.
+    """
+    from engine import crash_recovery
+
+    if crash_recovery.hold_active(root=root):
+        return "revert hold active"
+    override = read_override(root)
+    if override is not None:
+        if override != _OVERRIDE_ON:
+            return "override off"
+        return None
+    if not env_enabled():
+        return "AUTO_DEPLOY env off"
+    return None
+
+
+def deploy_gate_summary(root=None):
+    """One-line gate status for ``tools/live_ssh.py --deploy-log`` and ops."""
+    from engine import build_lock
+    from engine import deploy_queue
+
+    override = read_override(root)
+    ov_label = override if override is not None else "none"
+    reason = poll_skip_reason(root)
+    effective = "on" if reason is None else "off"
+    skip = reason if reason is not None else "none"
+    catchup = "yes" if catchup_requested(root) else "no"
+    from engine import crash_recovery
+
+    hold = "on" if crash_recovery.hold_active(root=root) else "off"
+    build = "on" if build_lock.is_active(root) else "off"
+    pending = "yes" if deploy_queue.has_pending(root) else "no"
+    return (
+        f"OVERRIDE={ov_label} EFFECTIVE={effective} POLL_SKIP={skip} "
+        f"CATCHUP={catchup} REVERT_HOLD={hold} BUILD_LOCK={build} "
+        f"DEPLOY_QUEUE={pending}"
+    )
+
+
+def tree_sync_blocked(root=None):
+    """True when full ``reset --hard`` / catch-up must not run (build lock)."""
+    from engine import build_lock
+
+    return build_lock.is_active(root)
+
+
+def _maybe_log_tree_sync_deferred(root, *, key, message):
+    """Throttle build-lock deferral logs so polls do not spam docker."""
+    global _last_build_lock_log_at, _last_build_lock_log_key
+    now = time.monotonic()
+    if key != _last_build_lock_log_key or (
+        now - _last_build_lock_log_at
+    ) >= _SKIP_LOG_INTERVAL:
+        print(message, flush=True)
+        _last_build_lock_log_at = now
+        _last_build_lock_log_key = key
+
+
+def _maybe_log_poll_skip(reason):
+    """Emit ``[auto_deploy] poll skipped: …`` on reason change or every 5 min."""
+    global _last_skip_log_at, _last_skip_log_reason
+    now = time.monotonic()
+    if (
+        reason != _last_skip_log_reason
+        or (now - _last_skip_log_at) >= _SKIP_LOG_INTERVAL
+    ):
+        print(f"[auto_deploy] poll skipped: {reason}", flush=True)
+        _last_skip_log_at = now
+        _last_skip_log_reason = reason
+
+
 def _enabled():
     """Whether try_auto_deploy should poll this tick.
 
@@ -278,14 +501,7 @@ def _enabled():
     Revert hold (crash recovery) forces off so hotfix / manual patches are not
     wiped by reset --hard while staff clears the hold.
     """
-    from engine import crash_recovery
-
-    if crash_recovery.hold_active():
-        return False
-    override = read_override()
-    if override is not None:
-        return override == _OVERRIDE_ON
-    return env_enabled()
+    return poll_skip_reason() is None
 
 
 def is_enabled():
@@ -295,6 +511,10 @@ def is_enabled():
 
 def status_text():
     """One short multi-line status string for the GM autodeploy command."""
+    from engine import build_lock
+    from engine import deploy_queue
+
+    root = _repo_root()
     override = read_override()
     env_on = env_enabled()
     effective = "on" if is_enabled() else "off"
@@ -307,12 +527,63 @@ def status_text():
         if catchup_requested()
         else "Catch-up queued: no"
     )
-    return (
-        f"Auto-deploy effective: {effective}\n"
-        f"{override_line}\n"
-        f"AUTO_DEPLOY env: {'on' if env_on else 'off'}\n"
-        f"{catchup_line}"
+    lines = [
+        f"Auto-deploy effective: {effective}",
+        override_line,
+        f"AUTO_DEPLOY env: {'on' if env_on else 'off'}",
+        catchup_line,
+    ]
+    lines.extend(build_lock.status_lines(root))
+    synced = (_load_state(root).get("origin_main") or "")
+    remote = ""
+    try:
+        remote = _origin_main_sha(root)
+    except subprocess.CalledProcessError:
+        pass
+    lines.extend(
+        deploy_queue.status_lines(root, synced_sha=synced, remote_sha=remote)
     )
+    return "\n".join(lines)
+
+
+def request_deploy_sync(root=None):
+    """Queue one batched catch-up to origin/main (``gm deploy sync``)."""
+    root = root or _repo_root()
+    if tree_sync_blocked(root):
+        raise RuntimeError("build lock is on — run gm buildlock off confirm first")
+    request_catchup(root)
+    return catchup_path(root)
+
+
+def deploy_queue_status_lines(root=None):
+    """Deploy-queue summary for GM status commands."""
+    from engine import deploy_queue
+
+    root = root or _repo_root()
+    synced = (_load_state(root).get("origin_main") or "")
+    remote = ""
+    try:
+        remote = _origin_main_sha(root)
+    except subprocess.CalledProcessError:
+        pass
+    return deploy_queue.status_lines(root, synced_sha=synced, remote_sha=remote)
+
+
+def needs_deploy_sync(root=None):
+    """True when origin/main is ahead of the last synced tree SHA."""
+    from engine import deploy_queue
+
+    root = root or _repo_root()
+    synced = (_load_state(root).get("origin_main") or "")
+    if deploy_queue.has_pending(root):
+        return True
+    if not synced:
+        return False
+    try:
+        remote = _origin_main_sha(root)
+    except subprocess.CalledProcessError:
+        return False
+    return bool(remote and remote != synced)
 
 
 def _countdown_seconds():
@@ -320,6 +591,22 @@ def _countdown_seconds():
         return max(5, int(os.environ.get("AUTO_DEPLOY_COUNTDOWN", DEFAULT_COUNTDOWN)))
     except ValueError:
         return DEFAULT_COUNTDOWN
+
+
+def _catchup_countdown_seconds():
+    """Seconds of Veil warning before feature / catch-up tree sync + copyover."""
+    try:
+        return max(
+            5,
+            int(
+                os.environ.get(
+                    "AUTO_DEPLOY_CATCHUP_COUNTDOWN",
+                    DEFAULT_CATCHUP_COUNTDOWN,
+                )
+            ),
+        )
+    except ValueError:
+        return DEFAULT_CATCHUP_COUNTDOWN
 
 
 def fetch_timeout_seconds():
@@ -730,6 +1017,65 @@ def _restore_protected_live_files(root, stash):
         )
 
 
+def _snapshot_db_before_tree_sync(root, *, triggered_by="auto_deploy"):
+    """Best-effort live DB copy before announced reset --hard."""
+    try:
+        from engine import world_backup as world_backup_mod
+
+        snap = getattr(world_backup_mod, "snapshot_live_db_pre_deploy", None)
+        if snap is None:
+            raise ImportError("snapshot_live_db_pre_deploy missing on world_backup")
+        path, detail = snap(root=root, triggered_by=triggered_by)
+        if path:
+            print(
+                f"[auto_deploy] pre-catchup db snapshot -> {detail}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[auto_deploy] pre-catchup db snapshot skipped: {detail}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(
+            f"[auto_deploy] pre-catchup db snapshot failed: {exc!r}",
+            flush=True,
+        )
+
+
+def _verify_boot_probe_or_rollback(root, previous_head):
+    """Prove the synced tree boots; roll back to ``previous_head`` on failure.
+
+    Fix overlays already use ``overlay_files_from_ref_with_boot_probe``;
+    full ``reset --hard`` syncs must pass the same bar or live would pick
+    up broken ``main`` and crash-loop the game child (Dallas class).
+
+    Returns True when the tree is left at the synced tip (probe ok or
+    probe disabled). Returns False after rolling back to ``previous_head``.
+    """
+    from engine.boot_probe import boot_probe_enabled, run_boot_probe_subprocess
+
+    if not boot_probe_enabled():
+        return True
+    ok, detail = run_boot_probe_subprocess(cwd=root)
+    if ok:
+        print(f"[auto_deploy] boot probe ok: {detail or 'boot ok'}", flush=True)
+        return True
+    prev = (previous_head or "")[:12] or "?"
+    print(
+        f"[auto_deploy] boot probe FAILED after sync — rolling back to "
+        f"{prev}: {detail}",
+        flush=True,
+    )
+    if previous_head:
+        stash = _stash_protected_live_files(root)
+        try:
+            _run_git("reset", "--hard", previous_head, cwd=root)
+        finally:
+            _restore_protected_live_files(root, stash)
+    return False
+
+
 def _reset_hard_to(root, sha):
     """Move the working tree to sha (feature pushes on Azure / any host).
 
@@ -746,6 +1092,9 @@ def _reset_hard_to(root, sha):
     When HEAD is already ``sha``, skip the stash/reset/restore cycle —
     re-running protect restore rewrites hundreds of mtimes and can
     copyover-loop the game for no code change (same trap as catch-up).
+
+    Returns True when the tree ends at ``sha`` (or was already there).
+    Returns False when boot probe fails and the tree was rolled back.
     """
     ensure_git_safe_directory(root)
     head = _head_sha(root)
@@ -755,7 +1104,9 @@ def _reset_hard_to(root, sha):
             "(skipping reset --hard + protect restore)",
             flush=True,
         )
-        return
+        _ensure_changelog_index_after_sync(root)
+        return True
+    previous_head = head
     print(f"[auto_deploy] syncing working tree to {sha[:12]}", flush=True)
     stash = _stash_protected_live_files(root)
     try:
@@ -786,6 +1137,22 @@ def _reset_hard_to(root, sha):
             )
     except Exception as exc:
         print(f"[auto_deploy] map heal skipped: {exc}", flush=True)
+    _ensure_changelog_index_after_sync(root)
+    if not _verify_boot_probe_or_rollback(root, previous_head):
+        return False
+    return True
+
+
+def _ensure_changelog_index_after_sync(root):
+    """Rebuild ``content/changelog_index.json`` when CHANGELOG sources advanced."""
+    try:
+        from engine import changelog_index as changelog_index_mod
+
+        changelog_index_mod.ensure_compiled_index(
+            root, log_prefix="[auto_deploy]",
+        )
+    except Exception as exc:
+        print(f"[auto_deploy] changelog index heal skipped: {exc}", flush=True)
 
 
 _GITHUB_SSH_ORIGIN = "git@github.com:capnknives/RiftForge.git"
@@ -1013,6 +1380,16 @@ def _sync_head_to_tip_if_behind(root, remote_sha, *, reason=""):
     head_sha = _head_sha(root)
     if not head_sha or head_sha == remote_sha:
         return True
+    if tree_sync_blocked(root):
+        _maybe_log_tree_sync_deferred(
+            root,
+            key=f"head_sync:{remote_sha[:12]}",
+            message=(
+                "[auto_deploy] HEAD sync deferred (build_lock active) — "
+                "Fix overlay applied; full tree sync waits for gm deploy sync"
+            ),
+        )
+        return True
     label = f" ({reason})" if reason else ""
     print(
         f"[auto_deploy] HEAD {head_sha[:12]} behind tip {remote_sha[:12]}"
@@ -1020,7 +1397,12 @@ def _sync_head_to_tip_if_behind(root, remote_sha, *, reason=""):
         flush=True,
     )
     try:
-        _reset_hard_to(root, remote_sha)
+        if not _reset_hard_to(root, remote_sha):
+            print(
+                "[auto_deploy] HEAD sync aborted (boot probe failed)",
+                flush=True,
+            )
+            return False
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         print(f"[auto_deploy] HEAD sync failed: {exc}", flush=True)
         return False
@@ -1029,6 +1411,11 @@ def _sync_head_to_tip_if_behind(root, remote_sha, *, reason=""):
 
 def _commit_subject(sha, root):
     return _git("log", "-1", "--format=%s", sha, cwd=root)
+
+
+def _commit_message(sha, root):
+    """Full commit message (subject + body) for deploy metadata parsing."""
+    return _git("log", "-1", "--format=%B", sha, cwd=root).strip()
 
 
 def _commit_parent_count(sha, root):
@@ -1053,39 +1440,218 @@ def _parse_subject_ticket_tail(summary: str, match) -> str:
     return rest
 
 
-def parse_deploy_metadata(subject: str) -> tuple[list[int], list[int], str]:
-    """Extract bug/suggestion ids + short summary from a deploy subject.
+def _normalize_deploy_line(line: str) -> str:
+    """Strip markdown/list noise so PR-body lines match Fix/Ship parsers."""
+    text = (line or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\*\*", "", text)
+    text = re.sub(r"^[-*]\s+", "", text)
+    return text.strip()
 
-    Only subjects that START like ``Fix bug #N:`` / ``Ship suggestion #N:``
-    yield ids. Mid-sentence mentions and bare PR refs deliberately return
-    empty id lists so auto-deploy does not announce a false world reset.
 
-    Returns ``(bug_ids, suggestion_ids, summary)``.
-    """
-    summary = subject.strip()
-    # Drop trailing "(#123)" PR reference from squash-merge subjects BEFORE
-    # any id scan, so a PR number can never become a ticket id.
-    summary = re.sub(r"\s*\(#\d+\)\s*$", "", summary).strip()
+def _ids_from_fix_match(match) -> tuple[list[int], str]:
+    """Expand a Fix-bug regex match into ids + trailing summary."""
+    start = int(match.group(1))
+    end = int(match.group(2)) if match.group(2) else None
+    bug_ids = _expand_fix_subject_bug_ids(start, end, match.group(3) or "")
+    summary = _parse_subject_ticket_tail(match.string, match)
+    return bug_ids, summary
 
-    bug_ids: list[int] = []
-    suggestion_ids: list[int] = []
-    match = _FIX_SUBJECT_RE.match(summary)
+
+def _parse_line_deploy_ids(line: str) -> tuple[list[int], list[int], str]:
+    """Try every Fix/Ship pattern on one normalized line."""
+    text = _normalize_deploy_line(line)
+    if not text:
+        return [], [], ""
+
+    match = _FIX_SUBJECT_RE.match(text)
+    if match:
+        bug_ids, summary = _ids_from_fix_match(match)
+        return bug_ids, [], summary
+
+    match = _FIX_BUG_REPORT_SUBJECT_RE.match(text)
+    if match:
+        bug_ids, summary = _ids_from_fix_match(match)
+        return bug_ids, [], summary
+
+    match = _SHIP_SUGGESTION_SUBJECT_RE.match(text)
     if match:
         start = int(match.group(1))
         end = int(match.group(2)) if match.group(2) else None
-        bug_ids = _expand_fix_subject_bug_ids(start, end, match.group(3) or "")
-        rest = _parse_subject_ticket_tail(summary, match)
-        summary = rest or "A bug fix has been deployed."
-    else:
-        match = _SHIP_SUGGESTION_SUBJECT_RE.match(summary)
-        if match:
-            start = int(match.group(1))
-            end = int(match.group(2)) if match.group(2) else None
-            suggestion_ids = _expand_fix_subject_bug_ids(
-                start, end, match.group(3) or "",
+        suggestion_ids = _expand_fix_subject_bug_ids(
+            start, end, match.group(3) or "",
+        )
+        summary = _parse_subject_ticket_tail(text, match)
+        return [], suggestion_ids, summary
+
+    match = _SHIP_SUGGESTION_REPORT_SUBJECT_RE.match(text)
+    if match:
+        start = int(match.group(1))
+        end = int(match.group(2)) if match.group(2) else None
+        suggestion_ids = _expand_fix_subject_bug_ids(
+            start, end, match.group(3) or "",
+        )
+        summary = _parse_subject_ticket_tail(text, match)
+        return [], suggestion_ids, summary
+
+    return [], [], ""
+
+
+def _first_subject_line(text: str) -> str:
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if line:
+            return line
+    return ""
+
+
+def _parse_deploy_text_lines(text: str) -> tuple[list[int], list[int], str]:
+    """Scan commit/PR text line-by-line for Fix/Ship ticket headers."""
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        bug_ids, suggestion_ids, summary = _parse_line_deploy_ids(line)
+        if bug_ids or suggestion_ids:
+            return bug_ids, suggestion_ids, summary
+    return [], [], ""
+
+
+def _merged_pr_number_from_subject(subject: str) -> int | None:
+    match = _MERGED_PR_REF_RE.search((subject or "").strip())
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _github_api_headers() -> dict[str, str]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "riftforge-auto-deploy",
+    }
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _fetch_merged_pr_text_via_gh(pr_number: int) -> str:
+    """Fallback when unauthenticated GitHub API cannot read a private PR."""
+    try:
+        proc = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/capnknives/RiftForge/pulls/{int(pr_number)}",
+                "--jq",
+                "{title,body}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=True,
+        )
+        row = json.loads(proc.stdout or "{}")
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        FileNotFoundError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return ""
+    if not isinstance(row, dict):
+        return ""
+    title = (row.get("title") or "").strip()
+    body = (row.get("body") or "").strip()
+    return f"{title}\n{body}".strip() if body else title
+
+
+def _fetch_merged_pr_text(pr_number: int) -> str:
+    """Fetch PR title + body for squash commits that omit the bug id."""
+    pr_number = int(pr_number)
+    cached = _PR_TEXT_CACHE.get(pr_number)
+    if cached is not None:
+        return cached
+    url = f"{_GITHUB_PULL_API}/{pr_number}"
+    req = urllib.request.Request(url, headers=_github_api_headers(), method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+        row = json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            text = _fetch_merged_pr_text_via_gh(pr_number)
+            _PR_TEXT_CACHE[pr_number] = text
+            if not text:
+                print(
+                    f"[auto_deploy] GitHub PR #{pr_number} lookup failed: "
+                    f"{exc} (set GITHUB_TOKEN or run gh auth login)",
+                    flush=True,
+                )
+            return text
+        print(
+            f"[auto_deploy] GitHub PR #{pr_number} lookup failed: {exc}",
+            flush=True,
+        )
+        _PR_TEXT_CACHE[pr_number] = ""
+        return ""
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        text = _fetch_merged_pr_text_via_gh(pr_number)
+        _PR_TEXT_CACHE[pr_number] = text
+        if not text:
+            print(
+                f"[auto_deploy] GitHub PR #{pr_number} lookup failed: {exc}",
+                flush=True,
             )
-            rest = _parse_subject_ticket_tail(summary, match)
-            summary = rest or "A player suggestion has been shipped."
+        return text
+    if not isinstance(row, dict):
+        _PR_TEXT_CACHE[pr_number] = ""
+        return ""
+    title = (row.get("title") or "").strip()
+    body = (row.get("body") or "").strip()
+    text = f"{title}\n{body}".strip() if body else title
+    _PR_TEXT_CACHE[pr_number] = text
+    return text
+
+
+def parse_deploy_metadata(
+    text: str,
+    *,
+    pr_fallback: bool = True,
+) -> tuple[list[int], list[int], str]:
+    """Extract bug/suggestion ids + short summary from deploy text.
+
+    Scans the commit subject, body lines, and (when ``pr_fallback``) the
+    linked GitHub PR title/body when the squash subject ends with
+    ``(#NNNN)`` but omits ``Fix bug #N``.
+
+    Recognized headers include ``Fix bug #N:``, ``Fix in-game bug N:``,
+    and agent PR prose ``Fixes bug report N`` (no ``#``).
+
+    Returns ``(bug_ids, suggestion_ids, summary)``.
+    """
+    subject_line = _first_subject_line(text)
+    bug_ids, suggestion_ids, summary = _parse_deploy_text_lines(text)
+
+    if not bug_ids and not suggestion_ids and pr_fallback:
+        pr_number = _merged_pr_number_from_subject(subject_line)
+        if pr_number:
+            pr_text = _fetch_merged_pr_text(pr_number)
+            if pr_text:
+                bug_ids, suggestion_ids, summary = _parse_deploy_text_lines(
+                    pr_text,
+                )
 
     if len(summary) > 120:
         summary = summary[:117] + "..."
@@ -1141,6 +1707,9 @@ def _advance_origin_only(root, state, remote_sha, subject, reason):
     # Do NOT write last_deploy -- that would imply we shipped a fix.
     # Tracking origin_main alone is enough for advance-only gating.
     _save_state(root, state)
+    from engine import deploy_queue
+
+    deploy_queue.clear_pending(root)
     return False
 
 
@@ -1158,6 +1727,54 @@ def _wait_for_ready(root, timeout_seconds):
     return False
 
 
+def _run_catchup_countdown(
+    root, *, commit_sha, summary, countdown=None, gateway_restart=None,
+):
+    """Announce a catch-up Veil countdown and wait for ``.deploy_ready``.
+
+    Used before ``reset --hard`` / tree syncs that will mtime-trigger
+    copyover. Returns True when the game finished the countdown (or the
+    deploy was already completed for this SHA).
+    """
+    deploy_notify = _fresh_deploy_notify()
+    seconds = (
+        int(countdown)
+        if countdown is not None
+        else _catchup_countdown_seconds()
+    )
+    if gateway_restart is None:
+        gateway_restart = _advance_touches_gateway(root, commit_sha)
+    signal = deploy_notify.queue_catchup_copyover(
+        root,
+        commit_sha=commit_sha,
+        countdown_seconds=seconds,
+        summary=summary,
+        triggered_by="engine/auto_deploy.py",
+        gateway_restart=gateway_restart,
+    )
+    if signal is None:
+        print(
+            f"[auto_deploy] catch-up countdown skipped for {commit_sha[:12]} "
+            "(already completed for this commit)",
+            flush=True,
+        )
+        return True
+    print(
+        f"[auto_deploy] catch-up Veil countdown {seconds}s for "
+        f"{commit_sha[:12]} (gateway_restart={gateway_restart}): {summary}",
+        flush=True,
+    )
+    timeout = DEFAULT_READY_TIMEOUT + seconds
+    if not _wait_for_ready(root, timeout):
+        print(
+            "[auto_deploy] timed out waiting for catch-up .deploy_ready -- "
+            "is deploy_notify wired in server.py?",
+            flush=True,
+        )
+        return False
+    return True
+
+
 def _run_deploy_pipeline(
     root, *, commit_sha, bug_ids, suggestion_ids, summary, countdown, files,
 ):
@@ -1169,9 +1786,12 @@ def _run_deploy_pipeline(
     list several tickets for a batch subject so on_resume marks every one
     resolved.
     """
-    from tools.apply_pr_fix import overlay_files_from_ref
+    from tools.apply_pr_fix import overlay_files_from_ref_with_boot_probe
 
     deploy_notify = _fresh_deploy_notify()
+    from engine import gateway_watch
+
+    gateway_restart = gateway_watch.paths_touch_gateway_restart(files)
 
     primary_bug = bug_ids[0] if bug_ids else None
     primary_suggest = suggestion_ids[0] if suggestion_ids else None
@@ -1186,6 +1806,7 @@ def _run_deploy_pipeline(
         countdown_seconds=countdown,
         triggered_by="engine/auto_deploy.py",
         commit_sha=commit_sha,
+        gateway_restart=gateway_restart,
     )
     if signal is None:
         print(
@@ -1197,7 +1818,8 @@ def _run_deploy_pipeline(
 
     label = deploy_notify.describe_ticket_ref(bug_ids, suggestion_ids)
     print(
-        f"[auto_deploy] countdown {countdown}s for {label}: {summary}",
+        f"[auto_deploy] countdown {countdown}s for {label} "
+        f"(gateway_restart={gateway_restart}): {summary}",
         flush=True,
     )
     timeout = DEFAULT_READY_TIMEOUT + countdown
@@ -1209,13 +1831,25 @@ def _run_deploy_pipeline(
         )
         return False
 
-    overlay_files_from_ref(commit_sha, files, cwd=root)
+    begin_announced_tree_sync(root)
+    ok, probe_detail = overlay_files_from_ref_with_boot_probe(
+        commit_sha, files, cwd=root,
+    )
+    if not ok:
+        clear_announced_copyover(root)
+        print(
+            f"[auto_deploy] overlay rolled back (boot probe): {probe_detail}",
+            flush=True,
+        )
+        return False
+
     print(
-        f"[auto_deploy] overlaid {len(files)} file(s) from {commit_sha[:12]}",
+        f"[auto_deploy] overlaid {len(files)} file(s) from {commit_sha[:12]} "
+        f"(boot probe: {probe_detail})",
         flush=True,
     )
     from engine.deploy_guard import run_post_overlay_checks
-    run_post_overlay_checks()
+    run_post_overlay_checks(root)
     return True
 
 
@@ -1288,22 +1922,16 @@ def _commits_between(from_sha, to_sha, root):
 
 def _fix_commits_from_shas(root, shas):
     """Parse Fix/Ship subjects from an ordered SHA list."""
-    from tools.apply_pr_fix import files_in_commit
-
     fixes = []
     for sha in shas:
         try:
             subject = _commit_subject(sha, root)
-            parent_count = _commit_parent_count(sha, root)
+            message = _commit_message(sha, root)
         except subprocess.CalledProcessError:
             continue
-        files = files_in_commit(sha, cwd=root)
-        ship, _reason = should_ship_bug_fix(
-            subject, parent_count=parent_count, file_count=len(files),
+        bug_ids, suggestion_ids, summary = parse_deploy_metadata(
+            message or subject,
         )
-        if not ship:
-            continue
-        bug_ids, suggestion_ids, summary = parse_deploy_metadata(subject)
         if not bug_ids and not suggestion_ids:
             continue
         fixes.append({
@@ -1354,8 +1982,10 @@ _FIX_SHIP_GREP_TERMS = (
     "Fix bugs",
     "Fix in-game",
     "Fixes bug",
+    "Fixes bug report",
     "Ship suggestion",
     "Ship suggestions",
+    "Ships suggestion report",
     "Stop nest dens",
 )
 
@@ -1413,6 +2043,34 @@ def _merge_bug_id_list(existing, new_ids):
     return out
 
 
+def _collect_merged_pr_ref_shas(git_root, to_sha, *, from_sha=None):
+    """Commits whose squash subject ends with ``(#NNNN)`` (PR title may hold bug id)."""
+    if not to_sha:
+        return []
+    rev_range = to_sha
+    if from_sha and from_sha != to_sha:
+        rev_range = f"{from_sha}..{to_sha}"
+    try:
+        out = _git(
+            "log",
+            "--reverse",
+            "--format=%H %s",
+            rev_range,
+            cwd=git_root,
+        )
+    except subprocess.CalledProcessError:
+        return []
+    shas: list[str] = []
+    for line in out.splitlines():
+        parts = line.strip().split(" ", 1)
+        if len(parts) != 2:
+            continue
+        sha, subject = parts[0], parts[1]
+        if _merged_pr_number_from_subject(subject):
+            shas.append(sha)
+    return shas
+
+
 def _collect_fix_ship_shas(git_root, to_sha, *, from_sha=None):
     """Return SHAs whose subjects may be Fix/Ship deploys (grep, not full history)."""
     if not to_sha:
@@ -1440,6 +2098,10 @@ def _collect_fix_ship_shas(git_root, to_sha, *, from_sha=None):
             if sha and sha not in seen:
                 seen.add(sha)
                 ordered.append(sha)
+    for sha in _collect_merged_pr_ref_shas(git_root, to_sha, from_sha=from_sha):
+        if sha not in seen:
+            seen.add(sha)
+            ordered.append(sha)
     return ordered
 
 
@@ -1614,11 +2276,13 @@ def record_catchup_last_deploy(root, fix, *, subject=None):
 def _run_reenable_catchup(root, state, remote_sha):
     """Full working-tree sync after GM ``autodeploy on`` (missed commits).
 
-    Uses the same ``reset --hard`` + protect stash path as a silent feature
+    Uses the same ``reset --hard`` + protect stash path as a feature
     advance — not a tip-only Fix overlay — so multi-commit gaps while the
-    toggle was off do not leave intermediate files behind. Missed ``Fix bug
-    #N`` subjects in that range are handed to deploy_notify for resolve +
-    reporter credit (no Veil countdown — the tree is already current).
+    toggle was off do not leave intermediate files behind. When the tree
+    must move, a catch-up Veil countdown (default 60s) warns players before
+    the sync that will mtime-trigger copyover. Missed ``Fix bug #N``
+    subjects in that range are handed to deploy_notify for resolve +
+    reporter credit after the tree lands.
     """
     from_sha = _catchup_from_sha(state)
     subject = "(unknown)"
@@ -1631,6 +2295,21 @@ def _run_reenable_catchup(root, state, remote_sha):
         f"{remote_sha[:12]} ({subject})",
         flush=True,
     )
+    if tree_sync_blocked(root):
+        from engine import deploy_queue
+
+        deploy_queue.record_blocked_advance(
+            root, from_sha=from_sha, to_sha=remote_sha, subject=subject,
+        )
+        _maybe_log_tree_sync_deferred(
+            root,
+            key=f"catchup:{remote_sha[:12]}",
+            message=(
+                "[auto_deploy] catch-up deferred (build_lock active) — "
+                "run gm deploy sync when ready"
+            ),
+        )
+        return False
     try:
         head_sha = _git("rev-parse", "HEAD", cwd=root).strip()
     except subprocess.CalledProcessError:
@@ -1644,9 +2323,29 @@ def _run_reenable_catchup(root, state, remote_sha):
             flush=True,
         )
     else:
+        # Warn in-game before rewriting files (mtime → copyover).
+        if not _run_catchup_countdown(
+            root,
+            commit_sha=remote_sha,
+            summary=(
+                "Catch-up rewrite — the Veil is about to stitch origin/main "
+                "into the live bones of this world."
+            ),
+        ):
+            # Leave the flag so the next poll retries.
+            return False
         try:
-            _reset_hard_to(root, remote_sha)
+            begin_announced_tree_sync(root)
+            _snapshot_db_before_tree_sync(root)
+            if not _reset_hard_to(root, remote_sha):
+                clear_announced_copyover(root)
+                print(
+                    "[auto_deploy] catch-up sync aborted (boot probe failed)",
+                    flush=True,
+                )
+                return False
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            clear_announced_copyover(root)
             print(f"[auto_deploy] catch-up sync failed: {exc}", flush=True)
             # Leave the flag so the next poll retries.
             return False
@@ -1670,6 +2369,9 @@ def _run_reenable_catchup(root, state, remote_sha):
     state["origin_main"] = remote_sha
     _save_state(root, state)
     clear_catchup(root)
+    from engine import deploy_queue
+
+    deploy_queue.clear_pending(root)
     print(
         f"[auto_deploy] catch-up complete at {remote_sha[:12]}",
         flush=True,
@@ -1692,7 +2394,9 @@ def try_auto_deploy():
     while overlays were off). That is intentional and flag-gated — not the
     old "files differ from tracked SHA" auto path.
     """
-    if not _enabled():
+    skip_reason = poll_skip_reason()
+    if skip_reason is not None:
+        _maybe_log_poll_skip(skip_reason)
         return False
 
     root = _repo_root()
@@ -1740,7 +2444,8 @@ def try_auto_deploy():
         return False
 
     subject = _commit_subject(remote_sha, root)
-    bug_ids, suggestion_ids, summary = parse_deploy_metadata(subject)
+    message = _commit_message(remote_sha, root)
+    bug_ids, suggestion_ids, summary = parse_deploy_metadata(message or subject)
     countdown = _countdown_seconds()
     missed_fixes = collect_missed_fix_commits(root, prev_sha, remote_sha)
 
@@ -1759,17 +2464,58 @@ def try_auto_deploy():
         parent_count = 1
     files = files_in_commit(remote_sha, cwd=root)
     ship, reason = should_ship_bug_fix(
-        subject, parent_count=parent_count, file_count=len(files),
+        message or subject,
+        parent_count=parent_count,
+        file_count=len(files),
     )
     if not ship:
-        # Feature / non-Fix pushes: still update live files, just no countdown.
+        # Feature / non-Fix pushes: Veil countdown, then sync the tree.
+        # (Never use Fix Bug #N chrome for incidental / merge subjects.)
+        if tree_sync_blocked(root):
+            from engine import deploy_queue
+
+            deploy_queue.record_blocked_advance(
+                root,
+                from_sha=prev_sha,
+                to_sha=remote_sha,
+                subject=subject,
+            )
+            _maybe_log_tree_sync_deferred(
+                root,
+                key=f"feature:{remote_sha[:12]}",
+                message=(
+                    f"[auto_deploy] tree sync deferred (build_lock active) "
+                    f"for {remote_sha[:12]}: {subject} — "
+                    "run gm deploy sync when ready"
+                ),
+            )
+            return False
+        if not _run_catchup_countdown(
+            root,
+            commit_sha=remote_sha,
+            summary=(
+                "A world rewrite is landing — stay put while the Veil "
+                "stitches the new bones into place."
+            ),
+        ):
+            return False
         try:
-            _reset_hard_to(root, remote_sha)
+            begin_announced_tree_sync(root)
+            _snapshot_db_before_tree_sync(root)
+            if not _reset_hard_to(root, remote_sha):
+                clear_announced_copyover(root)
+                print(
+                    "[auto_deploy] working-tree sync aborted "
+                    "(boot probe failed)",
+                    flush=True,
+                )
+                return False
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            clear_announced_copyover(root)
             print(f"[auto_deploy] working-tree sync failed: {exc}", flush=True)
             return False
         # A feature tip can land in the same poll batch as Fix commits
-        # underneath it -- resolve those tickets even without a Veil countdown.
+        # underneath it -- resolve those tickets after the tree sync.
         if missed_fixes:
             try:
                 _apply_catchup_fix_resolves(root, state, missed_fixes)

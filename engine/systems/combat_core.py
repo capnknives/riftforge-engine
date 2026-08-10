@@ -58,3 +58,26 @@ def roll_weighted_outcome(weights, *, default="hit", reserve=0.0, rng=None):
         if roll < cumulative:
             return name
     return default
+
+
+def normalized_outcome_weights(weights, *, default="hit", reserve=0.0):
+    """Map weighted buckets to outcome probabilities (no RNG).
+
+    Mirrors ``roll_weighted_outcome`` scaling: competing weights share
+    ``1 - reserve``; ``default`` absorbs whatever probability remains.
+    Preview / UI helpers use this so players see the same math the roll
+    uses without exposing raw weights.
+    """
+    total = 0.0
+    for _name, weight in weights:
+        total += weight
+    room = 1.0 - reserve
+    scale = (room / total) if total > room and total > 0 else 1.0
+    out = {}
+    weighted_sum = 0.0
+    for name, weight in weights:
+        share = weight * scale
+        out[name] = share
+        weighted_sum += share
+    out[default] = max(0.0, 1.0 - weighted_sum)
+    return out

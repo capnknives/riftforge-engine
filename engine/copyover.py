@@ -52,12 +52,17 @@ STATE_PATH = ".copyover_state.json"
 
 # Player-facing lines (plain tags -- never color alone). Shared by classic
 # execv copyover, gateway graceful restart, and gateway reattach.
+# Player-facing arc (keep in sync with deploy_notify / gateway hold music):
+#   warn+countdown → pause-coming → MSG_BEFORE → [WAIT] while IPC down →
+#   MSG_AFTER (connected) → soft stitch (optional) → "Rewrite complete"
+# after deferred boot. Do not reuse "holds" for success.
 MSG_BEFORE = (
     "*** The Veil shudders. Something ancient is rewriting the bones of "
-    "this world. Hold on. ***"
+    "this world — hold on. ***"
 )
 MSG_AFTER = (
-    "*** The Veil settles. You are still here. ***"
+    "*** The Veil swallows you whole. You are still here — "
+    "your thread holds. ***"
 )
 
 
@@ -135,15 +140,31 @@ def reload_world_save_modules():
     Auto-deploy overlays land on the bind-mount while this process still
     holds older bytecode -- without a reload, ``game.save()`` would skip
     God twins and omit new blob fields (bug report 152).
+
+    Reload ``engine.hooks`` *before* ``engine.persistence``. Persistence
+    imports hook callables at module top; if we reload persistence first
+    while the in-memory hooks module still lacks a newly added name
+    (e.g. ``heal_force_unspirit``), ``importlib.reload`` raises
+    ``ImportError`` and copyover aborts — the game process never exits,
+    so overlays never become live bytecode (bug report 387).
     """
     import importlib
 
     from engine import hooks
     from engine import persistence as ep
 
+    # Hooks first: persistence's top-level ``from engine.hooks import …``
+    # must see the on-disk hooks module, not the pre-overlay cache.
+    importlib.reload(hooks)
     ep = importlib.reload(ep)
-    from engine import hooks
-    hooks.reload_blob_codec()
+    # reload(hooks) clears bootstrap callbacks; re-register the active game's
+    # persist_blob codec before copyover save (empty blobs wiped live, #2096).
+    try:
+        import game_select
+
+        game_select.reregister_blob_codec()
+    except ImportError:
+        hooks.reload_blob_codec()
     return ep
 
 
@@ -169,6 +190,32 @@ async def _perform(game):
     # Persist the world NOW -- the new process's Game.__init__ reloads from
     # disk, so whatever isn't saved here is lost, same as any other restart.
     reload_world_save_modules()
+    from engine import hooks as _hooks
+
+    if not _hooks.blob_codec_registered():
+        print(
+            "[copyover] ABORT: blob codec not registered after module reload; "
+            "refusing to save (would wipe character blobs)",
+            flush=True,
+        )
+        # reload(hooks) already cleared attachers / combat / chargen. Do not
+        # return into a half-wired event loop — restore full game hooks so
+        # the process stays playable until the next real restart.
+        try:
+            import game_select
+
+            game_select.restore_hooks_after_copyover_abort()
+            print(
+                "[copyover] restored full hooks after abort "
+                "(no save; process continues)",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[copyover] failed to restore hooks after abort: {exc!r}",
+                flush=True,
+            )
+        return
     game.save(copyover=True)
 
     if gateway_enabled():

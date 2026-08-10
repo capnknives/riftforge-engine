@@ -21,7 +21,7 @@ from __future__ import annotations
 # Soft cap so an inbox cannot grow forever; oldest letters drop first.
 MAIL_CAP = 30
 # Hard cap on letter body length (characters).
-MAIL_TEXT_MAX = 500
+MAIL_TEXT_MAX = 2000
 
 
 def is_mail_room(room):

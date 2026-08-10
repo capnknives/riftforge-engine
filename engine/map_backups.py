@@ -38,7 +38,7 @@ from __future__ import annotations
 import os
 import shutil
 
-import maps as maps_mod
+from engine import world_maps as maps_mod
 
 from engine import hooks as hooks_mod
 

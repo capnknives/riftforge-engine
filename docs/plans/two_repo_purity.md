@@ -15,8 +15,8 @@ hook API details grow in [`../ENGINE_CONSUMER.md`](../ENGINE_CONSUMER.md).
 execution SoT: [`two_repo_purity_extractions_plan.md`](two_repo_purity_extractions_plan.md);
 closeout inventory: [`two_repo_purity_audit_2026-08-05.md`](two_repo_purity_audit_2026-08-05.md).
 Ongoing: export discipline when engine APIs change; dual-mount hack when
-editing both trees; next public tag **`v0.5.1`** when score-sheet /
-`python -m engine` MVP ships. Gateway:
+editing both trees; public tag **`v0.5.1`** when strangler + basegame
+body-parts demo ship (export + remote tag cut). Gateway:
 [`connection_gateway.md`](connection_gateway.md) (shipped).
 T3 hygiene peels (`persistence-api` / `lean-demo` / dirty-saves **bench**)
 are done in [`refactor_plan.md`](refactor_plan.md); full incremental

@@ -65,6 +65,7 @@ def ensure_demo_npc(game):
     )
     handset.is_phone = True
     phone_mod.stamp_phone_on_spawn(handset, game)
+    phone_mod.ensure_phone_number(handset, game)
     operator.inventory.append(handset)
     operator.move_to(post)
     game._basegame_operator_number = handset.phone_number

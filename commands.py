@@ -45,6 +45,8 @@ from command_support import (
 )
 from engine.verbs import ENGINE_COMMANDS
 from engine.verbs.basic import _report_history, cmd_move
+from engine import display_prefs
+from engine.session_attach import heal_character_session
 import game_select
 
 # The active game's verbs (SUPERS, basegame, or {} for a lean engine boot).
@@ -140,7 +142,7 @@ IDLE_WAKE_AGGRESSIVE = frozenset({
 # Derived from IDLE_SPECTATOR so idle watch and asleep recovery stay aligned.
 ASLEEP_BLOCK = frozenset({
     "look", "l", "examine", "exa", "ex",
-    "say", "'", "emote", "em", "tell", "whisper", "reply", "r",
+    "say", "'", "emote", "em", "smote", "tell", "whisper", "reply", "r",
     "rest", "sleep", "sit", "stand", "lay",
     "idlemode", "idle",
 }) | IDLE_WAKE_MOVE | IDLE_WAKE_AGGRESSIVE
@@ -149,7 +151,13 @@ ASLEEP_SPECTATOR = (IDLE_SPECTATOR - ASLEEP_BLOCK) | frozenset({
     "wake", "logout", "hp", "fuel", "where", "coins",
     "account", "combatnumbers", "bigmap", "atlas", "brief",
     "dominion", "bounty", "cases", "quests", "journal", "mail",
+    # Spirit Expert dream lane: sleep gate requires dreamenter while
+    # the body is still closed to the waking world (magic_basics §4.4).
+    "dreamenter", "dreamleave",
 })
+
+# cast dreamenter / cast dreamleave share the same asleep carve-out.
+_ASLEEP_DREAM_CAST_RITES = frozenset({"dreamenter", "dreamleave"})
 
 
 def _idlemode_should_wake(verb, character=None):
@@ -198,8 +206,44 @@ def dispatch(character, raw, game, *, force_actor=None):
     ``force_actor`` runs the verb as another body (God ``twin`` / ``omni``
     one-shots) without changing sustained act focus on the login character.
     """
+    from engine import log_context
+    from engine.session_attach import heal_character_session
+
+    # Heal half-cleared Session <-> Character links before any verb runs.
+    if character is not None:
+        heal_character_session(character, game)
+
+    # Colon emote shorthand (:grins) before alias expansion.
+    stripped = (raw or "").strip()
+    if stripped.startswith(":"):
+        colon_body = stripped[1:].lstrip()
+        if not colon_body:
+            session = getattr(character, "session", None)
+            if session is not None:
+                session.send("Smote what?")
+            return
+        display_prefs.ensure_display_defaults(character)
+        actor = force_actor or character
+        log_context.set_command_context(
+            game=game,
+            session=getattr(character, "session", None),
+            character=character,
+        )
+        try:
+            return _dispatch_body(
+                character, raw, game, "smote", colon_body,
+                force_actor=force_actor,
+            )
+        finally:
+            log_context.clear_command_context()
+            from engine.persistence import (
+                command_marks_character_dirty,
+                mark_character_dirty,
+            )
+            if command_marks_character_dirty("smote", colon_body):
+                mark_character_dirty(game, actor)
+
     # D65: expand player aliases before parse (never shadows built-ins).
-    from engine import display_prefs
     display_prefs.ensure_display_defaults(character)
     raw = display_prefs.expand_aliases(character, raw)
 
@@ -207,6 +251,25 @@ def dispatch(character, raw, game, *, force_actor=None):
     if not verb:                       # blank line -- do nothing
         return
 
+    log_context.set_command_context(
+        game=game,
+        session=getattr(character, "session", None),
+        character=character,
+    )
+    actor = force_actor or character
+    try:
+        return _dispatch_body(character, raw, game, verb, args, force_actor=force_actor)
+    finally:
+        log_context.clear_command_context()
+        from engine.persistence import (
+            command_marks_character_dirty,
+            mark_character_dirty,
+        )
+        if command_marks_character_dirty(verb, args):
+            mark_character_dirty(game, actor)
+
+
+def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
     import game_select
     _active_game = game_select.game_name()
 
@@ -242,7 +305,11 @@ def dispatch(character, raw, game, *, force_actor=None):
         ASLEEP_WORLD_CLOSED_MSG,
         asleep_blocks_world,
     )
-    if asleep_blocks_world(character) and verb not in ASLEEP_SPECTATOR:
+    _asleep_ok = verb in ASLEEP_SPECTATOR
+    if not _asleep_ok and verb == "cast":
+        rite = (args or "").strip().split(None, 1)[0].lower()
+        _asleep_ok = rite in _ASLEEP_DREAM_CAST_RITES
+    if asleep_blocks_world(character) and not _asleep_ok:
         if resolve_walk_direction(verb, getattr(character, "location", None)):
             character.session.send(
                 "You're asleep -- type 'wake' before you can move."
@@ -281,7 +348,13 @@ def dispatch(character, raw, game, *, force_actor=None):
         try:
             from supers import magic as _magic_cage
             _cage_held = _magic_cage.cage_holds_actor(character)
-        except Exception:
+        except Exception as exc:
+            from engine import log_util
+            log_util.ops(
+                "commands",
+                "cage gate error -- treating as not caged",
+                exc=exc,
+            )
             _cage_held = False
     if _cage_held and verb not in _CAGE_ALLOWED:
         if resolve_walk_direction(verb, getattr(character, "location", None)):
@@ -298,7 +371,7 @@ def dispatch(character, raw, game, *, force_actor=None):
 
     # GM mute: block global / room speech channels only (not movement).
     _MUTED_VERBS = frozenset({
-        "say", "'", "emote", "em", "tell", "whisper", "reply", "r", "ooc",
+        "say", "'", "emote", "em", "smote", "tell", "whisper", "reply", "r", "ooc",
     })
     if getattr(character, "muted", False) and verb in _MUTED_VERBS:
         character.session.send(
@@ -435,12 +508,10 @@ def dispatch(character, raw, game, *, force_actor=None):
         """Run *fn* with the login Session on *actor* when steering a host."""
         loaned = False
         prev_session = None
-        if (
-            actor is not character
-            and getattr(character, "session", None) is not None
-        ):
+        login_session = heal_character_session(character, game)
+        if actor is not character and login_session is not None:
             prev_session = getattr(actor, "session", None)
-            actor.session = character.session
+            actor.session = login_session
             loaned = True
         try:
             fn()
@@ -521,8 +592,13 @@ def dispatch(character, raw, game, *, force_actor=None):
             display_prefs.send_prompt(character, game)
             return
 
-    # Look the verb up in the table. .get() returns None if it isn't a command.
-    entry = COMMANDS.get(verb)
+    # Look the verb up in cmdsets first, then the flat table.
+    from engine import cmdset as cmdset_mod
+
+    room = getattr(actor, "location", None)
+    entry = cmdset_mod.lookup_command(actor, room, verb)
+    if entry is None:
+        entry = COMMANDS.get(verb)
     if entry:
         from engine import command_disable as _cmd_disable
         if _cmd_disable.is_disabled(game, verb):
@@ -543,6 +619,9 @@ def dispatch(character, raw, game, *, force_actor=None):
             except ImportError:
                 pass
         def _run_handler():
+            from engine import metrics as metrics_mod
+            metrics_mod.bump(game, "commands_total")
+            metrics_mod.bump(game, f"command.{verb}")
             handler(actor, args, game)  # call whichever function we found
         _loan_session_to_actor(_run_handler)
         if _twin_owner is not None and _active_game == "supers":
@@ -569,7 +648,24 @@ def dispatch(character, raw, game, *, force_actor=None):
                 )
                 traceback.print_exc()
     else:
-        character.session.send(f"Unknown command: '{verb}'. Try 'help'.")
+        from engine.help_db import closest_match
+
+        from engine import channels
+        dyn = channels.lookup_verb(verb)
+        if dyn is not None and not dyn.builtin:
+            def _run_channel():
+                channels.cmd_dynamic_channel(actor, args, game, verb=verb)
+            _loan_session_to_actor(_run_channel)
+            display_prefs.send_prompt(character, game)
+            return
+
+        hint = closest_match(verb, COMMANDS.keys(), max_distance=3)
+        if hint:
+            character.session.send(
+                f"Unknown command: '{verb}'. Did you mean '{hint}'? Try 'help'."
+            )
+        else:
+            character.session.send(f"Unknown command: '{verb}'. Try 'help'.")
 
     # D65: reprint custom prompt after every command (empty template = skip).
     display_prefs.send_prompt(character, game)

@@ -1,49 +1,44 @@
-"""lodging.py -- generic bed occupancy, lodging units, and home claims.
+"""
+lodging.py -- generic beds, home compounds, lease ticks, sleep venue checks.
 
-Engine-side lodging mechanics: bed furniture detection, sharing rules
-(via ``lodging_are_family`` hook), safe-sleep policy (via
-``lodging_sleep_policy`` hook), and rent/claim ledger scans. Game layers
-(SUPERS hotel rent, house doors, sleep verbs) stay in ``supers/lodging.py``.
-
-Pure logic: no sockets, no ``supers`` imports.
+Game-specific lover-sharing, hotel key lists, vagrancy fiction, and zone
+gates register via ``engine.hooks`` (``set_lodging_sleep_policy``,
+``set_lodging_bed_eligibility``, ``set_lodging_rent_tick``). Stdlib only;
+zero ``supers`` imports.
 """
 
 from __future__ import annotations
 
-from engine import hooks
+from engine import hooks as hooks_mod
 
-# BASIC lodging amenity tags stamped on homes / hotel rooms / bunk rooms.
+# BASIC lodging amenities shared by houses, apartments, and hotel guest rooms.
 HOME_BASIC_RESOURCES = ("water", "entertainment", "hygiene")
 
-# Max people on one bed Item. Empty = open; one sleeper = open only to a
-# registered family member (lover hook); two = full.
+# Max people on one bed Item (empty / one sleeper / full).
 BED_SHARE_MAX = 2
+
+_TICKS_PER_GAME_DAY = 9600
+LEASE_TICKS = _TICKS_PER_GAME_DAY
+
+
+def is_hotel_guest_room(room):
+    """True when ``room`` is a rented hotel guest unit (``is_hotel_room``)."""
+    if room is None:
+        return False
+    return bool(getattr(room, "is_hotel_room", False))
 
 
 def is_lodging_unit(room):
-    """True for claimable homes and generic hotel / lodging rooms.
-
-    Checks authored room flags only -- legacy hotel key lists stay in the
-    game layer (SUPERS ``is_hotel_guest_room``).
-    """
+    """True for claimable homes and hotel guest rooms."""
     if room is None:
         return False
     if getattr(room, "is_house", False):
         return True
-    if getattr(room, "is_hotel_room", False):
-        return True
-    if getattr(room, "is_lodging", False):
-        return True
-    return False
+    return is_hotel_guest_room(room)
 
 
 def stamp_home_basics(room):
-    """Ensure ``room`` offers the BASIC lodging amenity tags.
-
-    Idempotent. Fires ``stamp_lodging_room`` so the game may add fields
-    after the generic stamp (H1 ``stamp_map_room`` pattern).
-    Returns True when at least one tag was added.
-    """
+    """Ensure ``room`` offers the BASIC lodging amenity tags (idempotent)."""
     if room is None:
         return False
     resources = list(getattr(room, "resources", None) or [])
@@ -54,8 +49,160 @@ def stamp_home_basics(room):
             changed = True
     if changed:
         room.resources = resources
-    hooks.stamp_lodging_room(room)
     return changed
+
+
+def ensure_home_basics(game):
+    """Boot catch-up: stamp BASIC amenities on every lodging unit."""
+    if game is None:
+        return
+    for room in getattr(game, "rooms", {}).values():
+        if is_lodging_unit(room):
+            stamp_home_basics(room)
+
+
+def house_interior_cluster(seed, game):
+    """Every ``is_house`` room in the same interior compound as ``seed``."""
+    if seed is None or game is None:
+        return []
+    if not getattr(seed, "is_house", False):
+        return []
+    seen = {seed.key: seed}
+    stack = [seed]
+    while stack:
+        room = stack.pop()
+        for neighbor in (room.exits or {}).values():
+            if neighbor is None:
+                continue
+            if not getattr(neighbor, "is_house", False):
+                continue
+            key = getattr(neighbor, "key", None)
+            if not key or key in seen:
+                continue
+            seen[key] = neighbor
+            stack.append(neighbor)
+    return list(seen.values())
+
+
+def pick_main_homeroom(rooms):
+    """Choose the claim-hub Room for a house interior cluster."""
+    interiors = [r for r in (rooms or ()) if r is not None]
+    if not interiors:
+        return None
+    by_key = {r.key: r for r in interiors if getattr(r, "key", None)}
+    for key, room in by_key.items():
+        if key.endswith(" Living"):
+            return room
+    for room in interiors:
+        outbound = (room.exits or {}).get("out")
+        if outbound is not None and getattr(outbound, "private_home", False):
+            return room
+    for room in interiors:
+        main = getattr(room, "main_homeroom", None)
+        if main and main == getattr(room, "key", None):
+            return room
+    return sorted(interiors, key=lambda r: r.key)[0]
+
+
+def stamp_house_home_links(rooms, main_room=None):
+    """Stamp ``is_home`` + ``main_homeroom`` on every room in the cluster."""
+    interiors = [r for r in (rooms or ()) if r is not None]
+    if not interiors:
+        return None
+    main = main_room or pick_main_homeroom(interiors)
+    if main is None:
+        return None
+    main_key = main.key
+    for room in interiors:
+        room.is_home = True
+        room.main_homeroom = main_key
+        if not getattr(room, "is_house", False):
+            room.is_house = True
+    return main_key
+
+
+def ensure_house_home_links(game):
+    """Boot catch-up: link every ``is_house`` cluster with home stamps."""
+    if game is None:
+        return 0
+    stamped = 0
+    seen = set()
+    for room in getattr(game, "rooms", {}).values():
+        if not getattr(room, "is_house", False):
+            continue
+        key = getattr(room, "key", None)
+        if not key or key in seen:
+            continue
+        cluster = house_interior_cluster(room, game)
+        if not cluster:
+            continue
+        for member in cluster:
+            seen.add(member.key)
+        main_guess = pick_main_homeroom(cluster)
+        main_key = main_guess.key if main_guess else None
+        already = True
+        for member in cluster:
+            if not getattr(member, "is_home", False):
+                already = False
+                break
+            if getattr(member, "main_homeroom", None) != main_key:
+                already = False
+                break
+        if already and main_key:
+            continue
+        if stamp_house_home_links(cluster, main_guess):
+            stamped += 1
+    return stamped
+
+
+def main_homeroom_key(room):
+    """Return the claim-hub key for ``room``, or ``room.key`` / None."""
+    if room is None:
+        return None
+    main = getattr(room, "main_homeroom", None)
+    if main:
+        return main
+    return getattr(room, "key", None)
+
+
+def same_house_room(a, b):
+    """True when two rooms share a ``main_homeroom`` (or are the same room)."""
+    if a is None or b is None:
+        return False
+    if a is b:
+        return True
+    if getattr(a, "key", None) and a.key == getattr(b, "key", None):
+        return True
+    ma = main_homeroom_key(a)
+    mb = main_homeroom_key(b)
+    return bool(ma) and ma == mb
+
+
+def room_is_character_home(character, room, game=None):
+    """True when ``room`` is (or belongs to) the character's claimed home."""
+    if character is None or room is None:
+        return False
+    home_key = getattr(character, "home_room_key", None)
+    if not home_key:
+        return False
+    if home_key == getattr(room, "key", None):
+        return True
+    if not getattr(room, "is_house", False) and not getattr(room, "is_home", False):
+        return False
+    rooms = getattr(game, "rooms", None) if game is not None else None
+    home_room = rooms.get(home_key) if rooms else None
+    if home_room is None:
+        return main_homeroom_key(room) == home_key
+    return same_house_room(home_room, room)
+
+
+def room_allows_wash(room):
+    """True when wash / shower / cleanup works in ``room``."""
+    if room is None:
+        return False
+    if "hygiene" in getattr(room, "resources", ()):
+        return True
+    return is_lodging_unit(room)
 
 
 def _is_bed(obj):
@@ -70,7 +217,7 @@ def _is_bed(obj):
 
 
 def has_bunks(room):
-    """True when this room offers unlimited stronghold bunks (no bed Item)."""
+    """True when this room offers unlimited stronghold bunks."""
     if room is None:
         return False
     if not getattr(room, "has_bunks", False):
@@ -118,7 +265,8 @@ def bed_available_to(character, bed, room):
         return True
     if len(occ) >= BED_SHARE_MAX:
         return False
-    return hooks.lodging_are_family(character, occ[0])
+    # One sleeper: game hook decides sharing (lovers, family, …).
+    return hooks_mod.lodging_bed_eligibility(character, bed, room)
 
 
 def free_beds(room, prefer_owner=None, family_id=None, for_character=None):
@@ -140,7 +288,9 @@ def free_beds(room, prefer_owner=None, family_id=None, for_character=None):
             return 0
         if for_character is not None:
             occ = bed_occupants(bed, room)
-            if len(occ) == 1 and hooks.lodging_are_family(for_character, occ[0]):
+            if len(occ) == 1 and hooks_mod.lodging_bed_eligibility(
+                for_character, bed, room,
+            ):
                 return 0
         if owner is None or owner == "":
             return 1
@@ -169,14 +319,13 @@ def pick_bed(room, character, bed_name=None):
     free = [bed for bed in beds if bed_available_to(character, bed, room)]
     if not free:
         return None, "Every bed here is taken."
-    with_family = [
+    with_share = [
         b for b in free
-        if any(
-            hooks.lodging_are_family(character, o) for o in bed_occupants(b, room)
-        )
+        if bed_occupants(b, room)
+        and hooks_mod.lodging_bed_eligibility(character, b, room)
     ]
-    if with_family:
-        return with_family[0], None
+    if with_share:
+        return with_share[0], None
     own = [b for b in free if getattr(b, "owner_key", None) == character.key]
     if own:
         return own[0], None
@@ -186,23 +335,24 @@ def pick_bed(room, character, bed_name=None):
     return free[0], None
 
 
-def is_safe_sleep_venue(room, character=None, game=None):
-    """True when sleep here is a bed / home / authored floor camp (not public).
-
-    Game-specific rules (vehicles, vampire zones, …) register via
-    ``lodging_sleep_policy``; when the hook returns a bool, that wins.
-    Otherwise fall back to generic bed / bunk / house checks.
-    """
+def allows_floor_sleep(room):
+    """True if this room offers sleep without requiring a bed Item."""
     if room is None:
         return False
-    policy = hooks.lodging_sleep_policy(room, character, game)
-    if policy is not None:
-        return bool(policy)
+    if "sleep" not in getattr(room, "resources", ()):
+        return False
+    if has_bunks(room) or getattr(room, "floor_sleep", False):
+        return True
+    return not beds_in_room(room)
+
+
+def base_safe_sleep_venue(room):
+    """Engine-only safe-sleep checks (no game hooks)."""
+    if room is None:
+        return False
     if has_bunks(room):
         return True
-    if getattr(room, "floor_sleep", False):
-        return True
-    if "sleep" in getattr(room, "resources", ()) and not beds_in_room(room):
+    if allows_floor_sleep(room) or getattr(room, "floor_sleep", False):
         return True
     if getattr(room, "is_house", False):
         return True
@@ -211,14 +361,11 @@ def is_safe_sleep_venue(room, character=None, game=None):
     return False
 
 
-def _compound_hub_key(room):
-    """Return the claim-hub key for ``room``, or ``room.key`` / None."""
-    if room is None:
-        return None
-    main = getattr(room, "main_homeroom", None)
-    if main:
-        return main
-    return getattr(room, "key", None)
+def is_safe_sleep_venue(room, character=None, game=None):
+    """True when sleep here is bed / home / authored floor camp (not public)."""
+    if base_safe_sleep_venue(room):
+        return True
+    return hooks_mod.lodging_sleep_policy(room, character, game)
 
 
 def claimants_of(game, room_key):
@@ -231,7 +378,7 @@ def claimants_of(game, room_key):
     from engine.char_index import iter_characters
 
     dest = game.rooms.get(room_key)
-    main = _compound_hub_key(dest) if dest is not None else room_key
+    main = main_homeroom_key(dest) if dest is not None else room_key
     found = []
     for obj in iter_characters(game):
         home_key = getattr(obj, "home_room_key", None)
@@ -245,7 +392,7 @@ def claimants_of(game, room_key):
         home_room = game.rooms.get(home_key)
         if home_room is None:
             continue
-        if _compound_hub_key(home_room) == main:
+        if main_homeroom_key(home_room) == main:
             found.append(obj)
     if isinstance(cache, dict):
         cache[room_key] = found
@@ -255,3 +402,80 @@ def claimants_of(game, room_key):
 def is_room_claimed(game, room):
     """True if any living character lists this room (or its house) as home."""
     return bool(claimants_of(game, room.key))
+
+
+def is_player_character(character):
+    """True for living player bodies (not town / immersion roster NPCs)."""
+    return character is not None and not getattr(character, "is_npc", False)
+
+
+def _clear_bed_owners_for(game, room_key, owner_key):
+    """Clear ``owner_key`` on beds in ``room_key`` that match this renter."""
+    room = game.rooms.get(room_key)
+    if room is None:
+        return 0
+    cleared = 0
+    for bed in beds_in_room(room):
+        if getattr(bed, "owner_key", None) == owner_key:
+            bed.owner_key = None
+            cleared += 1
+    return cleared
+
+
+def clear_room_bed_owners(room):
+    """Wipe ``owner_key`` on every bed furniture Item in ``room``."""
+    if room is None:
+        return 0
+    cleared = 0
+    for bed in beds_in_room(room):
+        if getattr(bed, "owner_key", None):
+            bed.owner_key = None
+            cleared += 1
+    return cleared
+
+
+def iter_hotel_guest_rooms(game):
+    """Yield every live hotel guest Room (``is_hotel_room`` flag)."""
+    if game is None:
+        return
+    seen = set()
+    for room in getattr(game, "rooms", {}).values():
+        if not is_hotel_guest_room(room):
+            continue
+        key = getattr(room, "key", None)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        yield room
+
+
+def clear_hotel_bed_stamps_for(game, owner_key):
+    """Remove ``owner_key`` from beds in every hotel guest room."""
+    if not owner_key or game is None:
+        return 0
+    cleared = 0
+    for room in iter_hotel_guest_rooms(game):
+        cleared += _clear_bed_owners_for(game, room.key, owner_key)
+    return cleared
+
+
+def tick_leases(game):
+    """Clear expired hotel leases and free hotel bed owner_key stamps."""
+    from engine.char_index import iter_characters
+
+    if game is None:
+        return
+    now = getattr(game, "game_time_ticks", 0)
+    for obj in iter_characters(game):
+        until = getattr(obj, "lease_until_tick", None)
+        if until is None:
+            continue
+        if now < until:
+            continue
+        home = getattr(obj, "home_room_key", None)
+        guest_room = game.rooms.get(home) if home else None
+        if guest_room is not None and is_hotel_guest_room(guest_room):
+            _clear_bed_owners_for(game, home, obj.key)
+            obj.home_room_key = None
+        obj.lease_until_tick = None
+    hooks_mod.lodging_rent_tick(game)

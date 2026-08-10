@@ -21,7 +21,7 @@ import copy
 import json
 import os
 
-import maps as maps_mod
+from engine import world_maps as maps_mod
 
 
 def _backups_dir(root=None):
@@ -167,6 +167,14 @@ def heal_file_from_backup(live_path, backup_path, *, dry_run=False):
         return msg
 
     if added or exit_patches:
+        exit_errors = maps_mod.document_hand_exit_graph_errors(
+            os.path.basename(live_path), merged,
+        )
+        if exit_errors:
+            return (
+                f"map heal {map_id}: skipped write — would break boot "
+                f"({exit_errors[0]})"
+            )
         with open(live_path, "w", encoding="utf-8") as handle:
             json.dump(merged, handle, indent=4, ensure_ascii=False)
             handle.write("\n")

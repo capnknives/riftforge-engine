@@ -48,6 +48,13 @@ def set_quests_dirs(dirs):
     _CACHE = {}
 
 
+def _reset_quests_dirs_for_tests(dirs):
+    """Replace quest dirs (smoke tests only — not for production boot)."""
+    global _QUESTS_DIRS, _CACHE
+    _QUESTS_DIRS = [str(d) for d in (dirs or [])]
+    _CACHE = {}
+
+
 def register_complete_when_types(types):
     """Extend validation with extra ``complete_when.type`` strings."""
     global _EXTRA_COMPLETE_WHEN_TYPES

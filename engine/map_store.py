@@ -1,13 +1,14 @@
 """
-engine/map_store.py -- generic OLC map/zone JSON dual-write (dig / link / rset).
+map_store.py -- generic in-game map/zone JSON dual-write (dig / link / rset).
 
-Rooms are authored in content/maps/*.json and content/zones/*.json. This
-module is the in-game write half so staff can dig/link/edit while standing
-in the world and have changes survive copyover/restart.
+Rooms are authored in content/maps/*.json and content/zones/*.json. Area
+Studio is the preferred full builder; this module is the engine OLC write
+half so staff can dig/link/edit while standing in the world and have changes
+survive copyover/restart.
 
 Contract (same spirit as jobs/npc catalogs):
   1. Patch the owning map/zone JSON on disk (atomic write).
-  2. Validate with maps.load_all_maps(); rollback the file on failure.
+  2. Validate with world_maps.load_all_maps(); rollback on failure.
   3. Apply the same change to the live game.rooms graph (do NOT replace
      game.rooms -- that would orphan Character.location refs).
 
@@ -15,8 +16,9 @@ Grid cells are not in rooms[] -- dig from a grid cell adds a hand room
 plus a grid.portals entry. Pocket settlement enter/exit stays Studio/JSON
 (pockets[]); do not dig in/out for those gateways.
 
-SUPERS field catalogs for ``rset_field`` register via
-``engine.hooks.set_rset_flag_catalog`` at boot.
+Game-specific remodel / nest / populate batches live in ``supers/map_store.py``
+(thin facade re-exporting this module + SUPERS lodging rules). Zero ``supers``
+imports here (two-repo purity H6).
 """
 
 from __future__ import annotations
@@ -27,10 +29,13 @@ import os
 from engine.world import Room
 from engine import room_vnum as room_vnum_mod
 from engine.content_store import load_json, save_json
-from engine import hooks as hooks_mod
+from engine import world_maps as maps
+from engine import map_backups
+from engine import map_archive
+from engine import hooks
 
-import maps
-
+# Exit opposites for bidirectional dig/link. Includes diagonals (overland)
+# and nested indoor in/out. leave -> in matches Area Studio.
 OPPOSITE = {
     "north": "south",
     "south": "north",
@@ -47,13 +52,122 @@ OPPOSITE = {
     "leave": "in",
 }
 
+# Bool flags staff may toggle with `gm room rset <flag> on|off`.
+RSET_BOOL_FLAGS = frozenset({
+    "outdoor", "wilderness", "dark",
+    "vampire_safe", "hunter_safe", "evil_ward",
+    "no_combat", "no_loiter",
+    "is_house", "is_grave", "private_home",
+    "is_home", "is_hotel_room",
+    "hospital", "floor_sleep", "has_bunks", "vampire_nest",
+    "robable", "is_cell",
+    "consecrated", "evil_zone", "dungeon",
+    "no_random_spawn", "zone_exit",
+    "devils_gate", "unholy", "crossroads", "demon_deal",
+    "devils_trap", "salt_line", "iron_ward",
+    "croatoan_contaminated", "croatoan_quarantine", "croatoan_seal",
+})
+
+# String / free-text fields for rset.
+RSET_TEXT_FIELDS = frozenset({
+    "title", "description", "zone", "area_type", "spawn_nest", "spawn_hub",
+    "spawn_prey",
+    "main_homeroom",
+})
+
+# Comma-separated string lists (Area Studio CSV parity: trim, dedupe, stable order).
+RSET_LIST_FIELDS = frozenset({
+    "jobs",
+    "resources",
+})
+
+
+def parse_rset_csv_list(value):
+    """Parse a comma-separated rset list (Studio inspector ``_csv`` + dedupe)."""
+    seen = set()
+    out = []
+    for part in (value or "").split(","):
+        token = part.strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out
+
+
+def rset_reference_lines():
+    """Return the shared room-rset field/flag reference (help + bare verb).
+
+    Built from ``RSET_TEXT_FIELDS`` / ``RSET_BOOL_FLAGS`` so live
+    ``room rset`` output and ``help rset`` cannot drift apart. Includes a
+    short claimable-home recipe for new builders.
+    """
+    text = ", ".join(sorted(RSET_TEXT_FIELDS))
+    lists = ", ".join(sorted(RSET_LIST_FIELDS))
+    flags = ", ".join(sorted(RSET_BOOL_FLAGS))
+    return [
+        "Usage: room rset <field|flag> <value…>",
+        f"Text fields: {text}",
+        f"List fields (comma-separated): {lists}",
+        f"Flags (on|off): {flags}",
+        "",
+        "Claimable home (help lodging):",
+        "  Interior: room rset is_house on  (required for 'claim')",
+        "  House link: every interior gets is_home + main_homeroom "
+        "(Living key). Boot heals clusters; populate stamps at create.",
+        "  Street porch / apartment unit: room rset private_home on",
+        "  Hotels: room rset is_hotel_room on  (rent -- never is_house)",
+        "  Or: populate hotels on 'Hotel Floor <N>' (creates NA-NF)",
+        "  Or: populate hospitals on 'Hospital Floor <N>' "
+        "(creates Hospital NA-NF recovery wards)",
+        "Bare 'room rset' or 'room rset ?' reprints this list.",
+    ]
+
+
+def format_rset_help_page():
+    """Full ``help rset`` body built from ``rset_reference_lines()``."""
+    lines = [
+        "rset -- room rset fields and full flag list",
+        "",
+        "In-game write half for room text fields and boolean flags.",
+        "Stand in the room, then: room rset <field|flag> <value…>",
+        "Bare room rset (or room rset ?) prints the same list live.",
+        "",
+    ]
+    lines.extend(rset_reference_lines())
+    lines.extend([
+        "",
+        "Lodging flags (quick):",
+        "  is_house       claimable house / apartment interior",
+        "  is_home        interior chamber of a house compound",
+        "  main_homeroom  claim-hub room key (usually … Living)",
+        "  private_home   door ACL threshold (porch or unit)",
+        "  is_hotel_room  rent guest room (never claim; help populate)",
+        "  zone_exit      pocket mouth -- type 'exit' to leave the zone",
+        "",
+        "Street house pattern: outdoor entryway with private_home + in; "
+        "interior with is_house + out. Every is_house chamber shares "
+        "is_home + the same main_homeroom (Living). Apartments: both "
+        "flags on the unit (main_homeroom = itself).",
+        "Hotels: populate hotels on Hotel Floor N → rooms NA-NF.",
+        "Hospitals: populate hospitals on Hospital Floor N → "
+        "Hospital NA-NF recovery wards (hospital + sleep).",
+        "",
+        "See: help room | help lodging | help hospital | help populate | "
+        "help content | help build-maps",
+    ])
+    return "\n".join(lines)
+
+
 def opposite_direction(direction):
     """Return the reverse direction string, or None if unknown."""
     return OPPOSITE.get((direction or "").strip().lower())
 
+
 def is_grid_room(room):
     """True when this Room was built from a procedural grid cell."""
     return getattr(room, "grid_prefix", None) is not None
+
 
 def resolve_map_path(game, room):
     """Return (abs_path, kind, filename, map_id) for the room's map/zone file.
@@ -76,6 +190,10 @@ def resolve_map_path(game, room):
     filename = entry.get("filename")
     if not filename:
         raise ValueError(f"map_id {map_id!r} has no filename in the registry.")
+    source_path = entry.get("source_path")
+    if source_path and os.path.isfile(source_path):
+        kind = "zone" if os.path.dirname(source_path).endswith("zones") else "map"
+        return source_path, kind, filename, map_id
     maps_path = os.path.join(maps.get_maps_dir(), filename)
     zones_path = os.path.join(maps.get_zones_dir(), filename)
     if os.path.isfile(maps_path):
@@ -87,10 +205,12 @@ def resolve_map_path(game, room):
         f"content/maps/ or content/zones/."
     )
 
+
 def load_doc(path):
     """Load one map/zone JSON document (normalize rooms/grid containers)."""
     data = load_json(path)
     return _normalize_doc(data)
+
 
 def _normalize_doc(data):
     """Ensure rooms/pockets/grid containers exist (deep copy)."""
@@ -106,6 +226,7 @@ def _normalize_doc(data):
             grid["portals"] = []
     return data
 
+
 def save_doc_validated(path, doc):
     """Atomic write + full maps.load_all_maps() validate; rollback on failure.
 
@@ -115,10 +236,6 @@ def save_doc_validated(path, doc):
 
     Returns a short ok dict. Does NOT replace the live game.rooms graph.
     """
-    return _save_doc_validated_fn(path, doc)
-
-
-def _save_doc_validated_impl(path, doc):
     payload = _normalize_doc(doc)
     plane = payload.get("plane")
     if plane in maps.REALM_FOR_PLANE:
@@ -134,8 +251,6 @@ def _save_doc_validated_impl(path, doc):
     # *pre-write* bytes so a bad edit can ``gm maps restore`` later.
     if had_file and old_bytes is not None:
         try:
-            from engine import map_backups
-
             map_id = maps._map_id_for(os.path.basename(path), payload)
             map_backups.seed_backup_bytes_if_missing(old_bytes, map_id)
         except Exception:
@@ -159,8 +274,6 @@ def _save_doc_validated_impl(path, doc):
     map_id = maps._map_id_for(os.path.basename(path), payload)
     backup_note = None
     try:
-        from engine import map_archive, map_backups
-
         map_backups.refresh_backup_from_live(path, map_id, root=os.getcwd())
         map_archive.mark_map_edited(map_id)
         backup_note = map_id
@@ -177,8 +290,6 @@ def _save_doc_validated_impl(path, doc):
     }
 
 
-_save_doc_validated_fn = _save_doc_validated_impl
-
 def find_room_entry(doc, key):
     """Return the rooms[] dict for key, VNUM, or matching legacy key."""
     if not key:
@@ -191,9 +302,11 @@ def find_room_entry(doc, key):
             return room
     return None
 
+
 def _cell_override_key(room):
     """grid.cell_overrides key string for a grid Room."""
     return f"{int(room.grid_x)},{int(room.grid_y)}"
+
 
 def _ensure_hand_room_entry(doc, room):
     """Return (or create) the rooms[] dict for a live hand-authored Room.
@@ -231,6 +344,7 @@ def _ensure_hand_room_entry(doc, room):
     doc.setdefault("rooms", []).append(entry)
     return entry
 
+
 def _stamp_live_room_from_source(new_room, source_room, map_id):
     """Copy plane/realm/map_id defaults onto a newly dug Room."""
     new_room.map_id = map_id
@@ -242,6 +356,7 @@ def _stamp_live_room_from_source(new_room, source_room, map_id):
     if getattr(source_room, "zone", None):
         new_room.zone = source_room.zone
 
+
 def _live_set_exit(game, from_key, direction, to_key):
     """Wire live Room.exits[direction] = Room for to_key."""
     src = game.rooms.get(from_key)
@@ -252,12 +367,14 @@ def _live_set_exit(game, from_key, direction, to_key):
         raise ValueError(f"Live room {to_key!r} missing.")
     src.exits[direction] = dest
 
+
 def _live_clear_exit(game, from_key, direction):
     """Remove a live exit if present."""
     src = game.rooms.get(from_key)
     if src is None:
         return
     src.exits.pop(direction, None)
+
 
 def _taken_vnums(game, *, extra=None):
     """Set of validated vnum strings already claimed live (plus extras)."""
@@ -269,6 +386,7 @@ def _taken_vnums(game, *, extra=None):
             continue
         taken.add(room_vnum_mod.validate_vnum(raw))
     return taken
+
 
 def _allocate_and_stamp_vnum(game, entry, live=None, *, taken=None):
     """Assign a globally unique vnum onto a rooms[] dict and optional Room.
@@ -299,6 +417,7 @@ def _allocate_and_stamp_vnum(game, entry, live=None, *, taken=None):
     if live is not None:
         live.vnum = vnum
     return vnum
+
 
 def inspect_lines(game, room):
     """Build client-wrappable inspect lines for gm room (no color meaning)."""
@@ -338,7 +457,7 @@ def inspect_lines(game, room):
             f"Grid: {room.grid_prefix} ({room.grid_x}, {room.grid_y})"
         )
     flags = sorted(
-        name for name in sorted(hooks_mod.rset_flag_catalog()[0])
+        name for name in sorted(RSET_BOOL_FLAGS)
         if getattr(room, name, False)
     )
     if flags:
@@ -368,6 +487,7 @@ def inspect_lines(game, room):
     )
     return lines
 
+
 def _room_owner_hint(game, room_or_key):
     """Short 'map_id=… (filename)' hint for dig/link refusal messages."""
     room = room_or_key
@@ -382,6 +502,7 @@ def _room_owner_hint(game, room_or_key):
     if filename:
         return f"map_id={map_id!r} ({filename})"
     return f"map_id={map_id!r}"
+
 
 def dig_room(game, from_room, direction, new_key, *,
              description=None, title=None, bidirectional=True):
@@ -609,6 +730,7 @@ def dig_room(game, from_room, direction, new_key, *,
     msg += f" VNUM: {vnum}."
     return msg
 
+
 def create_room(game, here, new_key, *, description=None, title=None):
     """Create a disconnected hand room in the same map file as `here`."""
     new_key = (new_key or "").strip()
@@ -671,6 +793,7 @@ def create_room(game, here, new_key, *, description=None, title=None):
         + f"VNUM: {vnum}. "
         + "Link it with room link <dir> <VNUM|ROOM NAME>."
     )
+
 
 def link_rooms(game, from_room, direction, to_query, *, bidirectional=True):
     """Link from_room toward an existing room; persist both sides as needed.
@@ -780,6 +903,7 @@ def link_rooms(game, from_room, direction, to_query, *, bidirectional=True):
         f"Linked {from_label} --{direction}--> {dest_label}{extra} (saved)."
     )
 
+
 def unlink_exit(game, from_room, direction, *, bidirectional=True):
     """Remove an exit from from_room; optionally clear the reverse."""
     direction = (direction or "").strip().lower()
@@ -840,25 +964,25 @@ def unlink_exit(game, from_room, direction, *, bidirectional=True):
     from_label = room_vnum_mod.staff_room_label(from_room) or from_room.key
     return f"Unlinked {direction} from {from_label} (saved)."
 
+
 def rset_field(game, room, field, value):
     """Set a persisted field on room (JSON + live). Returns a message."""
     field = (field or "").strip().lower()
     value = (value or "").strip()
     if not field:
         # Same body as bare ``room rset`` / help rset (shared formatter).
-        raise ValueError("\n".join(hooks_mod.rset_reference_lines()))
+        raise ValueError("\n".join(rset_reference_lines()))
 
-    bool_flags, text_fields = hooks_mod.rset_flag_catalog()
     path, _, _, _ = resolve_map_path(game, room)
     doc = load_doc(path)
 
-    if field in bool_flags:
+    if field in RSET_BOOL_FLAGS:
         on = value.lower() in ("1", "true", "on", "yes", "y")
         off = value.lower() in ("0", "false", "off", "no", "n")
         if not on and not off:
             raise ValueError(
                 f"Flag {field}: use on|off (got {value!r}).\n"
-                + "\n".join(hooks_mod.rset_reference_lines())
+                + "\n".join(rset_reference_lines())
             )
         flag_val = on
         if is_grid_room(room):
@@ -882,18 +1006,52 @@ def rset_field(game, room, field, value):
         setattr(room, field, flag_val)
         return f"Set {room.key}.{field} = {flag_val} (saved)."
 
-    if field not in text_fields:
+    if field in RSET_LIST_FIELDS:
+        cleared = value.lower() in ("clear", "none", "-", "")
+        parsed = [] if cleared else parse_rset_csv_list(value)
+        if not cleared and not parsed:
+            raise ValueError(
+                f"{field} needs a comma-separated list "
+                f"(or 'clear' to remove).\n"
+                + "\n".join(rset_reference_lines())
+            )
+        hooks.rset_list_validate(field, parsed)
+        if is_grid_room(room):
+            grid = doc.setdefault("grid", {})
+            overrides = grid.setdefault("cell_overrides", {})
+            cell_key = _cell_override_key(room)
+            cell = overrides.setdefault(cell_key, {})
+            if parsed:
+                cell[field] = parsed
+            else:
+                cell.pop(field, None)
+                if not cell:
+                    overrides.pop(cell_key, None)
+        else:
+            entry = _ensure_hand_room_entry(doc, room)
+            if parsed:
+                entry[field] = parsed
+            else:
+                entry.pop(field, None)
+        save_doc_validated(path, doc)
+        setattr(room, field, list(parsed))
+        if parsed:
+            shown = ", ".join(parsed)
+            return f"Set {room.key}.{field} = [{shown}] (saved)."
+        return f"Cleared {room.key}.{field} (saved)."
+
+    if field not in RSET_TEXT_FIELDS:
         raise ValueError(
             f"Unknown field {field!r}.\n"
-            + "\n".join(hooks_mod.rset_reference_lines())
+            + "\n".join(rset_reference_lines())
         )
 
     if field == "area_type":
-        allowed = hooks_mod.map_area_types()
-        if value not in allowed:
+        area_types = hooks.map_area_types()
+        if value not in area_types:
             raise ValueError(
                 f"Unknown area_type {value!r} -- "
-                f"must be one of {sorted(allowed)}."
+                f"must be one of {sorted(area_types)}."
             )
 
     clear_title = False
@@ -941,142 +1099,156 @@ def rset_field(game, room, field, value):
     setattr(room, field, value)
     return f"Set {room.key}.{field} = {value!r} (saved)."
 
-def _clear_map_missing_stub(room):
-    """Drop persistence recovery-stub marks so look shows real prose."""
+
+
+# Bool flags ``append_hand_rooms`` may copy from a JSON entry onto a live Room.
+_APPEND_BOOL_FLAGS = frozenset({
+    "outdoor", "wilderness", "dark",
+    "is_house", "is_grave", "private_home",
+    "is_home", "is_hotel_room",
+    "vampire_safe", "hunter_safe", "evil_ward",
+    "no_combat", "no_loiter", "hospital", "floor_sleep", "has_bunks",
+    "vampire_nest", "robable", "is_cell",
+    "consecrated", "evil_zone", "dungeon", "no_random_spawn",
+    "zone_exit",
+    "devils_gate", "unholy", "crossroads", "demon_deal",
+    "devils_trap", "salt_line", "iron_ward",
+    "croatoan_contaminated", "croatoan_quarantine", "croatoan_seal",
+})
+
+
+def _room_storage_key(room):
+    """JSON ``key`` / exit target for a live hand room (legacy before VNUM)."""
     if room is None:
-        return
-    if getattr(room, "map_missing_stub", False):
-        try:
-            delattr(room, "map_missing_stub")
-        except Exception:
-            room.map_missing_stub = False
+        return None
+    leg = getattr(room, "legacy_key", None)
+    if leg:
+        return str(leg)
+    return getattr(room, "key", None)
 
 
-def _refresh_map_backup(path, map_id):
-    """Best-effort overwrite of content/map_backups/<map_id>.json."""
-    try:
-        from engine import map_backups
+def room_to_json(room, *, game=None):
+    """Serialize a live hand Room into a map/zone ``rooms[]`` dict.
 
-        map_backups.refresh_backup_from_live(path, map_id, root=os.getcwd())
-    except Exception:
-        # Never block populate / append on backup I/O.
-        pass
-
-
-def append_hand_rooms(game, anchor_room, new_rooms, *, extra_exits=None):
-    """Batch-create hand rooms with full lodging payloads; persist once.
-
-    Used by ``gm populate`` so apartments/homes write ``is_house``,
-    ``private_home``, ``resources``, ``seed_items``, etc. in one save --
-    plain ``dig_room`` cannot stamp those fields.
-
-    Args:
-        game: live Game
-        anchor_room: standing room (chooses the map/zone JSON file)
-        new_rooms: list of rooms[] dicts (must include unique ``key``;
-            may include exits, flags, resources, seed_items, title, …)
-        extra_exits: optional ``{from_key: {direction: to_key, …}, …}``
-            merged onto existing or newly written rooms[] entries
-            (street/floor → porch/unit links)
-
-    Returns:
-        Short success message string.
-
-    Raises:
-        ValueError on missing keys, collisions, or grid-cell anchors.
+    Inverse of :func:`_apply_entry_fields_to_live` plus exit wiring.
+    Used by townforge ``refresh_home_list`` after populate. Grid cells
+    return ``None``.
     """
-    if not new_rooms:
-        raise ValueError("No rooms to append.")
-    if is_grid_room(anchor_room):
-        raise ValueError(
-            "Cannot populate from a grid cell -- stand in a hand-authored "
-            "floor or street room (or dig a hand room first)."
-        )
-    path, _kind, _filename, map_id = resolve_map_path(game, anchor_room)
-    doc = load_doc(path)
-    rooms_list = doc.setdefault("rooms", [])
+    if room is None or is_grid_room(room):
+        return None
+    storage_key = _room_storage_key(room)
+    if not storage_key:
+        return None
+    entry = {
+        "key": storage_key,
+        "description": getattr(room, "description", None) or "",
+        "area_type": getattr(room, "area_type", None) or "city",
+        "exits": {},
+    }
+    live_key = getattr(room, "key", None)
+    vnum = getattr(room, "vnum", None)
+    if vnum:
+        try:
+            entry["vnum"] = room_vnum_mod.validate_vnum(vnum)
+        except ValueError:
+            entry["vnum"] = str(vnum).strip()
+    if live_key and str(live_key) != str(storage_key):
+        entry["legacy_key"] = str(live_key)
+    if getattr(room, "title", None):
+        entry["title"] = room.title
+    if getattr(room, "zone", None):
+        entry["zone"] = room.zone
+    if getattr(room, "city_name", None):
+        entry["city_name"] = room.city_name
+    for flag in _APPEND_BOOL_FLAGS:
+        if getattr(room, flag, False):
+            entry[flag] = True
+    for field in RSET_TEXT_FIELDS:
+        if field in ("title", "description", "zone", "area_type"):
+            continue
+        val = getattr(room, field, None)
+        if val:
+            entry[field] = val
+    resources = getattr(room, "resources", None)
+    if resources:
+        entry["resources"] = list(resources)
+    jobs = getattr(room, "jobs", None)
+    if jobs:
+        entry["jobs"] = list(jobs)
+    capacity = getattr(room, "resource_capacity", None)
+    if capacity:
+        entry["resource_capacity"] = dict(capacity)
+    if getattr(room, "layout_x", None) is not None and getattr(
+        room, "layout_y", None,
+    ) is not None:
+        entry["layout"] = {
+            "x": int(room.layout_x),
+            "y": int(room.layout_y),
+            "z": int(getattr(room, "layout_z", 0) or 0),
+        }
+    for direction, dest in (getattr(room, "exits", None) or {}).items():
+        if dest is None:
+            continue
+        if hasattr(dest, "key"):
+            dest_key = _room_storage_key(dest)
+        else:
+            dest_key = str(dest).strip() if dest else None
+        if dest_key:
+            entry["exits"][direction] = dest_key
+    return entry
 
-    # Collision checks before mutating the doc.
-    for entry in new_rooms:
-        key = (entry.get("key") or "").strip()
-        if not key:
-            raise ValueError("Each new room needs a non-empty key.")
-        if key in game.rooms:
-            raise ValueError(f"Room key {key!r} already exists live.")
-        if find_room_entry(doc, key) is not None:
-            raise ValueError(
-                f"Room key {key!r} already in {os.path.basename(path)}."
-            )
 
-    # Default zone / area_type from the anchor when the author omitted them.
-    zone = getattr(anchor_room, "zone", None)
-    area_type = getattr(anchor_room, "area_type", None) or "city"
-    taken = _taken_vnums(game)
-    for entry in new_rooms:
-        entry.setdefault("area_type", area_type)
-        if zone and "zone" not in entry:
-            entry["zone"] = zone
-        entry.setdefault("exits", {})
-        _allocate_and_stamp_vnum(game, entry, taken=taken)
-        rooms_list.append(entry)
+def _apply_entry_fields_to_live(live, entry):
+    """Stamp lodging / amenity fields from a rooms[] dict onto a live Room.
 
-    # Patch exits on existing rooms (floor / street) and any new rooms.
-    for from_key, exits in (extra_exits or {}).items():
-        # Prefer the rooms[] entry we just appended; else ensure the
-        # live anchor (or another existing hand room) has an entry.
-        target_entry = find_room_entry(doc, from_key)
-        if target_entry is None:
-            live_src = game.rooms.get(from_key)
-            if live_src is None:
-                raise ValueError(
-                    f"Cannot patch exits on unknown room {from_key!r}."
-                )
-            target_entry = _ensure_hand_room_entry(doc, live_src)
-        target_entry.setdefault("exits", {}).update(exits)
+    Mirrors what ``maps._add_room`` does for the subset populate needs:
+    title, description, area_type, zone, bool flags, resources,
+    resource_capacity. Does not touch exits (caller wires those).
+    """
+    if entry.get("title"):
+        live.title = str(entry["title"]).strip() or None
+    if entry.get("vnum"):
+        live.vnum = room_vnum_mod.validate_vnum(entry["vnum"])
+    if entry.get("description") is not None:
+        live.description = entry["description"]
+    if entry.get("area_type"):
+        live.area_type = entry["area_type"]
+    if entry.get("zone"):
+        live.zone = entry["zone"]
+    for flag in _APPEND_BOOL_FLAGS:
+        if flag in entry:
+            setattr(live, flag, bool(entry[flag]))
+    if "main_homeroom" in entry:
+        text = str(entry.get("main_homeroom") or "").strip()
+        live.main_homeroom = text or None
+    if "remodel_type" in entry:
+        text = str(entry.get("remodel_type") or "").strip().lower()
+        live.remodel_type = text or None
+    if "remodel_inbound_exit" in entry:
+        label = str(entry.get("remodel_inbound_exit") or "").strip().lower()
+        live.remodel_inbound_exit = label or None
+    resources = entry.get("resources")
+    if resources is not None:
+        live.resources = list(resources)
+    jobs = entry.get("jobs")
+    if jobs is not None:
+        live.jobs = list(jobs)
+    capacity = entry.get("resource_capacity")
+    if capacity is not None:
+        live.resource_capacity = dict(capacity)
+    # Live layout matches JSON, same as dig_room (wall_floor_breach_mechanic.md
+    # Phase A) -- without this, a populate-created room only gets usable
+    # layout after the next boot reload from JSON.
+    layout_blob = entry.get("layout")
+    if isinstance(layout_blob, dict) and "x" in layout_blob and "y" in layout_blob:
+        try:
+            live.layout_x = int(layout_blob["x"])
+            live.layout_y = int(layout_blob["y"])
+            live.layout_z = int(layout_blob.get("z", 0) or 0)
+        except (TypeError, ValueError):
+            pass
 
-    save_doc_validated(path, doc)
-    # Homes / apartments land in the protected backup slot immediately.
-    _refresh_map_backup(path, map_id)
 
-    # Live graph: create rooms, stamp fields, wire exits, place seeds.
-    for entry in new_rooms:
-        key = entry["key"]
-        live = Room(key, entry.get("description") or f"A room ({key}).")
-        _stamp_live_room_from_source(live, anchor_room, map_id)
-        hooks_mod.map_store_apply_entry_fields(live, entry)
-        if entry.get("vnum"):
-            live.vnum = room_vnum_mod.validate_vnum(entry["vnum"])
-        game.rooms[key] = live
-
-    # Wire every exit declared on new rooms + extra_exits.
-    def _all_exit_pairs():
-        for entry in new_rooms:
-            for direction, to_key in (entry.get("exits") or {}).items():
-                yield entry["key"], direction, to_key
-        for from_key, exits in (extra_exits or {}).items():
-            for direction, to_key in exits.items():
-                yield from_key, direction, to_key
-
-    for from_key, direction, to_key in _all_exit_pairs():
-        _live_set_exit(game, from_key, direction, to_key)
-
-    seeds_placed = 0
-    for entry in new_rooms:
-        seeds_placed += hooks_mod.map_store_place_seed_items(
-            game,
-            entry["key"],
-            entry.get("seed_items") or [],
-            where="append_hand_rooms",
-        )
-
-    n = len(new_rooms)
-    msg = (
-        f"Populated {n} room{'s' if n != 1 else ''} into "
-        f"{os.path.basename(path)} (saved)."
-    )
-    if seeds_placed:
-        msg += f" Placed {seeds_placed} seed item(s)."
-    return msg
 
 def delete_hand_rooms(game, anchor_room, keys, *, relocate_to=None):
     """Remove hand-authored rooms from JSON + live ``game.rooms``.
@@ -1167,4 +1339,3 @@ def delete_hand_rooms(game, anchor_room, keys, *, relocate_to=None):
         f"{os.path.basename(path)} (saved)."
     )
     return removed_json, msg
-

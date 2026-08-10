@@ -52,12 +52,15 @@ _after_session_attach = None
 # reconnect takeover, intentional quit, and client EOF all pass through
 # engine/connection.py before session is cleared.
 _on_session_disconnect = None
+_on_echo_begin = None
 _park_gm_spirit_on_disconnect = None
 
 # GMCP Char.Vitals / Char.Status payload builders (SUPERS fills meters;
 # engine/gmcp.py sends). fn(character) -> dict or None.
 _gmcp_char_vitals = None
 _gmcp_char_status = None
+# Prompt %Tg: fn(character, game) -> foe lifeforce band str or "".
+_prompt_target_band = None
 
 # System topic pages for bare `help` (game content; engine verbs read these).
 _help_topics = {}
@@ -110,8 +113,13 @@ _clinic_on_admit = None
 _clinic_on_discharge = None
 _clinic_casualty_meter = None
 _clinic_ko_clear = None
+_clinic_pre_admit = None
+_clinic_admit_prologue = None
+_clinic_ward_tick = None
 _justice_on_robbery = None
 _justice_fine_schedule = None
+_identity_verify_hook = None
+_disguise_pierce_check = None
 _follow_pull_skip = None
 _report_context_extra = None
 _room_broadcast_deliver = None
@@ -138,7 +146,9 @@ _cancel_rest = None
 
 # Lodging (H3a): bed sharing family check; safe-sleep policy; post-stamp hook.
 _lodging_are_family = None
+_lodging_bed_eligibility = None
 _lodging_sleep_policy = None
+_lodging_rent_tick = None
 _lodging_room_stamper = None
 
 # Paced travel (H3b): overland handler, player hop, cadence step, edge_ok, …
@@ -147,6 +157,8 @@ _paced_travel_overland_advance = None
 _paced_travel_player_hop = None
 _paced_travel_cadence_step = None
 _paced_travel_edge_ok = None
+_paced_travel_hub_ok = None
+_paced_travel_destinations = None
 _paced_travel_enter_alias = None
 _paced_travel_drive_to = None
 _paced_travel_gait_of = None
@@ -246,6 +258,10 @@ _concealed_presence_name = None
 # Viewer-relative room / look / leave face.
 # fn(viewer, subject) -> str | None. None / missing -> fall back to key path.
 _presence_face_for = None
+
+# Account roster line (login menu + ``account`` command).
+# fn(game, key, body=None) -> str. SUPERS adds Origin / Path / Aspect.
+_account_roster_label_for = None
 _room_presence_line = None
 # Echo room-look tag bits (``['echo']`` quiet vs full idle/regimen). SUPERS
 # registers so ``echo look quiet|full`` works without engine importing game.
@@ -282,6 +298,16 @@ _boot_content_heal = None
 # body was lost on load -- see engine/persistence.py's load_world).
 # fn(character) -> None (mutates character.hp in place).
 _recompute_hp = None
+
+# After load un-spirits a character whose corpse Item could not be relinked,
+# heal marooned afterlife desk flags / Heaven location (bug #387).
+# fn(character, game) -> None.
+_heal_force_unspirit = None
+
+# Per-character load normalization (home stamps, vehicle board flags) after
+# equipment rebind in ``load_world`` -- boot lifecycle Phase C.
+# fn(character, game) -> None.
+_normalize_character_after_load = None
 
 # Build a seed Item from a map file's seed_items entry (catalog_id lookup
 # etc.) -- maps.py's loader needs this so it stays supers-agnostic too.
@@ -462,6 +488,30 @@ def recompute_hp(character):
         _recompute_hp(character)
 
 
+def set_heal_force_unspirit(fn):
+    """Register fn(character, game) after persistence force-unspirit."""
+    global _heal_force_unspirit
+    _heal_force_unspirit = fn
+
+
+def heal_force_unspirit(character, game=None):
+    """Run post-load un-spirit heal hook, or no-op."""
+    if _heal_force_unspirit is not None:
+        _heal_force_unspirit(character, game)
+
+
+def set_normalize_character_after_load(fn):
+    """Register fn(character, game) after persistence load + equipment rebind."""
+    global _normalize_character_after_load
+    _normalize_character_after_load = fn
+
+
+def normalize_character_after_load(character, game=None):
+    """Run per-character load normalization hook, or no-op."""
+    if _normalize_character_after_load is not None:
+        _normalize_character_after_load(character, game)
+
+
 _gateway_resume_hook = None  # fn(game) -> None, or an awaitable -- see setter.
 
 
@@ -488,6 +538,46 @@ async def gateway_resume_hook(game):
     result = _gateway_resume_hook(game)
     if inspect.isawaitable(result):
         await result
+
+
+_deferred_boot_seed_hook = None  # fn(game) -> None
+_deferred_boot_seed_async_hook = None  # async fn(game) -> None
+
+
+def set_deferred_boot_seed_hook(fn):
+    """Register fn(game) to run after gateway reattach, before tick_loop.
+
+  SUPERS registers ``seed_content_deferred`` so copyover can open IPC
+  and send MSG_AFTER before heavy heals. Pass None to restore no-op.
+    """
+    global _deferred_boot_seed_hook
+    _deferred_boot_seed_hook = fn
+
+
+def set_deferred_boot_seed_async_hook(fn):
+    """Register async fn(game) for gateway welcome (yields between phases).
+
+    When set, ``run_deferred_boot_seed_async`` uses this so held clients
+    can type while heals run. Falls back to the sync hook if unset.
+    """
+    global _deferred_boot_seed_async_hook
+    _deferred_boot_seed_async_hook = fn
+
+
+def run_deferred_boot_seed(game):
+    """Run the registered deferred boot-seed hook (sync). No-op if unset."""
+    if _deferred_boot_seed_hook is None:
+        return
+    _deferred_boot_seed_hook(game)
+
+
+async def run_deferred_boot_seed_async(game):
+    """Run deferred boot heals, yielding to the event loop between phases."""
+    if _deferred_boot_seed_async_hook is not None:
+        await _deferred_boot_seed_async_hook(game)
+        return
+    if _deferred_boot_seed_hook is not None:
+        run_deferred_boot_seed(game)
 
 
 def set_character_attacher(fn):
@@ -554,6 +644,10 @@ _DEFAULT_MAP_AREA_TYPES = {
     "forest": [],
     "plains": [],
     "furnace": [],
+    "highway": [],
+    "desert": [],
+    "wetland": [],
+    "void": [],
 }
 
 
@@ -642,6 +736,21 @@ def set_blob_codec(to_blob, from_blob):
     global _blob_to, _blob_from
     _blob_to = to_blob
     _blob_from = from_blob
+
+
+def blob_codec_registered():
+    """True when game persistence can serialize character blobs (not ``{}``)."""
+    return _blob_to is not None
+
+
+def character_attacher_registered():
+    """True when Character composition (stats/Origin/…) will run on init."""
+    return _character_attacher is not None
+
+
+def game_meta_codec_registered():
+    """True when Game meta (Tide/Cadence/…) can be saved through hooks."""
+    return _game_meta_saver is not None
 
 
 def character_to_blob(character):
@@ -760,6 +869,18 @@ def on_session_disconnect(character, game, *, to_echo=True):
         _on_session_disconnect(character, game, to_echo=to_echo)
 
 
+def set_on_echo_begin(fn):
+    """Register fn(character, game) when a body becomes an offline Echo."""
+    global _on_echo_begin
+    _on_echo_begin = fn
+
+
+def on_echo_begin(character, game):
+    """Run the registered Echo-begin hook, or no-op."""
+    if _on_echo_begin is not None:
+        _on_echo_begin(character, game)
+
+
 def set_park_gm_spirit_on_disconnect(fn):
     """Register fn(spirit, game) to fold a permanent GM spirit on logout.
 
@@ -791,6 +912,25 @@ def gmcp_char_vitals(character):
     if _gmcp_char_vitals is not None:
         return _gmcp_char_vitals(character)
     return None
+
+
+def set_prompt_target_band(fn):
+    """Register fn(character, game) -> str for prompt token %Tg.
+
+    Pass None to restore the no-op default (segment omits itself).
+    """
+    global _prompt_target_band
+    _prompt_target_band = fn
+
+
+def prompt_target_band(character, game=None):
+    """Foe lifeforce band for %Tg, or \"\" when not in a real fight."""
+    if _prompt_target_band is not None:
+        try:
+            return _prompt_target_band(character, game) or ""
+        except Exception:
+            return ""
+    return ""
 
 
 def set_gmcp_char_status(fn):
@@ -1090,6 +1230,45 @@ def clinic_ko_clear(character, game):
         _clinic_ko_clear(character, game)
 
 
+def set_clinic_pre_admit(fn):
+    """Register fn(character, game, *, reason, attacker=None) -> bool."""
+    global _clinic_pre_admit
+    _clinic_pre_admit = fn
+
+
+def clinic_pre_admit(character, game, *, reason="injury", attacker=None):
+    """Game policy gate before ward selection / engine admit."""
+    if _clinic_pre_admit is None:
+        return True
+    return bool(_clinic_pre_admit(character, game, reason=reason, attacker=attacker))
+
+
+def set_clinic_admit_prologue(fn):
+    """Register fn(character, game, *, reason, attacker=None) before engine admit."""
+    global _clinic_admit_prologue
+    _clinic_admit_prologue = fn
+
+
+def clinic_admit_prologue(character, game, *, reason="injury", attacker=None):
+    """Run game hook after ward pick, before ``clinic_engine.admit``."""
+    if _clinic_admit_prologue is not None:
+        _clinic_admit_prologue(
+            character, game, reason=reason, attacker=attacker,
+        )
+
+
+def set_clinic_ward_tick(fn):
+    """Register fn(patient, room, game, *, now, ready) per hospitalized tick."""
+    global _clinic_ward_tick
+    _clinic_ward_tick = fn
+
+
+def clinic_ward_tick(patient, room, game, *, now, ready=False):
+    """Run game hook for ward vitals (blood, mood, region regen, …)."""
+    if _clinic_ward_tick is not None:
+        _clinic_ward_tick(patient, room, game, now=now, ready=ready)
+
+
 def set_justice_on_robbery(fn):
     """Register fn(actor, game, amount) after a successful robbery."""
     global _justice_on_robbery
@@ -1116,6 +1295,33 @@ def justice_fine_schedule(offense_type):
     return justice_mod.DEFAULT_FINE_CENTS
 
 
+def set_identity_verify_hook(fn):
+    """Register fn(subject, doc, *, context, game) -> VerifyResult overlay."""
+    global _identity_verify_hook
+    _identity_verify_hook = fn
+
+
+def identity_verify_hook(subject, doc, *, context="local", game=None):
+    """Optional game policy overlay for ``identity.verify_id``."""
+    if _identity_verify_hook is not None:
+        return _identity_verify_hook(subject, doc, context=context, game=game)
+    return None
+
+
+def set_disguise_pierce_check(fn):
+    """Register fn(viewer, subject) -> bool when disguise fails."""
+    global _disguise_pierce_check
+    _disguise_pierce_check = fn
+
+
+def disguise_pierce_check(viewer, subject):
+    """Run registered disguise pierce check."""
+    if _disguise_pierce_check is not None:
+        return bool(_disguise_pierce_check(viewer, subject))
+    from engine.systems import disguise as disguise_mod
+    return disguise_mod.pierce_disguise(viewer, subject)
+
+
 def set_follow_pull_skip(fn):
     """Register fn(follower, leader, game) -> True to skip follow-pull."""
     global _follow_pull_skip
@@ -1135,13 +1341,33 @@ def set_report_context_extra(fn):
     _report_context_extra = fn
 
 
-def report_context_extra(character, game):
+def _log_hook_fail(game, key, exc):
+    """Rate-limited stderr when a registered hook raises."""
+    from engine import log_util
+    log_util.ops_once_per_tick(
+        game,
+        key,
+        "hooks",
+        f"{key} failed ({exc!r})",
+        exc=exc,
+    )
+
+
+def report_context_extra(character, game, *, history=None, description=None):
     """Optional SUPERS gameplay facts merged into filed reports."""
     if _report_context_extra is not None:
         try:
-            extra = _report_context_extra(character, game)
-        except Exception:
-            return {}
+            try:
+                extra = _report_context_extra(
+                    character, game,
+                    history=history, description=description,
+                )
+            except TypeError:
+                # Older hook signatures take only (character, game).
+                extra = _report_context_extra(character, game)
+        except Exception as exc:
+            _log_hook_fail(game, "report_context_extra", exc)
+            return {"context_errors": [f"report_context_extra: {exc!r}"]}
         if isinstance(extra, dict):
             return extra
     return {}
@@ -1162,7 +1388,8 @@ def room_broadcast_deliver(watcher, room, game=None):
     if _room_broadcast_deliver is not None:
         try:
             return bool(_room_broadcast_deliver(watcher, room, game))
-        except Exception:
+        except Exception as exc:
+            _log_hook_fail(game, "room_broadcast_deliver", exc)
             return True
     return True
 
@@ -1181,7 +1408,8 @@ def room_broadcast_transform(watcher, room, text, game=None):
     if _room_broadcast_transform is not None:
         try:
             return _room_broadcast_transform(watcher, room, text, game)
-        except Exception:
+        except Exception as exc:
+            _log_hook_fail(game, "room_broadcast_transform", exc)
             return text
     return text
 
@@ -1330,6 +1558,48 @@ def after_body_loot(character, body, item, game=None):
     """Run the registered post-body-loot hook, or do nothing."""
     if _after_body_loot is not None:
         _after_body_loot(character, body, item, game)
+
+
+# fn(character, body, game) -> refusal str | None
+_body_loot_refusal = None
+
+# fn(body) -> iterable of Item
+_iter_body_loot_items = None
+
+
+def set_body_loot_refusal(fn):
+    """Register pre-loot gate for ``get <item> from <body>`` / ``loot``."""
+    global _body_loot_refusal
+    _body_loot_refusal = fn
+
+
+def body_loot_refusal(character, body, game=None):
+    """Refusal message when corpse loot is blocked; None when allowed."""
+    if _body_loot_refusal is None:
+        return None
+    return _body_loot_refusal(character, body, game)
+
+
+def set_iter_body_loot_items(fn):
+    """Register nested loot enumeration for corpse bodies."""
+    global _iter_body_loot_items
+    _iter_body_loot_items = fn
+
+
+def iter_body_loot_items(body):
+    """Yield lootable items on a corpse (game hook or generic nested loot)."""
+    if _iter_body_loot_items is not None:
+        yield from _iter_body_loot_items(body)
+        return
+    for entry in list(getattr(body, "loot", None) or []):
+        yield entry
+    for piece in (getattr(body, "body_equipment", None) or {}).values():
+        if piece is not None:
+            yield piece
+    for stack in (getattr(body, "body_clothing", None) or {}).values():
+        for piece in stack or []:
+            if piece is not None:
+                yield piece
 
 
 _after_look_in_body = None
@@ -1800,6 +2070,23 @@ def presence_face_for(viewer, subject):
     return None
 
 
+def set_account_roster_label_for(fn):
+    """Register fn(game, key, body=None) -> str for account roster lines."""
+    global _account_roster_label_for
+    _account_roster_label_for = fn
+
+
+def account_roster_label_for(game, key, body=None):
+    """Roster label for account menu / ``account`` command."""
+    if _account_roster_label_for is not None:
+        return _account_roster_label_for(game, key, body)
+    from engine.command_support import _presence_face
+
+    if body is not None:
+        return _presence_face(body)
+    return (key or "").strip() or "(unknown)"
+
+
 def set_extra_target_match_needles(fn):
     """Register fn(viewer, subject) -> iterable[str] for kind/race targeting.
 
@@ -1935,6 +2222,23 @@ def try_restore_folded_login(game, name):
     return _try_restore_folded_login(game, name)
 
 
+# fn(game, given_name, surname="") -> Character | None
+_try_restore_folded_login_identity = None
+
+
+def set_try_restore_folded_login_identity(fn):
+    """Register identity-based vault restore (given + optional surname)."""
+    global _try_restore_folded_login_identity
+    _try_restore_folded_login_identity = fn
+
+
+def try_restore_folded_login_identity(game, given_name, surname=""):
+    """Hydrate a hard-folded Echo by public identity, or None."""
+    if _try_restore_folded_login_identity is None:
+        return None
+    return _try_restore_folded_login_identity(game, given_name, surname or "")
+
+
 # Unfinished homezone onboarding: body vaulted on copyover boot; gateway
 # reattach must not treat it like a restorable hard fold.
 # fn(game, name) -> bool
@@ -1952,6 +2256,44 @@ def is_tutorial_incomplete_vault(game, name):
     if _is_tutorial_incomplete_vault is None:
         return False
     return bool(_is_tutorial_incomplete_vault(game, name))
+
+
+# Account login menu: hard-folded bodies still listed on an account roster.
+# fn(game, account, live_character_keys_low: set[str])
+#     -> list[(section, entry)]
+_account_menu_vault_rows = None
+
+
+def set_account_menu_vault_rows(fn):
+    """Register vaulted roster rows for ``account_login.build_account_menu``."""
+    global _account_menu_vault_rows
+    _account_menu_vault_rows = fn
+
+
+def account_menu_vault_rows(game, account, live_character_keys_low):
+    """Extra menu rows for vaulted characters not already live in memory."""
+    if _account_menu_vault_rows is None:
+        return []
+    return list(
+        _account_menu_vault_rows(game, account, live_character_keys_low) or []
+    )
+
+
+# fn(game, entry) -> Character | entry
+_restore_vault_menu_entry = None
+
+
+def set_restore_vault_menu_entry(fn):
+    """Register restore for a vaulted account-menu row pick."""
+    global _restore_vault_menu_entry
+    _restore_vault_menu_entry = fn
+
+
+def restore_vault_menu_entry(game, entry):
+    """Hydrate a vaulted menu row into a live Character, or pass through."""
+    if _restore_vault_menu_entry is None:
+        return entry
+    return _restore_vault_menu_entry(game, entry)
 
 
 # --- Dual-layer overland / zone / help (Phase 2 purity) ------------------
@@ -1977,6 +2319,26 @@ _try_enter_zone = None
 # Boarded vehicle: ``enter`` / ``in`` / ``out`` while in_vehicle is set.
 # fn(character, args, game) -> bool  /  fn(character, game, direction=) -> bool
 _try_vehicle_enter_as_house_in = None
+
+
+# --- Fuel-loop roster hook (lag P8.4) -------------------------------------
+# SUPERS keeps ``game.fuel_loop_characters`` in sync so ``fuel.tick_all``
+# never walks the full live roster. fn(game, character, *, op) where op is
+# ``add`` | ``remove`` | ``rebuild`` (character ignored on rebuild).
+_fuel_loop_roster_hook = None
+
+
+def set_fuel_loop_roster_hook(fn):
+    """Register fuel-loop index maintenance, or None to clear."""
+    global _fuel_loop_roster_hook
+    _fuel_loop_roster_hook = fn
+
+
+def fuel_loop_roster_notify(game, character, *, op):
+    """Notify the game hook that the live roster changed."""
+    if _fuel_loop_roster_hook is None:
+        return
+    _fuel_loop_roster_hook(game, character, op=op)
 
 
 # --- Companion duty hook (Phase 2 purity) ---------------------------------
@@ -2755,8 +3117,10 @@ _map_snapshot_daily_archive = None
 _rset_bool_flags = frozenset()
 _rset_text_fields = frozenset()
 _rset_reference_lines_fn = None
+_rset_list_validator = None
 _map_store_apply_entry_fields = None
 _map_store_place_seed_items = None
+_map_store_append_hand_rooms = None
 
 _containers_resolve_loot_bag = None
 _containers_find_in_loot_bag = None
@@ -2902,6 +3266,18 @@ def rset_reference_lines():
     return ["Usage: room rset <field|flag> <value…>"]
 
 
+def set_rset_list_validator(fn):
+    """Register fn(field, tokens) -> None; raise ValueError on bad list tokens."""
+    global _rset_list_validator
+    _rset_list_validator = fn
+
+
+def rset_list_validate(field, tokens):
+    """Optional game hook: validate parsed rset list-field tokens."""
+    if _rset_list_validator is not None:
+        _rset_list_validator(field, tokens)
+
+
 def set_map_store_apply_entry_fields(fn):
     """Register fn(live, entry) to stamp JSON rooms[] onto a live Room."""
     global _map_store_apply_entry_fields
@@ -2927,6 +3303,24 @@ def map_store_place_seed_items(game, room_key, seed_specs, *, where):
             game, room_key, seed_specs, where=where,
         )
     return 0
+
+
+def set_map_store_append_hand_rooms(fn):
+    """Register fn(game, anchor_room, new_rooms, extra_exits=...) -> str."""
+    global _map_store_append_hand_rooms
+    _map_store_append_hand_rooms = fn
+
+
+def map_store_append_hand_rooms(game, anchor_room, new_rooms, *, extra_exits=None):
+    """Batch-create hand rooms + persist JSON (SUPERS ``map_store`` hook)."""
+    if _map_store_append_hand_rooms is None:
+        raise RuntimeError(
+            "append_hand_rooms is not registered — boot SUPERS "
+            "(supers.bootstrap.register_core_hooks)."
+        )
+    return _map_store_append_hand_rooms(
+        game, anchor_room, new_rooms, extra_exits=extra_exits,
+    )
 
 
 def set_containers_resolve_loot_bag(fn):
@@ -3066,10 +3460,15 @@ def deliver_say(character, spoken, game, **kwargs):
         f"You {you_verb},{tone_bit} \"{spoken}\"{tag}"
     )
     if room is not None:
-        room.broadcast(
-            f'{_display_name(character)} {they_verb},{tone_bit} "{spoken}"{tag}',
-            exclude=character,
+        line = (
+            f'{_display_name(character)} {they_verb},{tone_bit} "{spoken}"{tag}'
         )
+        room.broadcast(line, exclude=character)
+        try:
+            from engine import channels
+            channels.append_room_say(game, room, line)
+        except Exception:
+            pass
 
 
 def set_autoloot_is_combat_zone(fn):
@@ -3387,11 +3786,76 @@ def containers_heal_folded_kit_bags(game):
     return 0
 
 
+# Demesne micro-room persistence (SUPERS demesne/overland registers these).
+_demesne_resolve_room_key = None
+_demesne_lookup_room_for_persist = None
+_demesne_iter_micro_rooms = None
+_quest_bank_growth_reward = None
+_fuel_phase_summary_line = None
+
+
+def set_demesne_resolve_room_key(fn):
+    global _demesne_resolve_room_key
+    _demesne_resolve_room_key = fn
+
+
+def demesne_resolve_room_key(game, room_key):
+    if _demesne_resolve_room_key is not None:
+        return _demesne_resolve_room_key(game, room_key)
+    return None
+
+
+def set_demesne_lookup_room_for_persist(fn):
+    global _demesne_lookup_room_for_persist
+    _demesne_lookup_room_for_persist = fn
+
+
+def demesne_lookup_room_for_persist(game, room_key):
+    if _demesne_lookup_room_for_persist is not None:
+        return _demesne_lookup_room_for_persist(game, room_key)
+    return None
+
+
+def set_demesne_iter_micro_rooms(fn):
+    global _demesne_iter_micro_rooms
+    _demesne_iter_micro_rooms = fn
+
+
+def demesne_iter_micro_rooms(game):
+    if _demesne_iter_micro_rooms is not None:
+        yield from _demesne_iter_micro_rooms(game)
+
+
+def set_quest_bank_growth_reward(fn):
+    """Register fn(character, amount) -> banked float for growth quest rewards."""
+    global _quest_bank_growth_reward
+    _quest_bank_growth_reward = fn
+
+
+def quest_bank_growth_reward(character, amount):
+    if _quest_bank_growth_reward is not None:
+        return _quest_bank_growth_reward(character, amount)
+    return 0
+
+
+def set_fuel_phase_summary_line(fn):
+    """Register fn(breakdown_dict) -> str | None for lag diag export."""
+    global _fuel_phase_summary_line
+    _fuel_phase_summary_line = fn
+
+
+def fuel_phase_summary_line(breakdown):
+    if _fuel_phase_summary_line is not None:
+        return _fuel_phase_summary_line(breakdown)
+    return None
+
+
 # Content kind profiles (OLC / content_new / Area Studio) — game registers
 # profile dirs, domain validators, and catalog save paths.
 _content_kinds_dirs: list[str] = []
 _content_kind_domain_validate = None
 _content_kind_save_entity = None
+_content_kind_load_entity = None
 _olc_authorizer = None
 
 
@@ -3413,6 +3877,18 @@ def set_content_kinds_dirs(dirs):
 def content_kinds_dirs():
     """Absolute paths to kind-profile JSON directories."""
     return list(_content_kinds_dirs)
+
+
+def register_builder_audit(domain_id, title, runner):
+    """Register a builder hygiene audit (jobs, quests, …)."""
+    from engine.content_kinds import audit as audit_mod
+    audit_mod.register(domain_id, title, runner)
+
+
+def run_builder_audits(*, game=None):
+    """Run all registered builder audits; return section tuples."""
+    from engine.content_kinds import audit as audit_mod
+    return audit_mod.run_all(game=game)
 
 
 def set_content_kind_domain_validator(fn):
@@ -3444,6 +3920,22 @@ def content_kind_save_entity(kind_id, entity_id, obj, **kwargs):
             "(game must call set_content_kind_save_entity at boot)"
         )
     return _content_kind_save_entity(kind_id, entity_id, obj, **kwargs)
+
+
+def set_content_kind_load_entity(fn):
+    """Register fn(kind_id, entity_id) -> dict for OLC edit drafts."""
+    global _content_kind_load_entity
+    _content_kind_load_entity = fn
+
+
+def content_kind_load_entity(kind_id, entity_id):
+    """Load one catalog row for in-game OLC edit."""
+    if _content_kind_load_entity is None:
+        raise RuntimeError(
+            "content_kind_load_entity hook not registered "
+            "(game must call set_content_kind_load_entity at boot)"
+        )
+    return _content_kind_load_entity(kind_id, entity_id)
 
 
 # Pluggable calendar (Gregorian default; games may swap at boot).
@@ -3492,6 +3984,19 @@ def lodging_are_family(a, b):
     return False
 
 
+def set_lodging_bed_eligibility(fn):
+    """Register fn(character, bed, room) -> bool for sharing a bed with one occupant."""
+    global _lodging_bed_eligibility
+    _lodging_bed_eligibility = fn
+
+
+def lodging_bed_eligibility(character, bed, room):
+    """True when ``character`` may join ``bed`` (default: False)."""
+    if _lodging_bed_eligibility is not None:
+        return bool(_lodging_bed_eligibility(character, bed, room))
+    return False
+
+
 def set_lodging_sleep_policy(fn):
     """Register fn(room, character, game) -> bool or None for safe sleep."""
     global _lodging_sleep_policy
@@ -3503,6 +4008,18 @@ def lodging_sleep_policy(room, character=None, game=None):
     if _lodging_sleep_policy is not None:
         return _lodging_sleep_policy(room, character, game)
     return None
+
+
+def set_lodging_rent_tick(fn):
+    """Register fn(game) called once per lease tick (hotel rent, eviction, …)."""
+    global _lodging_rent_tick
+    _lodging_rent_tick = fn
+
+
+def lodging_rent_tick(game):
+    """Run game lease tick hook, or no-op."""
+    if _lodging_rent_tick is not None:
+        _lodging_rent_tick(game)
 
 
 def set_lodging_room_stamper(fn):
@@ -3569,15 +4086,19 @@ def paced_travel_player_hop(character, hop, game, quiet=True):
 
 
 def set_paced_travel_cadence_step(fn):
-    """Register fn(actor, dest, game) -> bool for Cadence one-step pathing."""
+    """Register fn(actor, dest, game, *, quiet=...) -> bool for Cadence pathing."""
     global _paced_travel_cadence_step
     _paced_travel_cadence_step = fn
 
 
-def paced_travel_cadence_step(actor, dest, game):
-    """Cadence seek one-hop; False when unregistered."""
+def paced_travel_cadence_step(actor, dest, game, *, quiet=True):
+    """Cadence seek one-hop; False when unregistered.
+
+    ``quiet`` mirrors ``paced_travel_player_hop`` -- SUPERS bootstrap
+    registers a step that accepts it for idlemode / seek presentation.
+    """
     if _paced_travel_cadence_step is not None:
-        return bool(_paced_travel_cadence_step(actor, dest, game))
+        return bool(_paced_travel_cadence_step(actor, dest, game, quiet=quiet))
     return False
 
 
@@ -3596,6 +4117,36 @@ def paced_travel_edge_ok(from_room, neighbor, *, actor=None, game=None):
             )
         )
     return neighbor is not from_room
+
+
+def set_paced_travel_hub_ok(fn):
+    """Register fn(hub, from_room, *, actor, game) -> bool for pocket enters."""
+    global _paced_travel_hub_ok
+    _paced_travel_hub_ok = fn
+
+
+def paced_travel_hub_ok(hub, from_room, *, actor=None, game=None):
+    """May paced BFS enter this pocket hub? Default True."""
+    if _paced_travel_hub_ok is not None:
+        return bool(
+            _paced_travel_hub_ok(
+                hub, from_room, actor=actor, game=game,
+            ),
+        )
+    return True
+
+
+def set_paced_travel_destinations(fn):
+    """Register fn(character, game, zone) -> extra destination label strings."""
+    global _paced_travel_destinations
+    _paced_travel_destinations = fn
+
+
+def paced_travel_destinations(character, game, zone):
+    """Extra zone destination labels for paced walk (default: none)."""
+    if _paced_travel_destinations is not None:
+        return _paced_travel_destinations(character, game, zone) or ()
+    return ()
 
 
 def set_paced_travel_enter_alias(fn):
@@ -3984,3 +4535,19 @@ def populate_lodging_entry_stamper(entry, unit_kind):
     """Apply game lodging entry stamp hook, or no-op."""
     if _populate_lodging_entry_stamper is not None:
         _populate_lodging_entry_stamper(entry, unit_kind)
+
+
+_channel_audience_ok = None
+
+
+def set_channel_audience_ok(fn):
+    """Register fn(viewer, audience_token, game) -> bool for custom audiences."""
+    global _channel_audience_ok
+    _channel_audience_ok = fn
+
+
+def channel_audience_ok(viewer, audience_token, game):
+    """Extension hook for origin:/custom channel audience (default deny)."""
+    if _channel_audience_ok is not None:
+        return bool(_channel_audience_ok(viewer, audience_token, game))
+    return False

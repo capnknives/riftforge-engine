@@ -38,7 +38,11 @@
         "lake",
         "forest",
         "plains",
-        "furnace"
+        "furnace",
+        "highway",
+        "desert",
+        "wetland",
+        "void"
       ]
     },
     "outdoor": {

@@ -18,9 +18,10 @@ def exit_visible_for_flag(dest, game, network: GateNetwork, flag_attr: str):
     """False when ``dest`` is a closed gate of this network.
 
     Non-gate rooms (missing ``flag_attr``) always stay visible.
+    Sealed exits stored as ``None`` (demesne frontiers, macro edges) stay hidden.
     """
     if dest is None:
-        return True
+        return False
     if not getattr(dest, flag_attr, False):
         return True
     return is_open(dest, game, network, flag_attr=flag_attr)

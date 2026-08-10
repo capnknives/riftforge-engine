@@ -21,10 +21,45 @@ Pure graph walk: no networking, no database, no game loop, zero
 
 from __future__ import annotations
 
+import os
+import time as _time
 from collections import deque
 
+# Stop a single BFS before it monopolizes the asyncio loop (milliseconds).
+# ``0`` disables the wall. Cadence pathing passes this through from env.
+_DEFAULT_BFS_BUDGET_MS = 30.0
+_BFS_YIELD_EVERY = 48
 
-def path_directions_to(start, predicate, *, edge_ok, max_nodes=None):
+
+def pathfind_budget_ms():
+    """Per-call BFS wall from ``PATHFIND_BUDGET_MS`` (default 30ms; 0=off)."""
+    raw = os.environ.get("PATHFIND_BUDGET_MS", "").strip()
+    if not raw:
+        return _DEFAULT_BFS_BUDGET_MS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _DEFAULT_BFS_BUDGET_MS
+
+
+def _bfs_budget_exceeded(budget_ms, budget_t0, nodes_seen):
+    """True when a timed BFS should fail soft and retry next heartbeat."""
+    if budget_ms is None or budget_ms <= 0 or budget_t0 is None:
+        return False
+    if nodes_seen % 32 != 0:
+        return False
+    return (_time.perf_counter() - budget_t0) * 1000.0 >= budget_ms
+
+
+def path_directions_to(
+    start,
+    predicate,
+    *,
+    edge_ok,
+    max_nodes=None,
+    budget_ms=None,
+    budget_t0=None,
+):
     """BFS full path of exit labels from ``start`` to nearest matching room.
 
     ``edge_ok(from_room, neighbor)`` decides whether a cardinal exit may
@@ -55,6 +90,8 @@ def path_directions_to(start, predicate, *, edge_ok, max_nodes=None):
     while queue:
         if limit is not None and len(seen) >= limit:
             break
+        if _bfs_budget_exceeded(budget_ms, budget_t0, len(seen)):
+            return []
         room = queue.popleft()
         if predicate(room):
             goal = room
@@ -67,6 +104,8 @@ def path_directions_to(start, predicate, *, edge_ok, max_nodes=None):
             seen.add(neighbor)
             came_from[neighbor] = (room, direction)
             queue.append(neighbor)
+            if _bfs_budget_exceeded(budget_ms, budget_t0, len(seen)):
+                return []
     if goal is None:
         return []
     # Reconstruct path start -> goal.
@@ -80,25 +119,136 @@ def path_directions_to(start, predicate, *, edge_ok, max_nodes=None):
     return hops
 
 
-def next_step_toward(start, predicate, *, edge_ok, max_nodes=None):
-    """BFS from ``start`` for the nearest matching room; return FIRST hop.
+async def path_directions_to_async(
+    start,
+    predicate,
+    *,
+    edge_ok,
+    max_nodes=None,
+    budget_ms=None,
+    budget_t0=None,
+):
+    """Cooperative BFS -- yields to the event loop every ``_BFS_YIELD_EVERY`` nodes."""
+    import asyncio
 
-    Returns the first exit label on the path, or ``None`` when already
-    there / unreachable. Thin wrapper over ``path_directions_to``.
-    """
-    path = path_directions_to(
-        start, predicate, edge_ok=edge_ok, max_nodes=max_nodes,
+    if start is None or predicate is None:
+        return []
+    if predicate(start):
+        return []
+    seen = {start}
+    came_from = {}
+    queue = deque()
+    limit = int(max_nodes) if max_nodes is not None else None
+
+    for direction, neighbor in (start.exits or {}).items():
+        if neighbor is None or neighbor in seen:
+            continue
+        if not edge_ok(start, neighbor):
+            continue
+        seen.add(neighbor)
+        came_from[neighbor] = (start, direction)
+        queue.append(neighbor)
+    goal = None
+    while queue:
+        if limit is not None and len(seen) >= limit:
+            break
+        if _bfs_budget_exceeded(budget_ms, budget_t0, len(seen)):
+            return []
+        if len(seen) % _BFS_YIELD_EVERY == 0:
+            await asyncio.sleep(0)
+        room = queue.popleft()
+        if predicate(room):
+            goal = room
+            break
+        for direction, neighbor in (room.exits or {}).items():
+            if neighbor is None or neighbor in seen:
+                continue
+            if not edge_ok(room, neighbor):
+                continue
+            seen.add(neighbor)
+            came_from[neighbor] = (room, direction)
+            queue.append(neighbor)
+            if _bfs_budget_exceeded(budget_ms, budget_t0, len(seen)):
+                return []
+    if goal is None:
+        return []
+    hops = []
+    cur = goal
+    while cur is not start:
+        prev, direction = came_from[cur]
+        hops.append(direction)
+        cur = prev
+    hops.reverse()
+    return hops
+
+
+async def next_step_toward_async(
+    start,
+    predicate,
+    *,
+    edge_ok,
+    max_nodes=None,
+    budget_ms=None,
+    budget_t0=None,
+):
+    """Async first-hop BFS with cooperative yields."""
+    path = await path_directions_to_async(
+        start,
+        predicate,
+        edge_ok=edge_ok,
+        max_nodes=max_nodes,
+        budget_ms=budget_ms,
+        budget_t0=budget_t0,
     )
     if not path:
         return None
     return path[0]
 
 
-def path_to_room(start, dest, *, edge_ok, max_nodes=None):
+def next_step_toward(
+    start,
+    predicate,
+    *,
+    edge_ok,
+    max_nodes=None,
+    budget_ms=None,
+    budget_t0=None,
+):
+    """BFS from ``start`` for the nearest matching room; return FIRST hop.
+
+    Returns the first exit label on the path, or ``None`` when already
+    there / unreachable. Thin wrapper over ``path_directions_to``.
+    """
+    path = path_directions_to(
+        start,
+        predicate,
+        edge_ok=edge_ok,
+        max_nodes=max_nodes,
+        budget_ms=budget_ms,
+        budget_t0=budget_t0,
+    )
+    if not path:
+        return None
+    return path[0]
+
+
+def path_to_room(
+    start,
+    dest,
+    *,
+    edge_ok,
+    max_nodes=None,
+    budget_ms=None,
+    budget_t0=None,
+):
     """Directions list from ``start`` to exact ``dest`` Room, or []."""
     if dest is None:
         return []
     return path_directions_to(
-        start, lambda r, goal=dest: r is goal,
-        edge_ok=edge_ok, max_nodes=max_nodes,
+        start,
+        lambda r, goal=dest: r is goal,
+        edge_ok=edge_ok,
+        max_nodes=max_nodes,
+        budget_ms=budget_ms,
+        budget_t0=budget_t0,
     )

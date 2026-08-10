@@ -47,6 +47,12 @@ LOOT_BAG_TOO_LARGE = (
     "That is too bulky for a backpack -- carry it in your hands or stash "
     "it at home."
 )
+WEIGHT_CAPACITY_FULL = (
+    "You cannot carry that much weight."
+)
+VOLUME_CAPACITY_FULL = (
+    "You cannot carry that much bulk."
+)
 NO_LOOT_BAG = (
     "Your hands are full and you are not wearing a backpack for overflow "
     "(see 'help backpacks')."
@@ -169,6 +175,142 @@ def stack_key(item, viewer):
         return f"cat:{str(catalog_id).strip().lower()}"
     painted = hooks_mod.item_display_key(item, viewer)
     return strip_ansi(painted).strip().lower()
+
+
+def item_weight(item):
+    """Return optional item weight in abstract units (0 when unset).
+
+    Reads ``item.weight`` or catalog ``weight``. Missing fields mean the
+    item contributes nothing to weight math (backward compatible).
+    """
+    if item is None:
+        return 0.0
+    explicit = getattr(item, "weight", None)
+    if explicit is not None:
+        try:
+            return max(0.0, float(explicit))
+        except (TypeError, ValueError):
+            pass
+    catalog_id = getattr(item, "catalog_id", None)
+    if catalog_id:
+        spec = hooks_mod.get_item_spec(str(catalog_id))
+        if isinstance(spec, dict) and spec.get("weight") is not None:
+            try:
+                return max(0.0, float(spec["weight"]))
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+def item_volume(item):
+    """Return optional item volume in abstract units (0 when unset)."""
+    if item is None:
+        return 0.0
+    explicit = getattr(item, "volume", None)
+    if explicit is not None:
+        try:
+            return max(0.0, float(explicit))
+        except (TypeError, ValueError):
+            pass
+    catalog_id = getattr(item, "catalog_id", None)
+    if catalog_id:
+        spec = hooks_mod.get_item_spec(str(catalog_id))
+        if isinstance(spec, dict) and spec.get("volume") is not None:
+            try:
+                return max(0.0, float(spec["volume"]))
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+def _max_weight_limit(holder):
+    """Optional max weight on a character or bag Item; None = unlimited."""
+    if holder is None:
+        return None
+    raw = getattr(holder, "max_weight", None)
+    if raw is None and is_bag_item(holder):
+        catalog_id = getattr(holder, "catalog_id", None)
+        if catalog_id:
+            spec = hooks_mod.get_item_spec(str(catalog_id))
+            if isinstance(spec, dict):
+                raw = spec.get("max_weight")
+    if raw is None:
+        return None
+    try:
+        val = float(raw)
+        return val if val > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _max_volume_limit(holder):
+    """Optional max volume on a character or bag Item; None = unlimited."""
+    if holder is None:
+        return None
+    raw = getattr(holder, "max_volume", None)
+    if raw is None and is_bag_item(holder):
+        catalog_id = getattr(holder, "catalog_id", None)
+        if catalog_id:
+            spec = hooks_mod.get_item_spec(str(catalog_id))
+            if isinstance(spec, dict):
+                raw = spec.get("max_volume")
+    if raw is None:
+        return None
+    try:
+        val = float(raw)
+        return val if val > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _items_in_container(holder, viewer):
+    """Every Item row carried inside ``holder`` (open inv + worn bags)."""
+    if holder is None:
+        return []
+    if is_bag_item(holder):
+        return list(bag_contents(holder))
+    out = list(_surface_items(holder))
+    for bag in worn_bags(holder):
+        out.extend(bag_contents(bag))
+    gear = hooks_mod.containers_ensure_gear_bag(holder)
+    out.extend(list(gear or []))
+    return out
+
+
+def container_weight_used(holder, viewer=None):
+    """Sum of ``item_weight`` for everything inside ``holder``."""
+    viewer = viewer or holder
+    total = 0.0
+    for piece in _items_in_container(holder, viewer):
+        total += item_weight(piece)
+    return total
+
+
+def container_volume_used(holder, viewer=None):
+    """Sum of ``item_volume`` for everything inside ``holder``."""
+    viewer = viewer or holder
+    total = 0.0
+    for piece in _items_in_container(holder, viewer):
+        total += item_volume(piece)
+    return total
+
+
+def weight_volume_refusal(holder, item, *, viewer=None):
+    """Refusal when ``item`` would exceed weight/volume caps; else None."""
+    if holder is None or item is None:
+        return None
+    viewer = viewer or holder
+    max_w = _max_weight_limit(holder)
+    if max_w is not None:
+        used = container_weight_used(holder, viewer)
+        if used + item_weight(item) > max_w + 1e-9:
+            return WEIGHT_CAPACITY_FULL
+    max_v = _max_volume_limit(holder)
+    if max_v is not None:
+        used = container_volume_used(holder, viewer)
+        if used + item_volume(item) > max_v + 1e-9:
+            return VOLUME_CAPACITY_FULL
+    return None
 
 
 def item_carry_size(item):
@@ -319,8 +461,11 @@ def stow_in_loot_bag(character, item, *, loot_bag=None):
     return True, f"You stow {item.key} in {bag.key}."
 
 
-def stow_all_in_loot_bag(character, *, loot_bag=None):
-    """Stow every stowable loose inventory row into the loot backpack."""
+def stow_all_in_loot_bag(character, *, loot_bag=None, predicate=None):
+    """Stow every stowable loose inventory row into the loot backpack.
+
+    ``predicate(item)`` when set limits bulk stows (e.g. weapons-only).
+    """
     bag = loot_bag if loot_bag is not None else designated_loot_bag(character)
     if bag is None:
         return False, NO_LOOT_BAG
@@ -333,7 +478,11 @@ def stow_all_in_loot_bag(character, *, loot_bag=None):
         if not hooks_mod.containers_item_worn_on_body(character, piece)
         and not is_bag_item(piece)
     ]
+    if predicate is not None:
+        candidates = [piece for piece in candidates if predicate(piece)]
     if not candidates:
+        if predicate is not None:
+            return False, "You aren't carrying anything like that to stow."
         return False, "You aren't carrying anything to stow."
     names = []
     for piece in candidates:
@@ -399,6 +548,9 @@ def loot_bag_refusal(character, item, *, loot_bag=None):
     cap = bag_capacity(bag)
     if bag_would_add_slot(contents, item, character, cap):
         return LOOT_BAG_FULL
+    cap_refusal = weight_volume_refusal(bag, item, viewer=character)
+    if cap_refusal:
+        return cap_refusal
     return None
 
 
@@ -419,6 +571,60 @@ def _item_resting_place(character, item):
     return None
 
 
+def _item_carried_by_character(character, item):
+    """True when ``item`` is on the character (bags, open inv, or equipment)."""
+    if character is None or item is None:
+        return False
+    if _item_resting_place(character, item) is not None:
+        return True
+    equipment = getattr(character, "equipment", None)
+    if isinstance(equipment, dict) and item in equipment.values():
+        return True
+    return False
+
+
+def _ensure_open_inventory_holds(character, item):
+    """Last-resort tuck into open inventory so pickups never orphan Items."""
+    if character is None or item is None:
+        return
+    if try_merge_carried_stack(character, item):
+        return
+    if open_inventory_would_add_stack(character, item):
+        if open_inventory_stack_count(character) >= OPEN_INVENTORY_CAPACITY:
+            return
+    inv = getattr(character, "inventory", None)
+    if inv is None:
+        character.inventory = []
+        inv = character.inventory
+    if item not in inv:
+        inv.append(item)
+
+
+def _item_stack_merge_eligible(item):
+    """True when duplicate pickups may fold into one open-inventory stack row.
+
+    Reagents and gather crumbs stack. Weapons and armor never merge -- even
+    when catalog metadata is thin after map spawn (bug reports 329 / 350).
+    """
+    if item is None:
+        return False
+    if item_carry_size(item) != "small":
+        return False
+    catalog_id = getattr(item, "catalog_id", None)
+    slot = getattr(item, "slot", None)
+    if catalog_id:
+        spec = hooks_mod.get_item_spec(str(catalog_id))
+        if isinstance(spec, dict):
+            slot = slot or spec.get("slot")
+    if slot in ("weapon", "offhand") or slot in _ARMOR_SLOTS:
+        return False
+    if hooks_mod.weapon_grip_for(item):
+        return False
+    if getattr(item, "weapon_voice", None):
+        return False
+    return True
+
+
 def route_acquired_item(character, item):
     """Place one newly acquired item (gear bag, hands, or loot backpack).
 
@@ -427,8 +633,11 @@ def route_acquired_item(character, item):
     """
     if character is None or item is None:
         return None
+    hooks_mod.enrich_loaded_item(item)
     dest = placement_destination(character, item)
     if dest is None:
+        # ``before_acquire_item`` should refuse first; never orphan floor loot.
+        _ensure_open_inventory_holds(character, item)
         return None
     if try_merge_carried_stack(character, item, dest=dest):
         return None
@@ -441,6 +650,7 @@ def route_acquired_item(character, item):
     if dest == "gear":
         bag_item = designated_gear_bag(character)
         if bag_item is None:
+            _ensure_open_inventory_holds(character, item)
             return None
         if item in inv:
             inv.remove(item)
@@ -451,6 +661,7 @@ def route_acquired_item(character, item):
     if dest == "loot":
         loot = designated_loot_bag(character)
         if loot is None:
+            _ensure_open_inventory_holds(character, item)
             return None
         if item in inv:
             inv.remove(item)
@@ -459,7 +670,8 @@ def route_acquired_item(character, item):
     if dest == "hands":
         if item not in inv:
             inv.append(item)
-        return None
+    if not _item_carried_by_character(character, item):
+        _ensure_open_inventory_holds(character, item)
     return None
 
 
@@ -498,7 +710,13 @@ def open_stack_keys(character):
 
 def open_inventory_stack_count(character):
     """How many open-inventory stacks the character carries."""
-    return len(open_stack_keys(character))
+    count = len(open_stack_keys(character))
+    try:
+        from engine.systems.economy import loose_cash_inventory_stacks
+        count += loose_cash_inventory_stacks(character)
+    except ImportError:
+        pass
+    return count
 
 
 def open_inventory_would_add_stack(character, item):
@@ -581,6 +799,7 @@ def _spawn_single_stack_unit(item):
         "weapon_voice",
         "grip",
         "relic",
+        "relic_tier",
         "color",
     ):
         if hasattr(item, attr):
@@ -622,8 +841,7 @@ def try_merge_carried_stack(character, item, *, dest=None):
     """
     if character is None or item is None:
         return False
-    # Small reagents / gather crumbs stack; weapons and armor do not.
-    if item_carry_size(item) != "small":
+    if not _item_stack_merge_eligible(item):
         return False
     if open_inventory_would_add_stack(character, item):
         return False
@@ -666,6 +884,9 @@ def open_inventory_refusal(character, item):
         return None
     if hooks_mod.containers_is_gear_item(item):
         return hooks_mod.containers_gear_acquire_refusal(character, item)
+    cap_refusal = weight_volume_refusal(character, item, viewer=character)
+    if cap_refusal:
+        return cap_refusal
     if placement_destination(character, item) is not None:
         return None
     if item_carry_size(item) == "large":
@@ -794,6 +1015,12 @@ def rebind_containers_from_inventory(character):
             continue
         containers[slot] = piece
     character.containers = containers
+    try:
+        from engine.systems import wallet_container as wallet_mod
+
+        wallet_mod.rebind_wallet_from_inventory(character)
+    except ImportError:
+        pass
 
 
 def grant_and_wear_starter_kit_bag(character, *, where="kit"):

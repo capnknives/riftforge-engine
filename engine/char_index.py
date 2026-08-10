@@ -117,6 +117,11 @@ def register_character(game, character):
     chars = getattr(game, "characters", None)
     if isinstance(chars, set):
         chars.add(character)
+    from engine import hooks as hooks_mod
+    hooks_mod.fuel_loop_roster_notify(game, character, op="add")
+    if getattr(game, "_persist_warm", False):
+        from engine.persistence import mark_character_dirty
+        mark_character_dirty(game, character)
 
 
 def unregister_character(game, character):
@@ -124,6 +129,8 @@ def unregister_character(game, character):
     chars = getattr(game, "characters", None)
     if isinstance(chars, set):
         chars.discard(character)
+    from engine import hooks as hooks_mod
+    hooks_mod.fuel_loop_roster_notify(game, character, op="remove")
 
 
 def rebuild_character_index(game):
@@ -139,3 +146,5 @@ def rebuild_character_index(game):
         for obj in room.contents:
             if isinstance(obj, Character):
                 game.characters.add(obj)
+    from engine import hooks as hooks_mod
+    hooks_mod.fuel_loop_roster_notify(game, None, op="rebuild")

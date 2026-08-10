@@ -1,26 +1,139 @@
-"""phone.py -- generic ring/dial/contacts/voicemail-shell phone framework.
+"""
+phone.py -- generic physical phones, numbers, plane-local calls.
 
-Plane-local signal, physical handset numbers, phonebook aliases, payphone
-fee hook, and connected-call private speech. Game flavor (WKNZ, styled tags,
-Echo auto-answer, Cadence asks) registers via ``engine.hooks`` and/or wraps
-``dial`` in the game package (docs/plans/two_repo_purity.md H7a).
+Ring/voicemail state, dial/answer/hangup shell, and payphone economics live
+here. Game-specific switchboard lines (radio station call-ins, etc.) and
+Echo phone favors register via hooks (wired in ``supers/bootstrap.py``).
 
-No networking. Zero ``import supers``.
+Zero ``supers`` imports.
 """
 
 from __future__ import annotations
 
 import re
 
-from engine import hooks
 from engine.char_index import iter_characters
 import engine.systems.economy as economy_wallet
 
+PHONE_CATALOG_IDS = frozenset({"flip_phone", "payphone"})
+PAYPHONE_CATALOG_IDS = frozenset({"payphone"})
+PORTABLE_PHONE_CATALOG_IDS = frozenset({"flip_phone"})
+
+PAYPHONE_FEE = 1
 MAX_CONTACTS = 40
 MAX_ALIAS_LEN = 24
 
-# Active-call / ring state lives on Character for the process lifetime
-# (not persisted -- hang up on logout / copyover is fine for v1).
+_phone_catalog_ids = set(PHONE_CATALOG_IDS)
+_payphone_catalog_ids = set(PAYPHONE_CATALOG_IDS)
+_portable_catalog_ids = set(PORTABLE_PHONE_CATALOG_IDS)
+_special_dial_checker = None
+_phone_switchboard = None
+_echo_ask_handler = None
+
+
+def set_phone_catalog_ids(portable, payphone=None):
+    """Override default portable / payphone catalog id sets at boot."""
+    global _phone_catalog_ids, _payphone_catalog_ids, _portable_catalog_ids
+    _portable_catalog_ids = set(portable or ())
+    _payphone_catalog_ids = set(payphone or portable or ())
+    _phone_catalog_ids = _portable_catalog_ids | _payphone_catalog_ids
+
+
+def set_phone_special_dial_checker(fn):
+    """Register fn(raw) -> bool for non-number dial strings (WKNZ, …)."""
+    global _special_dial_checker
+    _special_dial_checker = fn
+
+
+def set_phone_switchboard(fn):
+    """Register fn(character, game, number, rest, mode) -> message | None."""
+    global _phone_switchboard
+    _phone_switchboard = fn
+
+
+def set_phone_echo_ask_handler(fn):
+    """Register fn(caller, echo, game, kind) -> player-facing message."""
+    global _echo_ask_handler
+    _echo_ask_handler = fn
+
+
+def _paint(character, role, text):
+    """Optional ANSI via style; always keep the plain tag in ``text``."""
+    try:
+        from engine import style as style_mod
+        return style_mod.paint_for(character, role, text)
+    except Exception:
+        return text
+
+
+def tag_phone(character=None):
+    """Plain + painted [PHONE] -- never color alone."""
+    return _paint(character, "teal", "[PHONE]")
+
+
+def tag_call(character=None):
+    """Plain + painted [CALL] -- never color alone."""
+    return _paint(character, "teal", "[CALL]")
+
+
+def deliver_giver_tip_text(character, giver_name, summary, *, kind=None):
+    """One-way tip from a mission giver (no ring / answer required)."""
+    _ = kind
+    if character is None or not summary:
+        return False
+    name = (giver_name or "someone").strip() or "someone"
+    tip = (summary or "").strip()
+    from engine import snoop as snoop_module
+
+    if has_portable_phone(character) and getattr(character, "session", None):
+        tag = tag_phone(character)
+        snoop_module.tell_paragraph(
+            character,
+            f"{tag} {name}: {tip}",
+        )
+        return True
+    if getattr(character, "session", None) is not None:
+        snoop_module.tell_paragraph(
+            character,
+            f"Word from {name} reaches you -- {tip}",
+        )
+        return True
+    return False
+
+
+def deliver_official_text(character, sender_label, body):
+    """One-way official SMS. Queues for offline handset holders."""
+    if character is None or not (body or "").strip():
+        return False
+    if not has_portable_phone(character):
+        return False
+    sender = (sender_label or "Sheriff's Office").strip() or "Sheriff's Office"
+    msg = f"{tag_phone(character)} {sender}: {(body or '').strip()}"
+    session = getattr(character, "session", None)
+    if session is not None:
+        from engine import snoop as snoop_module
+        snoop_module.tell_paragraph(character, msg)
+        return True
+    pending = getattr(character, "pending_phone_texts", None)
+    if not isinstance(pending, list):
+        character.pending_phone_texts = []
+        pending = character.pending_phone_texts
+    pending.append(msg)
+    return True
+
+
+def flush_pending_phone_texts(character):
+    """Deliver queued one-way texts after login or on ``phone``."""
+    pending = getattr(character, "pending_phone_texts", None)
+    if not pending:
+        return
+    session = getattr(character, "session", None)
+    if session is None:
+        return
+    from engine import snoop as snoop_module
+    for line in list(pending):
+        snoop_module.tell_paragraph(character, line)
+    character.pending_phone_texts = []
 
 
 def normalize_number(raw):
@@ -28,34 +141,33 @@ def normalize_number(raw):
     text = (raw or "").strip().upper()
     if not text:
         return None
-    # Allow 555-0142, 5550142, 555.0142
     compact = re.sub(r"[^0-9A-Z]+", "", text)
     if not compact:
         return None
-    # Pretty-print 555XXXX -> 555-XXXX when all digits and length 7.
     if compact.isdigit() and len(compact) == 7:
         return f"{compact[:3]}-{compact[3:]}"
     if compact.isdigit() and len(compact) == 10:
         return f"{compact[:3]}-{compact[3:6]}-{compact[6:]}"
-    # Keep WKNZ-shaped aliases readable.
-    if compact.lower() in ("wknz", "555wknz"):
-        return "555-WKNZ"
     return compact if len(compact) <= 16 else compact[:16]
 
 
-def _is_service_number(number):
-    """True when ``number`` is a non-handset service line (e.g. WKNZ)."""
-    norm = normalize_number(number)
-    if not norm:
-        return False
-    key = re.sub(r"[^0-9A-Z]+", "", norm).lower()
-    return key in ("wknz", "555wknz") or norm.upper() == "555-WKNZ"
+def is_special_dial(raw):
+    """True when the dial string targets a registered special line."""
+    if _special_dial_checker is not None:
+        try:
+            return bool(_special_dial_checker(raw))
+        except Exception:
+            return False
+    return False
 
 
 def is_phone_item(item):
     """True when a world Item is a phone (portable or payphone)."""
     if item is None:
         return False
+    cat = getattr(item, "catalog_id", None)
+    if cat in _phone_catalog_ids:
+        return True
     return bool(getattr(item, "is_phone", False))
 
 
@@ -63,9 +175,10 @@ def is_payphone_item(item):
     """True when the Item is payphone furniture."""
     if item is None:
         return False
-    if bool(getattr(item, "is_payphone", False)):
+    cat = getattr(item, "catalog_id", None)
+    if cat in _payphone_catalog_ids:
         return True
-    return False
+    return bool(getattr(item, "is_payphone", False))
 
 
 def is_portable_phone(item):
@@ -125,17 +238,13 @@ def _next_number(game):
 
 
 def ensure_phone_number(item, game=None):
-    """Stamp a unique ``phone_number`` on a phone Item if missing.
-
-    Returns the number string, or None when ``item`` is not a phone.
-    """
+    """Stamp a unique ``phone_number`` on a phone Item if missing."""
     if not is_phone_item(item):
         return None
     existing = getattr(item, "phone_number", None)
     if isinstance(existing, str) and existing.strip():
         return normalize_number(existing) or existing.strip().upper()
     if game is None:
-        # No game yet (catalog preview) -- leave unset until spawn.
         return None
     number = _next_number(game)
     item.phone_number = number
@@ -172,27 +281,22 @@ def primary_handset(character):
 
 
 def can_place_call(character, game):
-    """Return (ok, mode, detail) for outbound dial.
-
-    mode is ``portable`` or ``payphone``. detail is refusal text or fee.
-    """
-    _ = game
+    """Return (ok, mode, detail) for outbound dial."""
     room = getattr(character, "location", None)
     if room is None:
         return False, None, "You are nowhere."
-    fee = hooks.phone_payphone_fee()
     if has_portable_phone(character):
         return True, "portable", None
     if room_has_payphone(room):
         coins = economy_wallet.wallet_dollars(character)
-        if coins < fee:
+        if coins < PAYPHONE_FEE:
             return (
                 False,
                 "payphone",
-                f"The payphone wants {fee} dollars "
+                f"The payphone wants {PAYPHONE_FEE} dollars "
                 f"(you have {coins}).",
             )
-        return True, "payphone", fee
+        return True, "payphone", PAYPHONE_FEE
     return (
         False,
         None,
@@ -203,24 +307,19 @@ def can_place_call(character, game):
 
 def charge_payphone(character):
     """Deduct payphone fee. Returns True on success."""
-    fee = hooks.phone_payphone_fee()
     coins = economy_wallet.wallet_dollars(character)
-    if coins < fee:
+    if coins < PAYPHONE_FEE:
         return False
-    economy_wallet.set_wallet(character, coins - fee, 0)
+    economy_wallet.set_wallet(character, coins - PAYPHONE_FEE, 0)
     return True
 
 
 def find_item_by_number(game, number):
-    """Find a phone Item (and optional holder Character) by number.
-
-    Returns (item, holder_or_none, room_or_none).
-    """
+    """Find a phone Item (and optional holder Character) by number."""
     want = normalize_number(number)
-    if not want or _is_service_number(want):
+    if not want or is_special_dial(want):
         return None, None, None
     rooms = getattr(game, "rooms", None) or {}
-    # Characters (inventory).
     for ch in iter_characters(game):
         for piece in list(getattr(ch, "inventory", None) or []):
             if not is_phone_item(piece):
@@ -228,7 +327,6 @@ def find_item_by_number(game, number):
             got = normalize_number(getattr(piece, "phone_number", None))
             if got == want:
                 return piece, ch, getattr(ch, "location", None)
-    # Room furniture / floor.
     for room in rooms.values():
         for obj in list(getattr(room, "contents", None) or []):
             if not is_phone_item(obj):
@@ -239,12 +337,9 @@ def find_item_by_number(game, number):
     return None, None, None
 
 
-def _resolve_dial_number(character, raw_head, game):
-    """Resolve dial head to a number via hook then default phonebook/number."""
-    resolved = hooks.phone_dial_alias_resolver(raw_head, character, game)
-    if resolved is not None:
-        return normalize_number(resolved), None
-    text = (raw_head or "").strip()
+def resolve_dial_target(character, raw, game):
+    """Resolve dial args to a number string."""
+    text = (raw or "").strip()
     if not text:
         return None, "Dial which number? Try 'dial 555-0142' or 'call dean'."
     alias_key = text.split(None, 1)[0].lower()
@@ -253,14 +348,17 @@ def _resolve_dial_number(character, raw_head, game):
         return normalize_number(contacts[alias_key]), None
     if " " not in text and alias_key in (contacts or {}):
         return normalize_number(contacts[alias_key]), None
-    num = normalize_number(text.split(None, 1)[0])
+    head = text.split(None, 1)[0]
+    if is_special_dial(head):
+        return head.upper(), None
+    num = normalize_number(head)
     if not num:
         return None, "That does not look like a phone number or saved alias."
     return num, None
 
 
 def contacts_dict(character):
-    """Sanitized alias → number map on the character."""
+    """Sanitized alias -> number map on the character."""
     raw = getattr(character, "phone_contacts", None)
     if not isinstance(raw, dict):
         character.phone_contacts = {}
@@ -269,7 +367,7 @@ def contacts_dict(character):
 
 
 def save_contact(character, alias, number):
-    """Save phonebook alias → number. Returns (ok, message)."""
+    """Save phonebook alias -> number. Returns (ok, message)."""
     label = (alias or "").strip().lower()
     if not label or not re.match(r"^[a-z][a-z0-9_-]{0,23}$", label):
         return False, (
@@ -279,8 +377,8 @@ def save_contact(character, alias, number):
     if label in ("wknz", "save", "forget", "contacts", "number", "ask"):
         return False, "That alias is reserved."
     num = normalize_number(number)
-    if not num or _is_service_number(num):
-        return False, "Save a real phone number (not WKNZ)."
+    if not num or is_special_dial(num):
+        return False, "Save a real phone number (not a special line)."
     book = contacts_dict(character)
     if label not in book and len(book) >= MAX_CONTACTS:
         return False, f"Phonebook full ({MAX_CONTACTS} aliases)."
@@ -316,7 +414,7 @@ def clear_call(character):
 
 
 def _send(character, text):
-    """Session send when present (Echoes without Session stay silent)."""
+    """Session send when present."""
     session = getattr(character, "session", None)
     if session is not None:
         session.send(text)
@@ -330,15 +428,12 @@ def _room_emote_phone(character, verb_phrase):
     face = getattr(character, "key", "Someone")
     try:
         from command_support import _display_name
-
         face = _display_name(character, None) or face
     except Exception:
         pass
     line = f"{face} {verb_phrase}."
-    # Tagged for a11y when we send to the actor; room broadcast is plain.
     room.broadcast(line, exclude=character)
-    tag = hooks.phone_tag(character)
-    _send(character, f"{tag} {line}" if tag else line)
+    _send(character, f"{tag_phone(character)} {line}")
 
 
 def hangup_pair(a, b, *, reason="hangup"):
@@ -349,17 +444,14 @@ def hangup_pair(a, b, *, reason="hangup"):
         call = active_call(ch)
         if call:
             clear_call(ch)
-            tag = hooks.phone_call_tag(ch)
             if reason == "hangup":
-                _send(ch, f"{tag} Call ended." if tag else "Call ended.")
+                _send(ch, f"{tag_call(ch)} Call ended.")
             elif reason == "busy":
-                _send(ch, f"{tag} Line went dead." if tag else "Line went dead.")
+                _send(ch, f"{tag_call(ch)} Line went dead.")
             elif reason == "plane":
                 _send(
                     ch,
-                    f"{tag} The signal dies at the plane's edge."
-                    if tag
-                    else "The signal dies at the plane's edge.",
+                    f"{tag_call(ch)} The signal dies at the plane's edge.",
                 )
 
 
@@ -380,27 +472,17 @@ def begin_ring(caller, callee, *, caller_number, callee_number):
         "outbound": False,
     }
     _room_emote_phone(caller, "dials a number and holds a phone to their ear")
-    ptag = hooks.phone_tag(caller)
-    ctag = hooks.phone_tag(callee)
     _send(
         caller,
-        f"{ptag} Ringing {callee_number}…" if ptag else f"Ringing {callee_number}…",
+        f"{tag_phone(caller)} Ringing {callee_number}…",
     )
     _send(
         callee,
-        (
-            f"{ctag} Incoming call from {caller_number} — "
-            "type 'answer' or 'hangup'."
-        )
-        if ctag
-        else (
-            f"Incoming call from {caller_number} — "
-            "type 'answer' or 'hangup'."
-        ),
+        f"{tag_phone(callee)} Incoming call from {caller_number} — "
+        "type 'answer' or 'hangup'.",
     )
     room = getattr(callee, "location", None)
     if room is not None and getattr(callee, "session", None) is None:
-        # Offline Echo in the room: soft tell for watchers / snoops.
         face = getattr(callee, "key", "Someone")
         room.broadcast(
             f"{face}'s phone rings.",
@@ -415,10 +497,8 @@ def connect_call(caller, callee):
         call["state"] = "connected"
         call["peer_key"] = getattr(peer, "key", None)
         ch.phone_call = call
-    ctag = hooks.phone_call_tag(caller)
-    _send(caller, f"{ctag} Connected." if ctag else "Connected.")
-    ctag = hooks.phone_call_tag(callee)
-    _send(callee, f"{ctag} Connected." if ctag else "Connected.")
+    _send(caller, f"{tag_call(caller)} Connected.")
+    _send(callee, f"{tag_call(callee)} Connected.")
 
 
 def peer_on_call(character, game):
@@ -435,7 +515,6 @@ def peer_on_call(character, game):
     peer = finder(key)
     if peer is None:
         return None
-    # Peer must still think they are on this call.
     peer_call = active_call(peer)
     if not peer_call or peer_call.get("peer_key") != getattr(
         character, "key", None
@@ -458,39 +537,83 @@ def phone_say(character, game, text):
         return "The line is dead."
     if not same_plane(character, peer):
         hangup_pair(character, peer, reason="plane")
-        tag = hooks.phone_call_tag(character)
-        msg = "The signal dies at the plane's edge."
-        return f"{tag} {msg}" if tag else msg
+        return f"{tag_call(character)} The signal dies at the plane's edge."
     face = getattr(character, "key", "Someone")
     try:
         from command_support import _display_name
-
         face = _display_name(character, peer) or face
     except Exception:
         pass
-    ptag = hooks.phone_call_tag(peer)
     _send(
         peer,
-        f"{ptag} {face} (phone): {body}" if ptag else f"{face} (phone): {body}",
+        f"{tag_call(peer)} {face} (phone): {body}",
     )
     _room_emote_phone(character, "talks into a phone")
-    tag = hooks.phone_call_tag(character)
-    you = f"You say (phone): {body}"
-    return f"{tag} {you}" if tag else you
+    return f"{tag_call(character)} You say (phone): {body}"
 
 
 def _voicemail_stub(caller, callee_number):
     """Short refusal when Echo has voicemail on."""
-    return hooks.phone_voicemail_line(caller, callee_number)
+    return (
+        f"{tag_phone(caller)} {callee_number} — voicemail. "
+        "The Echo is not taking calls "
+        "('echo voicemail off' on their body)."
+    )
+
+
+def try_echo_auto_answer(caller, callee, game):
+    """If callee is an answering Echo, auto-connect. Returns message or None."""
+    session = getattr(callee, "session", None)
+    idle = bool(getattr(callee, "idle_mode", False))
+    acts_echo = False
+    if hasattr(callee, "acts_as_echo"):
+        try:
+            acts_echo = bool(callee.acts_as_echo())
+        except Exception:
+            acts_echo = session is None
+    else:
+        acts_echo = session is None
+
+    if session is not None and not idle and not acts_echo:
+        return None
+    if session is not None and idle:
+        return None
+
+    if getattr(callee, "folded", False):
+        hangup_pair(caller, callee, reason="busy")
+        return _voicemail_stub(
+            caller, (active_call(caller) or {}).get("peer_number") or "the line"
+        )
+    if echo_voicemail_on(callee):
+        hangup_pair(caller, callee, reason="busy")
+        return _voicemail_stub(
+            caller, (active_call(caller) or {}).get("peer_number") or "the line"
+        )
+    connect_call(caller, callee)
+    _send(
+        caller,
+        f"{tag_call(caller)} Their Echo picks up. "
+        "Try 'phone ask group|food|water|help'.",
+    )
+    return None
+
+
+def handle_echo_ask(caller, echo, game, kind):
+    """Cadence-shaped phone favors from an answering Echo."""
+    if _echo_ask_handler is not None:
+        return _echo_ask_handler(caller, echo, game, kind)
+    return (
+        "Ask for what? Try 'phone ask group', "
+        "'phone ask food', 'phone ask water', or 'phone ask help'."
+    )
 
 
 def dial(character, game, raw_args):
-    """Outbound dial to a handset number. Returns message for the caller."""
+    """Outbound dial. Returns message for the caller."""
     ok, mode, detail = can_place_call(character, game)
     if not ok:
         return detail
 
-    # Already on a call?
     if active_call(character):
         return "You are already on a call. 'hangup' first."
 
@@ -498,17 +621,16 @@ def dial(character, game, raw_args):
     if not parts:
         return "Dial which number? Try 'dial 555-0142' or 'call dean'."
     head = parts[0]
+    rest = parts[1] if len(parts) > 1 else ""
 
-    number, err = _resolve_dial_number(character, head, game)
+    number, err = resolve_dial_target(character, head, game)
     if err:
         return err
 
-    fee = hooks.phone_payphone_fee()
-    # Payphone fee at start of successful attempt.
     if mode == "payphone":
         if not charge_payphone(character):
             return (
-                f"The payphone wants {fee} dollars "
+                f"The payphone wants {PAYPHONE_FEE} dollars "
                 f"(you have {economy_wallet.wallet_dollars(character)})."
             )
 
@@ -517,54 +639,37 @@ def dial(character, game, raw_args):
     if my_phone is not None:
         my_number = ensure_phone_number(my_phone, game)
     elif mode == "payphone":
-        # Outbound-only booth: ephemeral caller-id.
         my_number = "PAYPHONE"
 
-    # Service numbers (WKNZ, …) are handled by the game ``dial`` wrapper.
-    if _is_service_number(number):
-        return (
-            f"{hooks.phone_tag(character)} No answer — number not in service."
-            if hooks.phone_tag(character)
-            else "No answer — number not in service."
-        )
+    if is_special_dial(number) and _phone_switchboard is not None:
+        msg = _phone_switchboard(character, game, number, rest, mode)
+        if msg is not None:
+            return msg
 
     item, holder, _room = find_item_by_number(game, number)
     if item is None:
-        ptag = hooks.phone_tag(character)
-        return (
-            f"{ptag} No answer — number not in service."
-            if ptag
-            else "No answer — number not in service."
-        )
+        return f"{tag_phone(character)} No answer — number not in service."
 
     if is_payphone_item(item) and holder is None:
-        ptag = hooks.phone_tag(character)
         return (
-            f"{ptag} That payphone does not take inbound "
+            f"{tag_phone(character)} That payphone does not take inbound "
             "calls — try a handset number."
         )
 
     if holder is None:
-        ptag = hooks.phone_tag(character)
-        return (
-            f"{ptag} No one is carrying that phone."
-            if ptag
-            else "No one is carrying that phone."
-        )
+        return f"{tag_phone(character)} No one is carrying that phone."
 
     if holder is character:
         return "You cannot call your own handset."
 
     if not same_plane(character, holder):
-        ptag = hooks.phone_tag(character)
         return (
-            f"{ptag} No signal — that phone is on another "
+            f"{tag_phone(character)} No signal — that phone is on another "
             "plane."
         )
 
     if active_call(holder):
-        ptag = hooks.phone_tag(character)
-        return f"{ptag} Busy signal." if ptag else "Busy signal."
+        return f"{tag_phone(character)} Busy signal."
 
     callee_number = ensure_phone_number(item, game) or number
     begin_ring(
@@ -573,16 +678,13 @@ def dial(character, game, raw_args):
         caller_number=my_number or "UNKNOWN",
         callee_number=callee_number,
     )
+    auto_msg = try_echo_auto_answer(character, holder, game)
+    if auto_msg:
+        return auto_msg
     call = active_call(character)
     if call and call.get("state") == "connected":
-        ctag = hooks.phone_call_tag(character)
-        return f"{ctag} Connected." if ctag else "Connected."
-    ptag = hooks.phone_tag(character)
-    return (
-        f"{ptag} Ringing {callee_number}…"
-        if ptag
-        else f"Ringing {callee_number}…"
-    )
+        return f"{tag_call(character)} Connected."
+    return f"{tag_phone(character)} Ringing {callee_number}…"
 
 
 def answer_call(character, game):
@@ -592,7 +694,6 @@ def answer_call(character, game):
         return "No incoming call."
     peer = peer_on_call(character, game)
     if peer is None:
-        # peer_on_call requires mutual peer_key; during ring both have state.
         key = call.get("peer_key")
         finder = getattr(game, "find_character", None)
         peer = finder(key) if callable(finder) and key else None
@@ -601,18 +702,14 @@ def answer_call(character, game):
         return "The caller hung up."
     if not same_plane(character, peer):
         hangup_pair(character, peer, reason="plane")
-        tag = hooks.phone_call_tag(character)
-        msg = "The signal dies at the plane's edge."
-        return f"{tag} {msg}" if tag else msg
+        return f"{tag_call(character)} The signal dies at the plane's edge."
     connect_call(peer, character)
     _room_emote_phone(character, "answers a phone")
-    tag = hooks.phone_call_tag(character)
-    return f"{tag} Connected." if tag else "Connected."
+    return f"{tag_call(character)} Connected."
 
 
 def hangup(character, game):
     """End ringing or connected call."""
-    _ = game
     call = active_call(character)
     if not call:
         return "You are not on a call."
@@ -621,13 +718,35 @@ def hangup(character, game):
     peer = finder(key) if callable(finder) and key else None
     hangup_pair(character, peer, reason="hangup")
     _room_emote_phone(character, "hangs up a phone")
-    tag = hooks.phone_call_tag(character)
-    return f"{tag} Call ended." if tag else "Call ended."
+    return f"{tag_call(character)} Call ended."
+
+
+def phone_request_song(character, game, song):
+    """Queue a song request via phone (game switchboard when special)."""
+    ok, mode, detail = can_place_call(character, game)
+    if not ok:
+        return detail
+    if mode == "payphone" and not charge_payphone(character):
+        return (
+            f"The payphone wants {PAYPHONE_FEE} dollars "
+            f"(you have {economy_wallet.wallet_dollars(character)})."
+        )
+    title = (song or "").strip()
+    if not title:
+        return "Request which song? Try 'phone request Dust on the Highway'."
+    if _phone_switchboard is not None:
+        msg = _phone_switchboard(
+            character, game, "SONG_REQUEST", title, mode,
+        )
+        if msg is not None:
+            return msg
+    return f"{tag_phone(character)} No request line is available here."
 
 
 def status_text(character, game):
     """Bare ``phone`` cheat-sheet / status."""
-    lines = [f"{hooks.phone_tag(character)} Phone" if hooks.phone_tag(character) else "Phone"]
+    flush_pending_phone_texts(character)
+    lines = [f"{tag_phone(character)} Phone"]
     phones = portable_phones_held(character)
     if phones:
         for p in phones:
@@ -636,9 +755,8 @@ def status_text(character, game):
     else:
         lines.append("  Handset: (none — buy a flip phone, or use a payphone)")
     room = getattr(character, "location", None)
-    fee = hooks.phone_payphone_fee()
     if room_has_payphone(room):
-        lines.append(f"  Payphone here: yes ({fee} dollars per call)")
+        lines.append(f"  Payphone here: yes ({PAYPHONE_FEE} dollars per call)")
     else:
         lines.append("  Payphone here: no")
     call = active_call(character)

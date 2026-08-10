@@ -129,6 +129,12 @@ class Item(GameObject):
         # Heaven / Hell (supers/ethereal_item.py). Players bless with
         # ``mark item <gear>``.
         self.is_ethereal = False
+        # Spirit mirror gear (idea #141): ghost copy; vanishes on re-embody.
+        self.is_spirit_mirror = False
+        self.spirit_mirror_source_key = None
+        # Corpse worn gear (spirit anchor bodies keep equipped refs).
+        self.body_equipment = {}
+        self.body_clothing = {}
         # Process-lifetime creation order for GM ``where item`` (newest).
         # Persisted in the items.container blob; restored on load_world.
         self.created_seq = next_item_created_seq()
@@ -365,6 +371,11 @@ class Room(GameObject):
             # Items / bodies: reverse pointer so Cadence move_body (and
             # similar) never scan ~12k rooms to find where an Item sits.
             obj.location = self
+            game = getattr(self, "game", None)
+            if game is not None and isinstance(obj, Item):
+                from engine import persistence as persistence_mod
+                if persistence_mod._persistable_floor_item(obj):
+                    persistence_mod.note_floor_item_room(game, self)
 
     def remove(self, obj):
         # Take an object out, but only if it's actually here (avoids an error).
@@ -379,6 +390,11 @@ class Room(GameObject):
                 unregister_character(game, obj)
         elif getattr(obj, "location", None) is self:
             obj.location = None
+            game = getattr(self, "game", None)
+            if game is not None and isinstance(obj, Item):
+                from engine import persistence as persistence_mod
+                if persistence_mod._persistable_floor_item(obj):
+                    persistence_mod.release_floor_item_room(game, self)
 
     def characters(self):
         """Return only the Characters in this room (used for broadcasting messages)."""
@@ -547,6 +563,11 @@ class Character(GameObject):
         self.engagement_moving_shot = False   # one-beat retreating-fire tax
         self.engagement_closing = False
         self.engagement_retreating = False
+        # Cross-room ranged: foe_key -> direction along line of fire.
+        self.ranged_shot_vs = {}
+        self.ranged_shot_direction = None   # active shot line from shooter
+        self.ranged_shot_from = None          # direction incoming shots arrive from
+        self.last_scan_direction = None       # recon bonus for spotting
         self.combat_intent = None         # None | "press" | "guard" | "feint"
         self.feint_exposed = False
         # Vanguard protect (group_combat_mechanics.md): standing ally you
@@ -760,7 +781,16 @@ class Character(GameObject):
         return bool(getattr(self, "idle_mode", False))
 
     def move_to(self, room):
-        """Move this character out of its current room and into `room`."""
+        """Move this character out of its current room and into `room`.
+
+        Pinned fixtures (``immovable=True``, e.g. gym training dummies) stay
+        put unless a heal sets ``_force_move`` for that single placement.
+        """
+        if (
+            getattr(self, "immovable", False)
+            and not getattr(self, "_force_move", False)
+        ):
+            return
         old_key = getattr(self.location, "key", None) if self.location else None
         if self.location:
             # Bypass Room.remove so we do NOT drop out of game.characters

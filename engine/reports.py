@@ -195,6 +195,27 @@ def get_by_id(kind, entry_id, directory="."):
     return None
 
 
+def by_reporter(kind, reporter_key, directory=".", *, open_only=True):
+    """Return every report filed by ``reporter_key`` (``Character.key``).
+
+    Default ``open_only=True`` keeps resolved/rejected tickets out of the
+    player ``bugs`` / ``ideas`` listings -- the usual "have I already filed
+    this?" check. Pass ``open_only=False`` when the player asks for full
+    history (``bugs all``). Oldest-first, same order as ``recent()``.
+    """
+    needle = (reporter_key or "").strip()
+    if not needle:
+        return []
+    out = []
+    for entry in recent(kind, None, directory=directory):
+        if entry.get("reporter") != needle:
+            continue
+        if open_only and entry.get("status", "open") != "open":
+            continue
+        out.append(entry)
+    return out
+
+
 def format_entry_lines(kind, entry, *, game=None):
     """Plain-text detail body for one report (GM show / host sync_reports)."""
     label = DISPLAY_LABELS.get(kind, (kind or "?").upper())

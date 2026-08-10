@@ -257,14 +257,88 @@ def migrate_wallet_fields(character):
     character.bank_cents = bc
 
 
+def _pocket_wallet_item(character):
+    """Worn pocket wallet Item when present (cash lives on the Item)."""
+    try:
+        from engine.systems import wallet_container as wallet_mod
+    except ImportError:
+        return None
+    return wallet_mod.designated_wallet(character)
+
+
+def _loose_cash_parts(character):
+    """Cash carried without a worn wallet (``character.dollars/cents``)."""
+    migrate_wallet_fields(character)
+    if _pocket_wallet_item(character) is not None:
+        return 0, 0
+    return inventory_loose_cash_parts(character)
+
+
+def inventory_loose_cash_parts(character):
+    """Loose bills in open inventory (``character.dollars/cents``)."""
+    migrate_wallet_fields(character)
+    return _carry_cents(
+        getattr(character, "dollars", 0),
+        getattr(character, "cents", 0),
+    )
+
+
+def loose_cash_inventory_stacks(character):
+    """Open-inventory stacks consumed by loose bills in hand."""
+    d, c = inventory_loose_cash_parts(character)
+    return 1 if (d > 0 or c > 0) else 0
+
+
+def format_pocket_cash(character):
+    """Player-facing pocket cash (wallet item or loose bills)."""
+    migrate_wallet_fields(character)
+    pocket = _pocket_wallet_item(character)
+    if pocket is not None:
+        from engine.systems import wallet_container as wallet_mod
+        d, c = wallet_mod.wallet_cash_parts(pocket)
+        return format_money(d, c)
+    d, c = _loose_cash_parts(character)
+    return format_money(d, c)
+
+
+def pocket_cash_is_loose(character):
+    """True when the character carries loose bills in open inventory."""
+    d, c = inventory_loose_cash_parts(character)
+    return d > 0 or c > 0
+
+
+def carry_cash_total_cents(character):
+    """All on-hand cash: worn wallet plus loose inventory bills."""
+    migrate_wallet_fields(character)
+    loose_d, loose_c = inventory_loose_cash_parts(character)
+    total = loose_d * 100 + loose_c
+    pocket = _pocket_wallet_item(character)
+    if pocket is not None:
+        from engine.systems import wallet_container as wallet_mod
+        total += wallet_mod.wallet_total_cents(pocket)
+    return total
+
+
 def wallet_dollars(character):
     migrate_wallet_fields(character)
-    return int(getattr(character, "dollars", 0) or 0)
+    pocket = _pocket_wallet_item(character)
+    if pocket is not None:
+        from engine.systems import wallet_container as wallet_mod
+        d, _c = wallet_mod.wallet_cash_parts(pocket)
+        return d
+    d, _c = _loose_cash_parts(character)
+    return d
 
 
 def wallet_cents(character):
     migrate_wallet_fields(character)
-    return int(getattr(character, "cents", 0) or 0)
+    pocket = _pocket_wallet_item(character)
+    if pocket is not None:
+        from engine.systems import wallet_container as wallet_mod
+        _d, c = wallet_mod.wallet_cash_parts(pocket)
+        return c
+    _d, c = _loose_cash_parts(character)
+    return c
 
 
 def wallet_total_cents(character):
@@ -301,8 +375,13 @@ def set_wallet(character, dollars, cents=0, *, reason=None, tick=None):
     """Set wallet to an exact (dollars, cents) pair."""
     before = wallet_total_cents(character)
     d, c = _carry_cents(dollars, cents)
-    character.dollars = d
-    character.cents = c
+    pocket = _pocket_wallet_item(character)
+    if pocket is not None:
+        from engine.systems import wallet_container as wallet_mod
+        wallet_mod.set_wallet_cash(pocket, d, c)
+    else:
+        character.dollars = d
+        character.cents = c
     if reason:
         delta = wallet_total_cents(character) - before
         if delta:
@@ -332,16 +411,32 @@ def set_bank(character, dollars, cents=0, *, reason=None, tick=None):
 
 
 def credit_wallet(character, dollars=0, cents=0, *, reason=None, tick=None):
-    """Add dollars/cents to the on-hand wallet."""
+    """Add dollars/cents to on-hand pocket cash. Returns False if hands are full."""
     migrate_wallet_fields(character)
     if cents != 0:
         delta = int(dollars or 0) * 100 + int(cents)
     else:
         delta = money_to_cents(dollars)
+    if delta <= 0:
+        return True
+    pocket = _pocket_wallet_item(character)
+    if pocket is None:
+        d0, c0 = _loose_cash_parts(character)
+        if d0 == 0 and c0 == 0:
+            from engine.systems.containers import (
+                OPEN_INVENTORY_CAPACITY,
+                open_stack_keys,
+            )
+            if len(open_stack_keys(character)) >= OPEN_INVENTORY_CAPACITY:
+                return False
     total = wallet_total_cents(character) + delta
     d, c = divmod(max(0, total), 100)
-    character.dollars = d
-    character.cents = c
+    if pocket is not None:
+        from engine.systems import wallet_container as wallet_mod
+        wallet_mod.set_wallet_cash(pocket, d, c)
+    else:
+        character.dollars = d
+        character.cents = c
     if reason and delta:
         record_wallet_ledger(
             character,
@@ -349,20 +444,38 @@ def credit_wallet(character, dollars=0, cents=0, *, reason=None, tick=None):
             reason=reason,
             tick=tick,
         )
+    return True
 
 
 def debit_wallet(character, dollars=0, cents=0, *, reason=None, tick=None):
-    """Remove dollars/cents from wallet. Returns False if insufficient."""
+    """Remove dollars/cents from on-hand cash. Returns False if insufficient."""
+    migrate_wallet_fields(character)
     if cents != 0:
         need = int(dollars or 0) * 100 + int(cents)
     else:
         need = money_to_cents(dollars)
-    if wallet_total_cents(character) < need:
+    if carry_cash_total_cents(character) < need:
         return False
-    total = wallet_total_cents(character) - need
-    d, c = divmod(total, 100)
-    character.dollars = d
-    character.cents = c
+    remaining = need
+    loose_d, loose_c = inventory_loose_cash_parts(character)
+    loose_total = loose_d * 100 + loose_c
+    if loose_total > 0 and remaining > 0:
+        take_loose = min(loose_total, remaining)
+        remaining -= take_loose
+        new_loose = loose_total - take_loose
+        ld, lc = divmod(new_loose, 100)
+        character.dollars = ld
+        character.cents = lc
+    if remaining > 0:
+        pocket = _pocket_wallet_item(character)
+        if pocket is not None:
+            from engine.systems import wallet_container as wallet_mod
+            wallet_c = wallet_mod.wallet_total_cents(pocket)
+            new_wallet = max(0, wallet_c - remaining)
+            wd, wc = divmod(new_wallet, 100)
+            wallet_mod.set_wallet_cash(pocket, wd, wc)
+        else:
+            return False
     if reason and need:
         record_wallet_ledger(
             character,
@@ -371,6 +484,54 @@ def debit_wallet(character, dollars=0, cents=0, *, reason=None, tick=None):
             tick=tick,
         )
     return True
+
+
+def transfer_wallet_to_loose(character, dollars=0, cents=0, *, reason=None, tick=None):
+    """Move cash from a worn wallet into loose inventory bills.
+
+    Returns ``(ok, message)``. Pulling the first loose bill needs a free
+    open-inventory stack when hands are full.
+    """
+    migrate_wallet_fields(character)
+    pocket = _pocket_wallet_item(character)
+    if pocket is None:
+        return False, "You need a pocket wallet for that."
+    if cents != 0:
+        need = int(dollars or 0) * 100 + int(cents)
+    else:
+        need = money_to_cents(dollars)
+    if need <= 0:
+        return False, "Pull how much? (a positive amount)"
+    from engine.systems import wallet_container as wallet_mod
+    wallet_c = wallet_mod.wallet_total_cents(pocket)
+    if wallet_c < need:
+        return False, (
+            f"You only have {format_pocket_cash(character)} in your wallet."
+        )
+    loose_d, loose_c = inventory_loose_cash_parts(character)
+    if loose_d == 0 and loose_c == 0:
+        from engine.systems.containers import (
+            OPEN_INVENTORY_CAPACITY,
+            open_inventory_stack_count,
+        )
+        if open_inventory_stack_count(character) >= OPEN_INVENTORY_CAPACITY:
+            return False, "Your hands are full."
+    new_wallet = wallet_c - need
+    wd, wc = divmod(new_wallet, 100)
+    wallet_mod.set_wallet_cash(pocket, wd, wc)
+    new_loose = loose_d * 100 + loose_c + need
+    ld, lc = divmod(new_loose, 100)
+    character.dollars = ld
+    character.cents = lc
+    if reason:
+        record_wallet_ledger(
+            character,
+            delta_wallet_cents=-need,
+            reason=reason,
+            tick=tick,
+        )
+    pulled = format_money(need // 100, need % 100)
+    return True, f"You pull {pulled} out of your wallet."
 
 
 def credit_bank(character, dollars=0, cents=0, *, reason=None, tick=None):
@@ -416,12 +577,12 @@ def debit_bank(character, dollars=0, cents=0, *, reason=None, tick=None):
 
 
 def can_afford(character, amount, cents=0):
-    """True when the on-hand wallet covers ``amount`` (any money shape)."""
+    """True when on-hand cash (wallet + loose bills) covers ``amount``."""
     if cents != 0:
         need = int(amount) * 100 + int(cents)
     else:
         need = money_to_cents(amount)
-    return wallet_total_cents(character) >= need
+    return carry_cash_total_cents(character) >= need
 
 
 def format_money(dollars, cents=0):
@@ -440,9 +601,20 @@ def format_money(dollars, cents=0):
 
 
 def format_wallet(character):
-    """Format on-hand wallet for player messages."""
-    migrate_wallet_fields(character)
-    return format_money(character.dollars, character.cents)
+    """Format on-hand pocket cash for player messages."""
+    return format_pocket_cash(character)
+
+
+def format_inventory_loose_cash(character):
+    """Format loose bills in open inventory (not the worn wallet)."""
+    d, c = inventory_loose_cash_parts(character)
+    return format_money(d, c)
+
+
+def format_carry_cash(character):
+    """Format total on-hand cash (wallet + loose inventory bills)."""
+    total = carry_cash_total_cents(character)
+    return format_money(total // 100, total % 100)
 
 
 def format_bank(character):
@@ -466,7 +638,7 @@ def _parse_deposit_amount(character, amount, *, bank=False):
     if isinstance(amount, str) and amount.strip().lower() == "all":
         if bank:
             return bank_total_cents(character)
-        return wallet_total_cents(character)
+        return carry_cash_total_cents(character)
     need = money_to_cents(amount)
     if need <= 0:
         return None
@@ -478,8 +650,8 @@ def deposit(character, amount, *, tick=None):
     cents = _parse_deposit_amount(character, amount, bank=False)
     if cents is None:
         return False, "Deposit how much? (a positive number, or 'all')"
-    if wallet_total_cents(character) < cents:
-        return False, f"You only have {format_wallet(character)} on you."
+    if carry_cash_total_cents(character) < cents:
+        return False, f"You only have {format_carry_cash(character)} on you."
     debit_wallet(character, cents=cents)
     credit_bank(character, cents=cents)
     record_wallet_ledger(

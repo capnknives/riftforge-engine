@@ -186,6 +186,8 @@ def handle_telnet_event(session, event):
     kind = event[0]
     if kind == telnet.EV_NEGOTIATE:
         _cmd, option = event[1], event[2]
+        if telnet.handle_negotiate(session, _cmd, option):
+            return
         if option == telnet.TELOPT_MSSP:
             # Listing crawlers -- server-driven status (engine/mssp.py).
             from engine import mssp

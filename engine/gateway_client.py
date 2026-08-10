@@ -247,6 +247,31 @@ class GatewayBridge:
         await self.send_frame(encode_ctrl({"op": "planned_restart"}))
         await asyncio.sleep(0.05)
 
+    async def notify_boot_warming(self, active: bool) -> None:
+        """Tell the gateway deferred boot is running (suppress stitch intercept)."""
+        await self.send_frame(
+            encode_ctrl({"op": "boot_warming", "active": bool(active)})
+        )
+
+    def _begin_gateway_copyover_reattach(self) -> None:
+        """Reset veil-playable gate before held sessions reattach."""
+        import asyncio
+
+        self.game._veil_world_ready = False
+        self.game._veil_stitch_announced = False
+        self.game._veil_ready_event = asyncio.Event()
+
+    async def _wait_gateway_copyover_sessions(self) -> None:
+        """Let reattach tasks reach the playable gate before deferred heals."""
+        await asyncio.sleep(0)
+
+    async def _end_gateway_copyover_reattach(self) -> None:
+        """Open the playable gate after deferred boot + rewrite announce."""
+        ev = getattr(self.game, "_veil_ready_event", None)
+        if ev is not None and not ev.is_set():
+            ev.set()
+        await self.notify_boot_warming(False)
+
     def _schedule_ctrl(self, msg: dict) -> None:
         """Fire-and-forget one CTRL frame from sync game code."""
         try:
@@ -324,6 +349,15 @@ class GatewayBridge:
         """Handle a CTRL message from the gateway."""
         op = msg.get("op")
         if op == "welcome":
+            held = [
+                e for e in (msg.get("sessions") or [])
+                if e.get("sid") and e.get("name")
+            ]
+            if held:
+                self._begin_gateway_copyover_reattach()
+                from engine import deploy_notify
+                deploy_notify.announce_world_stitching(self.game)
+                await self.notify_boot_warming(True)
             for entry in msg.get("sessions") or []:
                 sid = entry.get("sid")
                 if not sid:
@@ -333,6 +367,8 @@ class GatewayBridge:
                 await self._open_session(
                     sid, reattach_name=name, peer_host=peer
                 )
+            if held:
+                await self._wait_gateway_copyover_sessions()
             # Classic copyover.resume() calls this after execv; gateway
             # reattach is the equivalent -- finish any in-flight Fix deploy.
             from engine import deploy_notify
@@ -344,10 +380,18 @@ class GatewayBridge:
             # -- engine/ never imports supers directly (two-repo purity).
             from engine import hooks
             await hooks.gateway_resume_hook(self.game)
-            # Start the world heartbeat only after held clients are
-            # reattached (or confirmed empty). Starting earlier let Cadence
-            # treat connected PCs as Echoes for one+ ticks (Cage yank).
+            # Start the heartbeat as soon as held clients are rebound.
+            # Deferred heals used to run first and freeze who/look for tens
+            # of seconds under a false "complete" line (veil copyover UX).
+            # Tick handlers register at the end of deferred seed; early ticks
+            # are empty no-ops until then -- safe after reattach (not Echo).
             self._ensure_tick_loop()
+            # Heavy boot heals yield between small steps so commands stay live.
+            await hooks.run_deferred_boot_seed_async(self.game)
+            # Only now: "Rewrite complete" (queued in on_resume).
+            deploy_notify.announce_rewrite_ready(self.game)
+            if held:
+                await self._end_gateway_copyover_reattach()
             # Seed gateway stitch buffers from the authoritative game rings
             # so bare ooc/wiznet replay during the next IPC gap is not empty.
             try:

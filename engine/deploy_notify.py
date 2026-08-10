@@ -13,10 +13,11 @@ asyncio task which:
      each bug in bug_ids (or the legacy single bug_id) resolved in
      bug_reports.log — which credits reporters via the after-mark hook.
 
-GM ``autodeploy on`` catch-up (engine/auto_deploy.py) writes
-``.catchup_bug_resolve.json`` instead: copyover ``on_resume()`` (and the
-game tick) marks every missed Fix ticket resolved without a Veil countdown
-because the working tree was already synced via ``git reset --hard``.
+GM ``autodeploy on`` catch-up and silent feature advances still write
+``.catchup_bug_resolve.json`` for missed Fix ticket resolve + reporter
+credit. Before the working-tree sync that will mtime-trigger copyover,
+``queue_catchup_copyover`` runs the same Veil countdown path as Fix ships
+(default 60s) so players get warning before the rewrite.
 
 Networking stays out of this module (file hand-off only, same spirit as
 reports.py). The actual git pull runs on the host; engine/watch_and_run.py
@@ -237,9 +238,175 @@ def describe_ticket_countdown_verb(bug_ids=None, suggestion_ids=None):
     return f"has been {base}"
 
 
+# Signal kinds: Fix/suggestion ships vs silent tree catch-up before copyover.
+KIND_FIX = "fix"
+KIND_CATCHUP = "catchup"
+
+# Player-facing catch-up Veil lines (Supernatural gothic — clear arc, same
+# family as copyover MSG_BEFORE / Fix reseal countdowns).
+CATCHUP_COUNTDOWN_OPEN = (
+    "*** The Veil thins. Something ancient stirs — the bones of this world "
+    "will be rewritten. ***\r\n"
+    "*** The Veil will reseal in {total} seconds. Stay put — "
+    "your thread will hold. ***"
+)
+GATEWAY_RESTART_WARNING = (
+    "\r\n*** The weave that holds your connection must be torn down and "
+    "rewoven. You will drop to the menu — return after the rewrite. ***"
+)
+CATCHUP_STITCH_LINE = (
+    "*** The Veil is still stitching — hold a moment longer. ***"
+)
+CATCHUP_READY_LINE = (
+    "*** The Veil settles. The rewrite is complete — you are still here. ***"
+)
+# Legacy alias for smokes / older callers.
+CATCHUP_COUNTDOWN_LIVE = CATCHUP_READY_LINE
+TREE_SYNC_LINE = (
+    "*** The bones shift beneath you — the ancient rewrite is landing. "
+    "Hold still. ***"
+)
+
+
+def _countdown_tick_line(remaining: int) -> str:
+    """Gothic milestone during the Veil reseal countdown."""
+    return f"*** The Veil reseals in {remaining}... ***"
+
+
+def _countdown_done_line(*, gateway_restart: bool) -> str:
+    """After countdown: game-only pause vs full gateway tear (disconnect)."""
+    if gateway_restart:
+        return (
+            "*** The countdown ends. The binding Veil must tear free — "
+            "you will disconnect; log in again when the rewrite is done. ***"
+        )
+    return (
+        "*** The countdown ends. The Veil draws tight — the pause comes now. "
+        "Stay connected. ***"
+    )
+
+
+def _fix_countdown_open(
+    *,
+    ticket_ref: str,
+    verb: str,
+    summary: str,
+    total: int,
+    gateway_restart: bool,
+) -> str:
+    """Opening Fix-ship countdown (ticket chrome + Veil reseal timer)."""
+    lines = [
+        f"*** {ticket_ref} {verb}: {summary} ***",
+        (
+            f"*** The Veil will reseal in {total} seconds. Stay put — "
+            f"your thread will hold. ***"
+        ),
+    ]
+    if gateway_restart:
+        lines.append(GATEWAY_RESTART_WARNING.strip())
+    return "\r\n".join(lines)
+
+
+def _catchup_countdown_open(*, total: int, gateway_restart: bool) -> str:
+    """Opening catch-up / feature-ship countdown."""
+    text = CATCHUP_COUNTDOWN_OPEN.format(total=total)
+    if gateway_restart:
+        text += GATEWAY_RESTART_WARNING
+    return text
+
+
+def announce_world_stitching(game):
+    """Broadcast the soft stitch line once per copyover reattach."""
+    if game is None:
+        return
+    if getattr(game, "_veil_stitch_announced", False):
+        return
+    game._veil_stitch_announced = True
+    try:
+        game.broadcast_all(CATCHUP_STITCH_LINE)
+    except Exception as exc:
+        print(
+            f"[deploy_notify] announce_world_stitching failed: {exc!r}",
+            flush=True,
+        )
+
+
+def _maybe_announce_tree_sync(game):
+    """One line while auto_deploy rewrites the tree (between countdown and freeze)."""
+    if game is None:
+        return
+    from engine import auto_deploy
+
+    path = auto_deploy._tree_syncing_path(game.report_dir)
+    if not os.path.isfile(path):
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    try:
+        game.broadcast_all(TREE_SYNC_LINE)
+    except Exception as exc:
+        print(
+            f"[deploy_notify] tree_sync announce failed: {exc!r}",
+            flush=True,
+        )
+
+
+def _maybe_announce_disconnect_imminent(game):
+    """Last-chance tear-down line when the watcher is about to kill the gateway."""
+    if game is None:
+        return
+    from engine import auto_deploy
+
+    path = auto_deploy._disconnect_imminent_path(game.report_dir)
+    if not os.path.isfile(path):
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    try:
+        game.broadcast_all(GATEWAY_RESTART_WARNING.strip())
+    except Exception as exc:
+        print(
+            f"[deploy_notify] disconnect_imminent announce failed: {exc!r}",
+            flush=True,
+        )
+
+
+def queue_pending_ready_announce(game, message):
+    """Store the post-boot 'Rewrite complete' line until deferred seed ends."""
+    if game is None or not (message or "").strip():
+        return
+    game._veil_pending_ready_announce = (message or "").strip()
+
+
+def announce_rewrite_ready(game):
+    """Broadcast the deferred complete line (after boot seed yields).
+
+    Called from gateway welcome after ``run_deferred_boot_seed_async`` so
+    players never see 'complete' while ``who`` is still frozen on a fat heal.
+    """
+    if game is None:
+        return
+    text = getattr(game, "_veil_pending_ready_announce", None)
+    game._veil_pending_ready_announce = None
+    if not text:
+        return
+    try:
+        game.broadcast_all(text)
+    except Exception as exc:
+        print(
+            f"[deploy_notify] announce_rewrite_ready failed: {exc!r}",
+            flush=True,
+        )
+
+
 def queue_deploy(directory, *, pr, bug_id=None, bug_ids=None,
                  suggestion_id=None, suggestion_ids=None, summary="",
-                 countdown_seconds=30, triggered_by="unknown", commit_sha=None):
+                 countdown_seconds=30, triggered_by="unknown", commit_sha=None,
+                 kind=None, gateway_restart=False):
     """Write a new deploy signal -- tick() will pick it up on the next heartbeat.
 
     pr is stored for logging only (the host script already knows it). bug_id /
@@ -249,6 +416,8 @@ def queue_deploy(directory, *, pr, bug_id=None, bug_ids=None,
 
     commit_sha= (when known) is used as a stable deploy_key so auto_deploy does
     not re-announce the same squash-merge on every poll when local files drift.
+
+    ``kind`` is ``fix`` (default) or ``catchup`` (tree sync before copyover).
     """
     _seed_completed_from_auto_deploy(directory)
 
@@ -274,8 +443,15 @@ def queue_deploy(directory, *, pr, bug_id=None, bug_ids=None,
     suggest_ids = _normalize_suggestion_ids(
         suggestion_id=suggestion_id, suggestion_ids=suggestion_ids,
     )
+    signal_kind = kind or KIND_FIX
+    if signal_kind not in (KIND_FIX, KIND_CATCHUP):
+        signal_kind = KIND_FIX
     if not summary.strip():
-        if ids and suggest_ids:
+        if signal_kind == KIND_CATCHUP:
+            summary = (
+                "The Veil is stitching a world rewrite into place."
+            )
+        elif ids and suggest_ids:
             summary = "Reported bugs and suggestions have been shipped."
         elif suggest_ids:
             summary = "A player suggestion has been shipped."
@@ -294,6 +470,8 @@ def queue_deploy(directory, *, pr, bug_id=None, bug_ids=None,
         "phase": "pending",
         "deploy_key": deploy_key,
         "commit_sha": commit_sha,
+        "kind": signal_kind,
+        "gateway_restart": bool(gateway_restart),
     }
     _write_signal(directory, payload)
     # Drop any stale ready marker from a prior attempt.
@@ -302,6 +480,36 @@ def queue_deploy(directory, *, pr, bug_id=None, bug_ids=None,
     except OSError:
         pass
     return payload
+
+
+def queue_catchup_copyover(
+    directory,
+    *,
+    commit_sha,
+    countdown_seconds=60,
+    summary="",
+    triggered_by="engine/auto_deploy.py",
+    gateway_restart=False,
+):
+    """Queue a Veil countdown before a catch-up / feature tree sync + copyover.
+
+    Same ``.deploy_signal.json`` + ``.deploy_ready`` hand-off as Fix ships,
+    but player text is a gothic rewrite warning (no Bug #N chrome).
+    """
+    sha = (commit_sha or "").strip() or "catchup"
+    text = (summary or "").strip() or (
+        "The Veil is stitching a world rewrite into place."
+    )
+    return queue_deploy(
+        directory,
+        pr=sha[:12],
+        summary=text,
+        countdown_seconds=countdown_seconds,
+        triggered_by=triggered_by,
+        commit_sha=sha,
+        kind=KIND_CATCHUP,
+        gateway_restart=gateway_restart,
+    )
 
 
 def queue_catchup_resolves(directory, missed_fixes):
@@ -365,7 +573,7 @@ def _apply_catchup_fixes(game, fixes):
             all_bug_ids, all_suggestion_ids,
         )
         game.broadcast_all(
-            f"*** The Veil holds. {live_clause} (catch-up): "
+            f"*** Rewrite complete. {live_clause} (catch-up): "
             f"{last_summary} ***"
         )
 
@@ -561,6 +769,8 @@ def tick(game):
     global _deploy_task, _started_mtime
 
     directory = game.report_dir
+    _maybe_announce_tree_sync(game)
+    _maybe_announce_disconnect_imminent(game)
     if _process_catchup_resolves(game):
         return
 
@@ -614,24 +824,44 @@ async def _run_countdown(game, signal):
     )
     summary = signal.get("summary") or "A reported bug has been fixed."
     total = int(signal.get("countdown_seconds", 30))
+    kind = signal.get("kind") or KIND_FIX
+    gateway_restart = bool(signal.get("gateway_restart"))
 
-    ticket_ref = describe_ticket_ref(bug_ids, suggestion_ids)
-    verb = describe_ticket_countdown_verb(bug_ids, suggestion_ids)
-    game.broadcast_all(
-        f"*** {ticket_ref} {verb}: {summary} ***\r\n"
-        f"*** The Veil will reseal in {total} seconds. Stay put -- "
-        f"you will remain. ***"
-    )
-    print(
-        f"[deploy_notify] countdown started for {ticket_ref} "
-        f"(PR {signal.get('pr', '?')}, {total}s)",
-        flush=True,
-    )
+    if kind == KIND_CATCHUP:
+        game.broadcast_all(
+            _catchup_countdown_open(
+                total=total, gateway_restart=gateway_restart,
+            )
+        )
+        print(
+            f"[deploy_notify] catch-up Veil countdown started "
+            f"({total}s, gateway_restart={gateway_restart}, "
+            f"{signal.get('pr', '?')})",
+            flush=True,
+        )
+    else:
+        ticket_ref = describe_ticket_ref(bug_ids, suggestion_ids)
+        verb = describe_ticket_countdown_verb(bug_ids, suggestion_ids)
+        game.broadcast_all(
+            _fix_countdown_open(
+                ticket_ref=ticket_ref,
+                verb=verb,
+                summary=summary,
+                total=total,
+                gateway_restart=gateway_restart,
+            )
+        )
+        print(
+            f"[deploy_notify] countdown started for {ticket_ref} "
+            f"(PR {signal.get('pr', '?')}, {total}s, "
+            f"gateway_restart={gateway_restart})",
+            flush=True,
+        )
 
     # Walk second-by-second so we can hit WARN_AT milestones cleanly.
     for remaining in range(total, 0, -1):
         if remaining in _COUNTDOWN_WARN_AT and remaining < total:
-            game.broadcast_all(f"*** The Veil reseals in {remaining}... ***")
+            game.broadcast_all(_countdown_tick_line(remaining))
         await asyncio.sleep(1)
 
     signal["phase"] = "awaiting_copyover"
@@ -642,15 +872,17 @@ async def _run_countdown(game, signal):
         json.dump({"ok": True, "pr": signal.get("pr")}, f)
         f.write("\n")
 
+    # Do not claim the world is pausing yet -- the old process still answers
+    # commands until MSG_BEFORE / copyover.
     game.broadcast_all(
-        "*** The rewrite takes hold. The Veil folds -- hold on. ***"
+        _countdown_done_line(gateway_restart=gateway_restart)
     )
     print("[deploy_notify] deploy_ready written -- host may pull the fix now",
           flush=True)
 
 
 async def on_resume(game):
-    """After copyover, finish deploy hand-offs and reconcile missed Fix bugs."""
+    """After copyover, finish deploy hand-offs; defer 'complete' until boot ready."""
     directory = game.report_dir
 
     # Catch-up file (watcher) or last_deploy lag (retro after early catch-up).
@@ -669,11 +901,19 @@ async def on_resume(game):
         suggestion_ids=signal.get("suggestion_ids"),
     )
     summary = signal.get("summary") or "A reported bug has been fixed."
+    kind = signal.get("kind") or KIND_FIX
 
-    live_clause = describe_ticket_live_clause(bug_ids, suggestion_ids)
-    game.broadcast_all(
-        f"*** The Veil holds. {live_clause}: {summary} ***"
-    )
+    # Soft stitch line now; full "Rewrite complete" after deferred boot seed
+    # so who/look are not frozen under a false done signal.
+    announce_world_stitching(game)
+    if kind == KIND_CATCHUP:
+        queue_pending_ready_announce(game, CATCHUP_READY_LINE)
+    else:
+        live_clause = describe_ticket_live_clause(bug_ids, suggestion_ids)
+        queue_pending_ready_announce(
+            game,
+            f"*** The Veil settles. {live_clause}: {summary} ***",
+        )
 
     for bug_id in bug_ids:
         try:

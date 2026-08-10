@@ -25,6 +25,13 @@ from engine.systems.quests_loader import (
     validate_quest as loader_validate_quest,
 )
 import engine.systems.economy as economy_wallet
+from engine.systems.quest_flags import (
+    entry as _entry,
+    get_flag as _get_flag,
+    progress as _progress,
+    set_flag as _set_flag,
+    set_status as _set_status,
+)
 from engine.room_vnum import lookup_room, room_keys_match
 
 # Thin alias namespace matching the old loader_mod call sites in this file.
@@ -160,20 +167,6 @@ def _game_from_character(character, payload=None):
     return getattr(loc, "game", None) if loc is not None else None
 
 
-def _progress(character):
-    """Return mutable quest_progress dict (never None)."""
-    box = getattr(character, "quest_progress", None)
-    if box is None or not isinstance(box, dict):
-        character.quest_progress = {}
-        return character.quest_progress
-    return box
-
-
-def _entry(character, quest_id):
-    """Return one quest progress entry or None."""
-    return _progress(character).get(quest_id)
-
-
 def _send(character, lines):
     """Send one string or a list of strings to the character's session."""
     session = getattr(character, "session", None)
@@ -228,15 +221,12 @@ def _complete_quest(character, quest_id, game=None, *, announce=True):
         return False
     if entry.get("status") == "done":
         return False
-    entry["status"] = "done"
-    pin_map = (entry.get("flags") or {}).get("pin_map") or data.get(
-        "pin_npcs"
-    )
+    _set_status(character, quest_id, "done")
+    pin_map = _get_flag(character, quest_id, "pin_map") or data.get("pin_npcs")
     if pin_map and game is not None:
         _unpin_mentors(game, pin_map)
-    flags = entry.setdefault("flags", {})
-    if not flags.get("completion_rewards"):
-        flags["completion_rewards"] = True
+    if not _get_flag(character, quest_id, "completion_rewards"):
+        _set_flag(character, quest_id, "completion_rewards", True)
         if announce:
             _send(character, data.get("complete") or ["Case closed."])
         paid = _apply_rewards(character, data, game=game)
@@ -264,20 +254,57 @@ def _heal_stale_quest_entry(character, quest_id, game=None, *, silent=False):
     )
 
 
+def stale_active_quest_ids(character):
+    """Quest ids that are still ``active`` but past the final step index."""
+    ids = []
+    for qid in active_quest_ids(character):
+        entry = _entry(character, qid)
+        data = loader_mod.get_quest(qid)
+        if not entry or not data:
+            continue
+        steps = data.get("steps") or []
+        if not steps:
+            continue
+        if _parse_step_index(entry) >= len(steps):
+            ids.append(qid)
+    return ids
+
+
+def _npc_matches_giver(npc, giver_name):
+    """True when ``npc`` is the authored quest giver (substring match)."""
+    if npc is None or not giver_name:
+        return False
+    npc_key = (getattr(npc, "key", None) or "").lower()
+    return str(giver_name).lower() in npc_key
+
+
+def close_stale_quest_with_giver(character, quest_id, game, npc, room):
+    """Finalize a past-end quest with giver ``done`` room text when present."""
+    data = loader_mod.get_quest(quest_id) or {}
+    giver = data.get("giver_npc") or ""
+    lines = (data.get("npc_lines") or {}).get(giver) or {}
+    done_line = lines.get("done")
+    if done_line and room is not None:
+        room.broadcast(done_line, exclude=())
+    return _complete_quest(character, quest_id, game=game, announce=True)
+
+
 def heal_stale_quest_progress(game):
-    """Boot heal: close opener quests left active past the final step index."""
+    """Boot reconcile: count opener quests left active past the final step.
+
+    Closure is player-visible at ``talk <giver>`` or ``quests`` / ``questlog``
+    (Phase E) -- boot no longer silently marks them done.
+    """
     if game is None:
         return 0
     from engine.char_index import iter_characters
 
-    healed = 0
+    pending = 0
     for char in iter_characters(game):
         if getattr(char, "is_npc", False):
             continue
-        for qid in list(_progress(char).keys()):
-            if _heal_stale_quest_entry(char, qid, game=game, silent=True):
-                healed += 1
-    return healed
+        pending += len(stale_active_quest_ids(char))
+    return pending
 
 
 def current_step(character, quest_id=None):
@@ -302,8 +329,10 @@ def current_step(character, quest_id=None):
     if idx < 0 or idx >= len(steps):
         game = _game_from_character(character)
         if idx >= len(steps):
-            _heal_stale_quest_entry(
-                character, quest_id, game=game, silent=False,
+            game = _game_from_character(character)
+            announce = getattr(character, "session", None) is not None
+            _complete_quest(
+                character, quest_id, game=game, announce=announce,
             )
         return None
     return steps[idx]
@@ -392,8 +421,10 @@ def format_log_lines(character):
             "('quests' / 'takequest')."
         ]
     game = _game_from_character(character)
+    announce = getattr(character, "session", None) is not None
     for qid in list(prog.keys()):
-        _heal_stale_quest_entry(character, qid, game=game, silent=True)
+        if qid in stale_active_quest_ids(character):
+            _complete_quest(character, qid, game=game, announce=announce)
     lines = ["Quest log."] if sr else ["Quest log:"]
     for qid in sorted(prog.keys()):
         entry = prog[qid] or {}
@@ -515,18 +546,18 @@ def _apply_rewards(character, data, game=None):
             lines.append(economy_wallet.format_money(amount))
         elif rtype == "growth":
             amount = round(float(reward.get("amount", 0) or 0), 2)
-            character.growth = round(
-                float(getattr(character, "growth", 0) or 0) + amount, 2
-            )
-            lines.append(f"{amount:g} banked growth")
+            from engine import hooks
+            banked = hooks.quest_bank_growth_reward(character, amount)
+            if banked > 0:
+                lines.append(f"{banked:g} banked growth")
     return lines
 
 
-def _ensure_quest_spawns(game, data):
+def _ensure_quest_spawns(game, data, character=None):
     """Place quest drill mobs listed in JSON ``spawns`` via game hook."""
     if game is None or not data or _quest_spawn_handler is None:
         return
-    _quest_spawn_handler(game, data)
+    _quest_spawn_handler(game, data, character)
 
 
 def ensure_active_quest_spawns_for_character(game, character):
@@ -542,7 +573,7 @@ def ensure_active_quest_spawns_for_character(game, character):
     for qid in active_quest_ids(character):
         data = loader_mod.get_quest(qid)
         if data and (data.get("spawns") or []):
-            _ensure_quest_spawns(game, data)
+            _ensure_quest_spawns(game, data, character)
 
 
 def ensure_active_quest_spawns(game):
@@ -565,7 +596,7 @@ def ensure_active_quest_spawns(game):
             seen_quest_ids.add(qid)
             data = loader_mod.get_quest(qid)
             if data and (data.get("spawns") or []):
-                _ensure_quest_spawns(game, data)
+                _ensure_quest_spawns(game, data, char)
 
 
 def _apply_begin_prep(character, data, game=None):
@@ -782,13 +813,12 @@ def _maybe_opener_meta(character, quest_id):
     entry = _entry(character, quest_id)
     if entry is None:
         return
-    flags = entry.setdefault("flags", {})
-    if flags.get("opener_meta_told"):
+    if _get_flag(character, quest_id, "opener_meta_told"):
         return
     # Only after leaving step 0 (look_around) -- first successful beat.
     if int(entry.get("step", 0) or 0) < 1:
         return
-    flags["opener_meta_told"] = True
+    _set_flag(character, quest_id, "opener_meta_told", True)
     _send(character, _OPENER_META_LINE)
 
 
@@ -838,13 +868,13 @@ def begin(character, quest_id, game=None, *, force=False, defer_step=False):
         return False, "You already have that case open. See 'questlog'."
     if entry and entry.get("status") == "done" and not force:
         return False, "You already closed that case."
-    prog[quest_id] = {"status": "active", "step": 0, "flags": {}}
+    _set_status(character, quest_id, "active", step=0)
     pin_map = data.get("pin_npcs") or {}
     if pin_map and game is not None:
         _pin_mentors(game, pin_map)
-        prog[quest_id]["flags"]["pin_map"] = dict(pin_map)
+        _set_flag(character, quest_id, "pin_map", dict(pin_map))
     # Drill motes / Charge headroom before intro (Elemental openers).
-    _ensure_quest_spawns(game, data)
+    _ensure_quest_spawns(game, data, character)
     _apply_begin_prep(character, data, game=game)
     if _quest_begin_side_effect is not None:
         _quest_begin_side_effect(character, data, game)
@@ -852,7 +882,7 @@ def begin(character, quest_id, game=None, *, force=False, defer_step=False):
     _send(character, data.get("intro") or [])
     steps = data.get("steps") or []
     if not steps:
-        prog[quest_id]["status"] = "done"
+        _set_status(character, quest_id, "done")
         return True, f"Case '{data.get('title')}' had no steps -- marked done."
     _skip_start_steps(character, quest_id, game=game)
     entry = _entry(character, quest_id)
@@ -910,10 +940,10 @@ def abandon(character, quest_id=None, game=None, *, confirm=False):
             f"'abandonquest {quest_id} confirm' (or 'abandonquest confirm' "
             "when it is your only open case).",
         )
-    pin_map = (entry.get("flags") or {}).get("pin_map") or data.get("pin_npcs")
+    pin_map = _get_flag(character, quest_id, "pin_map") or data.get("pin_npcs")
     if pin_map and game is not None:
         _unpin_mentors(game, pin_map)
-    entry["status"] = "abandoned"
+    _set_status(character, quest_id, "abandoned")
     return True, f"You abandon the case: {data.get('title', quest_id)}."
 
 
@@ -1117,12 +1147,24 @@ def allows_talk(character, npc):
 def npc_talk_line(character, npc):
     """Return a quest-gated talk line for npc, or None to fall through.
 
-    Prefers: offer (if offered here and not started) → active → done.
+    Prefers: stale giver closure → offer → active → done.
     """
     if character is None or npc is None:
         return None
     npc_key = getattr(npc, "key", None) or ""
     room = getattr(character, "location", None)
+    game = _game_from_character(character)
+    # Past-final-step openers: giver delivers ``done`` room text, then close.
+    for qid in list(stale_active_quest_ids(character)):
+        data = loader_mod.get_quest(qid) or {}
+        giver = data.get("giver_npc") or ""
+        if not _npc_matches_giver(npc, giver):
+            continue
+        lines = (data.get("npc_lines") or {}).get(giver) or {}
+        done_line = lines.get("done")
+        if close_stale_quest_with_giver(character, qid, game, npc, room):
+            return done_line
+        return None
     # Active quest lines first.
     for qid in active_quest_ids(character):
         data = loader_mod.get_quest(qid) or {}

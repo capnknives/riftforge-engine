@@ -41,7 +41,7 @@ _STATIC_FIELDS = (
     ("LANGUAGE", "English"),
     ("CHARSET", "ASCII"),
     ("ANSI", "1"),
-    ("UTF-8", "0"),
+    ("UTF-8", "1"),
     ("PAY TO PLAY", "0"),
     ("PAY FOR PERKS", "0"),
     ("CRAWL DELAY", "-1"),
@@ -81,12 +81,25 @@ def build_status(game):
         uptime = "0"
     else:
         uptime = str(int(started))
+    host = os.environ.get("RIFTFORGE_MSSP_HOST", "").strip()
+    description = ""
+    if game is not None:
+        description = str(getattr(game, "mssp_description", "") or "").strip()
+    if not description:
+        description = os.environ.get(
+            "RIFTFORGE_MSSP_DESCRIPTION",
+            "Text MUD engine demo -- urban fantasy roleplay.",
+        ).strip()
     pairs = [
         ("NAME", MSSP_NAME),
         ("PLAYERS", str(player_count(game))),
         ("UPTIME", uptime),
         ("PORT", listen_port(game)),
     ]
+    if host:
+        pairs.append(("HOST", host))
+    if description:
+        pairs.append(("DESCRIPTION", description))
     status_override = None
     if game is not None:
         status_override = getattr(game, "mssp_status", None)

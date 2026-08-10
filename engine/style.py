@@ -163,6 +163,30 @@ TOME_WIDTH = 67
 ROOM_WIDTH = 67
 
 
+def layout_width(*, character=None, session=None, default=ROOM_WIDTH):
+    """Column budget for framed formatters (NAWS → prefs → default).
+
+    Order: ``session.term_width`` when NAWS negotiated, else the player's
+    ``display_width`` pref (``display_prefs.sheet_width``), else ``default``.
+    Always clamped to the same WIDTH_MIN/WIDTH_MAX band as ``config width``.
+    """
+    from engine import display_prefs
+
+    width = None
+    if session is not None:
+        tw = getattr(session, "term_width", None)
+        if tw is not None:
+            try:
+                width = int(tw)
+            except (TypeError, ValueError):
+                width = None
+    if width is None and character is not None:
+        width = display_prefs.sheet_width(character)
+    if width is None:
+        width = default
+    return max(display_prefs.WIDTH_MIN, min(display_prefs.WIDTH_MAX, int(width)))
+
+
 def code_for(role, depth="ansi"):
     """SGR code for `role` at `depth` ('ansi' or 'xterm256').
 
@@ -965,18 +989,94 @@ def format_tome(title, body_lines, *, related=None, syntax=None,
     return lines
 
 
+# Short bare-help trail for screenreader mode (prefs #30–#32). Full catalog
+# stays available via ``help topics`` / ``help index`` -- hearing every
+# HELP_CATEGORIES blurb is a half-hour TTS wall for new players.
+HELP_START_HERE = (
+    ("newbie", "first hour -- look, score, town, stuck"),
+    ("formatting", "screenreader, color, walk, combat tags"),
+    ("config", "turn display prefs on or off"),
+    ("walk", "path to a place without the ASCII map"),
+    ("needs", "hunger, thirst, sleep, and other meters"),
+    ("jobs", "clock in and earn dollars"),
+    ("combat", "how fighting works"),
+    ("training", "gym practice and study"),
+    ("origins", "what kind of person you are"),
+    ("paths", "list every Path / Background"),
+    ("protection", "newbie safety window"),
+    ("echo", "your body stays when you log out"),
+    ("stuck", "emergency teleport to Garth's pawn shop"),
+    ("bug", "file a bug report"),
+)
+
+
+def format_help_start_here(*, screenreader=False):
+    """Short Start Here list for bare ``help`` under screenreader mode.
+
+    Sighted bare help still uses the full categorized index. Screenreader
+    users get this short trail instead so TTS does not dump hundreds of
+    topic blurbs on first ``help``. Type ``help topics`` for the full list.
+    """
+    if screenreader:
+        lines = [
+            "",
+            _tts_period("Help: Start Here"),
+            "",
+            _tts_period(
+                "With a screenreader, bare help stays short so you are not "
+                "stuck listening to the whole catalog"
+            ),
+            _tts_period(
+                "Type help topics for every topic. Type commands for every verb"
+            ),
+            _tts_period("Type help followed by a name for one page"),
+            "",
+            _tts_period("Start here"),
+        ]
+        for name, blurb in HELP_START_HERE:
+            lines.append(f"  {name} -- {blurb}.")
+        lines.append("")
+        return lines
+
+    # Sighted callers rarely need this; keep a framed short list for tests.
+    w = max(40, int(TOME_WIDTH))
+    heavy = paint("dark_red", rule_equals(w))
+    lines = [
+        heavy,
+        render("<gold> TOME: <dark_magenta>Start Here"),
+        heavy,
+        paint(
+            "dark_grey",
+            " Type 'help topics' for the full index.  'commands' for verbs.",
+        ),
+        "",
+    ]
+    for name, blurb in HELP_START_HERE:
+        lines.append(
+            render(f"<silver>  {name} <dark_grey>-- <slate_grey>{blurb}")
+        )
+    lines.append("")
+    lines.append(heavy)
+    return lines
+
+
 def format_help_index(categories, *, width=TOME_WIDTH, screenreader=False):
     """Bare `help` grimoire index: category tomes with topic blurbs.
 
     `categories` is HELP_CATEGORIES shape: [(category, [(name, blurb), ...])].
 
     ``screenreader=True`` skips equals rules; vertical ``name -- blurb`` lists.
+    Screenreader bare ``help`` uses :func:`format_help_start_here` instead;
+    this full index is what ``help topics`` / ``help index`` emit.
     """
     if screenreader:
         lines = [
             "",
-            "Help Index.",
-            "Type help followed by a name for a page. Type commands for verbs.",
+            _tts_period("Help Index"),
+            _tts_period(
+                "Full topic catalog. Type help followed by a name for a page"
+            ),
+            _tts_period("Type commands for verbs. Type help for the short Start Here list"),
             "",
         ]
         for category, topics in categories:
@@ -1679,12 +1779,13 @@ def format_room(title, description, *, area_tag="Indoors", exits=None,
 
         title + area badge
         prose
-        Exits:
-        North - Dest
-        people / items as plain long-desc lines (no list bullets)
+        extras (weather, hooks)
+        items / people as plain long-desc lines (no list bullets)
+        optional local map
+        Exits: (last -- SR speed-read order)
 
     Compact ``Exits: n, e, s`` is opt-in via ``exits_verbose=False``.
-    Screenreader keeps vertical Paths / Souls / Items lists.
+    Screenreader keeps vertical Items / Souls / Paths lists (same order).
     """
     w = max(40, int(width))
     exits = list(exits or [])
@@ -1712,6 +1813,16 @@ def format_room(title, description, *, area_tag="Indoors", exits=None,
                         text = text + "."
                     lines.append(text)
             lines.append("")
+        if items:
+            lines.append("Items:")
+            for item in items:
+                lines.append(f"  {item}.")
+            lines.append("")
+        if souls:
+            lines.append("Souls:")
+            for soul in souls:
+                lines.append(f"  {soul}.")
+            lines.append("")
         if exits:
             if exits_verbose:
                 lines.append("Paths:")
@@ -1734,16 +1845,6 @@ def format_room(title, description, *, area_tag="Indoors", exits=None,
                     seen.add(key)
                 if tokens:
                     lines.append(f"Paths: {', '.join(tokens)}.")
-            lines.append("")
-        if souls:
-            lines.append("Souls:")
-            for soul in souls:
-                lines.append(f"  {soul}.")
-            lines.append("")
-        if items:
-            lines.append("Items:")
-            for item in items:
-                lines.append(f"  {item}.")
             lines.append("")
         return lines
 
@@ -1791,10 +1892,6 @@ def format_room(title, description, *, area_tag="Indoors", exits=None,
                 lines.append("  " + paint("muted", text))
         lines.append("")
 
-    if exits:
-        lines.extend(_sparse_exits_line(exits, verbose=exits_verbose))
-        lines.append("")
-
     if local_map_lines:
         for row in local_map_lines:
             text = str(row).rstrip("\r\n")
@@ -1805,13 +1902,18 @@ def format_room(title, description, *, area_tag="Indoors", exits=None,
         lines.append("")
 
     # Plain long-desc lines (LOTJ) -- no list-bullet chrome on look.
+    # Items, then people, then exits last (suggestion #115 / SR speed-read).
+    for item in items:
+        lines.append(paint("muted", str(item)))
+    if items:
+        lines.append("")
     for soul in souls:
         lines.append(paint("dark_magenta", str(soul)))
     if souls:
         lines.append("")
-    for item in items:
-        lines.append(paint("muted", str(item)))
-    if items:
+
+    if exits:
+        lines.extend(_sparse_exits_line(exits, verbose=exits_verbose))
         lines.append("")
 
     return lines

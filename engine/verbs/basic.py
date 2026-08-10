@@ -37,6 +37,7 @@ from command_support import (
     _is_presence_hidden,
     _display_name,
     floor_item_look_lines,
+    format_floor_items_for_look,
     _find_character,
     _find_item,
     _find_item_prefer_locked,
@@ -53,6 +54,114 @@ from engine.hooks import (
     item_drop_refusal,
     upgrade_legacy_container,
 )
+
+# Bare ``look items`` / ``look souls`` -- room section only (#163).
+_LOOK_SECTION_ALIASES = {
+    "items": "items",
+    "item": "items",
+    "souls": "souls",
+    "soul": "souls",
+    "people": "souls",
+    "persons": "souls",
+}
+
+
+def _look_room_section(character, game, section):
+    """Print only floor items or other people here -- skip room chrome."""
+    from engine import hooks
+    from engine import style
+    from engine import vision as vision_mod
+    from world import Character, Item
+
+    room = character.location
+    if hooks.is_consciousness_exile(character):
+        sensory = hooks.consciousness_sensory_room(character)
+        if sensory is not None:
+            room = sensory
+    if room is None:
+        character.session.send("You are nowhere.")
+        return
+    if not vision_mod.can_see_room(character, room):
+        character.session.send(
+            "It is pitch dark. You can still move by direction, "
+            "but you see nothing here."
+        )
+        return
+
+    from engine import display_prefs
+    prefs = display_prefs.preference_character(character, game)
+    screenreader = bool(getattr(prefs, "screenreader", False))
+
+    if section == "items":
+        floor_item_objs = [
+            o for o in room.contents if isinstance(o, Item)
+        ]
+        item_lines = format_floor_items_for_look(
+            floor_item_look_lines(floor_item_objs, character),
+            character,
+        )
+        if not item_lines:
+            character.session.send("You see no items here.")
+            return
+        if screenreader:
+            out = ["Items:"]
+            for row in item_lines:
+                text = style.strip_ansi(str(row)).strip()
+                if text and text[-1] not in ".!?":
+                    text = text + "."
+                out.append(f"  {text}")
+            character.session.send("\n".join(out))
+            return
+        character.session.send(
+            "\n".join(style.paint("muted", str(row)) for row in item_lines)
+        )
+        return
+
+    souls = []
+    for o in room.contents:
+        if o is character:
+            continue
+        if not isinstance(o, Character):
+            continue
+        if getattr(o, "vessel_host_key", None):
+            continue
+        if getattr(o, "husk_ridden", False):
+            continue
+        if hooks.in_veil(o):
+            if hooks.veil_visible_to(character, o):
+                label = (
+                    f"{hooks.veil_look_tag()} "
+                    f"{_display_name(o, viewer=character)}"
+                )
+                souls.append(
+                    hooks.room_presence_line(
+                        label, o, room, game, viewer=character,
+                    )
+                )
+            continue
+        if _is_presence_hidden(character, o):
+            continue
+        label = _display_name(o, viewer=character)
+        souls.append(
+            hooks.room_presence_line(
+                label, o, room, game, viewer=character,
+            )
+        )
+    if not souls:
+        character.session.send("Nobody else is here.")
+        return
+    if screenreader:
+        out = ["Souls:"]
+        for row in souls:
+            text = style.strip_ansi(str(row)).strip()
+            if text and text[-1] not in ".!?":
+                text = text + "."
+            out.append(f"  {text}")
+        character.session.send("\n".join(out))
+        return
+    character.session.send(
+        "\n".join(style.paint("dark_magenta", str(row)) for row in souls)
+    )
 
 
 def cmd_look(character, args, game, *, after_move=False):
@@ -76,8 +185,13 @@ def cmd_look(character, args, game, *, after_move=False):
 
     stripped = args.strip()
     if stripped:
-        # `look in <thing>` -- body belongings (#49).
+        # `look items` / `look souls` -- section only (#163).
         lower = stripped.lower()
+        section = _LOOK_SECTION_ALIASES.get(lower)
+        if section:
+            _look_room_section(character, game, section)
+            return
+        # `look in <thing>` -- body belongings (#49).
         if lower.startswith("in "):
             _look_in(character, stripped[3:].strip(), game)
             return
@@ -109,8 +223,14 @@ def cmd_look(character, args, game, *, after_move=False):
         return
 
     # Area badge: always area_type (bug #26 -- wilderness is a spawn flag,
-    # never shown as the terrain label). Plain text; color is decoration.
-    area_tag = getattr(room, "area_type", "plains").title()
+    # never shown as the terrain label). Plane + zone may relabel for
+    # spirit/elemental maps and soak venues (docs/plans/area_type_taxonomy.md).
+    from engine import map_ui as map_ui_mod
+    area_tag = map_ui_mod.area_display_label(
+        getattr(room, "plane", None) or "earth",
+        getattr(room, "area_type", "plains"),
+        zone=getattr(room, "zone", None),
+    )
 
     # Client prefs live on the login Mantle even when act focus runs look
     # through a God bilocate twin (bug #196).
@@ -149,6 +269,9 @@ def cmd_look(character, args, game, *, after_move=False):
     revalidate_zone_entry_stamp(character, game)
     stamped_entry = getattr(character, "zone_entry_hub_key", None)
     screenreader = bool(getattr(prefs, "screenreader", False))
+    # Brief auto-look: skip prose (below), ambient weather lines, and
+    # [TRAIL] clutter -- suggestion #115 / SR speed-read.
+    brief_auto = after_move and getattr(prefs, "brief", False)
     if stamped_entry and room.key != stamped_entry:
         if getattr(room, "zone", None) or getattr(room, "zone_exit_to", None):
             if screenreader:
@@ -174,24 +297,26 @@ def cmd_look(character, args, game, *, after_move=False):
     # ordinary sky when active.
     if getattr(room, "outdoor", False):
         from engine import game_calendar
-        eclipse_line = hooks.eclipse_ambient_line(game)
-        if eclipse_line:
-            extras.append(eclipse_line)
-        else:
+        if not brief_auto:
+            eclipse_line = hooks.eclipse_ambient_line(game)
+            if eclipse_line:
+                extras.append(eclipse_line)
+            else:
+                wx_line = hooks.weather_look_clause(
+                    room, game, screenreader=screenreader, character=character,
+                )
+                if wx_line:
+                    extras.append(wx_line)
+                else:
+                    extras.append(game_calendar.format_ambient(game.calendar()))
+    else:
+        # Indoor dampen: precip / storm / tornado may still speak one line.
+        if not brief_auto:
             wx_line = hooks.weather_look_clause(
                 room, game, screenreader=screenreader, character=character,
             )
             if wx_line:
                 extras.append(wx_line)
-            else:
-                extras.append(game_calendar.format_ambient(game.calendar()))
-    else:
-        # Indoor dampen: precip / storm / tornado may still speak one line.
-        wx_line = hooks.weather_look_clause(
-            room, game, screenreader=screenreader, character=character,
-        )
-        if wx_line:
-            extras.append(wx_line)
 
     # Hybrid weather vision (rain / storm / snow / nearby tornado): always
     # an overlay when severe outdoors; chance whiteout hides the rest of
@@ -225,6 +350,8 @@ def cmd_look(character, args, game, *, after_move=False):
     souls = []
     if not whiteout:
         for direction, dest in room.exits.items():
+            if dest is None:
+                continue
             if not hooks.look_exit_visible(dest, game):
                 continue
             if not vision_mod.character_knows_exit(character, room, direction):
@@ -253,7 +380,10 @@ def cmd_look(character, args, game, *, after_move=False):
         floor_item_objs = [
             o for o in room.contents if isinstance(o, Item)
         ]
-        floor_items = floor_item_look_lines(floor_item_objs, character)
+        floor_items = format_floor_items_for_look(
+            floor_item_look_lines(floor_item_objs, character),
+            character,
+        )
         souls = []
         for o in room.contents:
             if o is character:
@@ -328,6 +458,8 @@ def cmd_look(character, args, game, *, after_move=False):
             map_center,
             use_color=getattr(prefs, "use_color", True),
             compact=True,
+            character=character,
+            game=game,
         )
         if rendered:
             local_map_lines = rendered.split("\n")
@@ -356,7 +488,10 @@ def cmd_look(character, args, game, *, after_move=False):
         souls=souls,
         items=floor_items,
         extras=extras or None,
-        width=display_prefs.sheet_width(prefs),
+        width=style.layout_width(
+            character=character,
+            session=getattr(character, "session", None),
+        ),
         screenreader=bool(getattr(prefs, "screenreader", False)),
         local_map_lines=local_map_lines,
         exits_verbose=bool(getattr(prefs, "exits_verbose", True)),
@@ -376,8 +511,11 @@ def cmd_look(character, args, game, *, after_move=False):
         character.session.send(fear)
     # Procurer case read / other game tells after bare look.
     for line in hooks.after_bare_look(character, room, game):
-        if line:
-            character.session.send(line)
+        if not line:
+            continue
+        if brief_auto and str(line).strip().startswith("[TRAIL]"):
+            continue
+        character.session.send(line)
     # Blank before the custom prompt comes from send_prompt (dispatch),
     # not here -- avoid double-spacing after look.
     # GMCP Room.Info -- also covers auto-look after move (_move_one).
@@ -419,6 +557,8 @@ def maybe_map_after_move(character, game):
         map_center,
         use_color=getattr(prefs, "use_color", True),
         compact=True,
+        character=character,
+        game=game,
     )
     if rendered:
         character.session.send(rendered.replace("\n", "\r\n"))
@@ -451,6 +591,8 @@ def cmd_exits(character, args, game):
         return
     lines = []
     for direction, dest in (room.exits or {}).items():
+        if dest is None:
+            continue
         if not hooks.look_exit_visible(dest, game):
             continue
         if not vision_mod.character_knows_exit(character, room, direction):
@@ -576,7 +718,11 @@ def cmd_map(character, args, game):
     # primary signal either way (section 8 a11y).
     room = _local_map_center_room(character, game)
     rendered = maps_mod.render_local_map(
-        game.rooms, room, use_color=use_color
+        game.rooms,
+        room,
+        use_color=use_color,
+        character=character,
+        game=game,
     )
     if rendered is None:
         character.session.send(
@@ -743,7 +889,8 @@ def _directional_map_lines(character, game):
     visible = [
         (direction, dest.look_title())
         for direction, dest in exits.items()
-        if hooks.look_exit_visible(dest, game)
+        if dest is not None
+        and hooks.look_exit_visible(dest, game)
         and vision_mod.character_knows_exit(character, room, direction)
     ]
     if not visible:
@@ -787,7 +934,41 @@ def _look_at(character, query):
             character.session.send(line)
         return True
 
-    # Carried inventory first -- tactile even in pitch dark (you know what
+    room = character.location
+    can_see = vision_mod.can_see_room(character, room)
+
+    # When you can see the room, people here beat carried kit on substring
+    # collisions (bug #344: ``look Mira`` must not hit a ``mirror`` in pack).
+    # Inventory still wins in pitch dark -- tactile examine of what you hold.
+    if can_see:
+        target = _find_character(
+            query, room.characters(), self_character=character,
+        )
+        if target and _is_presence_hidden(character, target):
+            # Section 6 spirit-sight + living Reaper Mantle veil: same rule
+            # cmd_look's souls list applies -- you can't examine what you
+            # can't perceive.
+            target = None
+        if target:
+            # Viewer-relative header + body so hood / unintroduced never leak
+            # login keys or unique setdesc text to strangers.
+            from engine import hooks
+            header = _display_name(target, viewer=character)
+            body = hooks.look_body_for(character, target)
+            if body is None:
+                body = target.description
+            character.session.send(f"{header}\r\n{body}")
+            for line in hooks.look_extra_lines(character, target):
+                character.session.send(line)
+            # One-sided relationship quirk (asymmetric tags) -- private, rare.
+            # (hook -- no-op / None without a game installed; Phase 2 purity.)
+            if target is not character and getattr(character, "session", None):
+                quirk = hooks.look_quirk(character, target)
+                if quirk:
+                    character.session.send(quirk)
+            return True
+
+    # Carried inventory -- tactile even in pitch dark (you know what
     # you are holding). Floor loot waits until vision clears below.
     item = _find_item(query, character.inventory, character=character)
     if item:
@@ -797,8 +978,7 @@ def _look_at(character, query):
         hooks.after_look_item(character, item, game)
         return True
 
-    room = character.location
-    if not vision_mod.can_see_room(character, room):
+    if not can_see:
         # Handled: examine must not fall through to "You don't see that."
         character.session.send(
             "It is pitch dark. You can't make that out."
@@ -827,33 +1007,6 @@ def _look_at(character, query):
         from engine import hooks
         game = getattr(getattr(character, "session", None), "game", None)
         hooks.after_look_item(character, item, game)
-        return True
-
-    target = _find_character(
-        query, room.characters(), self_character=character,
-    )
-    if target and _is_presence_hidden(character, target):
-        # Section 6 spirit-sight + living Reaper Mantle veil: same rule
-        # cmd_look's souls list applies -- you can't examine what you
-        # can't perceive.
-        target = None
-    if target:
-        # Viewer-relative header + body so hood / unintroduced never leak
-        # login keys or unique setdesc text to strangers.
-        from engine import hooks
-        header = _display_name(target, viewer=character)
-        body = hooks.look_body_for(character, target)
-        if body is None:
-            body = target.description
-        character.session.send(f"{header}\r\n{body}")
-        for line in hooks.look_extra_lines(character, target):
-            character.session.send(line)
-        # One-sided relationship quirk (asymmetric tags) -- private, rare.
-        # (hook -- no-op / None without a game installed; Phase 2 purity.)
-        if target is not character and getattr(character, "session", None):
-            quirk = hooks.look_quirk(character, target)
-            if quirk:
-                character.session.send(quirk)
         return True
 
     return False
@@ -1460,9 +1613,12 @@ def cmd_say(character, args, game):
     """Speak to the room. Prefs #24: trailing ? / ! pick asks / exclaims.
 
     D58: optional leading whisper / shout / drawl (``say whisper …``).
+    Bare ``say`` replays recent speech in this room (last 20 lines).
     """
-    if not args:
-        character.session.send("Say what?")
+    from engine import channels
+
+    if not args or not args.strip():
+        channels.replay_room_say(character, game)
         return
     from engine import hooks
     tone, message = hooks.say_strip_tone_prefix(args)
@@ -1523,13 +1679,28 @@ def cmd_emote(character, args, game):
 
     Prefs #25: ``emote 's eyes glow.`` becomes ``Name's eyes glow.``
     D57: ``@name`` and ``$me`` resolve per viewer (``emote pats @erin``).
+    Also: ``@name's``, ``@name/subj|obj|poss``, ``$subj``, ``$obj``, ``$poss``.
     """
     text = (args or "").strip()
     if not text:
         character.session.send("Emote what?")
         return
     from engine import rp_emote
-    rp_emote.broadcast_emote(character, text, game)
+    rp_emote.broadcast_emote(character, text, game, mode="emote")
+
+
+def cmd_smote(character, args, game):
+    """Third-person action with auto subject (``smote grins`` / ``:grins``).
+
+    Same tokens as ``emote``. Strips redundant ``I …`` if you type it anyway.
+    Colon shorthand: ``:waves at @bob.``
+    """
+    text = (args or "").strip()
+    if not text:
+        character.session.send("Smote what?")
+        return
+    from engine import rp_emote
+    rp_emote.broadcast_emote(character, text, game, mode="smote")
 
 
 def cmd_tell(character, args, game):
@@ -1538,12 +1709,20 @@ def cmd_tell(character, args, game):
     exact-name, world-wide lookup GM commands like 'breaktier'/'setgravity'
     already use to target someone outside the room.
 
+    Bare ``tell`` replays your recent tell history (last 20 lines).
+
     An offline Echo (session is None) can't hear anything -- logging off
     doesn't delete a character (systems doc section 4-E), but it does mean
     nobody's there to read a tell. That case gets the SAME message as "no
     such name exists" so a 'tell' can't be used to probe who's an Echo vs.
     who was never a character at all.
     """
+    from engine import channels
+
+    if not args or not args.strip():
+        channels.replay_tells(character)
+        return
+
     parts = args.split(maxsplit=1)
     if len(parts) < 2:
         character.session.send("Tell whom what?")
@@ -1566,6 +1745,15 @@ def cmd_tell(character, args, game):
     target.session.send(f'{speaker_face} tells you, "{message}"')
     character.session.send(f'You tell {target_face}, "{message}"')
     target.session.last_tell_from = character.key
+    from engine import channels
+    channels.append_tell(
+        character.session,
+        f'You tell {target_face}, "{message}"',
+    )
+    channels.append_tell(
+        target.session,
+        f'{speaker_face} tells you, "{message}"',
+    )
     try:
         from engine import rp_transcript as transcript_mod
         transcript_mod.capture(
@@ -1625,20 +1813,13 @@ def cmd_ooc(character, args, game):
     a short ring — not a forever chat log.
     """
     from engine import display_prefs
-    from engine import channel_history
+    from engine import channels
     from engine import ooc_channel
     display_prefs.ensure_display_defaults(character)
 
     # Bare `ooc` -- replay the global ring buffer instead of usage nag.
     if not args or not args.strip():
-        if channel_history.is_empty(game, "ooc"):
-            channel_history.send_empty_hint(character, "ooc")
-            return
-        channel_history.send_replay_header(character, "ooc")
-        for entry in channel_history.entries(game, "ooc"):
-            line = channel_history.render_ooc_entry(entry, character, game)
-            character.session.send(line)
-        character.session.send("")
+        channels.replay_global(character, game, "ooc")
         return
 
     message = args.strip()
@@ -1699,11 +1880,11 @@ def cmd_who(character, args, game):
 
 
 def cmd_brief(character, args, game):
-    """brief [on|off] -- skip room prose after moves (classic MUD brief).
+    """brief [on|off] -- skip room clutter after moves (classic MUD brief).
 
     Bare ``brief`` toggles. Same pref as ``config brief``. Explicit
-    ``look`` always shows the full description; only auto-look after a
-    walk skips prose when brief is on.
+    ``look`` always shows the full description; auto-look after a walk
+    skips prose, weather sky lines, and [TRAIL] tracking when brief is on.
     """
     from engine import display_prefs
     display_prefs.ensure_display_defaults(character)
@@ -1726,8 +1907,8 @@ def cmd_brief(character, args, game):
         return
     if character.brief:
         character.session.send(
-            "Brief on -- room descriptions skip after you move; "
-            "type look for the full prose."
+            "Brief on -- after you move, room prose, weather lines, and "
+            "trail clutter are skipped; type look for the full room."
         )
     else:
         character.session.send(
@@ -2031,8 +2212,8 @@ def cmd_config(character, args, game):
         if choice in ("on", "yes", "true", "1"):
             character.brief = True
             character.session.send(
-                "Brief on -- room descriptions skip after you move; "
-                "type look for the full prose."
+                "Brief on -- after you move, room prose, weather lines, and "
+                "trail clutter are skipped; type look for the full room."
             )
         elif choice in ("off", "no", "false", "0"):
             character.brief = False
@@ -2124,8 +2305,7 @@ def cmd_config(character, args, game):
         if not rest:
             state = "on" if character.show_combat_tags else "off"
             character.session.send(
-                f"Combat tags are {state} "
-                "(screenreader always shows them). "
+                f"Combat tags are {state}. "
                 "Usage: config combattags on|off"
             )
             return
@@ -2137,18 +2317,44 @@ def cmd_config(character, args, game):
             )
         elif choice in ("off", "no", "false", "0"):
             character.show_combat_tags = False
-            if character.screenreader:
-                character.session.send(
-                    "Combat tags pref off, but screenreader mode still "
-                    "shows tags (a11y)."
-                )
-            else:
-                character.session.send(
-                    "Combat tags off -- cinematic combat without "
-                    "[DMG]/[HIT] prefixes."
-                )
+            character.session.send(
+                "Combat tags off -- cinematic combat without "
+                "[DMG]/[HIT] prefixes."
+            )
         else:
             character.session.send("Usage: config combattags on|off")
+        return
+    if key == "items":
+        sub = (rest or "").split(None, 1)
+        subkey = sub[0].lower() if sub else ""
+        subrest = sub[1] if len(sub) > 1 else ""
+        if subkey in ("compact", "floor", "flooritems"):
+            if not subrest:
+                state = (
+                    "on" if getattr(character, "compact_floor_items", False)
+                    else "off"
+                )
+                character.session.send(
+                    f"Compact floor items are {state}. "
+                    "Usage: config items compact on|off"
+                )
+                return
+            choice = subrest.split(None, 1)[0].lower()
+            if choice in ("on", "yes", "true", "1"):
+                character.compact_floor_items = True
+                character.session.send(
+                    "Floor items compact on -- look lists loot in one "
+                    "paragraph."
+                )
+            elif choice in ("off", "no", "false", "0"):
+                character.compact_floor_items = False
+                character.session.send(
+                    "Floor items compact off -- each stack on its own line."
+                )
+            else:
+                character.session.send("Usage: config items compact on|off")
+            return
+        character.session.send("Usage: config items compact on|off")
         return
     if key == "autokill":
         handler = hooks.config_handler("autokill")
@@ -2355,10 +2561,9 @@ def _config_status_lines(character):
         "12h" if getattr(character, "time_format", "24h") == "12h" else "24h"
     )
     tags_state = "on" if character.show_combat_tags else "off"
-    if character.screenreader:
-        tags_note = f"{tags_state} (forced on while screenreader)"
-    else:
-        tags_note = tags_state
+    items_compact = (
+        "on" if getattr(character, "compact_floor_items", False) else "off"
+    )
     lines = [
         "Config -- client and display preferences.",
         "Type config <setting> … to change. Short verbs still work.",
@@ -2377,7 +2582,9 @@ def _config_status_lines(character):
         f"  maplook: {'on' if character.map_on_look else 'off'}  "
         "-- config maplook on|off (embed map in look)",
         f"  brief: {'on' if getattr(character, 'brief', False) else 'off'}  "
-        "-- config brief on|off (skip prose after move; look for full)",
+        "-- config brief on|off (skip prose/weather/trail after move; look for full)",
+        f"  items: compact {items_compact}  "
+        "-- config items compact on|off (floor loot paragraph)",
         f"  mapmove: {'on' if character.map_on_move else 'off'}  "
         "-- config mapmove on|off (map after each move)",
         f"  drivemap: "
@@ -2395,7 +2602,7 @@ def _config_status_lines(character):
         f"  combatgag: "
         f"{'on' if character.combat_gag_other else 'off'}  "
         "-- config combatgag on|off",
-        f"  combattags: {tags_note}  -- config combattags on|off",
+        f"  combattags: {tags_state}  -- config combattags on|off",
         f"  autokill: "
         f"{'on' if getattr(character, 'autokill', False) else 'off'}  "
         "-- config autokill on|off (dungeon fodder KO finish)",
@@ -2537,19 +2744,20 @@ def cmd_account(character, args, game):
             account.features_suggested = suggests
         except Exception:
             pass
-        faces = []
-        for key in account.character_keys:
+        roster_lines = []
+        for key in accounts_mod.roster_character_keys(game, account):
             finder = getattr(game, "find_login_character", None)
             body = finder(key) if callable(finder) else None
             if body is None:
                 body = game.find_character(key)
-            if body is not None:
-                faces.append(_presence_face(body))
-            else:
-                faces.append(key)
+            from engine import hooks as hooks_mod
+
+            label = hooks_mod.account_roster_label_for(game, key, body)
+            roster_lines.append(f"    {label}")
         lines = [
             f"Account: {account.display_name}",
-            f"  Characters: {', '.join(faces) or '(none)'}",
+            "  Characters:",
+            *(roster_lines or ["    (none)"]),
             f"  OOC name: {account.ooc_identity} "
             f"(config oocname account|character)",
             f"  Bugs squashed: {int(account.bugs_squashed or 0)} "
@@ -2691,10 +2899,65 @@ def cmd_account(character, args, game):
     if sub in ("oocname", "ooc"):
         return cmd_config(character, f"oocname {rest}".strip(), game)
 
+    if sub == "discord":
+        return _cmd_account_discord(character, rest, game, account)
+
     character.session.send(
         "Usage: account | account create <name> <password> | "
-        "account link <name> <password> | account oocname …  "
+        "account link <name> <password> | account discord link|unlink | "
+        "account oocname …  "
         "See 'help account'."
+    )
+
+
+def _cmd_account_discord(character, rest, game, account):
+    """account discord [link|unlink|status] -- Discord OOC bridge."""
+    import time
+
+    from engine import discord_ooc_links
+
+    if account is None:
+        character.session.send(
+            "Link a MUD account first (account create / account link). "
+            "See 'help account'."
+        )
+        return
+    sub = (rest or "").strip().lower()
+    if sub in ("", "status", "show"):
+        character.session.send(
+            discord_ooc_links.status_for_account(game, account.name)
+        )
+        return
+    if sub == "link":
+        try:
+            display, _code, expires = discord_ooc_links.generate_link_code(
+                account.name
+            )
+        except ValueError as exc:
+            character.session.send(str(exc))
+            return
+        mins = max(1, int((expires - time.time()) // 60))
+        character.session.send(
+            "Discord link code (one-time, expires in "
+            f"{mins} min):\r\n"
+            f"  {display}\r\n"
+            "In Discord #ooc, post:\r\n"
+            f"  !link {display}\r\n"
+            "or use slash /link with that code."
+        )
+        return
+    if sub == "unlink":
+        removed = discord_ooc_links.unlink_account(account.name)
+        if removed:
+            character.session.send(
+                f"Discord unlinked ({removed} mapping(s) removed)."
+            )
+        else:
+            character.session.send("Discord was not linked.")
+        return
+    character.session.send(
+        "Usage: account discord  |  account discord link  |  "
+        "account discord unlink"
     )
 
 
@@ -2875,25 +3138,13 @@ def cmd_date(character, args, game):
 
 
 # Undated Unreleased bullets keep a sentinel date for display only.
-# Player-facing sort is date descending, then ``#N`` id, then file_index.
-#
-# A same-day sort keyed on the hidden ship timestamp (``sort_ts``) instead
-# of ``#N`` shipped briefly (2026-08-04) to fix a theoretical same-day
-# merge-race, but made the *visible* ``[n]`` stamps look scrambled in
-# practice: ``#N`` is allocated per-worktree at authoring time (parallel
-# feature branches each fetch "next id" from their own stale snapshot of
-# ``main``), so id order was never a reliable proxy for real ship order in
-# the first place -- sorting by the truth (``sort_ts``) just made that
-# pre-existing unreliability visible as ids bouncing around non-
-# monotonically in the list, which players found confusing/slow to skim
-# ("neat but time-consuming to go through"). Reverted: ``#N`` id is once
-# again the same-day tie-break, so what a player sees is always
-# monotonically descending top to bottom. ``sort_ts`` is still parsed and
-# still used to break genuine id *collisions* at load time (two different
-# bullets that reused the same ``#N``) -- see
-# ``_dedupe_changelog_entries_by_id`` -- just not as the primary display
-# order.
+# List order is **only** the UTC ship timestamp (``sort_ts`` from
+# ``changelog_stamp.py --prefix``), then fragment slug, then file_index.
+# Legacy bullets may still carry an optional hidden ``#N`` id for old
+# ``changes detail <n>`` bookmarks; new ships omit ``#N`` entirely.
+# Read/unread watermarks use ``sort_ts`` (``last_seen_changelog_sort_ts``).
 _CHANGELOG_UNDATED = "0001-01-01"
+_CHANGELOG_WM_MIN = "0000-00-00T00:00:00Z"
 
 # Hidden change id at the start of a bold lead-in: ``#042 2026-07-16 — …``.
 # Zero-padding is optional (``#42`` and ``#042`` both parse). Players never
@@ -2963,107 +3214,298 @@ def _strip_changelog_stamps(text):
 
 
 def _changelog_sort_key(entry):
-    """Sort key for ``changes``: newest date, then highest ``#N``, then file.
-
-    Returns a tuple suitable for ``sort(..., reverse=True)``. Calendar
-    ``date`` is the primary key (not the hidden ``sort_ts`` -- see the
-    comment above ``_CHANGELOG_UNDATED`` for why); ``#N`` id is the
-    same-day tie-break, which keeps every visible ``[n]`` stamp
-    monotonically descending top to bottom. Undated entries sink via
-    ``_CHANGELOG_UNDATED``.
-    """
+    """Sort key for ``changes``: newest ``sort_ts``, then slug, then file_index."""
     date = entry.get("date") or _CHANGELOG_UNDATED
-    change_id = entry.get("id") or 0
+    sort_ts = entry.get("sort_ts") or _changelog_sort_ts_from_date(date)
+    slug = (entry.get("slug") or "").lower()
     file_index = entry.get("file_index") or 0
-    return (date, change_id, file_index)
+    return (sort_ts, slug, file_index)
 
 
-def _changelog_entry_by_id(entries, change_id):
-    """Return the Unreleased entry whose stamped ``#N`` matches *change_id*."""
+def _changelog_display_stamp(entry):
+    """Player-facing timestamp stamp for list/detail headers."""
+    sort_ts = entry.get("sort_ts") or ""
+    if sort_ts and not sort_ts.startswith(_CHANGELOG_UNDATED):
+        if "T" in sort_ts:
+            date, time_part = sort_ts.split("T", 1)
+            return f"{date} {time_part[:5]}"
+        return sort_ts[:10]
+    date = entry.get("date") or _CHANGELOG_UNDATED
+    if date == _CHANGELOG_UNDATED:
+        return ""
+    return date
+
+
+def _changelog_entry_by_legacy_id(entries, change_id):
+    """Return the Unreleased entry whose legacy stamped ``#N`` matches."""
     for entry in entries:
         if entry.get("id") == change_id:
             return entry
     return None
 
 
-def _dedupe_changelog_entries_by_id(entries):
-    """Keep one in-game row per stamped ``#N`` when parallel PRs raced the id.
+def _changelog_entry_by_id(entries, change_id):
+    """Legacy alias — prefer ``_changelog_resolve_ref`` for new lookups."""
+    return _changelog_entry_by_legacy_id(entries, change_id)
 
-    Load-time safety net: the **newest** ``sort_ts`` wins so a fresh ship that
-    accidentally reused an older ``#N`` still appears in ``changes`` (older
-    keepers are not silently preferred). Ties break on highest ``file_index``.
 
-    On-disk repair still uses ``tools/changelog_dedupe_ids.py --apply``
-    (earliest ``sort_ts`` keeps the shared id; losers get fresh high ids) so
-    both ships remain listable after a hygiene pass. Entries without an id
-    (``0``) are kept as-is.
+def _changelog_resolve_ref(entries, ref):
+    """Resolve a ``changes detail`` reference to one loaded entry.
+
+    Accepts (in order): legacy numeric ``#N``, full/partial ``sort_ts``,
+    calendar date when unique, or a ``CHANGELOG.d`` fragment slug.
+    """
+    token = (ref or "").strip()
+    if not token:
+        return None
+    if token.startswith("#"):
+        token = token[1:].strip()
+    if token.isdigit():
+        legacy = _changelog_entry_by_legacy_id(entries, int(token))
+        if legacy is not None:
+            return legacy
+    token_lower = token.lower().replace(".md", "")
+    for entry in entries:
+        slug = (entry.get("slug") or "").lower()
+        if slug and slug == token_lower:
+            return entry
+    ref_norm = token.replace(" ", "T")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", ref_norm):
+        ref_norm = f"{ref_norm}T00:00:00Z"
+    elif re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", token):
+        date_part, time_part = token.split(" ", 1)
+        ref_norm = f"{date_part}T{time_part}:00Z"
+    elif re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", ref_norm):
+        ref_norm = f"{ref_norm}:00Z"
+    elif re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", ref_norm):
+        ref_norm = f"{ref_norm}Z"
+    exact = []
+    prefix = []
+    for entry in entries:
+        sort_ts = entry.get("sort_ts") or ""
+        if not sort_ts:
+            continue
+        if sort_ts == ref_norm:
+            exact.append(entry)
+        elif sort_ts.startswith(ref_norm):
+            prefix.append(entry)
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        exact.sort(key=_changelog_sort_key, reverse=True)
+        return exact[0]
+    if len(prefix) == 1:
+        return prefix[0]
+    if len(prefix) > 1:
+        prefix.sort(key=_changelog_sort_key, reverse=True)
+        return prefix[0]
+    day_match = re.fullmatch(r"\d{4}-\d{2}-\d{2}", token)
+    if day_match:
+        day = day_match.group(0)
+        day_hits = [
+            entry for entry in entries
+            if (entry.get("date") or "").startswith(day)
+            or (entry.get("sort_ts") or "").startswith(day)
+        ]
+        if len(day_hits) == 1:
+            return day_hits[0]
+    return None
+
+
+# Default ``changes`` / ``changes list`` size and the largest list scrollback.
+_CHANGES_DEFAULT_LIMIT = 10
+_CHANGES_MAX_LIST_COUNT = 100
+
+
+def _changes_open_numeric_entry(entries, n):
+    """Resolve bare ``changes <n>`` to the nth newest visible ship.
+
+    ``1`` = newest, ``2`` = second-newest, matching the list order players
+    see in ``changes all``. Does **not** look up legacy stamped ``#N`` ids —
+    those stay on ``changes detail <id>`` / ``changes #<id>`` so a short
+    token like ``2`` never opens the wrong ship (bug #378).
+    """
+    if n <= 0 or not entries:
+        return None
+    if 1 <= n <= len(entries):
+        return entries[n - 1]
+    return None
+    legacy = _changelog_entry_by_legacy_id(detail_entries, n)
+    if legacy is not None:
+        return legacy
+    if entries and 1 <= n <= len(entries):
+        return entries[n - 1]
+    return None
+
+
+def _changes_send_detail(character, game, entry, *, is_gm=False):
+    """Show one changelog entry's full text and bump the read watermark."""
+    if entry is None:
+        character.session.send("No matching change entry.")
+        return
+    body = _changelog_detail_body(entry)
+    character.session.send(
+        f"{_format_changes_detail_prefix(entry, is_gm=is_gm)} {body}".strip()
+    )
+    _changes_watermark_bump(game, character, entry.get("sort_ts"))
+
+
+def _dedupe_changelog_entries_by_slug(entries):
+    """Keep one in-game row per fragment slug (``CHANGELOG.d/<slug>.md``).
+
+    Parallel PRs should use unique fragment paths; if two bullets share a
+    slug, the newest ``sort_ts`` wins.
     """
     if not entries:
         return entries
-    by_id = {}
-    no_id = []
+    by_slug = {}
+    no_slug = []
     for entry in entries:
-        change_id = entry.get("id") or 0
-        if not change_id:
-            no_id.append(entry)
+        slug = (entry.get("slug") or "").strip().lower()
+        if not slug:
+            no_slug.append(entry)
             continue
-        # Newest sort_ts first; later file_index breaks ties.
-        keeper_key = (
-            entry.get("sort_ts") or _changelog_sort_ts_from_date(
-                entry.get("date") or _CHANGELOG_UNDATED,
-            ),
-            entry.get("file_index") or 0,
-        )
-        existing = by_id.get(change_id)
-        if existing is None:
-            by_id[change_id] = entry
-            continue
-        existing_key = (
-            existing.get("sort_ts") or _changelog_sort_ts_from_date(
-                existing.get("date") or _CHANGELOG_UNDATED,
-            ),
-            existing.get("file_index") or 0,
-        )
-        if keeper_key > existing_key:
-            by_id[change_id] = entry
-    deduped = list(by_id.values()) + no_id
+        existing = by_slug.get(slug)
+        if existing is None or _changelog_sort_key(entry) > _changelog_sort_key(existing):
+            by_slug[slug] = entry
+    deduped = list(by_slug.values()) + no_slug
     deduped.sort(key=_changelog_sort_key, reverse=True)
     return deduped
 
 
-def _format_changes_list_prefix(entry):
-    """``[id]`` plus optional ``[Category]`` when Keep-a-Changelog set one.
-
-    Fragment files under ``CHANGELOG.d/`` usually omit ``### Fixed`` headings,
-    so an empty category must not render as bare ``[]``.
-    """
-    stamp = entry.get("id") or 0
+def _format_changes_list_prefix(entry, *, is_gm=False, unread=False):
+    """Timestamp stamp, optional GM audience tags, optional category, unread *."""
+    stamp = _changelog_display_stamp(entry)
+    tags, _summary = _changelog_strip_leading_tags(entry.get("summary") or "")
+    aud = _changelog_audience_tag_labels(tags, is_gm=is_gm)
     category = (entry.get("category") or "").strip()
+    star = "*" if unread else ""
+    parts = []
+    if stamp:
+        parts.append(f"{star}{stamp}" if star else stamp)
+    elif star:
+        parts.append(star)
+    parts.extend(aud)
     if category:
-        return f"[{stamp}] [{category}]"
-    return f"[{stamp}]"
+        parts.append(f"[{category}]")
+    return " ".join(parts)
 
 
-def _parse_unreleased_entries(lines, *, fragment=False, file_index_start=0):
+def _format_changes_detail_prefix(entry, *, is_gm=False):
+    """Detail header: timestamp + optional GM tags/category (no unread star)."""
+    return _format_changes_list_prefix(entry, is_gm=is_gm, unread=False)
+
+
+def _changes_watermark_holder(game, character):
+    """Account (preferred) or character blob that stores the read watermark."""
+    from engine import accounts as accounts_mod
+
+    account = accounts_mod.account_for_character(game, character)
+    return account if account is not None else character
+
+
+def _changes_watermark_persist(game, character):
+    """Queue watermark for incremental save — never full ``game.save()`` here.
+
+    A full world snapshot on every ``changes`` list was multi-second on live
+  (autosave contention). Watermark loss before the next autosave only re-shows
+  ``*`` on one entry.
+    """
+    holder = _changes_watermark_holder(game, character)
+    if holder is None:
+        return
+    try:
+        from engine.persistence import mark_account_dirty, mark_character_dirty
+
+        if hasattr(holder, "password_hash"):
+            mark_account_dirty(game, holder)
+        else:
+            mark_character_dirty(game, holder)
+    except Exception:
+        pass
+
+
+def _changes_watermark_get(game, character):
+    """Return the newest ``sort_ts`` this viewer has already read."""
+    holder = _changes_watermark_holder(game, character)
+    if holder is None:
+        return _CHANGELOG_WM_MIN
+    sort_ts = str(getattr(holder, "last_seen_changelog_sort_ts", "") or "").strip()
+    if sort_ts:
+        return sort_ts
+    old_id = int(getattr(holder, "last_seen_changelog_id", 0) or 0)
+    if old_id > 0:
+        legacy = _changelog_entry_by_legacy_id(_load_unreleased_entries(), old_id)
+        if legacy and legacy.get("sort_ts"):
+            holder.last_seen_changelog_sort_ts = legacy["sort_ts"]
+            _changes_watermark_persist(game, character)
+            return legacy["sort_ts"]
+    return _CHANGELOG_WM_MIN
+
+
+def _changes_watermark_bump(game, character, sort_ts):
+    """Raise the read watermark to at least *sort_ts* and queue persistence."""
+    target = str(sort_ts or "").strip()
+    if not target or target <= _CHANGELOG_WM_MIN:
+        return
+    holder = _changes_watermark_holder(game, character)
+    if holder is None:
+        return
+    current = str(getattr(holder, "last_seen_changelog_sort_ts", "") or "").strip()
+    if not current:
+        old_id = int(getattr(holder, "last_seen_changelog_id", 0) or 0)
+        if old_id > 0:
+            legacy = _changelog_entry_by_legacy_id(_load_unreleased_entries(), old_id)
+            current = (legacy or {}).get("sort_ts") or _CHANGELOG_WM_MIN
+    if target <= current:
+        return
+    holder.last_seen_changelog_sort_ts = target
+    _changes_watermark_persist(game, character)
+
+
+def _changes_watermark_bump_entries(game, character, entries):
+    """Mark every displayed entry (and any older timestamps) as read."""
+    if not entries:
+        return
+    peak = max(
+        (entry.get("sort_ts") or _CHANGELOG_WM_MIN for entry in entries),
+        default=_CHANGELOG_WM_MIN,
+    )
+    _changes_watermark_bump(game, character, peak)
+
+
+def _changes_unread_entries(entries, watermark):
+    """Entries with a ``sort_ts`` strictly newer than *watermark*."""
+    wm = str(watermark or _CHANGELOG_WM_MIN)
+    return [
+        entry for entry in entries
+        if (entry.get("sort_ts") or _CHANGELOG_WM_MIN) > wm
+    ]
+
+
+def _changes_render_list_lines(
+    character, entries, *, title, watermark, flag_unread=False, is_gm=False,
+):
+    """Build the multi-line body for a ``changes`` list subcommand."""
+    lines_out = [title]
+    for entry in entries:
+        entry_ts = entry.get("sort_ts") or _CHANGELOG_WM_MIN
+        unread = flag_unread and entry_ts > watermark
+        prefix = _format_changes_list_prefix(
+            entry, is_gm=is_gm, unread=unread,
+        )
+        summary = _changelog_display_summary(entry.get("summary") or "")
+        lines_out.append(f"  {prefix} {summary}")
+    return lines_out
+
+
+def _parse_unreleased_entries(
+    lines, *, fragment=False, file_index_start=0, slug="",
+):
     """Parse Unreleased bullets from CHANGELOG.md or a CHANGELOG.d fragment.
 
-    Each entry is a dict::
-
-        {"category", "id", "date", "sort_ts", "summary", "full", "file_index"}
-
-    ``id`` is the hidden monotonic ``#N`` stamp (``0`` if missing).
-    ``date`` is ``YYYY-MM-DD`` for player display (or ``_CHANGELOG_UNDATED``).
-    ``sort_ts`` is ``YYYY-MM-DDTHH:MM:SSZ``, parsed but not used for the
-    primary display order (see ``_changelog_sort_key``); it still breaks
-    genuine ``#N`` collisions at load time.
-
-    When ``fragment`` is True, the whole file is treated as Unreleased body
-    (no ``## [Unreleased]`` heading required) so parallel PR fragment files
-    can hold one bullet each without editing CHANGELOG.md.
-
-    Entries are sorted newest ``date`` first, then ``id`` descending, so
-    every visible ``[n]`` stamp in ``changes`` reads monotonically top to
-    bottom.
+    Each entry is a dict with ``category``, optional legacy ``id``, ``date``,
+    ``sort_ts``, ``summary``, ``full``, ``file_index``, and ``slug``.
     """
     entries = []
     # Fragments are Unreleased-only files; the monolith uses a section gate.
@@ -3124,6 +3566,7 @@ def _parse_unreleased_entries(lines, *, fragment=False, file_index_start=0):
                 "summary": summary,
                 "full": [bullet],
                 "file_index": file_index,
+                "slug": slug,
             }
             entries.append(current)
             file_index += 1
@@ -3136,7 +3579,7 @@ def _parse_unreleased_entries(lines, *, fragment=False, file_index_start=0):
         if current is not None and stripped:
             current["full"].append(stripped)
 
-    # Newest date first; highest id wins same-day ties; undated sink.
+    # Newest ship timestamp first; slug/file_index break ties.
     entries.sort(key=_changelog_sort_key, reverse=True)
     return entries
 
@@ -3160,12 +3603,81 @@ def _read_changelog_text(path):
         return raw.decode("cp1252")
 
 
-def _load_unreleased_entries(repo_root=None):
-    """Load Unreleased entries from CHANGELOG.md plus CHANGELOG.d/*.md.
+_CHANGELOG_CACHE = None  # (cache_key_tuple, entries_list)
 
-    Legacy bullets stay in CHANGELOG.md. New ships add a unique fragment
-    under CHANGELOG.d/ so parallel PRs never conflict on Unreleased lines.
+
+def _changelog_index_cache_key(root):
+    """Cache key for compiled index + live source file count.
+
+    ``stat`` on the index alone is not enough: auto-deploy can overlay new
+    ``CHANGELOG.d`` fragments without rebuilding ``changelog_index.json``,
+    leaving index mtime/size unchanged while ships go missing from ``changes``.
+    A cheap ``listdir`` count busts that case without parsing 1600+ files.
     """
+    from engine import changelog_index as changelog_index_mod
+
+    path = changelog_index_mod.index_path(root)
+    try:
+        st = os.stat(path)
+        index_key = ("index", st.st_mtime_ns, st.st_size)
+    except OSError:
+        index_key = ("none",)
+    source_count = changelog_index_mod.changelog_source_file_count(root)
+    return index_key + (source_count,)
+
+
+def _load_unreleased_entries(repo_root=None):
+    """Load Unreleased entries for in-game ``changes``.
+
+    Fast path: read ``content/changelog_index.json`` when its baked-in source
+    file count matches live ``CHANGELOG`` sources. Slow path: parse markdown
+    when the index is missing or stale, then self-heal by rewriting the index
+    when the tree is writable (live bind-mount / local dev).
+    """
+    global _CHANGELOG_CACHE
+    root = repo_root or _changelog_repo_root()
+    cache_key = _changelog_index_cache_key(root)
+    if _CHANGELOG_CACHE is not None and _CHANGELOG_CACHE[0] == cache_key:
+        return _CHANGELOG_CACHE[1]
+
+    from engine import changelog_index as changelog_index_mod
+
+    entries = None
+    index_path = changelog_index_mod.index_path(root)
+    if cache_key[0] == "index" and not changelog_index_mod.index_likely_stale(root):
+        entries = changelog_index_mod.load_index_file(index_path)
+
+    if entries is None:
+        changelog_index_mod.ensure_compiled_index(root)
+        entries = changelog_index_mod.load_index_file(index_path)
+        if entries is None:
+            entries = _load_changelog_entries_from_sources(root)
+        cache_key = _changelog_index_cache_key(root)
+
+    _CHANGELOG_CACHE = (cache_key, entries)
+    return entries
+
+
+def _changelog_signature(root):
+    """File mtimes for CHANGELOG.md + CHANGELOG.d fragments (builder / CI only)."""
+    paths = [os.path.join(root, "CHANGELOG.md")]
+    frag_dir = os.path.join(root, "CHANGELOG.d")
+    if os.path.isdir(frag_dir):
+        for name in sorted(os.listdir(frag_dir)):
+            if name.endswith(".md") and name.lower() != "readme.md":
+                paths.append(os.path.join(frag_dir, name))
+    sig = []
+    for path in paths:
+        try:
+            st = os.stat(path)
+            sig.append((path, st.st_mtime_ns, st.st_size))
+        except OSError:
+            sig.append((path, None, None))
+    return tuple(sig)
+
+
+def _load_changelog_entries_from_sources(repo_root=None):
+    """Parse CHANGELOG.md + CHANGELOG.d/*.md (slow path; used by index builder)."""
     root = repo_root or _changelog_repo_root()
     entries = []
     file_index = 0
@@ -3182,18 +3694,19 @@ def _load_unreleased_entries(repo_root=None):
 
     frag_dir = os.path.join(root, "CHANGELOG.d")
     if os.path.isdir(frag_dir):
-        # Stable order for file_index tie-breaks; sort key still id-desc.
         names = sorted(
             n for n in os.listdir(frag_dir)
             if n.endswith(".md") and n.lower() != "readme.md"
         )
         for name in names:
             path = os.path.join(frag_dir, name)
+            slug = os.path.splitext(name)[0]
             try:
                 frag_entries = _parse_unreleased_entries(
                     _read_changelog_text(path).splitlines(keepends=True),
                     fragment=True,
                     file_index_start=file_index,
+                    slug=slug,
                 )
             except OSError:
                 continue
@@ -3201,37 +3714,118 @@ def _load_unreleased_entries(repo_root=None):
             file_index += len(frag_entries)
 
     entries.sort(key=_changelog_sort_key, reverse=True)
-    return _dedupe_changelog_entries_by_id(entries)
+    return _dedupe_changelog_entries_by_slug(entries)
+
+
+from engine.changelog_audience import (
+    audience_tag_labels as _changelog_audience_tag_labels,
+    display_summary as _changelog_display_summary,
+    strip_leading_tags as _changelog_strip_leading_tags,
+    visible_to_viewer as _changelog_visible_to_viewer,
+)
+
+
+def _changes_active_game():
+    """Resolved active game package for this process (lazy ``game_select``)."""
+    import game_select
+    return game_select.game_name()
+
+
+def _filter_changelog_entries_for_viewer(entries, character, *, mode="player"):
+    """Drop bullets outside this game's audience and listing mode.
+
+    ``mode`` controls staff-only visibility:
+
+    - ``player`` (default) — hide ``[ops]`` / ``[docs]`` / ``[easter]`` and
+      maintainer heuristics for **everyone**, including on-duty GMs playing the game.
+    - ``ops`` — staff-only bullets for GMs (``changes ops``).
+    - ``detail`` — player feed plus staff-only rows when the viewer is GM
+      (``changes detail <n>`` lookup).
+    """
+    from engine.changelog_audience import entry_is_staff_only, strip_leading_tags
+    from engine.changelog_audience import entry_audience as _entry_audience
+
+    active_game = _changes_active_game()
+    is_gm = _is_gm(character)
+    filtered = []
+    for entry in entries:
+        audience = entry.get("audience")
+        if audience is None:
+            tags, _ = strip_leading_tags(entry.get("summary") or "")
+            aud_set = _entry_audience(tags)
+        else:
+            aud_set = set(audience)
+        if active_game not in aud_set:
+            continue
+        staff_only = entry.get("staff_only")
+        if staff_only is None:
+            staff_only = entry_is_staff_only(entry)
+        if mode == "player" and staff_only:
+            continue
+        if mode == "ops":
+            if not is_gm:
+                continue
+            if not staff_only:
+                continue
+        if mode == "detail" and staff_only and not is_gm:
+            continue
+        filtered.append(entry)
+    return filtered
+
+
+def changes_unread_player_entries(character, game):
+    """Player-visible changelog rows newer than this viewer's watermark."""
+    all_entries = _load_unreleased_entries()
+    player_entries = _filter_changelog_entries_for_viewer(
+        all_entries, character, mode="player",
+    )
+    watermark = _changes_watermark_get(game, character)
+    return _changes_unread_entries(player_entries, watermark)
+
+
+def deliver_changes_unread_on_login(character, game):
+    """One-line MOTD-style nudge when unread player ships exist (Phase C)."""
+    session = getattr(character, "session", None)
+    if session is None:
+        return
+    unread = changes_unread_player_entries(character, game)
+    if not unread:
+        return
+    count = len(unread)
+    latest = unread[0]
+    summary = _changelog_display_summary(latest.get("summary") or "")
+    if len(summary) > 72:
+        summary = summary[:69].rstrip() + "..."
+    if count == 1:
+        session.send(
+            f"[NEWS] 1 unread change since your last visit — {summary} "
+            "(type changes or help changes)"
+        )
+    else:
+        session.send(
+            f"[NEWS] {count} unread changes since your last visit — "
+            f"newest: {summary} (type changes)"
+        )
 
 
 def _changelog_detail_body(entry):
-    """Full text for ``changes detail``, with date shown once (no ``#N``).
-
-    The markdown ``full`` lines still contain the stamped bold lead-in
-    (``#N YYYY-MM-DD — …``); strip both stamps from the first line, then
-    prepend only the parsed date so players never see the hidden id.
-    """
+    """Full text for ``changes detail`` without repeating the timestamp."""
     parts = list(entry.get("full") or [])
     if parts:
-        # First line may be ``**#042 2026-07-16 — Summary.** rest`` or a
-        # multi-line bold that only has the opening ``**`` on this line.
         first = parts[0]
         bold = re.match(r"\*\*(.+?)\*\*(.*)$", first, re.DOTALL)
         if bold:
             _id, _date, _sort_ts, rest_lead = _strip_changelog_stamps(bold.group(1))
+            rest_lead = _changelog_display_summary(rest_lead)
             rebuilt = rest_lead + bold.group(2)
             parts[0] = rebuilt.strip() or rest_lead
         elif first.startswith("**"):
             _id, _date, _sort_ts, remainder = _strip_changelog_stamps(first[2:])
-            parts[0] = remainder
+            parts[0] = _changelog_display_summary(remainder)
         else:
             _id, _date, _sort_ts, remainder = _strip_changelog_stamps(first)
-            parts[0] = remainder
-    body = " ".join(parts).strip()
-    date = entry.get("date") or _CHANGELOG_UNDATED
-    if date == _CHANGELOG_UNDATED:
-        return body
-    return f"{date} {body}".strip()
+            parts[0] = _changelog_display_summary(remainder)
+    return " ".join(parts).strip()
 
 
 def cmd_changes(character, args, game):
@@ -3239,10 +3833,13 @@ def cmd_changes(character, args, game):
     should feed into an in-game 'changes' command like traditional MUDs,"
     instead of players having to go read CHANGELOG.md by hand.
 
-    Reads CHANGELOG.md and CHANGELOG.d/*.md fresh on every call -- no
-    caching. This is a rare, non-performance-critical command (nothing
-    here runs on the tick loop), and the files can change between server
-    restarts anyway, so there's nothing worth caching.
+    Reads ``content/changelog_index.json`` when its source file count matches
+    live ``CHANGELOG`` sources; otherwise parses markdown and rewrites the
+    index when writable. Watermark updates use incremental account/character
+    dirty flags — not a full world save.
+
+    Bare ``changes`` lists **unread** player ships when you have any; otherwise
+    the 10 most recent. Use ``changes all`` for scrollback regardless.
 
     Shows each top-level '- **...**' BULLET under '## [Unreleased]' (plus
     fragment files under CHANGELOG.d/), tagged
@@ -3255,96 +3852,297 @@ def cmd_changes(character, args, game):
     wall of bare "- Fixed"/"- Changed" lines with no actual description
     of what changed.
 
-    Each bullet carries a monotonic ``#N`` id inside the bold lead-in
-    (``**#042 2026-07-16 — Summary.**``). Listing sorts by date
-    descending, then ``#N`` (not Keep-a-Changelog section / file order
-    alone) so players see newest calendar days first even when parallel
-    PRs raced the same id, while same-day ties stay stable. The visible
-    ``[n]`` stamp on each line is that ``#N`` id (highest / newest near
-    the top; ``#1`` sinks to the bottom), not a 1-based row index.
+    Each bullet is tagged with its ship timestamp (``YYYY-MM-DD HH:MM`` UTC),
+    most recent first. Order comes **only** from that timestamp — agents do
+    not assign row numbers. Use ``changes detail <time>`` (full or partial
+    ``T…Z`` stamp), ``changes detail <slug>`` (fragment filename), or a
+    legacy ``#N`` only via ``changes detail`` / ``changes #``.
 
-    New Unreleased ships should add ``CHANGELOG.d/<slug>.md`` (not edit
-    the top of CHANGELOG.md) so parallel PRs do not conflict.
+    New Unreleased ships add ``CHANGELOG.d/<slug>.md`` (not edit the top of
+    CHANGELOG.md) so parallel PRs do not conflict.
 
-    Suggestion #73: bullets whose bold summary starts with ``[ops]`` are
-    GM-only (deploy helpers, SSH paths, host ops). Players never see them
-    in the short list; ``changes detail <n>`` still resolves ``#N`` only
-    among entries visible to that viewer. The ``[ops]`` tag sits *after*
-    the date separator so filtering still matches.
+    Suggestion #73: bullets tagged ``[ops]``, ``[docs]``, or ``[easter]`` (or that match
+    maintainer heuristics when agents forget the tag) are hidden from the
+    default list for **everyone** — players and on-duty GMs alike. Staff
+    who want repo/deploy news type ``changes ops`` (GM only). ``changes detail``
+    still resolves staff-only rows when the viewer is GM.
+
+    Audience tags ``[supers]``, ``[basegame]``, ``[engine]``, or
+    ``[classic]`` at the summary start (optionally after ``[ops]``) scope a
+    bullet to that game package. Untagged bullets default to SUPERS.
 
     Usage:
-      changes [n]        -- the n most recent one-line summaries (n=10 default)
-      changes detail <n> -- the FULL text of entry ``#n`` (every wrapped line
-                             a one-line summary drops). A live suggestion
-                             (suggestions.log #25): "changes should have a
-                             number... but when you type changes 1 it shows
-                             the full info on change #1." ``<n>`` is the
-                             stamped changelog id, not a row offset.
-    """
-    usage = "Usage: changes [n] | changes detail <n>"
-    raw = args.strip()
+      changes                 -- unread ships when you have any, else last 10
+      changes all [n]         -- scrollback (alias: changes list; n up to 100)
+      changes <n>             -- open the nth newest ship in full (1 = newest, 2 = next, …)
+      changes ops [n]       -- staff-only [ops]/[docs]/[easter] ships (GM only)
+      changes unread [n]    -- only unread (same as bare changes when unread exist)
+      changes ops unread [n] -- unread staff-only ships (GM only)
+      changes catchup       -- mark everything read without listing
+      changes detail <ref>  -- full text (timestamp, slug, or legacy #N)
+      changes #<ref>        -- same full-text lookup (legacy #N ok)
 
-    entries = _load_unreleased_entries()
-    if not entries and not os.path.isfile(
+    Unread entries show a ``*`` before their timestamp on the default list.
+    The read watermark lives on your account (or this character when unlinked).
+    """
+    usage = (
+        "Usage: changes | changes all [n] | changes <n> | changes ops [n] | "
+        "changes unread [n] | changes ops unread [n] | changes catchup | "
+        "changes detail <time|slug|id> | changes #<time|slug|id>"
+    )
+    raw = args.strip()
+    raw_lower = raw.lower()
+
+    all_entries = _load_unreleased_entries()
+    if not all_entries and not os.path.isfile(
         os.path.join(_changelog_repo_root(), "CHANGELOG.md")
     ):
         character.session.send("No changelog available right now.")
         return
 
-    # Suggestion #73: hide [ops] bullets from non-GM players.
-    # Filter after parse/sort so [ops] never shifts a player's [n] for a
-    # non-ops entry when a GM-only bullet sits between two player ones.
-    if not _is_gm(character):
-        entries = [
-            e for e in entries
-            if not str(e.get("summary") or "").lstrip().startswith("[ops]")
-        ]
+    is_gm = _is_gm(character)
+    detail_entries = _filter_changelog_entries_for_viewer(
+        all_entries, character, mode="detail",
+    )
+    player_entries = _filter_changelog_entries_for_viewer(
+        all_entries, character, mode="player",
+    )
+    ops_entries = (
+        _filter_changelog_entries_for_viewer(all_entries, character, mode="ops")
+        if is_gm else []
+    )
+
+    if raw_lower.startswith("detail"):
+        if not detail_entries:
+            character.session.send("Nothing unreleased right now -- all caught up.")
+            return
+        if raw_lower.startswith("details"):
+            rest = raw[len("details"):].strip()
+        else:
+            rest = raw[len("detail"):].strip()
+        if not rest:
+            character.session.send("Usage: changes detail <time|slug|id>")
+            return
+        entry = _changelog_resolve_ref(detail_entries, rest)
+        if entry is None:
+            character.session.send(f"No change matching {rest!r}.")
+            return
+        _changes_send_detail(character, game, entry, is_gm=is_gm)
+        return
+
+    ops_mode = False
+    unread_mode = False
+    count_raw = ""
+    if raw_lower.startswith("ops"):
+        if not is_gm:
+            character.session.send("Staff only.")
+            return
+        ops_mode = True
+        rest = raw[len("ops"):].strip()
+        if rest.lower() in ("unread", "new"):
+            unread_mode = True
+        elif rest.lower().startswith("unread "):
+            unread_mode = True
+            count_raw = rest[len("unread"):].strip()
+        elif rest.lower().startswith("new "):
+            unread_mode = True
+            count_raw = rest[len("new"):].strip()
+        elif rest:
+            count_raw = rest
+        entries = ops_entries
+    else:
+        entries = player_entries
 
     if not entries:
-        character.session.send("Nothing unreleased right now -- all caught up.")
+        if ops_mode:
+            character.session.send("No staff changelog entries right now.")
+        else:
+            character.session.send("Nothing unreleased right now -- all caught up.")
         return
 
-    if raw.lower().startswith("detail"):
-        rest = raw[len("detail"):].strip()
-        try:
-            idx = int(rest)
-        except ValueError:
-            character.session.send("Usage: changes detail <n>")
-            return
-        if idx < 1:
-            character.session.send(f"No change #{idx}.")
-            return
-        entry = _changelog_entry_by_id(entries, idx)
-        if entry is None:
-            character.session.send(f"No change #{idx}.")
-            return
-        body = _changelog_detail_body(entry)
-        character.session.send(f"{_format_changes_list_prefix(entry)} {body}")
+    watermark = _changes_watermark_get(game, character)
+
+    if raw_lower in ("catchup", "mark"):
+        peak = (
+            max(
+                (entry.get("sort_ts") or _CHANGELOG_WM_MIN for entry in player_entries),
+                default=_CHANGELOG_WM_MIN,
+            )
+            if player_entries else _CHANGELOG_WM_MIN
+        )
+        _changes_watermark_bump(game, character, peak)
+        character.session.send("Marked all visible changes as read.")
         return
 
-    n = 10
-    if raw:
+    if not ops_mode:
+        if raw_lower in ("unread", "new"):
+            unread_mode = True
+        elif raw_lower.startswith("unread "):
+            unread_mode = True
+            count_raw = raw[len("unread"):].strip()
+        elif raw_lower.startswith("new "):
+            unread_mode = True
+            count_raw = raw[len("new"):].strip()
+
+    n = _CHANGES_DEFAULT_LIMIT
+    if unread_mode:
+        pool = _changes_unread_entries(entries, watermark)
+        if not pool:
+            character.session.send(
+                "No unread changes -- you are caught up. "
+                "(Type changes for the full recent list.)"
+            )
+            return
+        if count_raw:
+            try:
+                n = int(count_raw)
+            except ValueError:
+                character.session.send(usage)
+                return
+            if n <= 0:
+                character.session.send(f"{usage}  (n must be a positive number)")
+                return
+        shown = pool[:n]
+        title = (
+            "Unread staff changes (most recent first):"
+            if ops_mode else
+            "Unread changes (most recent first):"
+        )
+        lines_out = _changes_render_list_lines(
+            character,
+            shown,
+            title=title,
+            watermark=watermark,
+            flag_unread=False,
+            is_gm=is_gm,
+        )
+        if len(pool) > len(shown):
+            suffix = "changes ops unread" if ops_mode else "changes unread"
+            lines_out.append(
+                f"({len(pool) - len(shown)} more unread -- "
+                f"{suffix} {len(pool)} or changes catchup.)"
+            )
+        lines_out.append(
+            "(changes all 25 — scrollback; changes <n> — open one ship.)"
+        )
+        character.session.send("\n".join(lines_out))
+        _changes_watermark_bump_entries(game, character, shown)
+        return
+
+    if raw and not ops_mode:
+        if raw.startswith("#"):
+            rest = raw[1:].strip()
+            if not rest:
+                character.session.send(usage)
+                return
+            entry = _changelog_resolve_ref(detail_entries, rest)
+            if entry is None:
+                character.session.send(f"No change matching {rest!r}.")
+                return
+            _changes_send_detail(character, game, entry, is_gm=is_gm)
+            return
+        if raw_lower.startswith("list") or raw_lower.startswith("all"):
+            if raw_lower.startswith("all"):
+                count_raw = raw[3:].strip()
+            else:
+                count_raw = raw[4:].strip()
+        else:
+            try:
+                open_n = int(raw)
+            except ValueError:
+                entry = _changelog_resolve_ref(detail_entries, raw)
+                if entry is not None:
+                    _changes_send_detail(character, game, entry, is_gm=is_gm)
+                    return
+                character.session.send(usage)
+                return
+            if open_n <= 0:
+                character.session.send(f"{usage}  (n must be a positive number)")
+                return
+            entry = _changes_open_numeric_entry(entries, open_n)
+            if entry is None:
+                available = len(entries)
+                character.session.send(
+                    f"No ship at position {open_n} "
+                    f"(only {available} recent "
+                    f"{'entry' if available == 1 else 'entries'} — "
+                    f"try changes all, then changes 1)."
+                )
+                return
+            _changes_send_detail(character, game, entry, is_gm=is_gm)
+            return
+
+    n = _CHANGES_DEFAULT_LIMIT
+    if count_raw:
         try:
-            n = int(raw)
+            n = int(count_raw)
         except ValueError:
             character.session.send(usage)
             return
         if n <= 0:
             character.session.send(f"{usage}  (n must be a positive number)")
             return
+        if n > _CHANGES_MAX_LIST_COUNT:
+            character.session.send(
+                f"{usage}  (scrollback is at most {_CHANGES_MAX_LIST_COUNT})"
+            )
+            return
 
-    lines_out = ["Recent changes (most recent first):"]
-    for entry in entries[:n]:
-        prefix = _format_changes_list_prefix(entry)
-        date = entry.get("date") or _CHANGELOG_UNDATED
-        if date == _CHANGELOG_UNDATED:
-            # Should not happen after the Unreleased backfill; still render
-            # without a fake year so undated outliers are obvious.
-            lines_out.append(f"  {prefix} {entry['summary']}")
-        else:
-            lines_out.append(f"  {prefix} {date} {entry['summary']}")
-    lines_out.append("('changes detail <n>' shows an entry's full text.)")
+    # Bare ``changes`` (player): unread-first like classic MUD news.
+    if not raw and not ops_mode:
+        unread_pool = _changes_unread_entries(entries, watermark)
+        if unread_pool:
+            shown = unread_pool[:n]
+            title = "Unread changes (most recent first):"
+            lines_out = _changes_render_list_lines(
+                character,
+                shown,
+                title=title,
+                watermark=watermark,
+                flag_unread=False,
+                is_gm=is_gm,
+            )
+            if len(unread_pool) > len(shown):
+                lines_out.append(
+                    f"({len(unread_pool) - len(shown)} more unread — "
+                    f"changes unread {len(unread_pool)} or changes catchup.)"
+                )
+            lines_out.append(
+                "(changes all 25 — full scrollback; changes <n> — open one ship.)"
+            )
+            character.session.send("\n".join(lines_out))
+            _changes_watermark_bump_entries(game, character, shown)
+            return
+
+    shown = entries[:n]
+    unread_count = len(_changes_unread_entries(entries, watermark))
+    if ops_mode:
+        title = "Recent staff changes (most recent first):"
+        if unread_count:
+            title = (
+                f"Recent staff changes (most recent first; "
+                f"{unread_count} unread -- try changes ops unread):"
+            )
+    else:
+        title = "Recent changes (most recent first):"
+        if unread_count:
+            title = (
+                f"Recent changes (most recent first; "
+                f"{unread_count} unread -- try changes unread):"
+            )
+    lines_out = _changes_render_list_lines(
+        character,
+        shown,
+        title=title,
+        watermark=watermark,
+        flag_unread=True,
+        is_gm=is_gm,
+    )
+    lines_out.append(
+        "(changes all 25 — scrollback; changes <n> — open one ship.)"
+    )
     character.session.send("\n".join(lines_out))
+    _changes_watermark_bump_entries(game, character, shown)
 
 
 def _format_help_db_entry(character, entry):
@@ -3408,6 +4206,20 @@ def cmd_help(character, args, game):
     categories = get_help_categories()
     # Frame budget for every help path (prefs #3) -- matches score / who.
     help_w = display_prefs.sheet_width(character)
+    sr = bool(getattr(character, "screenreader", False))
+
+    # Full categorized catalog -- screenreader bare help is Start Here only,
+    # so these verbs recover the complete index for TTS users who want it.
+    if verb in ("topics", "index", "catalog", "all"):
+        lines = [""]
+        lines.extend(style.format_help_index(
+            categories,
+            width=help_w,
+            screenreader=sr,
+        ))
+        character.session.send("\r\n".join(lines).rstrip("\n"))
+        return
+
     if verb:
         db = getattr(game, "db", None)
         is_gm_viewer = _is_gm(character)
@@ -3513,13 +4325,19 @@ def cmd_help(character, args, game):
         character.session.send("\r\n".join(framed))
         return
 
-    # Categorized topic index -- Blood & Velvet grimoire (not 'commands').
+    # Bare help: screenreader users get a short Start Here trail (TTS cannot
+    # skim 500+ index blurbs). Sighted players keep the full categorized
+    # grimoire. Full catalog for everyone: help topics / help index.
+    sr = bool(getattr(character, "screenreader", False))
     lines = [""]
-    lines.extend(style.format_help_index(
-        categories,
-        width=help_w,
-        screenreader=bool(getattr(character, "screenreader", False)),
-    ))
+    if sr:
+        lines.extend(style.format_help_start_here(screenreader=True))
+    else:
+        lines.extend(style.format_help_index(
+            categories,
+            width=help_w,
+            screenreader=False,
+        ))
     character.session.send("\r\n".join(lines).rstrip("\n"))
 
 
@@ -3655,12 +4473,27 @@ def cmd_get(character, args, game):
         if body is None or not getattr(body, "is_body", False):
             character.session.send("You don't see a body like that here.")
             return
-        loot = getattr(body, "loot", None) or []
+        loot_refusal = hooks.body_loot_refusal(character, body, game)
+        if loot_refusal:
+            character.session.send(loot_refusal)
+            return
+        loot = list(hooks.iter_body_loot_items(body))
         taken = _find_item(left.strip(), loot)
         if taken is None:
             character.session.send(f"You don't find that in {body.key}.")
             return
-        loot.remove(taken)
+        if taken in (getattr(body, "body_equipment", None) or {}).values():
+            for slot, piece in list(body.body_equipment.items()):
+                if piece is taken:
+                    body.body_equipment.pop(slot, None)
+                    break
+        for slot, stack in list((getattr(body, "body_clothing", None) or {}).items()):
+            if isinstance(stack, list) and taken in stack:
+                stack.remove(taken)
+                if not stack:
+                    body.body_clothing.pop(slot, None)
+        if taken in (getattr(body, "loot", None) or []):
+            body.loot.remove(taken)
         from engine import hooks
         refusal = hooks.before_acquire_item(character, taken)
         if refusal:
@@ -3755,6 +4588,7 @@ def cmd_get(character, args, game):
         return
 
     from engine import hooks
+    hooks.enrich_loaded_item(item)
     refusal = hooks.before_acquire_item(character, item)
     if refusal:
         character.session.send(refusal)
@@ -4145,6 +4979,47 @@ def cmd_idlemode(character, args, game):
     )
 
 
+def cmd_save(character, args, game):
+    """Flush this character's blob to SQLite now (not the whole world).
+
+    Clears the autosave dirty queue for your body until you change again.
+    Cooldown prevents save spam. Dropped floor loot and world meta still
+    rely on the normal autosave pulse.
+    """
+    import time
+
+    from engine.persistence import (
+        PLAYER_SAVE_COOLDOWN_SEC,
+        persist_save_character,
+    )
+
+    if (args or "").strip():
+        character.session.send("Usage: save")
+        return
+
+    now = time.monotonic()
+    last = float(getattr(character, "_last_player_save_monotonic", 0.0) or 0.0)
+    elapsed = now - last
+    if elapsed < PLAYER_SAVE_COOLDOWN_SEC:
+        wait = int(PLAYER_SAVE_COOLDOWN_SEC - elapsed) + 1
+        character.session.send(
+            f"Save is cooling down — try again in ~{wait}s."
+        )
+        return
+
+    conn = getattr(game, "db", None)
+    if conn is None:
+        character.session.send("Save is not available right now.")
+        return
+
+    ok, msg = persist_save_character(
+        conn, game, character, player_checkpoint=True,
+    )
+    if ok:
+        character._last_player_save_monotonic = now
+    character.session.send(msg)
+
+
 def cmd_setpass(character, args, game):
     """Set or change your character's password (see auth.py for the hashing).
 
@@ -4485,6 +5360,95 @@ def cmd_hedit(character, args, game):
         f"New overlay page '{keyword}'. Type text to append lines, "
         "then /save when ready (or /cancel to abort). "
         "See /list /i /d /clear /r /syntax /category /alias /gm /ic /preview."
+    )
+
+
+def _my_reports_lines(kind, entries, *, noun, file_verb):
+    """Body lines for a player's own bug/suggestion listing."""
+    from engine import reports
+
+    label = reports.DISPLAY_LABELS.get(kind, (kind or "?").upper())
+    if not entries:
+        return [
+            f"You have no open {noun}.",
+            f"Use `{file_verb} <description>` to file one.",
+        ]
+    lines = []
+    for entry in entries:
+        entry_id = entry.get("id", "?")
+        status = entry.get("status", "open")
+        time = entry.get("time", "?")
+        description = (entry.get("description") or "").replace("\n", " ").strip()
+        status_bit = f" ({status})" if status != "open" else ""
+        lines.append(
+            f"  [{label} #{entry_id}]{status_bit} {time} — {description}"
+        )
+    return lines
+
+
+def _cmd_my_reports(character, args, game, kind, *, noun, file_verb, cmd_name, title):
+    """Shared body for ``bugs`` / ``ideas`` -- list this character's tickets."""
+    from engine import reports
+    from engine import style
+
+    show_all = False
+    for token in (args or "").split():
+        if token.lower() == "all":
+            show_all = True
+            continue
+        character.session.send(
+            f"Usage: {cmd_name} [all]  (open {noun} only unless you add all)"
+        )
+        return
+
+    entries = reports.by_reporter(
+        kind, character.key, directory=game.report_dir,
+        open_only=not show_all,
+    )
+    if not entries and show_all:
+        character.session.send(
+            f"You have not filed any {noun} yet. "
+            f"Use `{file_verb} <description>` to send one to staff."
+        )
+        return
+
+    scope = "all statuses" if show_all else "open only"
+    body = [style.paint("muted", f"({scope})")]
+    body += _my_reports_lines(
+        kind, entries, noun=noun, file_verb=file_verb,
+    )
+    lines = style.format_sheet(
+        title, body, width=52,
+        screenreader=bool(getattr(character, "screenreader", False)),
+    )
+    character.session.send("\r\n".join(lines))
+
+
+def cmd_bugs(character, args, game):
+    """List bug reports this character filed that are still open.
+
+    ``bugs`` shows open tickets only; ``bugs all`` includes resolved and
+    rejected history. Use when you forgot whether you already filed something.
+    """
+    from engine import reports
+    _cmd_my_reports(
+        character, args, game, reports.BUG,
+        noun="bug reports", file_verb="bug", cmd_name="bugs",
+        title="YOUR BUGS",
+    )
+
+
+def cmd_ideas(character, args, game):
+    """List suggestions this character filed that are still open.
+
+    Same shape as ``bugs``: ``ideas`` for open tickets, ``ideas all`` for
+    full history. Alias: ``suggestions``.
+    """
+    from engine import reports
+    _cmd_my_reports(
+        character, args, game, reports.SUGGEST,
+        noun="suggestions", file_verb="suggest", cmd_name="ideas",
+        title="YOUR IDEAS",
     )
 
 

@@ -20,6 +20,7 @@ import traceback
 import persistence
 from engine import bug_webhook  # noqa: F401 -- loads webhook helpers (GM squashbugs)
 from engine import suggestion_webhook  # noqa: F401 -- GM sendsuggest / squashsuggest
+from engine import ops_webhook  # noqa: F401 -- ops alerts (crash hold / save streak)
 from engine import discord_bridge  # noqa: F401 -- tagged Discord radio bridge
 from engine import copyover
 from world import build_world, Character
@@ -44,7 +45,18 @@ register_default_ticks = game_select.register_default_ticks
 
 # Game registers Character attach, persist blob, chargen, and help before any
 # Character is constructed (docs/ENGINE_CONSUMER.md).
-register_all_hooks()
+try:
+    register_all_hooks()
+except Exception as exc:
+    # Import-time failures (e.g. jobs.json validation) happen before Game()
+    # so the watcher can classify them for boot-hold / thrash guard.
+    try:
+        from engine import boot_failure
+
+        boot_failure.record_boot_failure(exc, phase="register_all_hooks")
+    except Exception:
+        pass
+    raise
 
 # Milestone E (a live player suggestion, section 4-E's pacing follow-up):
 # a compressed in-game clock so the world has a sense of elapsed time
@@ -59,7 +71,21 @@ TICKS_PER_GAME_DAY = 9600
 # scale 1 = 1/3 tick/heartbeat), so a tick-count gate silently stretched
 # autosave to ~3x this interval when the world clock defaulted to 1:1
 # real-time. Immediate saves still run on connect/disconnect/shutdown.
-AUTOSAVE_INTERVAL_SECONDS = 60.0
+# Default 90s (was 60) -- full SQLite apply still blocks the asyncio thread
+# for a beat; stretching the interval cuts freeze frequency. Override with
+# RIFTFORGE_AUTOSAVE_SECONDS.
+AUTOSAVE_INTERVAL_SECONDS = 90.0
+
+
+def _autosave_interval_seconds():
+    """Wall-clock seconds between background autosaves."""
+    raw = (os.environ.get("RIFTFORGE_AUTOSAVE_SECONDS") or "").strip()
+    if not raw:
+        return AUTOSAVE_INTERVAL_SECONDS
+    try:
+        return max(15.0, float(raw))
+    except ValueError:
+        return AUTOSAVE_INTERVAL_SECONDS
 
 
 def db_path_from_env(default="riftforge.db"):
@@ -92,6 +118,15 @@ class Game:
         except Exception as exc:
             print(f"[boot] map heal skipped: {exc}", flush=True)
         boot_profile_mod.mark("map_heal")
+        try:
+            from engine import changelog_index as changelog_index_mod
+
+            changelog_index_mod.ensure_compiled_index(
+                os.getcwd(), log_prefix="[boot]",
+            )
+        except Exception as exc:
+            print(f"[boot] changelog index heal skipped: {exc}", flush=True)
+        boot_profile_mod.mark("changelog_index")
         # Live Character roster (engine/char_index.py). RoomMap stamps
         # room.game on every insert so Room.add/remove keep the set
         # truthful (including procedural dungeons and smoke ad-hoc rooms).
@@ -100,6 +135,9 @@ class Game:
         raw_rooms, self.start_room, seed_items = build_world()
         boot_profile_mod.mark("build_world")
         self.characters = set()
+        # Monster/Celestial fuel-loop subset (supers/fuel.py) -- kept in sync
+        # via engine.hooks fuel_loop_roster_notify on register/despawn.
+        self.fuel_loop_characters = set()
         self.rooms = RoomMap(self)
         self.rooms.update(raw_rooms)
         # Phase 3 dual-read: legacy dig / JSON keys → VNUM identity.
@@ -116,6 +154,8 @@ class Game:
         # `gm users` lists these with flags=login|creating; public `who`
         # and room broadcasts still use `sessions` only (no half-made Echo).
         self.connecting_sessions = []
+        # In-process ops counters (logging audit Phase 4 -- ``gm metrics``).
+        self.metrics = {}
         # Wall-clock unix time of this process boot -- MSSP UPTIME (engine/mssp.py).
         # Not persisted; resets on every restart / copyover process spawn.
         self.started_at = time.time()
@@ -196,9 +236,9 @@ class Game:
         # Host/Infernal holy war (gm holywar) -- default OFF until staff
         # flips it; later becomes a scheduled world event outside Tide.
         self.holy_war_active = False
-        # Rank flavor on player score (gm titles) -- default ON; staff may
-        # hide path/court words gamewide until the ladder is ready.
-        self.rank_titles_visible = True
+        # Rank flavor on player score (gm titles) -- default OFF; staff
+        # flip ``gm titles on`` when path/court words should be public.
+        self.rank_titles_visible = False
         # Gamewide who layout (``gm whomode``); default RP introduce/veil rules.
         self.gm_who_mode = "rp"
         self.rumor_boards = {}
@@ -220,6 +260,8 @@ class Game:
         self.hell_exile_tuning = {}
         # GM Purgatory pit loot knobs (``gm pit drops``) -- empty = defaults.
         self.pit_drop_tuning = {}
+        # Canonical seal key wander state (``supers/seal_key.py``).
+        self.seal_key_wander = {}
         # GM Marches fog-rim ring cap + monthly rim seed state.
         self.marches_rim_tuning = {}
         self.marches_rim_state = {}
@@ -233,6 +275,8 @@ class Game:
         self.demesnes = {}
         self.gather_nodes = {}
         self.personal_realms = {}
+        self._personal_realms_dirty = False
+        self._floor_item_room_keys = set()
         self._load_persisted_meta()
 
         # Hot-loaded deferred maps (gm maps load) — restore BEFORE
@@ -291,6 +335,9 @@ class Game:
 
         boot_profile_mod.mark("load_world")
 
+        from engine import persistence as persistence_mod
+        persistence_mod.rebuild_floor_item_room_index(self)
+
         # Engine accounts: load after characters so back-pointers reconcile.
         persistence.load_accounts(self.db, self)
         try:
@@ -301,6 +348,7 @@ class Game:
             # so the next save keeps them -- never race SQLite while the
             # live process still holds an older in-memory accounts dict.
             accounts_mod.heal_restored_player_accounts(self)
+            accounts_mod.heal_empty_account_passwords(self)
         except Exception:
             print("[server] account reconcile/migrate failed:", flush=True)
             traceback.print_exc()
@@ -326,6 +374,13 @@ class Game:
         # Lean engine ("none"): no-op — meta already loaded above.
         game_select.seed_content(self)
         boot_profile_mod.mark("seed_content")
+        if _HAS_SUPERS:
+            try:
+                from supers import fuel as fuel_mod
+                fuel_mod.rebuild_vessel_husk_room_index(self)
+            except Exception:
+                print("[boot] vessel husk room index skipped:", flush=True)
+                traceback.print_exc()
         from engine import boot_stability
         boot_stability.mark_boot_finished()
         boot_profile_mod.print_report()
@@ -512,13 +567,91 @@ class Game:
             epoch_day_offset=getattr(self, "calendar_epoch_day", 0),
         )
 
-    def save(self, *, copyover=False):
+    def save(self, *, copyover=False, reason=None):
         """Snapshot the whole world to the database (see persistence.py)."""
         from engine import hooks as hooks_mod
+        from engine import log_util
 
+        if reason is None:
+            reason = "copyover" if copyover else "sync"
+        try:
+            self._save_snapshot(copyover=copyover, hooks_mod=hooks_mod)
+        except Exception as exc:
+            log_util.ops(
+                "persistence",
+                f"save failed reason={reason} ({exc!r})",
+                exc=exc,
+            )
+            self._note_save_failure(reason, exc)
+            raise
+        self._note_save_success()
+
+    def _note_save_success(self):
+        """Reset save-health streak after a successful snapshot."""
+        self._save_fail_streak = 0
+        from engine import metrics as metrics_mod
+        metrics_mod.bump(self, "saves_ok")
+        self._write_save_health(reason="ok")
+
+    def _note_save_failure(self, reason, exc):
+        """Track repeated save failures; ping staff once per boot at streak 3."""
+        streak = int(getattr(self, "_save_fail_streak", 0) or 0) + 1
+        self._save_fail_streak = streak
+        from engine import log_util
+        from engine import metrics as metrics_mod
+        log_util.ops(
+            "persistence",
+            f"save_fail_streak={streak} reason={reason} ({exc!r})",
+        )
+        metrics_mod.bump(self, "saves_fail")
+        self._write_save_health(reason=reason, streak=streak, error=str(exc))
+        if streak >= 3 and not getattr(self, "_save_fail_ping_sent", False):
+            self._save_fail_ping_sent = True
+            from engine import gm_notify
+            from engine import ops_webhook
+            gm_notify.ping_gms(
+                self,
+                f"World save failed {streak} times ({reason}) -- "
+                "check server logs for [persistence].",
+            )
+            ops_webhook.schedule_ops_alert(
+                "save_fail_streak",
+                f"World save failed {streak} times ({reason})",
+                streak=streak,
+                reason=reason,
+                error=str(exc),
+            )
+
+    def _write_save_health(self, *, reason, streak=None, error=None):
+        """Optional sidecar beside the DB for ops / watcher tooling."""
+        import json
+        import os
+        report_dir = getattr(self, "report_dir", ".") or "."
+        path = os.path.join(report_dir, ".save_health.json")
+        if streak is None:
+            streak = int(getattr(self, "_save_fail_streak", 0) or 0)
+        payload = {
+            "streak": streak,
+            "reason": reason,
+            "error": error,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+        except OSError:
+            pass
+
+    def _save_snapshot(self, *, copyover, hooks_mod):
+        """Inner save body -- ``save()`` wraps this for ``[persistence]`` tags."""
         if copyover:
             from engine import persistence as ep
 
+            # Copyover exits (or execv) immediately after this snapshot.
+            # Incremental dirty-cap saves can leave deferred bodies unwritten
+            # for the "next autosave" that never comes -- skill gains and
+            # other late mutations vanish on reload (bug report 372). Force
+            # a full world rewrite so every live character hits SQLite.
+            self._persist_force_full = True
             ep.save_world(self.db, self)
             ep.save_game_time(self.db, self.game_time_ticks)
             ep.save_calendar_epoch_day(
@@ -539,6 +672,7 @@ class Game:
                     township_mod.save_townships(self.db, self)
                     from supers import personal_realm as personal_realm_mod
                     personal_realm_mod.save_personal_realms(self.db, self)
+                    self._personal_realms_dirty = False
                     from supers.demesne.persist import save_demesnes
                     save_demesnes(self.db, self)
                 except Exception:
@@ -568,6 +702,7 @@ class Game:
                 township_mod.save_townships(self.db, self)
                 from supers import personal_realm as personal_realm_mod
                 personal_realm_mod.save_personal_realms(self.db, self)
+                self._personal_realms_dirty = False
                 from supers.demesne.persist import save_demesnes
                 save_demesnes(self.db, self)
             except Exception:
@@ -592,12 +727,32 @@ class Game:
             # Stamp before work: if the heartbeat blocks forever, the watcher
             # sees this mtime go stale and force-restarts.
             game_heartbeat.touch_heartbeat("pre_tick")
+            import os
+            import time as _tick_time
+            _slow_warn_sec = float(
+                os.environ.get("RIFTFORGE_SLOW_TICK_WARN", "2.0")
+            )
+            _tick_t0 = _tick_time.perf_counter()
             try:
                 await self.run_heartbeat_async()
             except Exception:
                 print("[tick_loop] a tick raised an exception -- skipping it, "
                       "heartbeat continues:")
                 traceback.print_exc()
+            else:
+                _elapsed_ms = (
+                    _tick_time.perf_counter() - _tick_t0
+                ) * 1000.0
+                if _elapsed_ms > (_slow_warn_sec * 1000.0):
+                    from engine import log_util
+                    from engine import metrics as metrics_mod
+                    log_util.ops(
+                        "tick_loop",
+                        "slow heartbeat "
+                        f"ms={_elapsed_ms:.1f} "
+                        f"ticks={self.game_time_ticks}",
+                    )
+                    metrics_mod.bump(self, "tick_slow")
             # Stamp after work so a completed heavy tick resets the clock.
             game_heartbeat.touch_heartbeat("post_tick")
             from engine import boot_stability
@@ -605,7 +760,7 @@ class Game:
             from engine import world_backup
             if world_backup.backup_request_pending():
                 try:
-                    self.save()
+                    await self.save_async(reason="world_backup")
                 except Exception:
                     traceback.print_exc()
                 world_backup.write_ack()
@@ -631,45 +786,138 @@ class Game:
         run_ticks(self)
         self._maybe_autosave()
 
-    async def save_async(self):
-        """Cooperative world snapshot (yields during blob work).
+    async def save_async(self, *, reason="async"):
+        """Cooperative world snapshot (yields during blob work + meta slices).
 
         Login and autosave share this path so the asyncio loop can serve
         other sessions while JSON rows are built. Only one save runs at a
         time -- concurrent callers spin with ``asyncio.sleep(0)``.
+
+        After the world apply, accounts + SUPERS meta tables are timed and
+        yield between slices so Cadence is not starved across a multi-
+        second meta wipe (lag P5).
         """
         import asyncio
+        import time as _save_time
         from engine import hooks as hooks_mod
+        from engine import log_util
         from engine import persistence
 
         while getattr(self, "_autosave_running", False):
             await asyncio.sleep(0)
         self._autosave_running = True
+        meta_stats = {}
         try:
-            await persistence.save_world_async(self.db, self)
-            persistence.save_game_time(self.db, self.game_time_ticks)
-            persistence.save_calendar_epoch_day(
-                self.db, getattr(self, "calendar_epoch_day", 0)
-            )
-            persistence.save_game_clock_tuning(self.db, self)
-            persistence.save_accounts(self.db, self)
-            hooks_mod.save_game_meta(self, self.db)
-            if _HAS_SUPERS:
-                try:
-                    from supers import homestead as homestead_mod
-                    from supers import gathering as gathering_mod
-                    homestead_mod.save_homesteads(self.db, self)
-                    gathering_mod.save_gather_nodes(self.db, self)
-                    from supers import player_shops as player_shops_mod
-                    player_shops_mod.save_player_shops(self.db, self)
-                    from supers import township as township_mod
-                    township_mod.save_townships(self.db, self)
-                    from supers import personal_realm as personal_realm_mod
-                    personal_realm_mod.save_personal_realms(self.db, self)
-                    from supers.demesne.persist import save_demesnes
-                    save_demesnes(self.db, self)
-                except Exception:
-                    traceback.print_exc()
+            try:
+                await persistence.save_world_async(self.db, self)
+
+                async def _meta_slice(name, fn):
+                    t0 = _save_time.perf_counter()
+                    try:
+                        fn()
+                    finally:
+                        meta_stats[f"{name}_ms"] = round(
+                            (_save_time.perf_counter() - t0) * 1000.0, 2,
+                        )
+                    await asyncio.sleep(0)
+
+                await _meta_slice(
+                    "game_time",
+                    lambda: persistence.save_game_time(
+                        self.db, self.game_time_ticks,
+                    ),
+                )
+                await _meta_slice(
+                    "calendar",
+                    lambda: persistence.save_calendar_epoch_day(
+                        self.db, getattr(self, "calendar_epoch_day", 0),
+                    ),
+                )
+                await _meta_slice(
+                    "clock",
+                    lambda: persistence.save_game_clock_tuning(self.db, self),
+                )
+                await _meta_slice(
+                    "accounts",
+                    lambda: persistence.save_accounts(self.db, self),
+                )
+                acct = getattr(self, "_last_accounts_save_stats", None) or {}
+                meta_stats["accounts_changed"] = acct.get("n_changed")
+                meta_stats["accounts_full"] = acct.get("force_full")
+                await _meta_slice(
+                    "game_meta",
+                    lambda: hooks_mod.save_game_meta(self, self.db),
+                )
+                gm_meta = getattr(self, "_last_game_meta_save_stats", None) or {}
+                meta_stats["game_meta_skipped"] = gm_meta.get("skipped")
+                meta_stats["game_meta_full"] = gm_meta.get("force_full")
+                meta_stats["game_meta_slices_written"] = gm_meta.get("n_written")
+                meta_stats["game_meta_slices_skipped"] = gm_meta.get("n_skipped")
+                meta_stats["game_meta_slices_throttled"] = gm_meta.get("n_throttled")
+                if gm_meta.get("slices_written"):
+                    meta_stats["game_meta_wrote"] = ",".join(
+                        gm_meta["slices_written"]
+                    )
+                if gm_meta.get("slices_skipped"):
+                    meta_stats["game_meta_skip_tags"] = ",".join(
+                        gm_meta["slices_skipped"]
+                    )
+                if _HAS_SUPERS:
+                    try:
+                        from supers import homestead as homestead_mod
+                        from supers import gathering as gathering_mod
+                        from supers import player_shops as player_shops_mod
+                        from supers import township as township_mod
+                        from supers import personal_realm as personal_realm_mod
+                        from supers.demesne.persist import save_demesnes
+
+                        await _meta_slice(
+                            "homesteads",
+                            lambda: homestead_mod.save_homesteads(
+                                self.db, self,
+                            ),
+                        )
+                        await _meta_slice(
+                            "gather",
+                            lambda: gathering_mod.save_gather_nodes(
+                                self.db, self,
+                            ),
+                        )
+                        await _meta_slice(
+                            "player_shops",
+                            lambda: player_shops_mod.save_player_shops(
+                                self.db, self,
+                            ),
+                        )
+                        await _meta_slice(
+                            "township",
+                            lambda: township_mod.save_townships(
+                                self.db, self,
+                            ),
+                        )
+                        await _meta_slice(
+                            "personal_realms",
+                            lambda: personal_realm_mod.save_personal_realms(
+                                self.db, self,
+                            ),
+                        )
+                        self._personal_realms_dirty = False
+                        await _meta_slice(
+                            "demesnes",
+                            lambda: save_demesnes(self.db, self),
+                        )
+                    except Exception:
+                        traceback.print_exc()
+                self._last_meta_save_stats = meta_stats
+            except Exception as exc:
+                log_util.ops(
+                    "persistence",
+                    f"save_async failed reason={reason} ({exc!r})",
+                    exc=exc,
+                )
+                self._note_save_failure(reason, exc)
+                raise
+            self._note_save_success()
         finally:
             self._autosave_running = False
 
@@ -688,42 +936,74 @@ class Game:
         except RuntimeError:
             self.save()
             return
-        loop.create_task(self.save_async())
+        loop.create_task(self.save_async(reason="scheduled"))
 
     async def _maybe_autosave_async(self):
         """Autosave every AUTOSAVE_INTERVAL_SECONDS of wall-clock time.
 
-        Builds the character/item snapshot with ``asyncio.sleep(0)`` yields
-        so player commands can run during JSON work; the SQLite wipe+rewrite
-        stays one short transaction. Post-login uses the same cooperative
-        path; disconnect schedules the same cooperative path; shutdown
-        still calls sync ``save()`` immediately.
+        Schedules ``save_async`` as a background task so the heartbeat can
+        return while the cooperative snapshot yields between heartbeats.
+        The SQLite wipe+rewrite still blocks when it runs, but players
+        are not frozen for the full save inside one tick slice.
         """
         if not self._autosave_due():
             return
         if getattr(self, "_autosave_running", False):
             return
+        import asyncio
+        asyncio.create_task(self._run_autosave_task())
+
+    def _merge_autosave_stats(self, total_ms):
+        """Combine world + meta slice timings into one autosave stats dict."""
+        world = getattr(self, "_last_world_save_stats", None) or {}
+        meta = getattr(self, "_last_meta_save_stats", None) or {}
+        stats = {
+            "save_ms": round(total_ms, 2),
+            "collect_ms": world.get("collect_ms"),
+            "apply_ms": world.get("apply_ms"),
+            "force_full": world.get("force_full"),
+            "skipped": world.get("skipped"),
+            "n_char_rows": world.get("n_char_rows"),
+            "n_item_rows": world.get("n_item_rows"),
+            "n_changed_chars": world.get("n_changed_chars"),
+            "n_changed_rooms": world.get("n_changed_rooms"),
+            "n_deferred_chars": world.get("n_deferred_chars"),
+            "n_deferred_rooms": world.get("n_deferred_rooms"),
+            "autosave_count": world.get("autosave_count"),
+            "full_every": world.get("full_every"),
+            "game_time_ticks": self.game_time_ticks,
+            "n_rooms": len(getattr(self, "rooms", {}) or {}),
+            "n_chars": len(getattr(self, "characters", ()) or ()),
+        }
+        for key, value in meta.items():
+            stats[key] = value
+        return stats
+
+    async def _run_autosave_task(self):
+        """Background autosave with rich diag timing (always stores last stats)."""
         from engine import diag_export
+        import collections
         import time as _save_time
-        _diag = diag_export.diag_enabled()
-        _t_save = _save_time.perf_counter() if _diag else None
-        await self.save_async()
-        if _diag and _t_save is not None:
-            diag_export.append_event(
-                "D",
-                "server.py:on_tick:autosave",
-                "autosave_ms",
-                {
-                    "save_ms": round(
-                        (_save_time.perf_counter() - _t_save) * 1000.0, 2
-                    ),
-                    "game_time_ticks": self.game_time_ticks,
-                    "n_rooms": len(getattr(self, "rooms", {}) or {}),
-                    "n_chars": len(
-                        getattr(self, "characters", ()) or ()
-                    ),
-                },
-            )
+
+        _t_save = _save_time.perf_counter()
+        try:
+            await self.save_async(reason="autosave")
+        finally:
+            total_ms = (_save_time.perf_counter() - _t_save) * 1000.0
+            stats = self._merge_autosave_stats(total_ms)
+            self._last_autosave_stats = stats
+            ring = getattr(self, "_autosave_stats", None)
+            if ring is None:
+                ring = collections.deque(maxlen=8)
+                self._autosave_stats = ring
+            ring.append(stats)
+            if diag_export.diag_enabled():
+                diag_export.append_event(
+                    "D",
+                    "server.py:on_tick:autosave",
+                    "autosave_ms",
+                    stats,
+                )
 
     def _autosave_due(self):
         """True once every AUTOSAVE_INTERVAL_SECONDS of wall-clock time.
@@ -735,7 +1015,7 @@ class Game:
         """
         now = time.monotonic()
         last = getattr(self, "_last_autosave_monotonic", None)
-        if last is not None and (now - last) < AUTOSAVE_INTERVAL_SECONDS:
+        if last is not None and (now - last) < _autosave_interval_seconds():
             return False
         self._last_autosave_monotonic = now
         return True
@@ -751,25 +1031,21 @@ class Game:
             return
         from engine import diag_export
         import time as _save_time
-        _diag = diag_export.diag_enabled()
-        _t_save = _save_time.perf_counter() if _diag else None
-        self.save()
-        if _diag and _t_save is not None:
+
+        _t_save = _save_time.perf_counter()
+        self.save(reason="autosave")
+        total_ms = (_save_time.perf_counter() - _t_save) * 1000.0
+        # Sync path has no per-slice meta dict -- still surface world stats.
+        stats = self._merge_autosave_stats(total_ms)
+        self._last_autosave_stats = stats
+        if diag_export.diag_enabled():
             diag_export.append_event(
                 "D",
                 "server.py:on_tick:autosave",
                 "autosave_ms",
-                {
-                    "save_ms": round(
-                        (_save_time.perf_counter() - _t_save) * 1000.0, 2
-                    ),
-                    "game_time_ticks": self.game_time_ticks,
-                    "n_rooms": len(getattr(self, "rooms", {}) or {}),
-                    "n_chars": len(
-                        getattr(self, "characters", ()) or ()
-                    ),
-                },
+                stats,
             )
+
 
 async def handle_client(reader, writer, game):
     """Called once per new connection. Each client runs its own Session coroutine
@@ -788,6 +1064,7 @@ async def handle_client(reader, writer, game):
             session.alive = False
             if session.character is not None:
                 session.character.session = None
+                session.character = None
             if session in game.sessions:
                 game.sessions.remove(session)
             connecting = getattr(game, "connecting_sessions", None)

@@ -48,7 +48,7 @@ WIDTH_DEFAULT = 67
 
 # Two-character optional-field tokens (checked before single-letter codes).
 _SEGMENT_TOKENS = frozenset({
-    "Hp", "En", "St", "Mn", "Fu", "Ex", "Gr",
+    "Hp", "En", "St", "Mn", "Fu", "Mo", "Tg", "Ex", "Gr",
 })
 
 
@@ -131,9 +131,11 @@ def ensure_display_defaults(character):
         # Prefs #20: hide third-party (room) combat lines for this viewer.
         character.combat_gag_other = False
     if not hasattr(character, "show_combat_tags"):
-        # Default on (a11y). Sighted players may opt out via config combattags.
-        # Screenreader mode always shows tags regardless of this flag.
+        # Default on (a11y). Any player may opt out via config combattags.
         character.show_combat_tags = True
+    if not hasattr(character, "compact_floor_items"):
+        # config items compact on|off -- one paragraph for floor loot on look.
+        character.compact_floor_items = False
     if not hasattr(character, "autokill"):
         # Dungeon fodder only -- pit / portal / stronghold trash (help autokill).
         character.autokill = False
@@ -171,30 +173,32 @@ def drive_map_render_args(character):
 def wants_combat_tags(character):
     """True when this viewer should see [DMG]/[HIT]/… on combat lines.
 
-    Screenreader mode always forces tags on. Sighted players default on
-    and may hide them with ``config combattags off``.
+    Default on; ``config combattags off`` hides them (screenreader too).
     """
     ensure_display_defaults(character)
-    if getattr(character, "screenreader", False):
-        return True
     return bool(getattr(character, "show_combat_tags", True))
+
+
+def wants_compact_floor_items(character):
+    """True when floor loot on look should collapse to one paragraph."""
+    ensure_display_defaults(character)
+    return bool(getattr(character, "compact_floor_items", False))
 
 
 def apply_screenreader_mode(character, enabled):
     """Turn screenreader mode on or off and sync related display prefs.
 
-    When enabling: flatten ASCII UI, keep combat tags on, and turn the
-    ASCII minimap off (directional ``map`` text is used instead). When
-    disabling: only clear the screenreader flag -- leave map / tags /
-    color alone so a later ``config screenreader off`` does not surprise
-    someone who had customized those separately.
+    When enabling: flatten ASCII UI, turn the ASCII minimap off (directional
+    ``map`` text is used instead), and default fightlog on. When disabling:
+    only clear the screenreader flag -- leave map / tags / color alone so a
+    later ``config screenreader off`` does not surprise someone who had
+    customized those separately.
 
     Returns a short confirmation string for the caller to send.
     """
     ensure_display_defaults(character)
     if enabled:
         character.screenreader = True
-        character.show_combat_tags = True
         character.show_minimap = False
         character.map_on_move = False
         character.map_on_look = False
@@ -243,7 +247,7 @@ def expand_aliases(character, raw):
         return raw
     parts = raw.split(maxsplit=1)
     verb = parts[0].lower()
-    # Lazy import: commands imports display_prefs only inside dispatch.
+    # commands.py imports display_prefs at module scope for _dispatch_body.
     from commands import COMMANDS, DIRECTIONS
     if verb in COMMANDS or verb in DIRECTIONS:
         return raw
@@ -368,6 +372,24 @@ def format_group_names(character):
     return ", ".join(names)
 
 
+def _prompt_momentum_value(character, vitals):
+    """Integer Momentum for prompt tokens (-100..100; 0 when unset).
+
+    Prefers Char.Vitals ``momentum`` when SUPERS stamped it so the prompt
+    line matches GMCP Mudlet gauges; otherwise reads Character.momentum
+    directly (engine-safe -- the field lives on world.Character).
+    """
+    raw = None
+    if isinstance(vitals, dict) and "momentum" in vitals:
+        raw = vitals.get("momentum")
+    else:
+        raw = getattr(character, "momentum", 0.0)
+    try:
+        return int(round(float(raw or 0.0)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _prompt_vitals(character, game=None):
     """Gather meter values for prompt expansion (engine-safe via hooks).
 
@@ -462,10 +484,14 @@ def _prompt_vitals(character, game=None):
         "has_mana": has_mana,
         "mana": mana_str,
         "max_mana": max_mana_str,
+        # Fight Momentum (-100..100). Prefer Char.Vitals when SUPERS stamped
+        # it (keeps prompt + GMCP in lockstep); else Character.momentum.
+        "momentum": _prompt_momentum_value(character, vitals),
         "room": room_key,
         "name": name,
         "exits": format_exit_abbrevs(character, game),
         "group": format_group_names(character),
+        "target_band": hooks.prompt_target_band(character, game),
     }
 
 
@@ -507,6 +533,18 @@ def _expand_segment(code, v):
         # Path noun from vitals (blood / grace / …); never bare "fuel".
         noun = v.get("fuel_label") or "fuel"
         return _seg("<dark_grey> ", f"<violet>[{v['fuel']}{noun}]")
+    if code == "Mo":
+        # Omit at 0 so out-of-fight prompts stay quiet; negative hex shove
+        # and banked fight tempo both show.
+        mom = int(v.get("momentum", 0) or 0)
+        if mom == 0:
+            return ""
+        return _seg("<dark_grey> ", f"<gold>[{mom}mo]")
+    if code == "Tg":
+        band = (v.get("target_band") or "").strip()
+        if not band:
+            return ""
+        return _seg("<dark_grey> ", f"<dark_red>[{band}]")
     if code == "Ex":
         return _seg("<dark_grey> ", f"<silver>[{v['exits']}]")
     if code == "Gr":
@@ -528,6 +566,7 @@ def format_prompt(character, game=None):
       %s %S   stamina percent / out of 100 (remaining effort)
       %f      fuel number, or ``\"\"`` when you have no fuel resource
       %m %M   mana / max mana, or ``\"\"`` when you have no mana
+      %o      Momentum (-100..100; 0 out of fight)
       %n %r   name / room
       %g      other groupmates ``Name1, Name2``, or ``\"\"`` if solo
       %%      literal %
@@ -540,6 +579,8 @@ def format_prompt(character, game=None):
       %St  [72/100st]
       %Mn  [88/100mn]   (mages only; percent of pool by default)
       %Fu  [80blood]   (fuel Origins only; Path noun)
+      %Mo  [66mo]      (fight Momentum; omits at 0)
+      %Tg  [bloodied]  foe lifeforce band while fighting (RP only; omits when unscathed)
       %Ex  [n,e,s,w]
       %Gr  [Sam, Dean] (colocated groupmates only; omits when solo/apart)
 
@@ -588,6 +629,8 @@ def format_prompt(character, game=None):
                 out.append(v["mana"])
             elif code == "M":
                 out.append(v["max_mana"])
+            elif code == "o":
+                out.append(str(v["momentum"]))
             elif code == "n":
                 out.append(v["name"])
             elif code == "r":

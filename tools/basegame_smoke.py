@@ -34,6 +34,14 @@ class _FakeSession:
     def __init__(self, replies):
         self.lines = []
         self._replies = list(replies)
+        self.alive = True
+        self.character = None
+
+    def attach(self, character):
+        """Bind this fake session to *character* (heal_character_session-safe)."""
+        self.character = character
+        character.session = self
+        return self
 
     def send(self, message):
         self.lines.append(message)
@@ -63,7 +71,7 @@ async def _run_chargen_for_path(game, path_index, path_id):
 
     char = Character(f"Smoke{path_id.capitalize()}")
     session = _FakeSession(_chargen_replies_for(path_index))
-    char.session = session
+    session.attach(char)
     ok = await hooks.run_chargen(session, char)
     assert ok, f"chargen for path {path_id!r} should not report disconnect"
     assert char.bg_path == path_id, (
@@ -73,6 +81,30 @@ async def _run_chargen_for_path(game, path_index, path_id):
     char.hp = stats_module.max_hp(char)
     char.move_to(game.start_room)
     return char
+
+
+def _smoke_body_parts_demo():
+    """Prove engine/systems/body_parts via basegame consumer (no SUPERS)."""
+    from basegame import anatomy_demo as anatomy_demo_mod
+    from basegame import body_parts as body_parts_module
+    from engine.systems import body_parts as body_parts_engine
+    from world import Character
+
+    body_parts_module.register_hooks()
+    limb_char = Character("LimbSmoke")
+    body_parts_engine.ensure_body_parts(limb_char)
+    regions = body_parts_engine.character_regions(limb_char)
+    assert "torso" in regions and "head" in regions
+    assert body_parts_engine.part_tier(limb_char, "torso") == body_parts_engine.TIER_HEALTHY
+    plan = anatomy_demo_mod.region_strike(
+        None, limb_char, "torso", 9999,
+    )
+    assert plan["tier_after"] == body_parts_engine.TIER_DISABLED
+    body_parts_engine.heal_region(limb_char, "torso", 9999)
+    assert body_parts_engine.part_tier(limb_char, "torso") == body_parts_engine.TIER_HEALTHY
+    assert body_parts_engine.tier_for_ratio(1.0) == body_parts_engine.TIER_HEALTHY
+    assert body_parts_engine.tier_for_ratio(0.5) == body_parts_engine.TIER_WOUNDED
+    assert body_parts_engine.tier_for_ratio(0.0) == body_parts_engine.TIER_DISABLED
 
 
 def main():
@@ -87,6 +119,7 @@ def main():
     game_select._reset_for_tests()
     assert game_select.game_name() == "basegame"
     assert "supers" not in sys.modules
+    _smoke_body_parts_demo()
 
     import server as server_mod
     assert server_mod._HAS_SUPERS is False
@@ -136,7 +169,7 @@ def main():
     assert len(placed) == len(PATH_ORDER)
 
     walker = placed[0]
-    walker.session = _FakeSession([])
+    _FakeSession([]).attach(walker)
     dispatch = hooks.get_dispatch()
     dispatch(walker, "look", game)
     assert any("Main Street" in line or "Notbigville" in line for line in walker.session.lines)
@@ -209,7 +242,7 @@ def main():
     outdoor_clause = weather_module.look_clause(walker.location, game)
     assert outdoor_clause, "Observatory should get generic weather clause for now"
 
-    walker.session = _FakeSession([])
+    _FakeSession([]).attach(walker)
     dispatch(walker, "score", game)
     sheet = " ".join(walker.session.lines)
     assert "Detective" in sheet
@@ -218,7 +251,7 @@ def main():
     post_key = "NB00006" if "NB00006" in game.rooms else "Post Office"
     peer = placed[1]
     walker.move_to(game.rooms[post_key])
-    walker.session = _FakeSession([])
+    _FakeSession([]).attach(walker)
     dispatch(walker, f"mail send {peer.key} hello from square", game)
     assert peer.mail_inbox and peer.mail_inbox[0]["text"] == "hello from square"
 
@@ -235,7 +268,7 @@ def main():
     assert lantern is not None
     before_qty = lantern["qty"]
     before_wallet = economy_mod.wallet_total_cents(walker)
-    walker.session = _FakeSession([])
+    _FakeSession([]).attach(walker)
     dispatch(walker, "buy lantern", game)
     assert walker.inventory, walker.session.lines
     assert lantern["qty"] == before_qty - 1, lantern
@@ -399,7 +432,7 @@ def main():
         brawler.location.key if brawler.location else None
     )
     medic.move_to(ward)
-    medic.session = _FakeSession([])
+    _FakeSession([]).attach(medic)
     dispatch(medic, f"treat {brawler.key}", game)
     assert not getattr(brawler, "hospitalized", False), medic.session.lines
 
@@ -410,7 +443,7 @@ def main():
     ranger = placed[3]
     assert ranger.bg_path == "ranger"
     crook.move_to(walker.location)
-    crook.session = _FakeSession([])
+    _FakeSession([]).attach(crook)
     walker_cash_before = economy_mod.wallet_total_cents(walker)
     dispatch(crook, f"steal {walker.key}", game)
     assert justice_mod.is_wanted(crook), crook.session.lines
@@ -419,7 +452,7 @@ def main():
     assert cell is not None and getattr(cell, "is_cell", False)
     ranger.move_to(cell)
     crook.move_to(cell)
-    ranger.session = _FakeSession([])
+    _FakeSession([]).attach(ranger)
     dispatch(ranger, f"arrest {crook.key}", game)
     assert justice_mod.is_jailed(crook, game)
     dest = cell.exits.get("north")
@@ -433,7 +466,7 @@ def main():
         f"game_time_ticks={game.game_time_ticks}"
     )
     economy_mod.credit_wallet(crook, dollars=20)
-    crook.session = _FakeSession([])
+    _FakeSession([]).attach(crook)
     dispatch(crook, "payfine", game)
     assert not justice_mod.is_wanted(crook)
 
@@ -441,7 +474,7 @@ def main():
     alley = game.rooms.get("NB00012")
     assert saloon is not None and alley is not None
     walker.move_to(saloon)
-    walker.session = _FakeSession([])
+    _FakeSession([]).attach(walker)
     for _ in range(2):
         dispatch(walker, "slam wall", game)
     assert walker.location.key == "NB00012", walker.location.key
@@ -463,7 +496,7 @@ def main():
     aerial_mod.ensure_stellar_defaults(stellar)
     stellar.bg_stellar = True
     assert aerial_mod.is_stellar(stellar)
-    stellar.session = _FakeSession([])
+    _FakeSession([]).attach(stellar)
     # Indoor refusal still works (Main Street is indoor-ish -- Observatory
     # is outdoor; use an indoor room to prove the gate, not the climb).
     indoor = game.rooms.get("NB00001")
@@ -473,7 +506,7 @@ def main():
     # non-Stellar still refused. Prove the non-Stellar gate separately:
     mundane = placed[1]
     mundane.bg_stellar = False
-    mundane.session = _FakeSession([])
+    _FakeSession([]).attach(mundane)
     mundane.move_to(indoor)
     dispatch(mundane, "fly", game)
     assert any(
@@ -482,7 +515,7 @@ def main():
 
     # Room hover: anyone can lift off in place; fly still Stellar-only.
     mundane.move_to(indoor)
-    mundane.session = _FakeSession([])
+    _FakeSession([]).attach(mundane)
     dispatch(mundane, "hover", game)
     assert aerial_mod.flight_tier(mundane) == aerial_mod.TIER_HOVER
     assert mundane.is_flying is True
@@ -497,9 +530,9 @@ def main():
     umbral_mod.ensure_umbral_defaults(umbral)
     umbral.bg_umbral = True
     umbral.umbral_charge = 1.0
-    umbral.session = _FakeSession([])
+    _FakeSession([]).attach(umbral)
     watcher = placed[3]
-    watcher.session = _FakeSession([])
+    _FakeSession([]).attach(watcher)
     shared = game.rooms.get("NB00001")
     umbral.move_to(shared)
     watcher.move_to(shared)
@@ -512,20 +545,20 @@ def main():
 
     # Night allows shroud; presence hook hides the actor.
     game.game_time_ticks = 0  # midnight -> night
-    umbral.session = _FakeSession([])
+    _FakeSession([]).attach(umbral)
     dispatch(umbral, "shroud", game)
     assert umbral.umbral_shrouded is True, umbral.session.lines
     assert umbral.stealth_active is True
     assert hooks_mod.can_notice_stealth(watcher, umbral, game) is False
 
-    umbral.session = _FakeSession([])
+    _FakeSession([]).attach(umbral)
     dispatch(umbral, "unshroud", game)
     assert umbral.umbral_shrouded is False
     assert umbral.stealth_active is False
     assert hooks_mod.can_notice_stealth(watcher, umbral, game) is True
 
     # Charge drain auto-clears shroud.
-    umbral.session = _FakeSession([])
+    _FakeSession([]).attach(umbral)
     dispatch(umbral, "shroud", game)
     assert umbral.umbral_shrouded is True
     umbral.umbral_charge = umbral_mod.UMBRAL_CHARGE_STEP
@@ -539,7 +572,7 @@ def main():
 
     quester = placed[0]
     quester.move_to(game.rooms["NB00001"])
-    quester.session = _FakeSession([])
+    _FakeSession([]).attach(quester)
     dispatch(quester, "questaccept fetch_pebble", game)
     assert quests_mod.has_active_quest(quester, "fetch_pebble")
     dispatch(quester, "south", game)
@@ -557,7 +590,7 @@ def main():
 
     rider = placed[0]
     plaza = game.rooms["NB00001"]
-    rider.session = _FakeSession([])
+    _FakeSession([]).attach(rider)
     vehicles_mod.ensure_game_vehicles(game)
     cart = vehicles_mod.vehicle_by_id(game, "cart")
     assert cart is not None, game.vehicles
@@ -569,7 +602,7 @@ def main():
     dispatch(rider, "board cart", game)
     assert rider.in_vehicle == "cart", rider.session.lines
     assert rider.location.key == cart["interior_key"]
-    rider.session = _FakeSession([])
+    _FakeSession([]).attach(rider)
     drive_dir = None
     for direction, dest in park_room.exits.items():
         dest_room = dest if not isinstance(dest, str) else game.rooms.get(dest)
@@ -585,7 +618,7 @@ def main():
     assert cart["parked_room"] != park_before, (
         cart["parked_room"], park_before, rider.session.lines
     )
-    rider.session = _FakeSession([])
+    _FakeSession([]).attach(rider)
     dispatch(rider, "unboard", game)
     assert rider.in_vehicle is None, rider.in_vehicle
     assert rider.location.key == cart["parked_room"]
@@ -601,7 +634,7 @@ def main():
     assert lodging_mod.beds_in_room(inn), "inn should have a seeded bunk bed"
     guest = placed[0]
     guest.move_to(inn)
-    guest.session = _FakeSession([])
+    _FakeSession([]).attach(guest)
     economy_mod.credit_wallet(guest, dollars=10)
     dispatch(guest, "rent bed", game)
     assert guest.home_room_key == "NB00014", guest.home_room_key
@@ -612,7 +645,7 @@ def main():
 
     walker = placed[1]
     walker.move_to(game.rooms["NB00001"])
-    walker.session = _FakeSession([])
+    _FakeSession([]).attach(walker)
     post = game.rooms.get("NB00006")
     dispatch(walker, "walk post", game)
     if walker.location is not post:
@@ -637,7 +670,7 @@ def main():
         zone_backup = zone_handle.read()
     dig_name = "H9 Demo Alcove"
     walker.move_to(saloon)
-    walker.session = _FakeSession([])
+    _FakeSession([]).attach(walker)
     before_keys = set(game.rooms.keys())
     try:
         dispatch(walker, f"dig up {dig_name}", game)
@@ -675,15 +708,15 @@ def main():
     callee.inventory.append(handset)
     callee_number = handset.phone_number
     economy_mod.credit_wallet(caller, dollars=5)
-    caller.session = _FakeSession([])
+    _FakeSession([]).attach(caller)
     dispatch(caller, f"dial {callee_number}", game)
     assert any("ring" in line.lower() for line in caller.session.lines), (
         caller.session.lines
     )
-    callee.session = _FakeSession([])
+    _FakeSession([]).attach(callee)
     dispatch(callee, "answer", game)
     assert phone_mod.active_call(caller) is not None
-    caller.session = _FakeSession([])
+    _FakeSession([]).attach(caller)
     dispatch(caller, "hangup", game)
     assert phone_mod.active_call(caller) is None
 
@@ -691,7 +724,7 @@ def main():
     from engine.systems import appearance as appearance_mod
 
     model = placed[2]
-    model.session = _FakeSession([])
+    _FakeSession([]).attach(model)
     for slot, option in (
         ("hair_style", "short"),
         ("hair_color", "brown"),
@@ -707,7 +740,7 @@ def main():
     # ---- H7c: persona trait flavor ----
     greeter = placed[3]
     greeter.move_to(post)
-    greeter.session = _FakeSession([])
+    _FakeSession([]).attach(greeter)
     dispatch(greeter, "greet Operator", game)
     assert any(
         "stranger" in line.lower() or "welcome" in line.lower()
@@ -719,10 +752,10 @@ def main():
 
     tagger = placed[0]
     buddy = placed[1]
-    tagger.session = _FakeSession([])
+    _FakeSession([]).attach(tagger)
     dispatch(tagger, f"friend {buddy.key}", game)
     assert relationships_mod.get_kind(tagger, buddy) == "friend"
-    tagger.session = _FakeSession([])
+    _FakeSession([]).attach(tagger)
     dispatch(tagger, "relate", game)
     assert any(buddy.key in line for line in tagger.session.lines), (
         tagger.session.lines

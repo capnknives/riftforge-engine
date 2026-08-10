@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 
 
-# Three automations -- keep order: bugs, suggestions, lag diag.
+# Three automations -- keep order: bugs, suggestions, lag diag, ops alerts.
 AUTOMATIONS = (
     {
         "slug": "bug-fixer",
@@ -54,6 +54,16 @@ AUTOMATIONS = (
         "instructions": (
             ".cursor/automations/lag-diag-analyzer.INSTRUCTIONS.md"
         ),
+    },
+    {
+        "slug": "ops-alerts",
+        "name": "Ops alerts (crash hold / save streak)",
+        "kind": "ops",
+        "gm_verbs": ("(automatic)",),
+        "url_env": "RIFTFORGE_OPS_WEBHOOK_URL",
+        "auth_env": "RIFTFORGE_OPS_WEBHOOK_AUTH",
+        "setup_doc": ".env.example",
+        "instructions": "engine/ops_webhook.py",
     },
 )
 

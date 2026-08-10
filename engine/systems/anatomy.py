@@ -67,7 +67,12 @@ _TARGET_SPECS = {
     "cheekbone": ("head", "high", "cheekbone", None),
     "skull": ("head", "high", "skull", "staggered"),
     "ear": ("head", "high", "ear", None),
+    "brow": ("head", "high", "brow", "dazed"),
+    "eye": ("head", "high", "eye", "blinded"),
+    "mouth": ("head", "high", "mouth", "gagged"),
     "throat": ("neck", "high", "throat", "winded"),
+    "nape": ("neck", "high", "nape", "dazed"),
+    "collarbone": ("torso", "high", "collarbone", "splinted"),
     # Body line -- torso, stamina / organ trauma.
     "solar_plexus": ("torso", "body", "solar plexus", "winded"),
     "liver": ("torso", "body", "liver", "winded"),
@@ -76,13 +81,43 @@ _TARGET_SPECS = {
     "sternum": ("torso", "body", "sternum", None),
     "kidney": ("torso", "body", "kidney", "winded"),
     "abdomen": ("torso", "body", "abdomen", None),
+    "heart": ("torso", "body", "heart", "shaken"),
+    "gut": ("torso", "body", "gut", "cramped"),
+    # Arms / hands -- guard height (body line); distinct located marks.
+    "shoulder": ("arms", "body", "shoulder", "hampered"),
+    "upper_arm": ("arms", "body", "upper arm", "hampered"),
+    "elbow": ("arms", "body", "elbow", "hampered"),
+    "forearm": ("arms", "body", "forearm", "deadened"),
+    "wrist": ("hands", "body", "wrist", "deadened"),
+    "knuckles": ("hands", "body", "knuckles", "deadened"),
+    "fingers": ("hands", "body", "fingers", "deadened"),
     # Low line -- legs / feet, mobility.
+    "hip": ("legs", "low", "hip", "unsteady"),
     "lead_calf": ("legs", "low", "lead calf", "hobbled"),
     "thigh": ("legs", "low", "thigh", "hobbled"),
     "knee": ("legs", "low", "knee", "hobbled"),
     "shin": ("legs", "low", "shin", None),
     "ankle": ("legs", "low", "ankle", "hobbled"),
     "instep": ("feet", "low", "instep", None),
+    "heel": ("feet", "low", "heel", "unsteady"),
+}
+
+# Within-line auto-pick weights: arms/hands targets are rarer than torso
+# vitals so Dean does not auto-spam forearm every swing. Called shots bypass
+# this table entirely (resolve_called_shot wins in choose_target).
+_TARGET_AUTO_WEIGHTS = {
+    # High -- head/neck vitals dominate; brow/eye/mouth/nape are seasoning.
+    "temple": 3, "jaw": 3, "chin": 3, "skull": 2, "nose": 1, "cheekbone": 1,
+    "ear": 1, "brow": 1, "eye": 1, "mouth": 1, "throat": 2, "nape": 1,
+    "collarbone": 1,
+    # Body -- torso bread-and-butter; limbs lighter.
+    "solar_plexus": 3, "liver": 2, "floating_ribs": 2, "kidney": 2,
+    "ribs": 2, "sternum": 1, "abdomen": 2, "heart": 1, "gut": 2,
+    "shoulder": 1, "upper_arm": 1, "elbow": 1, "forearm": 1,
+    "wrist": 1, "knuckles": 1, "fingers": 1,
+    # Low -- classic leg targets; hip/heel seasoning.
+    "thigh": 3, "knee": 3, "lead_calf": 2, "ankle": 2, "shin": 1,
+    "hip": 1, "instep": 1, "heel": 1,
 }
 
 TARGETS = {
@@ -207,5 +242,7 @@ def choose_target(reaction=None, press=False, feint_exposed=False,
     chosen_line = rng.choices(
         lines, weights=[weights[ln] for ln in lines], k=1
     )[0]
-    target = rng.choice(_TARGETS_BY_LINE[chosen_line])
+    pool = _TARGETS_BY_LINE[chosen_line]
+    pick_weights = [_TARGET_AUTO_WEIGHTS.get(tid, 1) for tid in pool]
+    target = rng.choices(pool, weights=pick_weights, k=1)[0]
     return target, TARGETS[target]["region"]

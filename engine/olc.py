@@ -49,6 +49,7 @@ def _cheat_sheet():
         "  olc kinds                     list registered kinds",
         "  olc explain <kind>            field checklist",
         "  olc new <kind> [id]           start wizard (optional catalog id)",
+        "  olc edit <kind> <id>          load existing row into draft",
         "  olc set <field> <value...>    set one field on open wizard",
         "  olc show                      show draft + missing fields",
         "  olc done                      validate and save",
@@ -150,6 +151,38 @@ def cmd_olc(character, args, game):
         nxt = _next_missing_field(kind_id, obj)
         if nxt:
             _prompt_field(character, kind_id, nxt)
+        return
+
+    if head == "edit":
+        bits = rest.split(None, 1)
+        if len(bits) < 2:
+            character.session.send("Usage: olc edit <kind> <entity_id>")
+            return
+        kind_id = bits[0]
+        entity_id = bits[1].strip()
+        if not entity_id:
+            character.session.send("Usage: olc edit <kind> <entity_id>")
+            return
+        try:
+            obj = hooks.content_kind_load_entity(kind_id, entity_id)
+        except Exception as err:
+            character.session.send(str(err))
+            return
+        if not isinstance(obj, dict):
+            character.session.send(
+                f"OLC edit refused: loader returned {type(obj).__name__}, "
+                "expected dict."
+            )
+            return
+        _set_session(character, {
+            "kind": kind_id,
+            "entity_id": entity_id,
+            "obj": dict(obj),
+        })
+        character.session.send(
+            f"OLC edit: {kind_id} id={entity_id}. "
+            "Use olc set / olc show, then olc done to upsert."
+        )
         return
 
     if head == "set":

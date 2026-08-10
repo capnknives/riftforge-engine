@@ -11,6 +11,8 @@ Env (optional):
 - ``RIFTFORGE_CRASH_MAX_EXITS`` -- non-planned exits in window (default ``5``)
 - ``RIFTFORGE_CRASH_REVERT_BACKOFF`` -- base spawn backoff seconds (default ``30``)
 - ``RIFTFORGE_DB_CORRUPT_MAX_EXITS`` -- corrupt DB boot exits before hold (default ``3``)
+- ``RIFTFORGE_BOOT_FAILURE_MAX_EXITS`` -- identical boot-error exits before hold (default ``3``)
+- ``RIFTFORGE_RELOAD_STORM_MAX_EXITS`` -- game respawns without stable boot stamp before reload-storm revert (default ``5``)
 - ``RIFTFORGE_AUTO_DB_RECOVER`` -- staging helper: restore latest backup on hold (``1``)
 """
 
@@ -33,6 +35,7 @@ HOLD_FILENAME = ".crash_revert_hold"
 # manual `gm recover clearhold` every single time.
 HOLD_META_FILENAME = ".crash_revert_hold_meta.json"
 DB_HOLD_FILENAME = ".db_corruption_hold"
+BOOT_HOLD_FILENAME = ".boot_failure_hold"
 PLANNED_RESTART_FILENAME = ".planned_restart"
 GATEWAY_OUTAGE_FILENAME = ".gateway_outage.json"
 
@@ -40,6 +43,11 @@ DEFAULT_CRASH_WINDOW = 300.0
 DEFAULT_MAX_EXITS = 5
 DEFAULT_BACKOFF_BASE = 30.0
 DEFAULT_DB_CORRUPT_MAX_EXITS = 3
+DEFAULT_BOOT_FAILURE_MAX_EXITS = 3
+# Planned copyover / SIGUSR1 reload exits used to bypass the crash budget
+# entirely, so map-heal + auto-deploy mtime churn could spin forever without
+# ever tripping ``revert_to_last_stable``.
+DEFAULT_RELOAD_STORM_MAX_EXITS = 5
 
 
 def _repo_root():
@@ -70,6 +78,10 @@ def _db_hold_path(root=None):
     return os.path.join(root or _repo_root(), DB_HOLD_FILENAME)
 
 
+def _boot_hold_path(root=None):
+    return os.path.join(root or _repo_root(), BOOT_HOLD_FILENAME)
+
+
 def db_corrupt_max_exits():
     raw = (os.environ.get("RIFTFORGE_DB_CORRUPT_MAX_EXITS") or "").strip()
     if not raw:
@@ -83,6 +95,16 @@ def db_corrupt_max_exits():
 def auto_db_recover_enabled():
     raw = (os.environ.get("RIFTFORGE_AUTO_DB_RECOVER") or "").strip().lower()
     return raw in ("1", "true", "yes", "on")
+
+
+def boot_failure_max_exits():
+    raw = (os.environ.get("RIFTFORGE_BOOT_FAILURE_MAX_EXITS") or "").strip()
+    if not raw:
+        return DEFAULT_BOOT_FAILURE_MAX_EXITS
+    try:
+        return max(2, int(raw))
+    except ValueError:
+        return DEFAULT_BOOT_FAILURE_MAX_EXITS
 
 
 def db_hold_active(*, root=None):
@@ -116,6 +138,43 @@ def read_db_hold_reason(*, root=None):
         return ""
 
 
+def boot_hold_active(*, root=None):
+    return os.path.isfile(_boot_hold_path(root))
+
+
+def set_boot_hold(*, reason="", root=None):
+    path = _boot_hold_path(root)
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write((reason or "deterministic boot failure").strip() + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        pass
+
+
+def clear_boot_hold(*, root=None):
+    try:
+        os.remove(_boot_hold_path(root))
+    except OSError:
+        pass
+
+
+def read_boot_hold_reason(*, root=None):
+    path = _boot_hold_path(root)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return (handle.read() or "").strip()
+    except OSError:
+        return ""
+
+
+def respawn_paused(*, root=None):
+    """True when the watcher must not respawn the game child (DB or boot hold)."""
+    root = root or _repo_root()
+    return db_hold_active(root=root) or boot_hold_active(root=root)
+
+
 def _recent_db_corrupt_exits(recent):
     return [row for row in recent if row.get("db_corrupt")]
 
@@ -125,6 +184,27 @@ def _recent_all_db_corrupt(recent):
     if not recent:
         return False
     return all(bool(row.get("db_corrupt")) for row in recent)
+
+
+def _recent_unplanned_exits(recent):
+    """Crash-budget rows only — deliberate copyover reloads are tracked separately."""
+    return [row for row in recent if not row.get("planned")]
+
+
+def _recent_boot_error_exits(recent):
+    """Exits that carried a boot-failure stamp (not SQLite corruption)."""
+    return [
+        row for row in recent
+        if row.get("boot_error") and not row.get("db_corrupt")
+    ]
+
+
+def _exit_boot_signature(row):
+    """Normalize ``(exc_type, message-prefix)`` for one exit row."""
+    return (
+        row.get("boot_exc_type") or "",
+        str(row.get("boot_error") or "")[:160],
+    )
 
 
 def crash_window_seconds():
@@ -145,6 +225,17 @@ def crash_max_exits():
         return max(2, int(raw))
     except ValueError:
         return DEFAULT_MAX_EXITS
+
+
+def reload_storm_max_exits():
+    """Respawns without a fresh stable-boot stamp before auto-revert."""
+    raw = (os.environ.get("RIFTFORGE_RELOAD_STORM_MAX_EXITS") or "").strip()
+    if not raw:
+        return DEFAULT_RELOAD_STORM_MAX_EXITS
+    try:
+        return max(2, int(raw))
+    except ValueError:
+        return DEFAULT_RELOAD_STORM_MAX_EXITS
 
 
 def backoff_base_seconds():
@@ -306,6 +397,7 @@ def set_revert_hold(*, reason="", root=None):
     """
     from engine import auto_deploy
 
+    was_active = hold_active(root=root)
     path = _hold_path(root)
     try:
         with open(path, "w", encoding="utf-8") as handle:
@@ -336,6 +428,17 @@ def set_revert_hold(*, reason="", root=None):
         except OSError:
             pass
 
+    if not was_active:
+        try:
+            from engine import ops_webhook
+            ops_webhook.schedule_ops_alert(
+                "crash_revert_hold",
+                (reason or "crash budget exceeded").strip(),
+                sha=sha or "",
+            )
+        except Exception:
+            pass
+
 
 def clear_revert_hold(*, root=None):
     """Head GM clears hold so auto-deploy may resume."""
@@ -350,7 +453,7 @@ def clear_revert_hold(*, root=None):
 
 
 def resume_after_crash_hold(*, root=None):
-    """Clear revert/db holds and queue auto-deploy catch-up.
+    """Clear revert / db / boot holds and queue auto-deploy catch-up.
 
     Deliberately does **not** forget the thrash-guard failure signature
     (``last_revert_signature``). Resuming — whether via staff
@@ -368,6 +471,7 @@ def resume_after_crash_hold(*, root=None):
     root = root or _repo_root()
     clear_revert_hold(root=root)
     clear_db_hold(root=root)
+    clear_boot_hold(root=root)
     from engine import auto_deploy
 
     auto_deploy.set_override("on", root=root)
@@ -407,6 +511,8 @@ def maybe_auto_resume_hold(*, root=None):
         return False, "no hold active"
     if db_hold_active(root=root):
         return False, "db corruption hold active (needs manual restore)"
+    if boot_hold_active(root=root):
+        return False, "boot failure hold active (needs fix + clearhold)"
     baseline = read_hold_sha(root=root)
     if not baseline:
         return False, "no recorded hold baseline SHA (clear manually)"
@@ -457,6 +563,27 @@ def record_exit(*, returncode, hang_kill=False, root=None):
         state["last_planned_restart_at"] = time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)
         )
+        # Still count deliberate reloads (copyover / announced deploy) toward
+        # the reload-storm budget — they used to vanish from ``recent_exits``,
+        # so auto-revert never fired during Veil/copyover cascades.
+        recent = _prune_exits(
+            state.get("recent_exits") or [], now=now, window=crash_window_seconds(),
+        )
+        row = {
+            "at": now,
+            "code": int(returncode) if returncode is not None else None,
+            "planned": True,
+        }
+        boot_err = boot_failure.take_boot_failure(root=root)
+        if boot_err:
+            if boot_err.get("message"):
+                row["boot_error"] = str(boot_err.get("message"))[:200]
+            if boot_err.get("exc_type"):
+                row["boot_exc_type"] = str(boot_err.get("exc_type"))[:80]
+            if boot_err.get("db_corrupt"):
+                row["db_corrupt"] = True
+        recent.append(row)
+        state["recent_exits"] = recent
         save_state(state, root=root)
         return state
 
@@ -547,6 +674,56 @@ def evaluate_db_corruption(*, root=None):
     return "hold", detail
 
 
+def evaluate_boot_failure(*, root=None):
+    """Trip boot hold (and pause respawn) after repeated identical boot errors.
+
+    Returns ``(action, detail)`` where ``action`` is ``none`` or ``hold``.
+    Code revert cannot fix import-time validation / content-schema crashes;
+    this mirrors ``evaluate_db_corruption`` but for tagged boot failures.
+    """
+    root = root or _repo_root()
+    if boot_hold_active(root=root):
+        return "none", "boot hold already active"
+
+    state = load_state(root)
+    now = time.time()
+    recent = _prune_exits(
+        state.get("recent_exits") or [], now=now, window=crash_window_seconds(),
+    )
+    boot_recent = _recent_boot_error_exits(recent)
+    needed = boot_failure_max_exits()
+    if len(boot_recent) < needed:
+        return "none", "below boot failure threshold"
+
+    signature = _dominant_signature(boot_recent)
+    if signature is None:
+        return "none", "no boot failure signature"
+
+    matching = [
+        row for row in boot_recent
+        if _exit_boot_signature(row) == signature
+    ]
+    if len(matching) < needed:
+        return "none", "mixed boot failures"
+
+    detail = (matching[-1].get("boot_error") or "boot failure").strip()
+    exc_type = (matching[-1].get("boot_exc_type") or "Error").strip()
+    set_boot_hold(
+        reason=(
+            f"deterministic boot failure ({needed} identical exits in "
+            f"{crash_window_seconds():.0f}s): {exc_type}: {detail}"
+        )[:500],
+        root=root,
+    )
+    print(
+        f"[crash_recovery] BOOT HOLD - respawn paused. "
+        f"Fix the boot error ({exc_type}: {detail[:120]}), then "
+        f"gm recover clearhold (or fix files on bind-mount and clearhold).",
+        flush=True,
+    )
+    return "hold", detail
+
+
 def should_revert(*, root=None, now=None):
     """Return ``(trip: bool, reason: str)`` for crash budget / gateway outage."""
     root = root or _repo_root()
@@ -558,6 +735,8 @@ def should_revert(*, root=None, now=None):
         return False, "revert hold active"
     if db_hold_active(root=root):
         return False, "db corruption hold active"
+    if boot_hold_active(root=root):
+        return False, "boot failure hold active"
     stable = boot_stability.load_stable(root)
     if not stable or not (stable.get("sha") or "").strip():
         return False, "no stable boot stamp yet"
@@ -567,12 +746,13 @@ def should_revert(*, root=None, now=None):
 
     state = load_state(root)
     recent = _prune_exits(state.get("recent_exits") or [], now=now, window=crash_window_seconds())
+    unplanned = _recent_unplanned_exits(recent)
     # Code revert cannot fix a corrupt SQLite file — skip when every recent
     # exit was a corrupt-DB boot failure.
-    if _recent_all_db_corrupt(recent):
+    if _recent_all_db_corrupt(unplanned):
         return False, "db corruption pattern (code revert skipped)"
 
-    if len(recent) >= crash_max_exits():
+    if len(unplanned) >= crash_max_exits():
         # Thrash guard: if the LAST revert already tried to fix this exact
         # failure and it came right back, a second git reset cannot help —
         # this is a runtime-state-dependent / content bug, not a code
@@ -580,7 +760,7 @@ def should_revert(*, root=None, now=None):
         # postmortem: 52 reverts against the same hillside_sanctuary boot
         # crash, none of which could possibly have fixed it). Hold directly
         # with a loud, specific reason instead of reverting again.
-        signature = _dominant_signature(recent)
+        signature = _dominant_signature(unplanned)
         last_signature = state.get("last_revert_signature")
         if (
             signature is not None
@@ -604,7 +784,7 @@ def should_revert(*, root=None, now=None):
                 flush=True,
             )
             return False, "repeated failure signature after revert (thrash guard)"
-        return True, f"{len(recent)} exits in {crash_window_seconds():.0f}s"
+        return True, f"{len(unplanned)} exits in {crash_window_seconds():.0f}s"
 
     # Continuous failure: no stable stamp refresh within window while failing.
     stable_at = stable.get("at") or ""
@@ -612,12 +792,53 @@ def should_revert(*, root=None, now=None):
         stable_ts = time.mktime(time.strptime(stable_at, "%Y-%m-%dT%H:%M:%SZ"))
     except (TypeError, ValueError, OverflowError):
         stable_ts = 0
-    if recent and stable_ts and (now - stable_ts) >= crash_window_seconds():
-        first_fail = min(float(row.get("at", now)) for row in recent)
+    if unplanned and stable_ts and (now - stable_ts) >= crash_window_seconds():
+        first_fail = min(float(row.get("at", now)) for row in unplanned)
         if first_fail > stable_ts and (now - first_fail) >= crash_window_seconds():
             return True, "continuous failure past crash window"
 
     return False, "ok"
+
+
+def should_revert_reload_storm(
+    *, spawn_failures, game_spawn_wall, root=None, now=None,
+):
+    """Return ``(trip, reason)`` when reloads outrun stable-boot stamps.
+
+    Copyover / planned-restart exits do not always carry boot-failure
+    stamps, but the watcher still respawns the game child. When that
+    happens ``reload_storm_max_exits()`` times without
+    ``.boot_stable.json`` refreshing for the current spawn, treat it like
+    a crash loop and allow ``revert_to_last_stable``.
+    """
+    root = root or _repo_root()
+    now = time.time() if now is None else now
+    if hold_active(root=root):
+        return False, "revert hold active"
+    if db_hold_active(root=root):
+        return False, "db corruption hold active"
+    if boot_hold_active(root=root):
+        return False, "boot failure hold active"
+    stable = boot_stability.load_stable(root)
+    if not stable or not (stable.get("sha") or "").strip():
+        return False, "no stable boot stamp yet"
+
+    needed = reload_storm_max_exits()
+    if int(spawn_failures or 0) < needed:
+        return False, "below reload storm threshold"
+
+    try:
+        stable_mtime = os.path.getmtime(boot_stability.stable_path(root))
+    except OSError:
+        stable_mtime = 0.0
+    # Same freshness gate as watch_and_run uses to clear spawn_failures.
+    if stable_mtime >= (float(game_spawn_wall) - 1.0):
+        return False, "stable boot fresh for this spawn"
+
+    return True, (
+        f"{spawn_failures} game respawns without stable boot stamp "
+        f"(reload/copyover storm)"
+    )
 
 
 def revert_to_last_stable(*, root=None, reason=""):
@@ -768,6 +989,7 @@ def status_text(*, root=None):
         f"  stable recorded: {stable.get('at') or '(never)'}",
         f"  revert hold: {'ON' if hold_active(root=root) else 'off'}",
         f"  db corruption hold: {'ON' if db_hold_active(root=root) else 'off'}",
+        f"  boot failure hold: {'ON' if boot_hold_active(root=root) else 'off'}",
     ]
     reason = read_hold_reason(root=root)
     if reason:
@@ -781,6 +1003,9 @@ def status_text(*, root=None):
     db_reason = read_db_hold_reason(root=root)
     if db_reason:
         lines.append(f"  db hold reason: {db_reason}")
+    boot_reason = read_boot_hold_reason(root=root)
+    if boot_reason:
+        lines.append(f"  boot hold reason: {boot_reason}")
     if state.get("last_revert_signature"):
         sig = state["last_revert_signature"]
         lines.append(

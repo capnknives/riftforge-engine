@@ -106,6 +106,39 @@ def register_all_hooks():
         fn()
 
 
+def reregister_blob_codec():
+    """Re-wire critical hooks after ``importlib.reload(engine.hooks)``.
+
+    Copyover reloads hooks before persistence; that clears bootstrap
+    callbacks. Must run before ``game.save(copyover=True)``. Restores
+    blob codec plus character attacher (and SUPERS Game meta).
+    """
+    name = _resolve()
+    if name == "supers":
+        from supers.bootstrap import reregister_blob_codec as fn
+        fn()
+    elif name == "basegame":
+        from basegame.bootstrap import reregister_blob_codec as fn
+        fn()
+    elif name == "classic":
+        from classic.bootstrap import reregister_blob_codec as fn
+        fn()
+    else:
+        from engine import hooks
+        hooks.reload_blob_codec()
+
+
+def restore_hooks_after_copyover_abort():
+    """Full ``register_all_hooks`` after a refused copyover save.
+
+    ``reload_world_save_modules`` clears every bootstrap callback. The light
+    ``reregister_blob_codec`` path may still leave combat/chargen/help hooks
+    empty when we abort without ``os._exit``. Re-running full registration
+    keeps the live process playable until the next real restart.
+    """
+    register_all_hooks()
+
+
 def register_default_ticks(game):
     """Wire the active game's tick handlers onto `game`. No-op for "none"."""
     name = _resolve()

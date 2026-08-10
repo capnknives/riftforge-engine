@@ -19,8 +19,12 @@ SB = 250   # Subnegotiation Begin
 SE = 240   # Subnegotiation End
 
 # Telnet option numbers we care about.
+# 1 = ECHO -- remote echo on/off (password masking at login).
+# 31 = NAWS (Negotiate About Window Size) -- client reports cols/rows.
 # 70 = MSSP (Mud Server Status Protocol) -- listing crawlers / Mudlet.
 # 201 = GMCP (Generic Mud Communication Protocol) -- Mudlet gauges / UI.
+TELOPT_ECHO = 1
+TELOPT_NAWS = 31
 TELOPT_MSSP = 70
 TELOPT_GMCP = 201
 
@@ -161,6 +165,96 @@ def parse_stream(buf: bytes):
 
     remainder = bytes(buf[i:])
     return bytes(text), events, remainder
+
+
+def parse_naws_payload(data: bytes):
+    """Decode NAWS SB payload into (width, height) or (None, None).
+
+    RFC 1073: four bytes, 16-bit width then 16-bit height, each in network
+    (big-endian) byte order. Returns (None, None) when too short or invalid.
+    """
+    if len(data) < 4:
+        return None, None
+    width = (data[0] << 8) | data[1]
+    height = (data[2] << 8) | data[3]
+    # Sanity floor -- zero-width terminals are useless for layout.
+    if width < 20 or height < 4:
+        return None, None
+    return width, height
+
+
+def offer_naws(session) -> None:
+    """Ask the client to send window size (IAC DO NAWS).
+
+    Clients that ignore NAWS are unaffected -- no reply, defaults stay.
+    """
+    session._write_raw(do(TELOPT_NAWS))
+
+
+def set_client_echo(session, enabled: bool) -> None:
+    """Toggle remote echo for password prompts (IAC WILL / WONT ECHO).
+
+    RFC 857: when the server sends WILL ECHO it takes over echoing, so the
+    client stops local echo (password masking). WONT ECHO releases echo back
+    to the client for normal typing.
+
+    ``enabled=True`` restores local echo after a masked password read.
+    ``enabled=False`` masks the next line on clients that honor ECHO.
+    Plain ``nc`` clients ignore the negotiation and still show keystrokes --
+    that is acceptable graceful fallback.
+    """
+    if enabled:
+        session._write_raw(wont(TELOPT_ECHO))
+    else:
+        session._write_raw(will(TELOPT_ECHO))
+
+
+def handle_negotiate(session, cmd: int, option: int) -> bool:
+    """Apply one WILL/WONT/DO/DONT event. Return True when handled here.
+
+    NAWS and ECHO are engine-owned; GMCP/MSSP stay in their modules.
+    Unhandled options return False so gmcp.handle_telnet_event can refuse
+    politely (DONT/WONT) without double-replying.
+    """
+    if option == TELOPT_NAWS:
+        if cmd == WILL:
+            # Client will send NAWS SB when the window changes -- ack it.
+            session._write_raw(do(TELOPT_NAWS))
+        elif cmd == DO:
+            # Client asks us to send NAWS -- we only consume, never emit.
+            session._write_raw(wont(TELOPT_NAWS))
+        elif cmd in (WONT, DONT):
+            # Client declined -- leave term_width/term_height unset.
+            pass
+        return True
+    if option == TELOPT_ECHO:
+        # Acknowledge client ECHO negotiation without fighting local echo
+        # policy (password masking uses set_client_echo on the server side).
+        if cmd == DO:
+            session._write_raw(will(TELOPT_ECHO))
+        elif cmd == WILL:
+            session._write_raw(do(TELOPT_ECHO))
+        elif cmd == DONT:
+            session._write_raw(wont(TELOPT_ECHO))
+        elif cmd == WONT:
+            session._write_raw(dont(TELOPT_ECHO))
+        return True
+    return False
+
+
+def handle_naws_subneg(session, data: bytes) -> None:
+    """Store NAWS width/height on the Session for layout formatters."""
+    from engine import display_prefs
+
+    width, height = parse_naws_payload(data)
+    if width is None:
+        return
+    # Share the same clamp as ``config width`` player prefs.
+    session.term_width = max(
+        display_prefs.WIDTH_MIN,
+        min(display_prefs.WIDTH_MAX, int(width)),
+    )
+    session.term_height = int(height)
 
 
 def text_to_command_line(text: bytes, *, keep_indent: bool = False) -> str:

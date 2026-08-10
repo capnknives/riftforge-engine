@@ -6,6 +6,8 @@ squashbugs). These checks print warnings to docker logs; they never block a
 deploy that already squash-merged on GitHub.
 """
 
+import os
+
 
 def check_integrations():
     """Return a list of human-readable warning strings (empty = all good).
@@ -134,7 +136,20 @@ def check_integrations():
     return warnings
 
 
-def run_post_overlay_checks():
+def run_post_overlay_checks(root=None):
     """Print any post-overlay warnings; never raises."""
+    if root is None:
+        root = os.getcwd()
+    try:
+        from engine import changelog_index as changelog_index_mod
+
+        changelog_index_mod.ensure_compiled_index(
+            root, log_prefix="[auto_deploy]",
+        )
+    except Exception as exc:
+        print(
+            f"[auto_deploy] post-overlay warning: changelog index heal skipped: {exc}",
+            flush=True,
+        )
     for message in check_integrations():
         print(f"[auto_deploy] post-overlay warning: {message}", flush=True)

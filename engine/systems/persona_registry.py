@@ -393,6 +393,12 @@ def traveler_level(character):
     return level
 
 
+def lifestyle_traits(traits):
+    """Personality tags only -- exclude traveler-reach tags from ``traits``."""
+    reach = _TRAVELER_LEVEL_FOR_TAG
+    return [t for t in (traits or ()) if t not in reach]
+
+
 def can_travel(character, kind):
     """True when traveler reach is high enough for town|map|realm."""
     need = _TRAVELER_KIND_LEVEL.get((kind or "").lower())

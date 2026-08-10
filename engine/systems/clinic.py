@@ -10,6 +10,8 @@ Stdlib only; zero ``supers`` imports.
 
 from __future__ import annotations
 
+import random as _random_module
+
 # Default pacing when ``game`` is absent (smoke / unit tests).
 DEFAULT_KO_ADMIT_TICKS = 3
 DEFAULT_STAY_TICKS = 20
@@ -144,3 +146,144 @@ def tick(game):
         ready_hp = max_hp * DISCHARGE_HP_FRACTION
         if (until and now >= until) or float(character.hp) >= ready_hp:
             discharge(character, game=game)
+
+
+# --- Ward selection + discharge bookkeeping (generic peel) ---------------
+
+
+def _room_map_id(room):
+    """map_id string for a room, or None."""
+    if room is None:
+        return None
+    return getattr(room, "map_id", None) or None
+
+
+def _room_zone(room):
+    """zone tag for a room, or None."""
+    if room is None:
+        return None
+    return getattr(room, "zone", None) or None
+
+
+def prefer_near(candidates, near_room):
+    """Filter candidate rooms to the same map (then zone) as ``near_room``.
+
+    Returns the narrowed list when non-empty; otherwise the original
+    candidates unchanged (global fallback). Ported from supers/hospital.py
+    with zero game-package imports.
+    """
+    if not candidates or near_room is None:
+        return list(candidates)
+    map_id = _room_map_id(near_room)
+    if map_id:
+        local = [
+            room for room in candidates
+            if _room_map_id(room) == map_id
+        ]
+        if local:
+            return local
+    zone = _room_zone(near_room)
+    if zone:
+        local = [
+            room for room in candidates
+            if _room_zone(room) == zone
+        ]
+        if local:
+            return local
+    return list(candidates)
+
+
+def count_patients(room, *, count_collapsed=True):
+    """How many hospitalized (and optionally collapsed) actors are in ``room``."""
+    if room is None:
+        return 0
+    n = 0
+    for obj in getattr(room, "contents", ()) or ():
+        if getattr(obj, "hospitalized", False):
+            n += 1
+            continue
+        if count_collapsed and getattr(obj, "collapsed", False):
+            n += 1
+    return n
+
+
+def pick_ward(
+    game,
+    rooms_getter=None,
+    *,
+    near_room=None,
+    rng=None,
+    room_filter=None,
+    fallback=None,
+):
+    """Choose a ward room near ``near_room``: empty, else least occupied.
+
+    ``rooms_getter`` defaults to ``game.rooms.values()``; games with custom
+    room stores or SUPERS-specific filters pass their own callable.
+    ``room_filter`` optionally narrows to recovery wards (hospital + sleep,
+    Earth plane, etc.) before the proximity pass. ``fallback`` is called
+    when no wards match (e.g. return a hospital lobby).
+  """
+    if game is None:
+        return None
+    if rooms_getter is None:
+        rooms = getattr(game, "rooms", None) or {}
+        rooms_getter = rooms.values
+    roll = rng if rng is not None else _random_module
+    wards = list(rooms_getter())
+    if room_filter is not None:
+        wards = [room for room in wards if room_filter(room)]
+    preferred = prefer_near(wards, near_room)
+    wards = preferred if preferred else wards
+    if not wards:
+        if callable(fallback):
+            return fallback()
+        return None
+    empty = [ward for ward in wards if count_patients(ward) == 0]
+    if empty:
+        return roll.choice(empty)
+    min_n = min(count_patients(ward) for ward in wards)
+    candidates = [ward for ward in wards if count_patients(ward) == min_n]
+    return roll.choice(candidates)
+
+
+# --- Aggregate-HP resolver (discharge threshold) ---------------------------
+
+_max_hp_resolver = None
+
+
+def set_max_hp_resolver(fn):
+    """Register fn(character) -> float for discharge HP thresholds.
+
+    Same registration pattern as ``engine.systems.body_parts.set_max_hp_resolver``;
+    games register once at import (``supers/hospital.py`` wires ``stats.max_hp``).
+    Pass None to clear (test-only).
+    """
+    global _max_hp_resolver
+    _max_hp_resolver = fn
+
+
+def _resolve_max_hp(character, max_hp_resolver):
+    if max_hp_resolver is not None:
+        return float(max_hp_resolver(character))
+    if _max_hp_resolver is not None:
+        return float(_max_hp_resolver(character))
+    return _hp_cap(character)
+
+
+def is_ready_to_discharge(
+    character,
+    *,
+    now_tick,
+    max_hp_resolver=None,
+    until_tick_attr="hospital_until_tick",
+    hospitalized_attr="hospitalized",
+    discharge_hp_frac=1.0,
+):
+    """True when stay timer elapsed or HP is at/above ``discharge_hp_frac`` of max."""
+    if not getattr(character, hospitalized_attr, False):
+        return False
+    until = int(getattr(character, until_tick_attr, 0) or 0)
+    max_hp = _resolve_max_hp(character, max_hp_resolver)
+    hp = float(getattr(character, "hp", 0) or 0)
+    return now_tick >= until or hp >= max_hp * discharge_hp_frac

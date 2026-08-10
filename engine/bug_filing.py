@@ -68,7 +68,10 @@ def record_and_confirm(
         subject_character
         if subject_character is not None else character
     )
-    ctx = report_context.build(context_character, game)
+    ctx = report_context.build(
+        context_character, game,
+        history=history, description=description,
+    )
     account = accounts_mod.account_for_character(game, character)
     account_name = (
         account.display_name if account is not None else None

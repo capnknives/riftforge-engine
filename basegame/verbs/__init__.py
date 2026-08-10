@@ -13,6 +13,7 @@ COMMANDS (AGENTS.md rule 11).
 from basegame.verbs.drive import cmd_board, cmd_drive, cmd_unboard
 from basegame.verbs.character import cmd_score
 from basegame.verbs.mail import cmd_mail
+from basegame.verbs.noticeboard import cmd_notice
 from basegame.verbs.weather import cmd_forecast, cmd_weather
 from basegame.verbs.work import cmd_work
 from basegame.verbs.fly import cmd_descend, cmd_fly, cmd_hover
@@ -91,6 +92,10 @@ BASEGAME_COMMANDS = {
     "mail": (
         cmd_mail,
         "letters at the Post Office (see 'help mail')",
+    ),
+    "notice": (
+        cmd_notice,
+        "community board: post or read notices (see 'help noticeboard')",
     ),
     "weather": (
         cmd_weather,

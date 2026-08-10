@@ -124,6 +124,7 @@ def broadcast_ooc(
     *,
     speaker_session=None,
     kind: str = OOC_KIND_NORMAL,
+    skip_discord_mirror: bool = False,
 ):
     """Send one OOC line to every connected session; record history + Discord.
 
@@ -132,6 +133,9 @@ def broadcast_ooc(
     to that session anyway (``cmd_ooc`` parity).
 
     *kind* ``author_nudge`` uses gold + ``[AUTHOR]`` (Chuck bug/suggest lines).
+
+    *skip_discord_mirror* avoids re-posting lines that already arrived from
+    Discord (prevents webhook echo loops).
 
     Returns True when at least one session received the line.
     """
@@ -162,12 +166,44 @@ def broadcast_ooc(
         speaker_session.send("")
         gmcp.push_comm(speaker_session, "ooc", message, face)
         delivered = True
-    try:
-        from engine import discord_bridge
+    if not skip_discord_mirror:
+        try:
+            from engine import discord_bridge
 
-        discord_bridge.schedule_ooc(public_plain)
-    except Exception as exc:
-        print(f"[discord_bridge] ooc schedule skipped: {exc}", flush=True)
+            discord_bridge.schedule_ooc(public_plain)
+        except Exception as exc:
+            print(f"[discord_bridge] ooc schedule skipped: {exc}", flush=True)
+    return delivered
+
+
+def broadcast_ooc_from_discord(game, face: str, message: str) -> bool:
+    """Relay one Discord #ooc line into the global OOC channel.
+
+    Uses a synthetic history entry (no Character speaker) and never
+    mirrors back out to Discord.
+    """
+    from engine import gmcp
+
+    public_plain = format_ooc_line(face, message)
+    entry = {
+        "speaker": None,
+        "message": message,
+        "plain": public_plain,
+        "from_discord": True,
+    }
+    channel_history.append(
+        game, "ooc", entry, gateway_plain=public_plain,
+    )
+    delivered = False
+    for session in list(getattr(game, "sessions", None) or []):
+        other = getattr(session, "character", None)
+        if other is None:
+            continue
+        line = render_ooc_line(other, face, message)
+        session.send(line)
+        session.send("")
+        gmcp.push_comm(session, "ooc", message, face)
+        delivered = True
     return delivered
 
 
@@ -180,6 +216,9 @@ def format_ooc_history_entry(entry, viewer, game) -> str:
     message = str(entry.get("message") or "")
     kind = entry.get("kind") or OOC_KIND_NORMAL
     speaker_key = entry.get("speaker")
+    plain = entry.get("plain")
+    if not speaker_key and isinstance(plain, str) and plain:
+        return plain
     if not speaker_key or game is None:
         if viewer is not None:
             return render_ooc_line(viewer, "?", message, kind=kind)

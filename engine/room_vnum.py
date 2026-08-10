@@ -1003,6 +1003,73 @@ def heal_character_room_keys(game) -> dict:
     return stats
 
 
+def heal_persisted_room_key_blobs(game) -> dict:
+    """Boot heal: remap legacy room keys on game-level SQLite blobs.
+
+    Extends :func:`heal_character_room_keys` to ``gather_nodes``,
+    ``player_shops``, and ``townships`` tables that store ``room_key``
+    strings outside Character fields.
+    """
+    stats = {
+        "gather_nodes": 0,
+        "player_shops": 0,
+        "townships": 0,
+    }
+    if game is None:
+        return stats
+    aliases = getattr(game, "room_aliases", None) or {}
+    if not aliases:
+        return stats
+
+    def _remap(value):
+        if not value:
+            return value, False
+        text = str(value).strip()
+        if text in aliases:
+            return aliases[text], True
+        rooms = getattr(game, "rooms", None) or {}
+        if text in rooms:
+            return text, False
+        return text, False
+
+    store = getattr(game, "gather_nodes", None)
+    if isinstance(store, dict) and store:
+        rebuilt = {}
+        changed = False
+        for room_key, nodes in store.items():
+            new_key, ch = _remap(room_key)
+            rebuilt[new_key] = nodes
+            changed = changed or ch
+        if changed:
+            game.gather_nodes = rebuilt
+            stats["gather_nodes"] = len(rebuilt)
+
+    shops = getattr(game, "player_shops", None)
+    if isinstance(shops, dict):
+        for shop in shops.values():
+            if not isinstance(shop, dict):
+                continue
+            for field in ("host_room_key", "hub_room_key"):
+                raw = shop.get(field)
+                new, ch = _remap(raw)
+                if ch:
+                    shop[field] = new
+                    stats["player_shops"] += 1
+
+    towns = getattr(game, "townships", None)
+    if isinstance(towns, dict):
+        for town in towns.values():
+            if not isinstance(town, dict):
+                continue
+            for field in ("hub_room_key", "mouth_room_key"):
+                raw = town.get(field)
+                new, ch = _remap(raw)
+                if ch:
+                    town[field] = new
+                    stats["townships"] += 1
+    return stats
+
+
 def find_room_by_vnum(game, vnum_text):
     """Return the Room whose ``vnum`` matches ``vnum_text``, or None.
 

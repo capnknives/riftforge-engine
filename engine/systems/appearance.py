@@ -1,28 +1,15 @@
-"""appearance.py -- generic slot-based appearance catalog + description builder.
+"""
+appearance.py -- generic structured appearance slots + description builder.
 
-Character creation stores curated slots (hair style/color, eyes, height,
-physique, skin tone) on ``Character.appearance`` and derives
-``Character.description`` from them for look/examine. Physique is
-deliberately NOT named body_type -- that field is the combat-lexicon axis
-for creatures (humanoid/quadruped), a different concern.
+Catalog data registers at boot via ``register_appearance_kit``. Game-specific
+kit resolution (Cosmic Elemental aspects, etc.) uses
+``set_appearance_kit_resolver``.
 
-Freeform description override is game-owned (``Character.desc_override`` +
-``setdesc``): when the override flag is set, ``apply_appearance`` leaves
-the hand-written description alone. ``setdesc clear`` turns the flag off
-and rebuilds from slots when complete.
-
-Catalog JSON paths and kit registries are injected via ``engine.hooks``
-(two-repo purity H7b). Pure data + string building: zero ``supers`` imports.
+Zero ``supers`` imports.
 """
 
 from __future__ import annotations
 
-import json
-
-from engine import content_validate as cv
-from engine import hooks as _hooks
-
-# Core look slots -- required for is_complete / auto description.
 CORE_SLOTS = (
     "hair_style",
     "hair_color",
@@ -32,40 +19,83 @@ CORE_SLOTS = (
     "skin_tone",
 )
 
-# Mortal-only identity extras -- prompted at create; optional on legacy saves.
 EXTENDED_SLOTS = (
     "facial_hair",
     "scars",
     "voice",
 )
 
-# All slots for the mortal kit (chargen + ``appearance`` listing).
 SLOTS = CORE_SLOTS + EXTENDED_SLOTS
-
-# Max length for a player-typed custom slot value (catalog ids are short;
-# freeform like "storm-grey" or "sun-bleached wheat" needs a modest cap).
 CUSTOM_MAX_LEN = 40
-
-# Room-face short-desc override (setshort) -- shorter than setdesc so
-# look listings stay skim-friendly for strangers.
 SHORT_DESC_MAX_LEN = 60
-
-# Pronoun ids players may pick (section 7 item 4 / D17).
 PRONOUNS = ("he", "she", "they")
 
-# Map pronoun -> noun used in the auto-built look description.
 _PERSON_WORD = {
     "he": "man",
     "she": "woman",
     "they": "person",
 }
 
+_APPEARANCE_KITS: dict = {}
+_KIT_PERSON_WORD: dict = {}
+_KIT_SHORT_NOUN: dict = {}
+_NO_CROWN_STYLES: dict = {
+    "bald": ("bald", "a bald head"),
+    "heat_shimmer": ("heat-shimmered", "a heat-shimmered outline"),
+    "still_surface": ("glass-still", "a still glassy surface"),
+    "empty_sky": ("sky-empty", "an empty sky outline"),
+    "bare_stone": ("bare-stone", "a bare stone crown"),
+}
 
-def _load_mortal_catalog():
-    """Read the mortal appearance catalog via the registered content path."""
-    path = _hooks.appearance_content_path()
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+_kit_resolver = None
+_age_phrase_fn = None
+
+
+def set_appearance_kit_resolver(fn):
+    """Register fn(character) -> kit id string (default ``mortal``)."""
+    global _kit_resolver
+    _kit_resolver = fn
+
+
+def set_appearance_age_phrase(fn):
+    """Register fn(age:int) -> optional decade phrase for look prose."""
+    global _age_phrase_fn
+    _age_phrase_fn = fn
+
+
+def register_appearance_kit(
+    kit_id,
+    catalog,
+    *,
+    person_words=None,
+    short_noun=None,
+    no_crown_styles=None,
+):
+    """Register one appearance kit catalog at boot."""
+    _APPEARANCE_KITS[kit_id] = catalog
+    if person_words:
+        _KIT_PERSON_WORD[kit_id] = dict(person_words)
+    if short_noun:
+        _KIT_SHORT_NOUN[kit_id] = short_noun
+    if no_crown_styles:
+        _NO_CROWN_STYLES.update(no_crown_styles)
+
+
+def appearance_kits():
+    """Registered kit id -> catalog map (read-only view)."""
+    return dict(_APPEARANCE_KITS)
+
+
+def validate_all_kits():
+    """Fail loud when a registered kit catalog is missing slot tables."""
+    for kit_id, catalog in _APPEARANCE_KITS.items():
+        if not isinstance(catalog, dict):
+            raise ValueError(f"appearance kit {kit_id!r} must be a dict catalog")
+        for slot in slots_for_kit(kit_id):
+            if slot not in catalog:
+                raise ValueError(
+                    f"appearance kit {kit_id!r} missing catalog for slot {slot!r}"
+                )
 
 
 def slots_for_kit(kit_id=None):
@@ -75,86 +105,33 @@ def slots_for_kit(kit_id=None):
     return SLOTS
 
 
-def validate_appearance_slot_entry(entry, *, where):
-    """Fail loud if one appearance option row is malformed."""
-    cv.require_keys(entry, ("id", "name"), where)
-    cv.require_nonempty_str(entry, "id", where)
-    cv.require_nonempty_str(entry, "name", where)
-
-
-def _validate_kit(kit_id, catalog):
-    """Sanity-check one appearance kit catalog (same rules as mortal)."""
-    required = slots_for_kit(kit_id)
-    for slot in required:
-        assert slot in catalog, \
-            f"appearance kit {kit_id!r}: missing slot '{slot}'"
-        entries = catalog[slot]
-        assert entries, f"appearance kit {kit_id!r}: slot '{slot}' is empty"
-        ids = [e["id"] for e in entries]
-        assert len(ids) == len(set(ids)), \
-            f"appearance kit {kit_id!r}: slot '{slot}' has duplicate ids"
-        for i, entry in enumerate(entries):
-            validate_appearance_slot_entry(
-                entry, where=f"appearance kit {kit_id!r}:{slot}[{i}]",
-            )
-
-
-def validate_all_kits():
-    """Sanity-check every registered appearance kit once at boot."""
-    for kit_id, catalog in _hooks.appearance_kits().items():
-        _validate_kit(kit_id, catalog)
-
-
 def default_appearance():
-    """Return a fresh appearance dict with every slot unset (None).
-
-    Used by Character.__init__ and by persistence load merges so old saves
-    that lack the key still get a complete slot map. Extended mortal slots
-    are included so new keys merge cleanly without forcing legacy fills.
-    """
+    """Return a fresh appearance dict with every slot unset (None)."""
     return {slot: None for slot in SLOTS}
 
 
 def kit_for_character(character):
-    """Appearance kit id for chargen / display (mortal or game-registered kit).
-
-    Prefers an explicit ``appearance_kit`` stamp; otherwise consults the
-    registered kit resolver hook (SUPERS infers Cosmic Elemental Aspect).
-    Everyone else uses the mortal catalog.
-    """
-    if character is None:
-        return "mortal"
-    stamped = getattr(character, "appearance_kit", None)
-    kits = _hooks.appearance_kits()
-    if stamped and stamped in kits:
-        return stamped
-    resolver = _hooks.kit_for_character_resolver()
-    if resolver is not None:
-        inferred = resolver(character)
-        if inferred and inferred in kits:
-            return inferred
+    """Appearance kit id for chargen / display (default ``mortal``)."""
+    if _kit_resolver is not None:
+        try:
+            kit = _kit_resolver(character)
+            if kit and kit in _APPEARANCE_KITS:
+                return kit
+        except Exception:
+            pass
     return "mortal"
 
 
-def _short_noun_for(kit=None):
-    """Room-face noun for anonymous short-descs (figure / fire-being / …)."""
-    kit_id = kit or "mortal"
-    nouns = _hooks.appearance_kit_short_nouns()
-    return nouns.get(kit_id, "figure")
-
-
-def _non_skin_kit(kit=None):
-    """True when the kit uses matter wording instead of mortal skin."""
-    kit_id = kit or "mortal"
-    return kit_id in _hooks.appearance_kit_short_nouns()
+def short_noun_for(kit=None):
+    """Room-face noun for anonymous short-descs."""
+    return _KIT_SHORT_NOUN.get(kit or "mortal", "figure")
 
 
 def catalog_for(kit_id=None):
-    """Return the slot→entries dict for ``kit_id`` (default mortal)."""
-    kits = _hooks.appearance_kits()
-    if kit_id and kit_id in kits:
-        return kits[kit_id]
-    return kits["mortal"]
+    """Return the slot->entries dict for ``kit_id`` (default mortal)."""
+    if kit_id and kit_id in _APPEARANCE_KITS:
+        return _APPEARANCE_KITS[kit_id]
+    return _APPEARANCE_KITS.get("mortal", {})
 
 
 def valid_ids(slot, kit=None):
@@ -166,12 +143,7 @@ def valid_ids(slot, kit=None):
 
 
 def normalize_custom(text):
-    """Clean a freeform slot value typed by the player.
-
-    Returns the cleaned string, or None if empty / too long after strip.
-    Keeps spaces and light punctuation so "storm grey" and "blue-green"
-    stay readable in the auto-built look sentence.
-    """
+    """Clean a freeform slot value typed by the player."""
     if text is None:
         return None
     cleaned = " ".join(str(text).split())
@@ -183,43 +155,29 @@ def normalize_custom(text):
 
 
 def display(slot, option_id, *, kit=None):
-    """Return the player-facing display name for a slot value.
-
-    Catalog ids resolve to their `name` field (kit first, then any kit).
-    Custom freeform values are returned as-is. Returns None only when
-    `option_id` is empty/None.
-    """
+    """Return the player-facing display name for a slot value."""
     if not option_id:
         return None
-    # Prefer the active kit so Aspect ids resolve to Aspect names.
     for entry in catalog_for(kit).get(slot, []):
         if entry["id"] == option_id:
             return entry["name"]
-    # Search other kits (legacy / mentor stamps / mixed saves).
-    kits = _hooks.appearance_kits()
-    for other_id, catalog in kits.items():
+    for other_id, catalog in _APPEARANCE_KITS.items():
         if other_id == (kit or "mortal"):
             continue
         for entry in catalog.get(slot, []):
             if entry["id"] == option_id:
                 return entry["name"]
-    # Custom value -- already player-facing text.
     return str(option_id)
 
 
 def list_options(slot, kit=None):
-    """Return the list of {id, name} dicts for `slot` in ``kit``.
-
-    Callers iterate this for chargen prompts and help text -- the catalog
-    order in JSON is the presentation order.
-    """
+    """Return the list of {id, name} dicts for `slot` in ``kit``."""
     return list(catalog_for(kit).get(slot, []))
 
 
 def person_word_for(pronoun, kit=None):
-    """Noun used in auto-built look prose (man/woman/person or *-being)."""
-    kit_id = kit or "mortal"
-    kit_map = _hooks.appearance_kit_person_words().get(kit_id) or {}
+    """Noun used in auto-built look prose."""
+    kit_map = _KIT_PERSON_WORD.get(kit or "mortal") or {}
     if pronoun in kit_map:
         return kit_map[pronoun]
     return _PERSON_WORD.get(pronoun, "person")
@@ -227,18 +185,15 @@ def person_word_for(pronoun, kit=None):
 
 def _no_crown_bits(hair_style, style_shown):
     """Return (short_bit, full_bit) when style means no hair/crown, else None."""
-    styles = _hooks.appearance_no_crown_styles()
-    if hair_style in styles:
-        return styles[hair_style]
+    if hair_style in _NO_CROWN_STYLES:
+        return _NO_CROWN_STYLES[hair_style]
     if style_shown and str(style_shown).lower() == "bald":
-        bald = styles.get("bald")
-        if bald:
-            return bald
+        return _NO_CROWN_STYLES["bald"]
     return None
 
 
 def a_or_an(word):
-    """Pick 'a' or 'an' from the first letter of *word* (simple English)."""
+    """Pick 'a' or 'an' from the first letter of *word*."""
     w = (word or "").strip().lower()
     if not w:
         return "a"
@@ -261,11 +216,11 @@ def with_article(rest, *, capitalize=False):
 
 
 def _skin_short_bit(skin, kit=None):
-    """Skin (or non-skin matter) fragment for anonymous short-descs."""
+    """Skin (or elemental matter) fragment for anonymous short-descs."""
     if not skin:
         return None
     skin_l = str(skin).lower()
-    if _non_skin_kit(kit):
+    if (kit or "").startswith("elemental_"):
         return skin_l
     if skin_l.endswith("skinned"):
         return skin_l
@@ -309,7 +264,7 @@ def normalize_short_desc(text):
 
 
 def build_short_desc(appearance, pronoun="they", *, kit=None):
-    """Anonymous short face from filled look slots (until setshort)."""
+    """Anonymous short face from filled look slots."""
     appearance = appearance or {}
     height = display("height", appearance.get("height"), kit=kit)
     physique = display("physique", appearance.get("physique"), kit=kit)
@@ -335,7 +290,7 @@ def build_short_desc(appearance, pronoun="they", *, kit=None):
         bits.append(f"{str(hair_color).lower()}-haired")
     elif hair_style and style_shown:
         bits.append(str(style_shown).lower())
-    noun = _short_noun_for(kit)
+    noun = short_noun_for(kit)
     if bits or eyes:
         if not bits:
             return with_article(
@@ -346,6 +301,57 @@ def build_short_desc(appearance, pronoun="they", *, kit=None):
             face = f"{face} with {str(eyes).lower()} eyes"
         return face
     return with_article(person_word_for(pronoun, kit=kit))
+
+
+def build_hood_short_desc(appearance, pronoun="they", *, kit=None):
+    """Hood-up face: height + physique + skin; no hair, no eyes."""
+    appearance = appearance or {}
+    height = display("height", appearance.get("height"), kit=kit)
+    physique = display("physique", appearance.get("physique"), kit=kit)
+    skin = display("skin_tone", appearance.get("skin_tone"), kit=kit)
+    bits = []
+    if height:
+        bits.append(str(height).lower())
+    if physique:
+        bits.append(str(physique).lower())
+    skin_bit = _skin_short_bit(skin, kit=kit)
+    if skin_bit:
+        bits.append(skin_bit)
+    if not bits:
+        return None
+    noun = short_noun_for(kit)
+    return with_article(f"{' '.join(bits)} {noun}")
+
+
+def build_mask_short_desc(appearance, pronoun="they", *, kit=None):
+    """Mask-on face: height + hair + eyes visible through the mask."""
+    appearance = appearance or {}
+    height = display("height", appearance.get("height"), kit=kit)
+    hair_color = display("hair_color", appearance.get("hair_color"), kit=kit)
+    hair_style = appearance.get("hair_style")
+    style_shown = (
+        display("hair_style", hair_style, kit=kit) if hair_style else ""
+    )
+    eyes = display("eye_color", appearance.get("eye_color"), kit=kit)
+    no_crown = _no_crown_bits(hair_style, style_shown)
+    bits = []
+    if height:
+        bits.append(str(height).lower())
+    if no_crown:
+        bits.append(no_crown[0])
+    elif hair_color:
+        bits.append(f"{str(hair_color).lower()}-haired")
+    elif hair_style and style_shown:
+        bits.append(str(style_shown).lower())
+    if not bits and not eyes:
+        return None
+    if not bits:
+        bits.append("masked")
+    noun = short_noun_for(kit)
+    face = with_article(f"{' '.join(bits)} {noun}")
+    if eyes:
+        face = f"{face} with {str(eyes).lower()} eyes"
+    return face
 
 
 def build_description(appearance, pronoun, age=None, *, kit=None):
@@ -360,18 +366,16 @@ def build_description(appearance, pronoun, age=None, *, kit=None):
     hair_style = appearance["hair_style"]
     style_shown = display("hair_style", hair_style, kit=kit)
     age_bit = ""
-    if age is not None:
-        phrase_fn = _hooks.appearance_age_phrase_fn()
-        if phrase_fn is not None:
-            try:
-                phrase = phrase_fn(int(age))
-                if phrase:
-                    age_bit = f" {phrase}"
-            except Exception:
-                age_bit = ""
+    if age is not None and _age_phrase_fn is not None:
+        try:
+            phrase = _age_phrase_fn(int(age))
+            if phrase:
+                age_bit = f" {phrase}"
+        except Exception:
+            age_bit = ""
     matter = "skin"
     crown = "hair"
-    if _non_skin_kit(kit):
+    if (kit or "").startswith("elemental_"):
         matter = "matter"
         crown = "crown"
     lead = with_article(height, capitalize=True)
@@ -401,10 +405,7 @@ def build_description(appearance, pronoun, age=None, *, kit=None):
 
 
 def apply_appearance(character):
-    """If ``character.appearance`` is complete, rewrite ``character.description``.
-
-    No-op when incomplete or when ``character.desc_override`` is True.
-    """
+    """Rewrite character.description from slots when complete and allowed."""
     if getattr(character, "desc_override", False):
         return
     age = getattr(character, "age", None)

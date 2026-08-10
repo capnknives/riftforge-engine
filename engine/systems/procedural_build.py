@@ -922,6 +922,9 @@ def _build_one_home(street_room, street_name, address, *, rng, large=False):
     )
 
 
+_POPULATE_HOMES_BATCH_CAP = 20
+
+
 def populate_homes(game, street_room, count, *, large=False, rng=None):
     """Create ``count`` claimable street homes off the standing street.
 
@@ -929,8 +932,8 @@ def populate_homes(game, street_room, count, *, large=False, rng=None):
     """
     if count < 1:
         return False, "Usage: populate homes <n> [large]"
-    if count > 20:
-        return False, "Cap is 20 homes per populate call."
+    if count > _POPULATE_HOMES_BATCH_CAP:
+        return False, f"Cap is {_POPULATE_HOMES_BATCH_CAP} homes per populate call."
 
     street_name = parse_street_name(street_room)
     if not street_name:
@@ -972,7 +975,7 @@ def populate_homes(game, street_room, count, *, large=False, rng=None):
 
     _stamp_home_layouts(game, street_room, new_rooms)
 
-    msg = map_store.append_hand_rooms(
+    msg = hooks.map_store_append_hand_rooms(
         game,
         street_room,
         new_rooms,
@@ -1208,9 +1211,6 @@ def populate_neighborhood(
                 "Usage: populate neighborhood <direction> <n> [large]  "
                 "(n is the target house count on that street)"
             )
-        if homes_count > 20:
-            return False, "Cap is 20 homes per populate call."
-
 
     rng = rng or random
     keep = None
@@ -1431,7 +1431,7 @@ def populate_neighborhood(
             f"(target {homes_count}) -- nothing added."
         )
 
-    ok_h, msg_h = populate_homes(
+    ok_h, msg_h = _populate_homes_batched(
         game, hub, need, large=large, rng=rng,
     )
     if not ok_h:
@@ -1441,6 +1441,24 @@ def populate_neighborhood(
         f"{hub_msg} Stocked {need} {size}home(s) toward target "
         f"{homes_count} (had {have_homes}). {msg_h}"
     )
+
+
+def _populate_homes_batched(game, street_room, count, *, large=False, rng=None):
+    """Call :func:`populate_homes` in batches of ``_POPULATE_HOMES_BATCH_CAP``."""
+    if count < 1:
+        return True, "No homes requested."
+    msgs = []
+    remaining = int(count)
+    while remaining > 0:
+        batch = min(_POPULATE_HOMES_BATCH_CAP, remaining)
+        ok, msg = populate_homes(
+            game, street_room, batch, large=large, rng=rng,
+        )
+        msgs.append(msg)
+        if not ok:
+            return False, " ".join(msgs)
+        remaining -= batch
+    return True, " ".join(msgs)
 
 
 def _room_entry_has_sleep(entry):

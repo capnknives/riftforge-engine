@@ -25,10 +25,11 @@ What this does:
     ``GAME_HANG_BOOT_GRACE`` (see ``engine/game_heartbeat.py``).
 
   - Exception: edits under ``engine/gateway*.py`` (or
-    ``engine/gateway_protocol.py``) require a gateway restart — the
-    long-lived holder does not re-import. Those changes restart gateway
-    + game (clients drop). Without that, peer-IP forwarding and similar
-    gateway fixes stay on disk while the process still runs old code.
+    ``engine/gateway_protocol.py``), or to this watcher module itself,
+    require killing the gateway child — the long-lived holder does not
+    re-import. Those changes restart gateway + game (clients drop).
+    Without that, peer-IP forwarding and similar gateway fixes stay on
+    disk while the process still runs old code.
 
   - ``engine/auto_deploy.py`` (and ``tools/apply_pr_fix.py``) are
     ``importlib.reload``'d on every deploy poll for the same reason: a
@@ -119,6 +120,20 @@ def _copyover_boot_grace_seconds():
         return max(0.0, float(raw))
     except ValueError:
         return 45.0
+
+
+def _copyover_settle_seconds():
+    """Quiet period after the last watched mtime change before SIGUSR1.
+
+    Batches rapid auto-deploy ``reset --hard`` churn (several merges landing
+    within a minute) into one copyover instead of a Veil storm per commit.
+    Set ``COPYOVER_SETTLE_SECONDS=0`` to restore immediate reload on change.
+    """
+    raw = os.environ.get("COPYOVER_SETTLE_SECONDS", "30").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 30.0
 
 
 def reload_auto_deploy():
@@ -344,12 +359,37 @@ def _watcher_self_changed(before, after):
     return False
 
 
+def _disconnect_warn_seconds():
+    """Brief pause so deploy_notify can warn before the gateway is killed."""
+    raw = os.environ.get("DEPLOY_DISCONNECT_WARN_SECONDS", "5").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 5.0
+
+
+def _grace_disconnect_warning(root, proc):
+    """Touch marker + wait while game is still up (countdown may have missed)."""
+    if proc is None or proc.poll() is not None:
+        return
+    from engine import auto_deploy
+
+    auto_deploy.touch_disconnect_imminent(root)
+    deadline = time.time() + _disconnect_warn_seconds()
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            break
+        time.sleep(0.25)
+    auto_deploy.clear_disconnect_imminent(root)
+
+
 def _reexec_watcher(proc, gateway_proc):
     """Replace this long-lived PID-1 process so new skip/grace logic loads."""
     print(
         "[watch] watch_and_run.py changed -- re-execing watcher",
         flush=True,
     )
+    _grace_disconnect_warning(_repo_root(), proc)
     _stop_game(proc)
     if gateway_proc is not None:
         _stop_gateway(gateway_proc)
@@ -364,19 +404,9 @@ def _gateway_paths_changed(before, after):
     Only these files require killing the long-lived gateway child; other
     ``.py`` edits keep clients held across a game-only restart.
     """
-    # Normpath so Windows vs POSIX separators from glob still match.
-    watched = {
-        os.path.normpath("engine/gateway.py"),
-        os.path.normpath("engine/gateway_client.py"),
-        os.path.normpath("engine/gateway_protocol.py"),
-    }
-    keys = set(before) | set(after)
-    for path in keys:
-        if os.path.normpath(path) not in watched:
-            continue
-        if before.get(path) != after.get(path):
-            return True
-    return False
+    from engine import gateway_watch
+
+    return gateway_watch.snapshot_touches_gateway_restart(before, after)
 
 
 def _respawn_game(_proc, _game_spawn_wall, *, spawn_failures):
@@ -437,8 +467,23 @@ def _maybe_auto_revert(*, reason_prefix=""):
     return ok
 
 
+def _maybe_reload_storm_revert(*, spawn_failures, game_spawn_wall):
+    """Revert when copyover / respawn churn outruns stable-boot stamps."""
+    trip, reason = crash_recovery.should_revert_reload_storm(
+        spawn_failures=spawn_failures,
+        game_spawn_wall=game_spawn_wall,
+    )
+    if not trip:
+        return False
+    print(
+        f"[watch] reload storm detected ({reason}) -- evaluating auto-revert",
+        flush=True,
+    )
+    return _maybe_auto_revert(reason_prefix=f"reload storm: {reason}; ")
+
+
 def _after_game_exit(proc, *, hang_kill=False, root=None):
-    """Record exit, maybe trip DB hold, maybe code-revert."""
+    """Record exit, maybe trip DB/boot hold, maybe code-revert."""
     root = root or _repo_root()
     crash_recovery.record_exit(
         returncode=proc.returncode,
@@ -449,6 +494,9 @@ def _after_game_exit(proc, *, hang_kill=False, root=None):
     if action == "auto_restored":
         return
     if crash_recovery.db_hold_active(root=root):
+        return
+    crash_recovery.evaluate_boot_failure(root=root)
+    if crash_recovery.boot_hold_active(root=root):
         return
     _maybe_auto_revert(reason_prefix="exit: ")
 
@@ -591,8 +639,12 @@ def main():
     before = _snapshot()
     pending_copyover = False
     copyover_boot_grace = _copyover_boot_grace_seconds()
+    copyover_settle_seconds = _copyover_settle_seconds()
+    settle_deadline = None
     spawn_failures = 0
     backup_running = False
+    # Log boot/db hold once when respawn pauses — not every 1s poll tick.
+    hold_pause_announced = False
 
     # First load (and later deploy polls reload) so auto_deploy patches that
     # arrive via reset --hard actually run inside this long-lived watcher.
@@ -619,6 +671,13 @@ def main():
         )
     else:
         print("[watch] hang check off (GAME_HANG_CHECK=0)", flush=True)
+    if copyover_settle_seconds > 0:
+        print(
+            f"[watch] copyover settle on "
+            f"({copyover_settle_seconds:.0f}s quiet after last file change; "
+            "COPYOVER_SETTLE_SECONDS=0 for immediate reload)",
+            flush=True,
+        )
 
     while True:
         time.sleep(POLL_SECONDS)
@@ -628,6 +687,7 @@ def main():
             game_spawn_wall = new_wall
             before = _snapshot()
             pending_copyover = False
+            settle_deadline = None
             continue
 
         stable = boot_stability.load_stable()
@@ -708,9 +768,26 @@ def main():
                 proc, game_spawn_wall = _spawn_game()
                 before = _snapshot()
                 pending_copyover = False
+                settle_deadline = None
                 continue
 
         if proc.poll() is not None:   # None means "still running"
+            _after_game_exit(proc, root=root)
+            if crash_recovery.respawn_paused(root=root):
+                if not hold_pause_announced:
+                    hold_pause_announced = True
+                    reason = (
+                        crash_recovery.read_boot_hold_reason(root=root)
+                        or "crash hold active"
+                    )
+                    print(
+                        f"[watch] server.py exited ({proc.returncode}) "
+                        f"-- respawn PAUSED ({reason[:240]}). "
+                        "Fix content, then gm recover clearhold.",
+                        flush=True,
+                    )
+                continue
+            hold_pause_announced = False
             if use_gateway:
                 print(
                     f"[watch] server.py exited ({proc.returncode}) "
@@ -723,15 +800,23 @@ def main():
                     "-- restarting (no copyover possible for a crash)",
                     flush=True,
                 )
-            _after_game_exit(proc, root=root)
-            if crash_recovery.db_hold_active(root=root):
-                continue
             spawn_failures += 1
+            if _maybe_reload_storm_revert(
+                spawn_failures=spawn_failures,
+                game_spawn_wall=game_spawn_wall,
+            ):
+                spawn_failures = 0
+                proc, game_spawn_wall = _spawn_game()
+                before = _snapshot()
+                pending_copyover = False
+                settle_deadline = None
+                continue
             proc, game_spawn_wall = _respawn_game(
                 proc, game_spawn_wall, spawn_failures=spawn_failures,
             )
             before = _snapshot()
             pending_copyover = False
+            settle_deadline = None
             continue
 
         # Alive but stuck (no exit): classic autorun never sees this.
@@ -754,14 +839,25 @@ def main():
                 )
             _stop_game(proc)
             _after_game_exit(proc, hang_kill=True, root=root)
-            if crash_recovery.db_hold_active(root=root):
+            if crash_recovery.respawn_paused(root=root):
                 continue
             spawn_failures += 1
+            if _maybe_reload_storm_revert(
+                spawn_failures=spawn_failures,
+                game_spawn_wall=game_spawn_wall,
+            ):
+                spawn_failures = 0
+                proc, game_spawn_wall = _spawn_game()
+                before = _snapshot()
+                pending_copyover = False
+                settle_deadline = None
+                continue
             proc, game_spawn_wall = _respawn_game(
                 proc, game_spawn_wall, spawn_failures=spawn_failures,
             )
             before = _snapshot()
             pending_copyover = False
+            settle_deadline = None
             continue
 
         # Boot heal / auto-deploy catalog merges can touch watched JSON while
@@ -786,10 +882,59 @@ def main():
                     _stop_game(proc)
                     proc, game_spawn_wall = _spawn_game()
                 pending_copyover = False
+                settle_deadline = None
                 before = _snapshot()
                 continue
 
         after = _snapshot()
+
+        def _fire_copyover(*, reason_label):
+            """SIGUSR1 the game child for a deliberate reload."""
+            nonlocal proc, game_spawn_wall, before, pending_copyover, settle_deadline
+            if use_gateway:
+                print(
+                    f"[watch] {reason_label} -- "
+                    "signaling game (announce + exit; gateway holds clients)",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[watch] {reason_label} -- hot-reloading (copyover)",
+                    flush=True,
+                )
+            if not _signal_planned_copyover(proc):
+                _stop_game(proc)
+                proc, game_spawn_wall = _spawn_game()
+            pending_copyover = False
+            settle_deadline = None
+            before = after
+
+        # Batched reload: quiet period elapsed since the last mtime churn.
+        if (
+            copyover_settle_seconds > 0
+            and settle_deadline is not None
+            and after == before
+            and proc.poll() is None
+            and time.time() >= settle_deadline
+        ):
+            if crash_recovery.hold_active(root=root):
+                print(
+                    "[watch] revert hold active -- clearing settled copyover",
+                    flush=True,
+                )
+                settle_deadline = None
+                continue
+            in_boot_grace = (
+                copyover_boot_grace > 0
+                and (time.time() - game_spawn_wall) < copyover_boot_grace
+            )
+            if in_boot_grace:
+                pending_copyover = True
+                settle_deadline = None
+                continue
+            _fire_copyover(reason_label="settled code/content change")
+            continue
+
         if after != before:
             if crash_recovery.hold_active(root=root):
                 print(
@@ -812,6 +957,7 @@ def main():
                     "restarting gateway + game (clients drop)",
                     flush=True,
                 )
+                _grace_disconnect_warning(root, proc)
                 _stop_game(proc)
                 _stop_gateway(gateway_proc)
                 gateway_proc = _spawn_gateway()
@@ -831,28 +977,27 @@ def main():
                     flush=True,
                 )
                 pending_copyover = True
+                settle_deadline = None
                 before = after
                 continue
-            # Both modes: SIGUSR1 → copyover._perform announces MSG_BEFORE.
-            # Gateway: game then exits; next loop respawns (clients held).
-            # Direct: classic execv copyover keeps client fds.
-            if use_gateway:
+            from engine import auto_deploy as auto_deploy_mod
+            announced = auto_deploy_mod.announced_copyover_pending(root)
+            if copyover_settle_seconds > 0 and not announced:
+                settle_deadline = time.time() + copyover_settle_seconds
                 print(
                     "[watch] code/content change detected -- "
-                    "signaling game (announce + exit; gateway holds clients)",
+                    f"waiting {copyover_settle_seconds:.0f}s settle "
+                    "(batch rapid deploy edits)",
                     flush=True,
                 )
-            else:
-                print(
-                    "[watch] code/content change detected -- "
-                    "hot-reloading (copyover)",
-                    flush=True,
-                )
-            if not _signal_planned_copyover(proc):
-                _stop_game(proc)
-                proc, game_spawn_wall = _spawn_game()
-            pending_copyover = False
-            before = after   # don't re-trigger next second on the same edit
+                before = after
+                continue
+            if announced:
+                auto_deploy_mod.clear_announced_copyover(root)
+                _fire_copyover(reason_label="announced deploy sync")
+                continue
+            _fire_copyover(reason_label="code/content change detected")
+            continue
 
         ticks_until_deploy += 1
         if ticks_until_deploy >= deploy_every:

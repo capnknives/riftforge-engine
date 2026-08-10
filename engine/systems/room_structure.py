@@ -111,6 +111,8 @@ def set_wall_state(game, room, target_id, *, hp, wrecked=None):
     if wrecked is None:
         wrecked = hp <= 0
     targets[target_id] = {"hp": hp, "wrecked": bool(wrecked)}
+    if game is not None:
+        game._room_structure_dirty = True
     return targets[target_id]
 
 

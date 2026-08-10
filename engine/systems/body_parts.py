@@ -57,6 +57,29 @@ def tier_for_ratio(ratio):
     return TIER_BRUISED
 
 
+def region_displays_full_percent(hp, cap):
+    """True when ``score``'s integer limb percent would read 100%."""
+    cap = max(1, int(cap))
+    hp = int(hp)
+    if hp >= cap:
+        return True
+    return int(round(100.0 * hp / cap)) >= 100
+
+
+def _should_snap_bruised_to_full(hp, cap):
+    """True when a sub-cap bruised limb should heal to full on knit/treat."""
+    cap = max(1, int(cap))
+    hp = int(hp)
+    if hp <= 0 or hp >= cap:
+        return False
+    if (cap - hp) <= 1:
+        return True
+    ratio = hp / cap
+    if ratio <= 0.50:
+        return False
+    return region_displays_full_percent(hp, cap)
+
+
 # --- Region weight templates -------------------------------------------
 # A humanoid_standard split of aggregate max HP across regions -- must sum
 # to 1.0 (a body cannot structurally hold more or less HP than its own
@@ -434,9 +457,9 @@ def heal_region(character, region, amount):
     before = min(part_hp(character, region), cap)
     old_tier = tier_for_ratio(before / max(1, cap))
     after = min(cap, before + max(0, int(amount)))
-    # Rest / treat / knit drips must not leave a 1-HP sliver that still
-    # tiers as bruised while score rounds the limb to 100% (bug #337).
-    if after > before and after < cap and (cap - after) <= 1:
+    # Rest / treat / knit drips must not leave a near-cap sliver that still
+    # tiers as bruised while score rounds the limb to 100% (bugs #337 / #357).
+    if after > before and after < cap and _should_snap_bruised_to_full(after, cap):
         after = cap
     parts = ensure_body_parts(character)
     parts[region] = {"hp": after}

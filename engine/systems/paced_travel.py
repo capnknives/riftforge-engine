@@ -1,11 +1,10 @@
-"""paced_travel.py -- in-zone paced walking (one hop per tick).
+"""
+paced_travel.py -- generic paced walking between tagged destinations.
 
-Generic room-graph pathing, walk-focus stamps, and the shared
-``walk`` / ``jog`` / ``run`` dispatch core. Overland foot travel,
-lifestyle amenity resolution, and Cadence drive hops stay in the game
-layer (SUPERS ``walk.py``) via hooks.
-
-Pure logic: no sockets, no ``supers`` imports.
+Games inject passability (``set_paced_travel_edge_ok``), optional zone
+destination lists (``set_paced_travel_destinations``), and pocket enter
+aliases (``set_paced_travel_enter_alias``). Stdlib only; zero ``supers``
+imports.
 """
 
 from __future__ import annotations
@@ -13,11 +12,9 @@ from __future__ import annotations
 import re
 from collections import deque
 
-from command_support import _move_one, _pull_followers
-from engine import hooks
-from engine.pathfind import next_step_toward, path_directions_to
+from engine import hooks as hooks_mod
+from engine.systems.overland import is_virtual_room
 
-# Cap so a bad path or loop cannot hang the single-threaded command loop.
 MAX_WALK_STEPS = 200
 
 TRAVEL_PACES = ("walk", "jog", "run")
@@ -33,7 +30,8 @@ PACE_HOPS_PER_ADVANCE = {
 }
 WALK_STEP_EVERY = PACE_STEP_EVERY["walk"]
 
-# Player shorthand that maps onto room.resources tags (auto landmarks).
+_COORD_RE = re.compile(r"^(-?\d+)\s*[, ]\s*(-?\d+)$")
+
 _RESOURCE_HINTS = {
     "clinic": ("clinic",),
     "hospital": ("clinic",),
@@ -51,6 +49,10 @@ _RESOURCE_HINTS = {
     "gym": ("training",),
     "train": ("training",),
     "training": ("training",),
+    "spar": ("training",),
+    "sparring": ("training",),
+    "sparring gym": ("training",),
+    "spar gym": ("training",),
     "work": ("work",),
     "job": ("work",),
     "sleep": ("sleep",),
@@ -69,6 +71,7 @@ _RESOURCE_HINTS = {
 }
 
 _NOISY_LAST_WORD = re.compile(r"^(\d+|[a-z]\d*|\d+[a-z]?|[a-z])$", re.I)
+
 _SECONDARY_ROOM_TOKENS = frozenset({
     "ward", "upper", "hall", "stockroom", "cellar", "annex", "back",
     "overflow", "corridor", "entryway", "foyer",
@@ -115,6 +118,14 @@ def normalize_query(raw):
     return " ".join(text.split())
 
 
+def parse_coordinates(raw):
+    """Return (x, y) ints from ``20 20`` / ``20,20``, or None."""
+    match = _COORD_RE.match((raw or "").strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 def _is_vnum_token(text):
     """True when ``text`` looks like a hand-room VNUM (``GE00008``)."""
     from engine.room_vnum import parse_vnum
@@ -147,6 +158,13 @@ def _player_walk_room_label(room):
     return label
 
 
+def _send(character, text):
+    """Send one line when the actor has a live Session."""
+    session = getattr(character, "session", None)
+    if session is not None:
+        session.send(text)
+
+
 def _room_tokens(room):
     """Word tokens from a room's player title and storage key for matching."""
     parts = []
@@ -169,7 +187,7 @@ def _room_tokens(room):
 
 
 def _alias_candidates_for_room(room, zone_rooms):
-    """Short walk labels for one room (unique last-word, title, key, resources)."""
+    """Short walk labels for one room."""
     key = getattr(room, "key", "") or ""
     title = room.look_title() if hasattr(room, "look_title") else key
     norm_key = normalize_query(key)
@@ -267,6 +285,74 @@ def _pick_best_room(needle, candidates):
     return None, f"Which place? {names}"
 
 
+def rooms_in_zone(game, zone):
+    """All rooms sharing ``zone`` (settlement pocket), or empty list."""
+    if not zone or game is None:
+        return []
+    rooms = getattr(game, "rooms", None) or {}
+    n = len(rooms)
+    cache = getattr(game, "_rooms_by_zone_cache", None)
+    if cache is None or cache[0] != n:
+        index = {}
+        for room in rooms.values():
+            z = getattr(room, "zone", None)
+            if z:
+                index.setdefault(z, []).append(room)
+        game._rooms_by_zone_cache = (n, index)
+        cache = game._rooms_by_zone_cache
+    return list(cache[1].get(zone, ()))
+
+
+def list_zone_destinations(character, game):
+    """Build sorted unique short labels for bare ``walk`` inside a zone."""
+    room = character.location
+    zone = getattr(room, "zone", None)
+    zone_rooms = rooms_in_zone(game, zone)
+    labels = set()
+    last_word_rooms = {}
+    pair_rooms = {}
+    for candidate in zone_rooms:
+        tokens = _room_tokens(candidate)
+        if tokens:
+            last = tokens[-1]
+            if last:
+                last_word_rooms.setdefault(last, []).append(candidate)
+            if len(tokens) >= 2:
+                pair = f"{tokens[-2]} {tokens[-1]}"
+                pair_rooms.setdefault(pair, []).append(candidate)
+        for tag in getattr(candidate, "resources", None) or []:
+            tag_n = normalize_query(str(tag))
+            if tag_n in _RESOURCE_HINTS or tag_n in (
+                "clinic", "food", "training", "bank", "mail", "vendor",
+                "hygiene", "sleep", "social", "work",
+            ):
+                labels.add(tag_n)
+        if getattr(candidate, "hospital", False):
+            labels.add("clinic")
+    for last, same_last in last_word_rooms.items():
+        if (
+            not _token_is_noisy(last)
+            and len(last) >= 3
+            and last not in _SECONDARY_ROOM_TOKENS
+            and len(same_last) == 1
+        ):
+            labels.add(last)
+    for pair, same_pair in pair_rooms.items():
+        parts = pair.split()
+        if (
+            parts
+            and parts[-1] not in _SECONDARY_ROOM_TOKENS
+            and not _token_is_noisy(parts[-1])
+            and len(pair) <= 24
+            and len(same_pair) == 1
+        ):
+            labels.add(pair)
+    extra = hooks_mod.paced_travel_destinations(character, game, zone)
+    if extra:
+        labels.update(extra)
+    return sorted(labels, key=str.lower)[:40]
+
+
 def match_zone_room(needle, zone_rooms):
     """Pick a room in ``zone_rooms`` for ``needle``, or raise ambiguity."""
     needle = normalize_query(needle)
@@ -277,17 +363,22 @@ def match_zone_room(needle, zone_rooms):
     for room in zone_rooms:
         aliases = _alias_candidates_for_room(room, zone_rooms)
         key_n = normalize_query(room.key)
+        title_n = normalize_query(
+            room.look_title() if hasattr(room, "look_title") else key_n
+        )
+        desc_n = normalize_query(getattr(room, "description", "") or "")
         tags = set(getattr(room, "resources", None) or [])
         if getattr(room, "hospital", False):
             tags.add("clinic")
         hinted = _RESOURCE_HINTS.get(needle) or ()
+        token_hay = f"{key_n} {title_n} {desc_n}"
         if (
             needle in aliases
             or needle == key_n
             or needle in key_n
             or needle in tags
             or (hinted and tags.intersection(hinted))
-            or (needle.split() and all(t in key_n for t in needle.split()))
+            or (needle.split() and all(t in token_hay for t in needle.split()))
         ):
             candidates.append(room)
 
@@ -295,55 +386,41 @@ def match_zone_room(needle, zone_rooms):
     return _pick_best_room(needle, list(by_key.values()))
 
 
-def _expand_walk_neighbors(room, *, edge_ok, actor=None, game=None):
-    """Yield ``(neighbor, hop)`` for BFS -- cardinals, enter, and zone exit."""
-    for direction, neighbor in (room.exits or {}).items():
-        if neighbor is None or neighbor is room:
-            continue
-        if not edge_ok(room, neighbor):
-            continue
-        yield neighbor, direction
-
-    entries = getattr(room, "zone_entries", None) or {}
-    hubs_seen = set()
-    for hub in entries.values():
-        if hub is None or hub.key in hubs_seen:
-            continue
-        hub_zone = getattr(hub, "zone", None)
-        if hub_zone and not edge_ok(room, hub):
-            continue
-        alias = hooks.paced_travel_enter_alias(entries, hub)
-        if not alias:
-            continue
-        hubs_seen.add(hub.key)
-        yield hub, ("enter", alias)
-
-    exit_to = getattr(room, "zone_exit_to", None)
-    if exit_to is not None:
-        yield exit_to, ("exit", None)
+def _best_enter_alias(entries, hub):
+    """Pick a stable ``enter <alias>`` label for ``hub`` from zone_entries."""
+    aliases = [a for a, h in entries.items() if h is hub]
+    if not aliases:
+        return None
+    custom = hooks_mod.paced_travel_enter_alias(entries, hub)
+    if custom:
+        return custom
+    return min(aliases, key=len)
 
 
-def next_hop_toward_destination(
-    start, dest_key, actor=None, game=None, *, edge_ok=None,
-):
-    """BFS first hop toward ``dest_key``, including pocket enter/exit edges.
+def _edge_ok(from_room, neighbor, actor=None, game=None):
+    """May a paced walk BFS step this exit?"""
+    if neighbor is from_room:
+        return False
+    return hooks_mod.paced_travel_edge_ok(
+        from_room, neighbor, actor=actor, game=game,
+    )
 
-    ``edge_ok(from_room, neighbor)`` supplies passability; when omitted the
-    hook ``paced_travel_edge_ok`` is used (always True when unset).
-    """
+
+def _hub_ok(hub, from_room, actor=None, game=None):
+    """May a paced walk BFS enter this pocket hub?"""
+    return hooks_mod.paced_travel_hub_ok(
+        hub, from_room, actor=actor, game=game,
+    )
+
+
+def next_hop_toward_destination(start, dest_key, actor=None, game=None):
+    """BFS first hop toward ``dest_key``, including pocket enter/exit edges."""
     if start is None or not dest_key:
         return None
     if start.key == dest_key:
         return None
-    from engine.systems.overland import is_virtual_room
-
     if is_virtual_room(start):
         return None
-
-    if edge_ok is None:
-        edge_ok = lambda fr, nb, a=actor, g=game: hooks.paced_travel_edge_ok(
-            fr, nb, actor=a, game=g,
-        )
 
     seen = {start}
     queue = deque()
@@ -357,13 +434,28 @@ def next_hop_toward_destination(
         queue.append((neighbor, hop))
 
     def _expand(room, first_hop):
-        for neighbor, hop in _expand_walk_neighbors(
-            room, edge_ok=edge_ok, actor=actor, game=game,
-        ):
-            if neighbor in seen:
+        for direction, neighbor in room.exits.items():
+            if not _edge_ok(room, neighbor, actor=actor, game=game):
                 continue
-            use_hop = hop if first_hop is None else first_hop
-            _push(neighbor, use_hop)
+            hop = direction if first_hop is None else first_hop
+            _push(neighbor, hop)
+        entries = getattr(room, "zone_entries", None) or {}
+        hubs_seen = set()
+        for hub in entries.values():
+            if hub is None or hub in seen or hub.key in hubs_seen:
+                continue
+            if not _hub_ok(hub, room, actor=actor, game=game):
+                continue
+            alias = _best_enter_alias(entries, hub)
+            if not alias:
+                continue
+            hubs_seen.add(hub.key)
+            hop = ("enter", alias) if first_hop is None else first_hop
+            _push(hub, hop)
+        exit_to = getattr(room, "zone_exit_to", None)
+        if exit_to is not None and exit_to not in seen:
+            hop = ("exit", None) if first_hop is None else first_hop
+            _push(exit_to, hop)
 
     _expand(start, None)
     while queue:
@@ -374,19 +466,12 @@ def next_hop_toward_destination(
     return None
 
 
-def path_hop_distances_from(start, actor=None, game=None, max_nodes=600, *, edge_ok=None):
-    """BFS hop counts from ``start`` to reachable rooms (cap ``max_nodes``)."""
+def path_hop_distances_from(start, actor=None, game=None, max_nodes=600):
+    """BFS hop counts from ``start`` to reachable rooms."""
     if start is None:
         return {}
-    from engine.systems.overland import is_virtual_room
-
     if is_virtual_room(start):
         return {start.key: 0}
-
-    if edge_ok is None:
-        edge_ok = lambda fr, nb, a=actor, g=game: hooks.paced_travel_edge_ok(
-            fr, nb, actor=a, game=g,
-        )
 
     tick = int(getattr(game, "game_time_ticks", 0) or 0) if game is not None else 0
     actor_token = id(actor) if actor is not None else 0
@@ -412,14 +497,34 @@ def path_hop_distances_from(start, actor=None, game=None, max_nodes=600, *, edge
         if expanded > max_nodes:
             break
         next_dist = dist + 1
-        for neighbor, _hop in _expand_walk_neighbors(
-            room, edge_ok=edge_ok, actor=actor, game=game,
-        ):
-            if neighbor in seen:
+        for direction, neighbor in (room.exits or {}).items():
+            if neighbor is None or neighbor in seen:
+                continue
+            if not _edge_ok(room, neighbor, actor=actor, game=game):
                 continue
             seen.add(neighbor)
             distances[neighbor.key] = next_dist
             queue.append((neighbor, next_dist))
+        entries = getattr(room, "zone_entries", None) or {}
+        hubs_seen = set()
+        for hub in entries.values():
+            if hub is None or hub in seen or hub.key in hubs_seen:
+                continue
+            if not _hub_ok(hub, room, actor=actor, game=game):
+                continue
+            alias = _best_enter_alias(entries, hub)
+            if not alias:
+                continue
+            hubs_seen.add(hub.key)
+            if hub.key not in seen:
+                seen.add(hub)
+                distances[hub.key] = next_dist
+                queue.append((hub, next_dist))
+        exit_to = getattr(room, "zone_exit_to", None)
+        if exit_to is not None and exit_to not in seen:
+            seen.add(exit_to)
+            distances[exit_to.key] = next_dist
+            queue.append((exit_to, next_dist))
 
     if game is not None:
         game._walk_hop_dist_cache = {
@@ -432,7 +537,7 @@ def path_hop_distances_from(start, actor=None, game=None, max_nodes=600, *, edge
     return distances
 
 
-def path_hop_count(start, dest, actor=None, game=None, max_nodes=600, *, edge_ok=None):
+def path_hop_count(start, dest, actor=None, game=None, max_nodes=600):
     """Return BFS hop count from ``start`` to ``dest``, or None if blocked."""
     if start is None or dest is None:
         return None
@@ -441,10 +546,9 @@ def path_hop_count(start, dest, actor=None, game=None, max_nodes=600, *, edge_ok
     dest_key = getattr(dest, "key", None)
     if not dest_key:
         return None
-    hops = path_hop_distances_from(
-        start, actor=actor, game=game, max_nodes=max_nodes, edge_ok=edge_ok,
+    return path_hop_distances_from(
+        start, actor=actor, game=game, max_nodes=max_nodes,
     ).get(dest_key)
-    return hops
 
 
 def get_walk_focus(actor):
@@ -516,32 +620,8 @@ def _stamp_walk_focus(actor, game, *, mode, dest_label, dest_room_key=None,
     return focus
 
 
-def _send(character, text):
-    """Send one line when the actor has a live Session."""
-    session = getattr(character, "session", None)
-    if session is not None:
-        session.send(text)
-
-
-def _engaged(character):
-    """True when this character has a live fight target."""
-    return getattr(character, "target", None) is not None
-
-
-def _engaged_refuse_move(character):
-    """Player-facing block when walking away mid-fight."""
-    if not _engaged(character):
-        return None
-    msg = hooks.paced_travel_engaged_refuse(character)
-    if msg:
-        return msg
-    return (
-        "You're squared up -- disengage first or let the first beat land."
-    )
-
-
-def _default_player_hop(character, hop, game, quiet=True):
-    """Apply one hop: cardinal via ``_move_one``, or enter/exit."""
+def _take_player_hop(character, hop, game, quiet=True):
+    """Apply one hop: cardinal via move_one, or enter/exit pocket."""
     if hop is None or character is None:
         return False
     if isinstance(hop, tuple):
@@ -558,6 +638,8 @@ def _default_player_hop(character, hop, game, quiet=True):
             return True
         return False
 
+    from command_support import _move_one, _pull_followers
+    from engine import hooks
     from engine import vision as vision_mod
 
     if getattr(character, "asleep", False):
@@ -579,36 +661,38 @@ def _default_player_hop(character, hop, game, quiet=True):
     _move_one(character, hop, dest, game, auto_look=not quiet)
     _pull_followers(character, room, hop, game)
     if quiet and character.session is not None:
-        gait = hooks.paced_travel_gait_of(character)
+        gait = hooks_mod.paced_travel_gait_of(character)
         character.session.send(f"You {gait} {hop}.")
     return True
 
 
-def step_toward_room(actor, dest, game, *, mode="player", quiet=True, edge_ok=None):
-    """Take one hop toward ``dest`` (player hop or Cadence hook)."""
+def step_toward_room(actor, dest, game, *, mode="player", quiet=True):
+    """Take one hop toward ``dest`` (player hop)."""
     if actor is None or dest is None:
         return False
     if getattr(actor, "location", None) is dest:
         return False
-    if mode == "cadence":
-        return hooks.paced_travel_cadence_step(actor, dest, game)
-
+    if mode != "player":
+        return hooks_mod.paced_travel_cadence_step(
+            actor, dest, game, quiet=quiet,
+        )
     dest_key = getattr(dest, "key", None)
     if not dest_key:
         return False
     hop = next_hop_toward_destination(
-        actor.location, dest_key, actor=actor, game=game, edge_ok=edge_ok,
+        actor.location, dest_key, actor=actor, game=game,
     )
     if hop is None:
         return False
     before = actor.location
-    ok = hooks.paced_travel_player_hop(actor, hop, game, quiet=quiet)
+    ok = _take_player_hop(actor, hop, game, quiet=quiet)
     if not ok:
         return False
     return actor.location is not before
 
 
-def start_paced_walk(character, dest_room, game, *, label=None, pace="walk"):
+def start_paced_walk(character, dest_room, game, *, label=None, pace="walk",
+                     engaged_check=None, in_vehicle_check=None):
     """Begin (or replace) a paced walk to ``dest_room``; take one hop now."""
     from engine import group as group_mod
 
@@ -620,11 +704,14 @@ def start_paced_walk(character, dest_room, game, *, label=None, pace="walk"):
     if character.location is dest_room:
         clear_walk_focus(character)
         return f"You are already at {_player_walk_room_label(dest_room)}."
-    drive_msg = hooks.paced_travel_drive_to(character, dest_room, game)
-    if drive_msg is not None:
-        return drive_msg
-    if _engaged(character):
-        return _engaged_refuse_move(character)
+    if in_vehicle_check is not None:
+        msg = in_vehicle_check(character, dest_room, game)
+        if msg is not None:
+            return msg
+    if engaged_check is not None:
+        msg = engaged_check(character)
+        if msg:
+            return msg
     if getattr(character, "asleep", False):
         return "You're asleep -- type 'wake' before you can move."
 
@@ -657,7 +744,7 @@ def start_paced_walk(character, dest_room, game, *, label=None, pace="walk"):
     if not moved or character.location is before:
         clear_walk_focus(character)
         return f"You can't find a path to {dest_label} from here."
-    if _engaged(character):
+    if engaged_check is not None and engaged_check(character):
         clear_walk_focus(
             character,
             notice=f"Something engages you -- {pace} interrupted.",
@@ -669,13 +756,13 @@ def start_paced_walk(character, dest_room, game, *, label=None, pace="walk"):
     return ""
 
 
-def walk_to(character, dest_room, game, *, pace="walk"):
+def walk_to(character, dest_room, game, *, pace="walk", **kwargs):
     """Start a paced walk to ``dest_room`` (compat name for callers)."""
-    return start_paced_walk(character, dest_room, game, pace=pace)
+    return start_paced_walk(character, dest_room, game, pace=pace, **kwargs)
 
 
-def _advance_room_walk(character, game, focus):
-    """One paced hop for a room-mode walk_focus. Returns True if still walking."""
+def _advance_room_walk(character, game, focus, engaged_check=None):
+    """One paced hop for a room-mode walk_focus."""
     dest_key = focus.get("dest_room_key")
     dest = (getattr(game, "rooms", None) or {}).get(dest_key) if dest_key else None
     label = focus.get("dest_label") or dest_key or "your destination"
@@ -693,7 +780,7 @@ def _advance_room_walk(character, game, focus):
         _send(character, f"You arrive at {label}.")
         cmd_look(character, "", game, after_move=True)
         return False
-    if _engaged(character):
+    if engaged_check is not None and engaged_check(character):
         clear_walk_focus(
             character,
             notice=f"Something engages you -- {pace} interrupted.",
@@ -737,7 +824,13 @@ def _advance_room_walk(character, game, focus):
             notice=f"{pace_gerund(pace)} interrupted -- no path to {label}.",
         )
         return False
-    if _engaged(character):
+    # Run/jog take multiple hops per tick -- refresh the room each hop
+    # (bug #368) so players are not blind between steps.
+    if pace in ("run", "jog") and character.location is not dest:
+        from engine.verbs.basic import cmd_look
+
+        cmd_look(character, "", game, after_move=True)
+    if engaged_check is not None and engaged_check(character):
         clear_walk_focus(
             character,
             notice=f"Something engages you -- {pace} interrupted.",
@@ -749,7 +842,7 @@ def _advance_room_walk(character, game, focus):
     return True
 
 
-def tick_walks(game):
+def tick_walks(game, *, advance_overland=None, engaged_check=None):
     """Advance paced player journeys at each pace's hop rate."""
     from engine.char_index import iter_characters
     from engine.npc_act import SilentSession
@@ -775,24 +868,29 @@ def tick_walks(game):
         if now - last < step_every:
             continue
         hops = int(PACE_HOPS_PER_ADVANCE.get(pace, 1) or 1)
+        mode = focus.get("mode") or "room"
         for _ in range(max(1, hops)):
             focus = get_walk_focus(character)
             if focus is None:
                 break
             mode = focus.get("mode") or "room"
-            if mode == "overland":
-                still = hooks.paced_travel_overland_advance(character, game, focus)
+            if mode == "overland" and advance_overland is not None:
+                still = advance_overland(
+                    character, game, focus, engaged_check=engaged_check,
+                )
             else:
-                still = _advance_room_walk(character, game, focus)
+                still = _advance_room_walk(
+                    character, game, focus, engaged_check=engaged_check,
+                )
             if not still:
                 break
 
 
 def cmd_paced_travel(character, args, game, *, pace="walk"):
-    """Generic room-graph dispatch for ``walk`` / ``jog`` / ``run``.
+    """Lean walk/jog/run handler for in-zone room-graph pacing (basegame demo).
 
-    Game layers handle homestead, vehicles, lifestyle tokens, and overland
-    lists before calling this for stop / zone-target resolution.
+    SUPERS registers richer lifestyle/overland/vehicle detours via hooks;
+    this shell covers stop, destination listing, and named room match only.
     """
     pace = normalize_pace(pace)
     raw = (args or "").strip()
@@ -804,44 +902,40 @@ def cmd_paced_travel(character, args, game, *, pace="walk"):
     head = raw.split(maxsplit=1)[0].lower() if raw else ""
     if head in ("stop", "off", "cancel", "clear", "done"):
         if has_walk_focus(character):
-            clear_walk_focus(
-                character,
-                notice=f"{pace_gerund(pace)} cancelled.",
-            )
+            clear_walk_focus(character, notice=f"{pace_gerund(pace)} cancelled.")
         else:
             _send(character, _not_traveling_msg(pace))
-        return
-
-    if raw and hooks.paced_travel_overland_handler(character, args, game, pace):
         return
 
     if not raw:
         if has_walk_focus(character):
             _send(character, format_walk_focus_status(character, game))
             return
-        listed = hooks.paced_travel_list_destinations(character, game, pace)
-        if listed:
+        zone = getattr(room, "zone", None)
+        if zone:
+            labels = list_zone_destinations(character, game)
+            _send(character, f"{pace_gerund(pace)} destinations in this area ({zone}):")
+            if labels:
+                for label in labels:
+                    _send(character, f"  {label}")
+            else:
+                _send(character, "  (none found -- try room names from look)")
             return
-        _send(
-            character,
-            f"No {pace} list here. Use exits from look, or name a destination.",
-        )
+        _send(character, f"No {pace} list here.")
         return
 
     zone = getattr(room, "zone", None)
-    if zone:
-        zone_rooms = hooks.paced_travel_zone_rooms(game, zone)
-        dest, err = match_zone_room(raw, zone_rooms)
-        if err:
-            _send(character, err)
-            return
-        msg = start_paced_walk(character, dest, game, pace=pace)
-        if msg:
-            _send(character, msg)
+    if not zone:
+        _send(character, "You can't pace-travel from here.")
         return
-
-    _send(
-        character,
-        f"{pace_gerund(pace)} works inside settlement zones. "
-        "Type look for exits here.",
-    )
+    zone_rooms = rooms_in_zone(game, zone)
+    dest, err = match_zone_room(raw, zone_rooms)
+    if err:
+        _send(character, err)
+        return
+    if dest is None:
+        _send(character, f"No destination matches {raw!r} in this zone.")
+        return
+    msg = start_paced_walk(character, dest, game, pace=pace)
+    if msg:
+        _send(character, msg)

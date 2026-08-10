@@ -21,6 +21,9 @@ Run:
 
 Env:
   RIFTFORGE_PORT          -- public telnet port (default 4000)
+  RIFTFORGE_WS_PORT       -- optional WebSocket port (default 4080; 0=off)
+  RIFTFORGE_WSS_CERT      -- optional TLS cert path for WebSocket (wss://)
+  RIFTFORGE_WSS_KEY       -- optional TLS key path (pair with RIFTFORGE_WSS_CERT)
   RIFTFORGE_GATEWAY_IPC   -- IPC listen host:port (default 127.0.0.1:4001)
   RIFTFORGE_GATEWAY_IPC_ALLOW_NONLOCAL -- set 1 to bind IPC off loopback
     (unsafe on live; passwordless reattach becomes reachable)
@@ -51,6 +54,7 @@ import asyncio
 import importlib
 import os
 import signal
+import ssl
 import time
 import uuid
 from collections import deque
@@ -72,14 +76,15 @@ from engine.gateway_protocol import (
 # Rotating hold lines while the game child is down. Plain text + [WAIT]
 # tag (never color alone — gateway has no style palette). Telnet \r\n.
 # Keep them short; clients may sit here for a long boot.
+# [WAIT] = IPC down only. Never say "rewrite complete" / success here.
+# Avoid "holds" colliding with old deploy success lines (veil copyover UX).
 HOLD_MUSIC_LINES = (
-    b"\r\n*** [WAIT] The Veil hums softly. The world is still "
-    b"stitching itself back together. ***\r\n",
     b"\r\n*** [WAIT] Soft static under the floorboards. Hang on -- "
     b"you are still connected. ***\r\n",
-    b"\r\n*** [WAIT] Somewhere a distant elevator chime. The bones "
-    b"of the world are rewriting. ***\r\n",
-    b"\r\n*** [WAIT] The Veil holds your place. Please stand by. ***\r\n",
+    b"\r\n*** [WAIT] The world is still stitching. Stay put. ***\r\n",
+    b"\r\n*** [WAIT] Somewhere a distant elevator chime. The rewrite "
+    b"is still in progress. ***\r\n",
+    b"\r\n*** [WAIT] Please stand by -- the game is reloading. ***\r\n",
 )
 
 
@@ -166,12 +171,21 @@ def _peer_host_from_writer(writer) -> Optional[str]:
 
 
 class ClientSlot:
-    """One held telnet client and its optional bound character name."""
+    """One held telnet or WebSocket client and its optional bound character name."""
 
-    def __init__(self, session_id: str, reader, writer, peer: Optional[str] = None):
+    def __init__(
+        self,
+        session_id: str,
+        reader,
+        writer,
+        peer: Optional[str] = None,
+        *,
+        protocol: str = "telnet",
+    ):
         self.session_id = session_id
         self.reader = reader
         self.writer = writer
+        self.protocol = protocol  # "telnet" or "websocket"
         self.name: Optional[str] = None  # set when game reports bound
         self.ooc_face: Optional[str] = None  # account or character label for OOC
         self.head_gm: bool = False  # head GM may queue restart from gateway
@@ -181,13 +195,25 @@ class ClientSlot:
         self.peer: Optional[str] = peer
         self.alive = True
         self.line_buffer = b""  # stitch-mode line assembly
+        self.ws_recv_buf = b""  # incomplete WebSocket frames (WS clients only)
+        self._ws_handshake_done = protocol != "websocket"
 
 
 class Gateway:
-    """Accept telnet clients; bridge them to one game IPC connection."""
+    """Accept telnet/WebSocket clients; bridge them to one game IPC connection."""
 
-    def __init__(self, public_port: int, ipc_host: str, ipc_port: int):
+    def __init__(
+        self,
+        public_port: int,
+        ipc_host: str,
+        ipc_port: int,
+        *,
+        ws_port: Optional[int] = None,
+        ws_ssl: Optional[ssl.SSLContext] = None,
+    ):
         self.public_port = public_port
+        self.ws_port = ws_port
+        self.ws_ssl = ws_ssl
         self.ipc_host = ipc_host
         self.ipc_port = ipc_port
         self.clients: dict[str, ClientSlot] = {}
@@ -214,6 +240,9 @@ class Gateway:
             self._stitch_histories[spec.name] = deque(maxlen=spec.ring_max)
         # Last time any game→client DATA frame was forwarded (stitch detect).
         self._last_game_data_at = time.monotonic()
+        # Game sets via CTRL boot_warming during deferred copyover boot --
+        # forward commands instead of stitch-intercept while heals run.
+        self._boot_warming = False
 
     async def send_to_game(self, frame: bytes) -> None:
         """Write one framed message to the connected game, if any."""
@@ -228,12 +257,28 @@ class Gateway:
                 self._game_writer = None
 
     async def send_to_client(self, session_id: str, data: bytes) -> None:
-        """Forward game bytes to one held telnet client."""
+        """Forward game bytes to one held client (telnet raw or WS text frame)."""
         slot = self.clients.get(session_id)
         if slot is None or not slot.alive:
             return
         try:
-            slot.writer.write(data)
+            if slot.protocol == "websocket":
+                from engine import websocket as ws_mod
+
+                # Game speaks telnet line discipline; browsers want WS text frames.
+                # Split on newlines so each game line becomes one frame (MVP).
+                text = data.decode("utf-8", errors="replace")
+                parts = text.split("\n")
+                for idx, chunk in enumerate(parts):
+                    if idx < len(parts) - 1:
+                        payload = chunk + "\n"
+                    else:
+                        payload = chunk
+                    if not payload and idx == len(parts) - 1:
+                        continue
+                    slot.writer.write(ws_mod.encode_text_frame(payload))
+            else:
+                slot.writer.write(data)
             await slot.writer.drain()
         except (ConnectionError, OSError):
             await self._drop_client(session_id, notify_game=True)
@@ -424,6 +469,8 @@ class Gateway:
         """True when the gateway should handle OOC / GM restart locally."""
         if self._game_writer is None:
             return True
+        if self._boot_warming:
+            return False
         stale = time.monotonic() - self._last_game_data_at
         return stale >= _stitch_stale_seconds()
 
@@ -491,13 +538,14 @@ class Gateway:
     def _channel_message_text(self, text: str, verb: str) -> Optional[str]:
         """Return speak body, or ``None`` when *text* is the bare verb."""
         stripped = (text or "").strip()
-        lower = stripped.lower()
-        if lower == verb:
+        if not stripped:
             return None
-        prefix = f"{verb} "
-        if lower.startswith(prefix):
-            return stripped[len(prefix) :].strip()
-        return None
+        parts = stripped.split(None, 1)
+        if not parts or parts[0].lower() != (verb or "").lower():
+            return None
+        if len(parts) == 1:
+            return None
+        return parts[1].strip()
 
     async def _replay_gateway_channel(
         self, slot: ClientSlot, channel_name: str,
@@ -542,10 +590,37 @@ class Gateway:
     async def _relay_gateway_channel(
         self, slot: ClientSlot, channel_name: str, message: str,
     ) -> None:
+        from engine import channels
+
         if channel_name == "ooc":
             await self._relay_gateway_ooc(slot, message)
         elif channel_name == "wiznet":
             await self._relay_gateway_wiznet(slot, message)
+        else:
+            spec = channels.get_channel(channel_name)
+            if spec is None:
+                return
+            plain = channels.format_custom_plain(
+                spec, self._slot_ooc_face(slot), message,
+            )
+            if not plain:
+                return
+            self._append_gateway_chat_line(channel_name, plain)
+            for sid, peer in list(self.clients.items()):
+                if not self._gateway_slot_may_hear(peer, spec):
+                    continue
+                await self._send_plain(sid, plain)
+                await self._send_plain(sid, "")
+
+    def _gateway_slot_may_hear(self, slot: ClientSlot, spec) -> bool:
+        from engine import channels
+
+        aud = (spec.audience or channels.AUDIENCE_ALL).lower()
+        if aud in ("", channels.AUDIENCE_ALL):
+            return True
+        if aud in (channels.AUDIENCE_STAFF, channels.AUDIENCE_GM):
+            return bool(slot.staff_gm)
+        return True
 
     async def _handle_intercepted_line(self, slot: ClientSlot, line: bytes) -> bool:
         """Handle stitch-mode commands. Return True when consumed."""
@@ -566,7 +641,8 @@ class Gateway:
             spec = channel_history.get_channel(channel_name)
             if spec is None:
                 return False
-            if spec.staff_only and not slot.staff_gm:
+            aud = (getattr(spec, "audience", "") or "").lower()
+            if aud in ("staff", "gm") and not slot.staff_gm:
                 await self._send_plain(slot.session_id, "You aren't a GM.")
                 return True
             body = self._channel_message_text(text, spec.verb)
@@ -601,7 +677,7 @@ class Gateway:
                 await self._send_plain(
                     slot.session_id,
                     f"*** [ALERT] {tip}"
-                    "Hold on; OOC still works until the Veil settles. ***",
+                    "Stay connected; OOC still works until rewrite complete. ***",
                 )
             else:
                 await self._send_plain(
@@ -692,10 +768,10 @@ class Gateway:
         if self._game_writer is None:
             wait = (
                 "*** [WAIT] OOC and wiznet work while the game restarts; "
-                "other commands need the Veil to settle. ***"
+                "other commands need the rewrite to finish. ***"
                 if slot.staff_gm
                 else "*** [WAIT] OOC works while the game restarts; other "
-                "commands need the Veil to settle. ***"
+                "commands need the rewrite to finish. ***"
             )
             await self._send_plain(slot.session_id, wait)
             return True
@@ -705,6 +781,22 @@ class Gateway:
         """Send one assembled line to the game child."""
         payload = line + b"\r\n"
         await self.send_to_game(encode_data(session_id, payload))
+
+    async def _process_client_input(self, slot: ClientSlot, data: bytes) -> None:
+        """Assemble telnet lines once, then stitch-handle or forward to game.
+
+        Always line-buffer so a command typed while IPC is up cannot split
+        across a game-only restart (``ooc hello`` + IPC drop + ``world`` tail
+        used to produce a bogus ``hello world`` WAIT line).
+        """
+        slot.line_buffer += data
+        lines, slot.line_buffer = _pop_complete_lines(slot.line_buffer)
+        for line in lines:
+            if self._should_intercept_commands():
+                if await self._handle_intercepted_line(slot, line):
+                    continue
+            if self._game_writer is not None:
+                await self._forward_client_line(slot.session_id, line)
 
     async def handle_telnet(self, reader, writer) -> None:
         """Accept one public telnet connection and hold it until EOF."""
@@ -727,22 +819,93 @@ class Gateway:
                 data = await reader.read(4096)
                 if not data:
                     break
-                if self._should_intercept_commands():
-                    slot.line_buffer += data
-                    lines, slot.line_buffer = _pop_complete_lines(slot.line_buffer)
-                    for line in lines:
-                        if await self._handle_intercepted_line(slot, line):
-                            continue
-                        if self._game_writer is not None:
-                            await self._forward_client_line(session_id, line)
-                else:
-                    await self.send_to_game(encode_data(session_id, data))
+                await self._process_client_input(slot, data)
         except (ConnectionError, OSError, asyncio.CancelledError):
             pass
         finally:
             await self._drop_client(session_id, notify_game=True)
             print(f"[gateway] client closed sid={session_id[:8]}… "
                   f"({len(self.clients)} held)", flush=True)
+
+    async def _complete_websocket_handshake(
+        self, reader, writer
+    ) -> bool:
+        """Read HTTP headers and reply 101 Switching Protocols. False on fail."""
+        from engine import websocket as ws_mod
+
+        buf = b""
+        while b"\r\n\r\n" not in buf and len(buf) < ws_mod.MAX_HANDSHAKE_BYTES:
+            chunk = await reader.read(4096)
+            if not chunk:
+                return False
+            buf += chunk
+        key, response = ws_mod.parse_handshake_request(buf)
+        if response is None:
+            return False
+        if key is None:
+            writer.write(response)
+            await writer.drain()
+            return False
+        writer.write(response)
+        await writer.drain()
+        return True
+
+    async def handle_websocket(self, reader, writer) -> None:
+        """Accept one browser WebSocket; bridge line text like telnet."""
+        peer = _peer_host_from_writer(writer)
+        if not await self._complete_websocket_handshake(reader, writer):
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return
+        session_id = uuid.uuid4().hex
+        slot = ClientSlot(
+            session_id, reader, writer, peer=peer, protocol="websocket",
+        )
+        slot._ws_handshake_done = True
+        self.clients[session_id] = slot
+        print(
+            f"[gateway] websocket open sid={session_id[:8]}… "
+            f"peer={peer or '-'} ({len(self.clients)} held)",
+            flush=True,
+        )
+        open_msg = {"op": "open", "sid": session_id}
+        if peer:
+            open_msg["peer"] = peer
+        await self.send_to_game(encode_ctrl(open_msg))
+        try:
+            from engine import websocket as ws_mod
+
+            while self._running and slot.alive:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                slot.ws_recv_buf += chunk
+                app_bytes, remainder, close_req = ws_mod.decode_client_frames(
+                    slot.ws_recv_buf
+                )
+                slot.ws_recv_buf = remainder
+                if close_req:
+                    try:
+                        writer.write(ws_mod.encode_close())
+                        await writer.drain()
+                    except Exception:
+                        pass
+                    break
+                if not app_bytes:
+                    continue
+                await self._process_client_input(slot, app_bytes)
+        except (ConnectionError, OSError, asyncio.CancelledError):
+            pass
+        finally:
+            await self._drop_client(session_id, notify_game=True)
+            print(
+                f"[gateway] websocket closed sid={session_id[:8]}… "
+                f"({len(self.clients)} held)",
+                flush=True,
+            )
 
     async def handle_game_ipc(self, reader, writer) -> None:
         """One game process connected to the IPC port.
@@ -822,6 +985,15 @@ class Gateway:
                             "Discord outage suppressed",
                             flush=True,
                         )
+                    elif op == "boot_warming":
+                        active = bool((payload or {}).get("active"))
+                        self._boot_warming = active
+                        if active:
+                            self._note_game_data()
+                        print(
+                            f"[gateway] boot_warming={'on' if active else 'off'}",
+                            flush=True,
+                        )
                     elif op == "chat_history":
                         self._merge_chat_history_payload(payload or {})
                     elif op == "chat_append":
@@ -856,8 +1028,27 @@ class Gateway:
         ipc_server = await asyncio.start_server(
             self.handle_game_ipc, self.ipc_host, self.ipc_port
         )
+        ws_server = None
+        if self.ws_port:
+            if self.ws_ssl is not None:
+                ws_server = await asyncio.start_server(
+                    self.handle_websocket,
+                    "0.0.0.0",
+                    self.ws_port,
+                    ssl=self.ws_ssl,
+                )
+            else:
+                ws_server = await asyncio.start_server(
+                    self.handle_websocket, "0.0.0.0", self.ws_port
+                )
+        ws_note = ""
+        if self.ws_port:
+            ws_note = (
+                f" wss=:{self.ws_port}" if self.ws_ssl is not None
+                else f" websocket=:{self.ws_port}"
+            )
         print(
-            f"[gateway] listening telnet=:{self.public_port} "
+            f"[gateway] listening telnet=:{self.public_port}{ws_note} "
             f"ipc={self.ipc_host}:{self.ipc_port}",
             flush=True,
         )
@@ -867,8 +1058,12 @@ class Gateway:
             name="gateway-hold-music",
         )
         try:
-            async with telnet_server, ipc_server:
-                await asyncio.Future()  # run forever
+            if ws_server is not None:
+                async with telnet_server, ipc_server, ws_server:
+                    await asyncio.Future()  # run forever
+            else:
+                async with telnet_server, ipc_server:
+                    await asyncio.Future()  # run forever
         finally:
             hold_task.cancel()
             try:
@@ -877,13 +1072,30 @@ class Gateway:
                 pass
 
 
+def _load_ws_ssl_context():
+    """Optional TLS for WebSocket when cert + key paths are set in env."""
+    cert = os.environ.get("RIFTFORGE_WSS_CERT", "").strip()
+    key = os.environ.get("RIFTFORGE_WSS_KEY", "").strip()
+    if not cert or not key:
+        return None
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(cert, key)
+    return ctx
+
+
 def main() -> None:
     """Entry point for `python -m engine.gateway`."""
     public_port = _env_int("RIFTFORGE_PORT", 4000)
+    ws_port = _env_int("RIFTFORGE_WS_PORT", 4080)
+    if ws_port <= 0:
+        ws_port = None
+    ws_ssl = _load_ws_ssl_context() if ws_port else None
     ipc_host, ipc_port = parse_ipc_addr()
     # Pen-test M3: never expose passwordless reattach on a public bind.
     require_loopback_ipc(ipc_host, role="gateway")
-    gw = Gateway(public_port, ipc_host, ipc_port)
+    gw = Gateway(
+        public_port, ipc_host, ipc_port, ws_port=ws_port, ws_ssl=ws_ssl,
+    )
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

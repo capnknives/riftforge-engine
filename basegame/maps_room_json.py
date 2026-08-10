@@ -64,3 +64,19 @@ def stamp_basegame_map_room(room, data, *, filename=None):
     active_combat = data.get("active_combat")
     if active_combat is not None:
         room.active_combat = bool(active_combat)
+
+    reset_ticks = data.get("reset_empty_ticks")
+    if reset_ticks is not None:
+        try:
+            room.reset_empty_ticks = int(reset_ticks)
+        except (TypeError, ValueError):
+            pass
+
+    reset_specs = data.get("reset_item_specs")
+    if reset_specs is not None:
+        if not isinstance(reset_specs, list):
+            where = f"{filename}: " if filename else ""
+            raise ValueError(
+                f"{where}room {room.key!r}: reset_item_specs must be a list"
+            )
+        room.reset_item_specs = [dict(entry) for entry in reset_specs]

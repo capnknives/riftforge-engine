@@ -74,6 +74,11 @@ class Account:
         self.wizinvis = True
         # Playtester diagnostic tools (``playtest`` / ``playtester add``).
         self.playtester = False
+        # Highest changelog ship timestamp this account has read (ISO UTC).
+        # Legacy ``last_seen_changelog_id`` is uplifted once on read.
+        self.last_seen_changelog_sort_ts = ""
+        # Legacy numeric watermark (pre Aug 2026 timestamp-only feed).
+        self.last_seen_changelog_id = 0
 
     def to_blob(self):
         """JSON-serializable extras for the accounts.data column."""
@@ -91,6 +96,12 @@ class Account:
             "gm_see_accounts": bool(self.gm_see_accounts),
             "wizinvis": bool(self.wizinvis),
             "playtester": bool(self.playtester),
+            "last_seen_changelog_id": int(
+                getattr(self, "last_seen_changelog_id", 0) or 0
+            ),
+            "last_seen_changelog_sort_ts": str(
+                getattr(self, "last_seen_changelog_sort_ts", "") or ""
+            ),
         }
 
     def apply_blob(self, data):
@@ -125,6 +136,12 @@ class Account:
         # Missing key = default staff-invisible (old saves keep prior behavior).
         self.wizinvis = bool(data.get("wizinvis", True))
         self.playtester = bool(data.get("playtester", False))
+        self.last_seen_changelog_id = int(
+            data.get("last_seen_changelog_id", 0) or 0
+        )
+        self.last_seen_changelog_sort_ts = str(
+            data.get("last_seen_changelog_sort_ts", "") or ""
+        )
 
 
 def normalize_account_name(raw):
@@ -183,6 +200,11 @@ def register_account(game, account):
     """Insert ``account`` into ``game.accounts`` (overwrites same key)."""
     accounts = ensure_accounts_dict(game)
     accounts[account_lookup_key(account.name)] = account
+    try:
+        from engine.persistence import mark_account_dirty
+        mark_account_dirty(game, account)
+    except Exception:
+        pass
     return account
 
 
@@ -255,6 +277,15 @@ def link_character(game, account, character):
     if key_low not in existing_low:
         account.character_keys.append(key)
     character.account = account.name
+    try:
+        from engine.persistence import mark_account_dirty
+        mark_account_dirty(game, account)
+        if prev_name:
+            prev = find_account(game, prev_name)
+            if prev is not None and prev is not account:
+                mark_account_dirty(game, prev)
+    except Exception:
+        pass
     return None
 
 
@@ -276,6 +307,11 @@ def unlink_character(game, account, character, *, clear_back_pointer=True):
             account_lookup_key(account.name)
         ):
             character.account = ""
+    try:
+        from engine.persistence import mark_account_dirty
+        mark_account_dirty(game, account)
+    except Exception:
+        pass
 
 
 def account_for_character(game, character):
@@ -546,6 +582,70 @@ def heal_restored_player_accounts(game):
     return {"created": created, "linked": linked, "accounts": len(accounts)}
 
 
+def _roster_password_hash(game, key):
+    """Best-effort password_hash for a roster key (live, login, or vault)."""
+    finder = getattr(game, "find_character", None)
+    if callable(finder):
+        char = finder(key)
+        if char is None:
+            login_finder = getattr(game, "find_login_character", None)
+            if callable(login_finder):
+                char = login_finder(key)
+        if char is not None:
+            body_hash = (getattr(char, "password_hash", None) or "").strip()
+            if body_hash:
+                return body_hash
+    db = getattr(game, "db", None)
+    if db is None:
+        return ""
+    from engine import persistence
+
+    row = persistence.vault_get(db, key)
+    if row is None:
+        return ""
+    try:
+        envelope = persistence.decompress_vault_envelope(row[4])
+        stats = envelope.get("stats") or {}
+        return (stats.get("password_hash") or "").strip()
+    except Exception:
+        return ""
+
+
+def heal_empty_account_passwords(game):
+    """Boot heal: copy a linked character hash when account password is blank.
+
+    Pre-account-first saves often registered account rows without ever setting
+    ``password_hash`` (login was character-name + body password only). Those
+    accounts are unrecoverable until we copy the first linked body's hash.
+    """
+    accounts = ensure_accounts_dict(game)
+    if getattr(game, "find_character", None) is None and getattr(game, "db", None) is None:
+        return {"healed": 0}
+
+    healed = 0
+    for account in accounts.values():
+        if (account.password_hash or "").strip():
+            continue
+        for key in account.character_keys:
+            body_hash = _roster_password_hash(game, key)
+            if not body_hash:
+                continue
+            account.password_hash = body_hash
+            healed += 1
+            try:
+                from engine.persistence import mark_account_dirty
+                mark_account_dirty(game, account)
+            except Exception:
+                pass
+            print(
+                f"[accounts] boot-heal copied password_hash onto account "
+                f"{account.name!r} from character {key!r}",
+                flush=True,
+            )
+            break
+    return {"healed": healed}
+
+
 def migrate_legacy_gm_ranks(game):
     """Move per-character ``gm_rank`` onto linked (or auto-made) accounts.
 
@@ -593,6 +693,11 @@ def unregister_account(game, account):
     key = account_lookup_key(account.name)
     if key in accounts and accounts[key] is account:
         del accounts[key]
+        try:
+            from engine.persistence import mark_account_dirty
+            mark_account_dirty(game, account)
+        except Exception:
+            pass
 
 
 def playable_link_target(game, character):
@@ -653,17 +758,44 @@ def account_is_staff(account):
     return (account.gm_rank or "").strip() in ("gm", "head_gm")
 
 
+def roster_character_keys(game, account):
+    """All PC storage keys tied to ``account`` (explicit list + ``.account``)."""
+    if account is None:
+        return []
+    keys = []
+    seen = set()
+    for key in list(getattr(account, "character_keys", None) or []):
+        low = (key or "").strip().lower()
+        if not low or low in seen:
+            continue
+        seen.add(low)
+        keys.append(key)
+    acct_name = (getattr(account, "name", None) or "").strip().lower()
+    if acct_name and game is not None:
+        for char in getattr(game, "characters", None) or []:
+            if getattr(char, "is_npc", False):
+                continue
+            if (getattr(char, "account", None) or "").strip().lower() != acct_name:
+                continue
+            low = (getattr(char, "key", None) or "").strip().lower()
+            if low and low not in seen:
+                seen.add(low)
+                keys.append(char.key)
+    return keys
+
+
 def account_login_choices(game, account):
     """Build account-login pick list: owned PCs, then cast if staff.
 
     Returns a list of ``(section, character)`` where ``section`` is
-    ``"character"`` or ``"cast"``.
+    ``"character"`` or ``"cast"``. Vaulted-only roster keys are omitted
+  here -- ``account_login.build_account_menu`` adds them for the menu.
     """
     choices = []
     if account is None or game is None:
         return choices
     seen = set()
-    for key in list(account.character_keys):
+    for key in roster_character_keys(game, account):
         finder = getattr(game, "find_login_character", None)
         char = finder(key) if callable(finder) else None
         if char is None:
@@ -781,3 +913,9 @@ def resolve_staff_switch_target(game, account, name):
     return None, (
         f"'{raw}' is not on your account roster or immersion cast."
     )
+
+
+def is_guest_character(character):
+    """True for legacy ephemeral guest bodies (no new logins mint these)."""
+    return bool(getattr(character, "is_guest", False))
+

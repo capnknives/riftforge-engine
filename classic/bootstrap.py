@@ -9,6 +9,23 @@ _MAPS_DIR = os.path.join(_CONTENT_DIR, "maps")
 _ZONES_DIR = os.path.join(_CONTENT_DIR, "zones")
 
 
+def reregister_blob_codec():
+    """Re-wire blob + character attacher after ``importlib.reload(engine.hooks)``."""
+    import importlib
+
+    from classic.character_attach import attach_classic
+    import classic.persist_blob as pb
+
+    pb = importlib.reload(pb)
+    hooks.set_character_attacher(attach_classic)
+    hooks.set_blob_codec(pb.character_to_blob, pb.apply_character_blob)
+    hooks.set_blob_codec_reload(reregister_blob_codec)
+    print(
+        "[copyover] hooks re-registered (blob+attacher) [classic]",
+        flush=True,
+    )
+
+
 def register_core_hooks():
     """Character attach, blob codec, stat hooks."""
     from classic.character_attach import attach_classic

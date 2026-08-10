@@ -28,6 +28,121 @@ from engine.world import Room
 # Live park spots -- next to riftforge.db / bug_reports.log (not in git).
 PARKING_FILENAME = "vehicle_parking.json"
 
+# America atlas scenic cruise pacing (SUPERS may override via hook).
+SCENIC_STEP_EVERY = 2
+DRIVE_TICKS = SCENIC_STEP_EVERY + 2
+
+# Scenic tick hooks (SUPERS registers at bootstrap).
+_vehicle_scenic_macro_step = None
+_vehicle_tick_drive_extra = None
+_vehicle_scenic_step_every = None
+
+
+def set_vehicle_scenic_macro_step(fn):
+    """Register fn(game, veh, nx, ny, driver) -> (ok, status)."""
+    global _vehicle_scenic_macro_step
+    _vehicle_scenic_macro_step = fn
+
+
+def set_vehicle_tick_drive_extra(fn):
+    """Register fn(game, veh, nx, ny) after each scenic macro step."""
+    global _vehicle_tick_drive_extra
+    _vehicle_tick_drive_extra = fn
+
+
+def set_vehicle_scenic_step_every(fn):
+    """Register fn(game) -> int heartbeats between macro steps."""
+    global _vehicle_scenic_step_every
+    _vehicle_scenic_step_every = fn
+
+
+# Motorcycle / charter hooks (SUPERS registers at bootstrap).
+_vehicle_is_motorcycle = None
+_vehicle_rider_on_curb = None
+_vehicle_motorcycle_occupants = None
+_vehicle_mount_one = None
+_vehicle_hatch_blocked = None
+_vehicle_leave_motorcycle = None
+_vehicle_parked_without_rider = None
+
+
+def set_vehicle_is_motorcycle(fn):
+    global _vehicle_is_motorcycle
+    _vehicle_is_motorcycle = fn
+
+
+def vehicle_is_motorcycle(veh):
+    if _vehicle_is_motorcycle is not None:
+        return bool(_vehicle_is_motorcycle(veh))
+    return False
+
+
+def set_vehicle_rider_on_curb(fn):
+    global _vehicle_rider_on_curb
+    _vehicle_rider_on_curb = fn
+
+
+def vehicle_rider_on_curb(character, veh, game):
+    if _vehicle_rider_on_curb is not None:
+        return bool(_vehicle_rider_on_curb(character, veh, game))
+    return False
+
+
+def set_vehicle_motorcycle_occupants(fn):
+    global _vehicle_motorcycle_occupants
+    _vehicle_motorcycle_occupants = fn
+
+
+def vehicle_motorcycle_occupants(game, veh):
+    if _vehicle_motorcycle_occupants is not None:
+        return _vehicle_motorcycle_occupants(game, veh)
+    return []
+
+
+def set_vehicle_mount_one(fn):
+    global _vehicle_mount_one
+    _vehicle_mount_one = fn
+
+
+def vehicle_mount_one(character, veh, role, game):
+    if _vehicle_mount_one is not None:
+        _vehicle_mount_one(character, veh, role, game)
+        return
+    raise RuntimeError("motorcycle mount hook not registered")
+
+
+def set_vehicle_hatch_blocked(fn):
+    global _vehicle_hatch_blocked
+    _vehicle_hatch_blocked = fn
+
+
+def vehicle_hatch_blocked(character, game, veh):
+    if _vehicle_hatch_blocked is not None:
+        return bool(_vehicle_hatch_blocked(character, game, veh))
+    return False
+
+
+def set_vehicle_leave_motorcycle(fn):
+    global _vehicle_leave_motorcycle
+    _vehicle_leave_motorcycle = fn
+
+
+def vehicle_leave_motorcycle(character, game, veh, **kwargs):
+    if _vehicle_leave_motorcycle is not None:
+        return _vehicle_leave_motorcycle(character, game, veh, **kwargs)
+    return False
+
+
+def set_vehicle_parked_without_rider(fn):
+    global _vehicle_parked_without_rider
+    _vehicle_parked_without_rider = fn
+
+
+def vehicle_parked_without_rider(game, room, parked):
+    if _vehicle_parked_without_rider is not None:
+        return _vehicle_parked_without_rider(game, room, parked)
+    return []
+
 
 def _require_keys(spec, keys, where):
     """Raise AssertionError when any key in ``keys`` is missing from ``spec``."""
@@ -668,8 +783,127 @@ def vehicle_by_id(game, vid):
     return game.vehicles.get(vid)
 
 
+def heal_character_vehicle_board_state(character, game):
+    """Re-link one body's ``in_vehicle`` / ``vehicle_role`` after load.
+
+    Older saves wrote the interior ``room_key`` but omitted board flags;
+    ``leave`` / ``drive`` soft-locked until healed. Persistence load calls
+    this per character (boot lifecycle Phase C) instead of a full-world scan.
+    Returns True when board fields or driver slot were touched.
+    """
+    if game is None or character is None:
+        return False
+    ensure_game_vehicles(game)
+    ensure_vehicle_defaults(character)
+    room = getattr(character, "location", None)
+    veh_here = vehicle_for_interior_room(game, room)
+    vid = getattr(character, "in_vehicle", None)
+
+    if veh_here is not None:
+        want_id = veh_here.get("id")
+        touched = False
+        if vid != want_id:
+            character.in_vehicle = want_id
+            touched = True
+        role = getattr(character, "vehicle_role", None)
+        if role not in ("driver", "passenger"):
+            driver = veh_here.get("driver")
+            driver_ok = (
+                driver is not None
+                and driver is not character
+                and getattr(driver, "in_vehicle", None) == want_id
+                and getattr(driver, "vehicle_role", None) == "driver"
+            )
+            if driver_ok:
+                character.vehicle_role = "passenger"
+            else:
+                character.vehicle_role = "driver"
+                veh_here["driver"] = character
+            touched = True
+        elif role == "driver":
+            veh_here["driver"] = character
+        return touched
+
+    if not vid:
+        return False
+    veh = vehicle_by_id(game, vid)
+    if veh is None:
+        character.in_vehicle = None
+        character.vehicle_role = None
+        return True
+    from engine.systems import overland as overland_mod
+
+    if vehicle_is_motorcycle(veh):
+        interior = veh.get("interior")
+        if room is interior:
+            park_key = veh.get("parked_room")
+            park = (
+                (getattr(game, "rooms", None) or {}).get(park_key)
+                if park_key
+                else None
+            )
+            if park is not None:
+                character.move_to(park)
+                return True
+            return False
+        on_curb = vehicle_rider_on_curb(character, veh, game)
+        on_road = overland_mod.is_virtual_room(room) and (
+            getattr(character, "in_vehicle", None) == veh.get("id")
+        )
+        if on_curb or on_road:
+            role = getattr(character, "vehicle_role", None)
+            if role not in ("driver", "passenger"):
+                driver = veh.get("driver")
+                driver_ok = (
+                    driver is not None
+                    and driver is not character
+                    and getattr(driver, "in_vehicle", None) == vid
+                    and getattr(driver, "vehicle_role", None) == "driver"
+                )
+                if driver_ok:
+                    character.vehicle_role = "passenger"
+                else:
+                    character.vehicle_role = "driver"
+                    veh["driver"] = character
+                return True
+            if role == "driver":
+                veh["driver"] = character
+            return False
+    interior = veh.get("interior")
+    if room is not interior:
+        character.in_vehicle = None
+        character.vehicle_role = None
+        if veh.get("driver") is character:
+            veh["driver"] = None
+        return True
+    return False
+
+
+def heal_vehicle_board_state(game):
+    """Full-world board heal (smoke / manual repair — not boot_seed).
+
+    Prefer ``heal_character_vehicle_board_state`` on persistence load.
+    """
+    if game is None:
+        return 0
+    from engine.char_index import iter_characters
+
+    healed = 0
+    for char in list(iter_characters(game)):
+        if heal_character_vehicle_board_state(char, game):
+            healed += 1
+    if healed:
+        print(
+            f"[vehicles] heal_vehicle_board_state: relinked/cleared {healed}",
+            flush=True,
+        )
+    return healed
+
+
 def vehicle_occupants(game, veh):
     """Characters aboard this vehicle (cabin + cockpit + cargo for charters)."""
+    if vehicle_is_motorcycle(veh):
+        return vehicle_motorcycle_occupants(game, veh)
     out = []
     seen = set()
     rooms = []
@@ -700,6 +934,9 @@ def _send(character, text):
 
 def _board_one(character, veh, role, game):
     """Move one character into the vehicle interior with a role."""
+    if vehicle_is_motorcycle(veh):
+        vehicle_mount_one(character, veh, role, game)
+        return
     ensure_vehicle_defaults(character)
     interior = veh["interior"]
     face = character.key
@@ -832,6 +1069,18 @@ def leave_vehicle(character, game, *, pull_followers=True):
         character.in_vehicle = None
         character.vehicle_role = None
         return False
+    if vehicle_hatch_blocked(character, game, veh):
+        _send(character, "The hatch is sealed for flight.")
+        return False
+
+    if vehicle_is_motorcycle(veh):
+        if veh.get("drive_until") and game.game_time_ticks < veh["drive_until"]:
+            clear_active_drive(veh)
+        elif veh.get("scenic_path") or veh.get("scenic_mode"):
+            clear_active_drive(veh)
+        return vehicle_leave_motorcycle(
+            character, game, veh, pull_followers=pull_followers,
+        )
     park_key = veh.get("parked_room")
     park = game.rooms.get(park_key) if park_key else None
     interior = veh.get("interior")
@@ -924,3 +1173,154 @@ def drive_step(character, vehicle, direction, game) -> bool:
     for who in vehicle_occupants(game, vehicle):
         _send(who, f"The {vehicle.get('key', 'vehicle')} rolls {label}.")
     return True
+
+
+def clear_active_drive(veh):
+    """Cancel in-progress tile cruise (and any legacy montage stamps)."""
+    if veh is None:
+        return
+    veh["drive_until"] = 0
+    veh["drive_dest"] = None
+    veh["drive_started"] = 0
+    veh["scenic_path"] = None
+    veh["scenic_last_step"] = 0
+    veh["scenic_mode"] = False
+
+
+def _scenic_step_every(game):
+    if _vehicle_scenic_step_every is not None:
+        try:
+            return int(_vehicle_scenic_step_every(game))
+        except Exception:
+            pass
+    return SCENIC_STEP_EVERY
+
+
+def _apply_scenic_macro_step(game, veh, nx, ny):
+    """Move a boarded vehicle one America-macro tile (scenic tick)."""
+    driver = None
+    for who in vehicle_occupants(game, veh):
+        if getattr(who, "vehicle_role", None) == "driver":
+            driver = who
+            break
+    if driver is None:
+        occupants = vehicle_occupants(game, veh)
+        driver = occupants[0] if occupants else None
+    if _vehicle_scenic_macro_step is not None:
+        ok, status = _vehicle_scenic_macro_step(game, veh, nx, ny, driver)
+        if not ok:
+            return False, status or "blocked"
+        if status == "stranded":
+            return True, "stranded"
+        return True, status
+    # Bare engine: stamp macro on vehicle + occupants.
+    from engine.systems import overland as overland_mod
+
+    veh["macro_pos"] = (nx, ny)
+    veh["micro_pos"] = None
+    veh["parked_room"] = None
+    for who in vehicle_occupants(game, veh):
+        overland_mod.ensure_overland_defaults(who)
+        who.macro_pos = (nx, ny)
+        who.micro_pos = None
+    return True, None
+
+
+def tick_drives(game, *, finish_drive_fn=None):
+    """Advance America tile-cruise macro steps once per heartbeat.
+
+    ``finish_drive_fn(game, veh)`` is called when a scenic path completes;
+    games pass their arrival prose handler (SUPERS ``_finish_drive``).
+    """
+    if not getattr(game, "_vehicles_ready", False):
+        return
+    now = game.game_time_ticks
+    step_every = _scenic_step_every(game)
+    for veh in game.vehicles.values():
+        path = veh.get("scenic_path")
+        if not (veh.get("scenic_mode") and isinstance(path, list)):
+            if veh.get("drive_until"):
+                veh["drive_until"] = 0
+                veh["drive_dest"] = None
+            continue
+        last = int(veh.get("scenic_last_step") or 0)
+        if now - last < step_every:
+            continue
+        if not path:
+            veh["scenic_mode"] = False
+            veh["scenic_path"] = None
+            if finish_drive_fn is not None:
+                finish_drive_fn(game, veh)
+            continue
+        step = path.pop(0)
+        try:
+            nx, ny = int(step[0]), int(step[1])
+        except (TypeError, ValueError, IndexError):
+            clear_active_drive(veh)
+            continue
+        ok, status = _apply_scenic_macro_step(game, veh, nx, ny)
+        veh["scenic_last_step"] = now
+        if not ok:
+            clear_active_drive(veh)
+            for who in vehicle_occupants(game, veh):
+                _send(
+                    who,
+                    "The road trip aborts -- road blocked. "
+                    "You stay aboard where you are.",
+                )
+            continue
+        for who in vehicle_occupants(game, veh):
+            _send(
+                who,
+                f"The road rolls on -- overland ({nx}, {ny}).",
+            )
+        if _vehicle_tick_drive_extra is not None:
+            _vehicle_tick_drive_extra(game, veh, nx, ny)
+        if status == "wrecked":
+            clear_active_drive(veh)
+            continue
+        if status == "stranded":
+            clear_active_drive(veh)
+            for who in vehicle_occupants(game, veh):
+                _send(who, "The engine dies -- out of gas.")
+            continue
+        if not path:
+            veh["scenic_mode"] = False
+            veh["scenic_path"] = None
+            if finish_drive_fn is not None:
+                finish_drive_fn(game, veh)
+
+
+def _board_alias_for(veh):
+    """Short board token for look hints."""
+    aliases = veh.get("aliases") or []
+    for pref in ("car", "ride", "truck", "bike"):
+        if pref in aliases:
+            return pref
+    key = (veh.get("key") or veh.get("id") or "vehicle").lower()
+    return key.split()[0] if key else "vehicle"
+
+
+def look_vehicle_hint(room, game, character=None):
+    """Extra look line when vehicles are parked in this room."""
+    ensure_game_vehicles(game)
+    if room is None:
+        return None
+    parked = vehicle_parked_without_rider(
+        game, room, parked_vehicles_in(game, room),
+    )
+    if not parked:
+        return None
+    names = [v.get("key") or v.get("id") or "?" for v in parked]
+    sr = bool(getattr(character, "screenreader", False)) if character else False
+    if len(parked) == 1:
+        alias = _board_alias_for(parked[0])
+        verb = "mount" if mc_mod.is_motorcycle(parked[0]) else "board"
+        if sr:
+            return f"Vehicle: {names[0]}. {verb.capitalize()}: enter {alias}."
+        return f"Parked: {names[0]}. {verb.capitalize()}: enter {alias}."
+    listed = "; ".join(names) if sr else ", ".join(names)
+    tip = "Board: enter <name>, or enter car for yours."
+    if sr:
+        return f"Vehicles ({len(parked)}): {listed}. {tip}"
+    return f"Parked: {listed}. {tip}"

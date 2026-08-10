@@ -1,17 +1,11 @@
-"""relationships.py -- the engine's generic directed-tag relationship core.
+"""
+relationships.py -- generic one-sided social tags between characters.
 
-One-sided social tags between characters live on ``Character.relationships``
-as ``{other_key: kind}``. One kind per target (a new tag replaces). Family
-is a help category; settable family kinds are sibling and parent (mentor).
+Storage is ``Character.relationships``: ``{other_key: kind}``. One kind per
+target (a new tag replaces). Game-specific flavor pools, cast bond ensures,
+and franchise egg prose register via hooks (wired in ``supers/bootstrap.py``).
 
-Asymmetry is flavor, not a gate. Games layer favorite-person resolution,
-hunt/rest buddy pickers, and enemy-tier pursue on top of these primitives
-the same way SUPERS keeps franchise cast bonds, easter-egg prose pools, and
-Cadence-specific partner rules in ``supers/relationships.py``
-(docs/plans/two_repo_purity.md, Phase 7 H7d).
-
-Pure attribute access + game.find_character when resolving favorites: zero
-``supers`` imports.
+Zero ``supers`` imports.
 """
 
 from __future__ import annotations
@@ -32,18 +26,62 @@ KINDS = (
     "nemesis",
     "mortal_enemy",
 )
-# Greatest → least for resolve_favorite_person when favorite_person unset.
+# Greatest -> least for resolve_favorite_person when favorite_person unset.
 FAVORITE_PRIORITY = KINDS
 # Hunt / rest / beckon close ties (never Enemy-tier).
 CLOSE_KINDS = frozenset({
     "lover", "sibling", "parent", "best_friend", "ashkin", "friend",
 })
+# Mutual ashkin side-by-side soak (incoming damage mult cut).
+ASHKIN_SOAK = 0.05
+# Help category only -- not a settable kind id.
+FAMILY_KINDS = frozenset({"sibling", "parent"})
 # Cadence lethal pursue (rival is competitive only -- not in this set).
 ENEMY_TIER = frozenset({
     "enemy", "oppressor", "nemesis", "mortal_enemy",
 })
-# Help category only -- not a settable kind id.
-FAMILY_KINDS = frozenset({"sibling", "parent"})
+
+# ---------------------------------------------------------------------------
+# Game hook slots
+# ---------------------------------------------------------------------------
+
+_wants_solo_hunt = None
+_is_grumpy_for_partners = None
+_social_lead_follow_grumpy_gate = None
+
+
+def set_relationship_wants_solo_hunt(fn):
+    """Register fn(actor) -> bool; True skips hunt-partner pick."""
+    global _wants_solo_hunt
+    _wants_solo_hunt = fn
+
+
+def set_relationship_is_grumpy_for_partners(fn):
+    """Register fn(character) -> bool; grumpy actors skip lover hunt picks."""
+    global _is_grumpy_for_partners
+    _is_grumpy_for_partners = fn
+
+
+def set_relationship_social_lead_follow_grumpy_gate(fn):
+    """Register fn(follower) -> bool; False blocks a grumpy hangout follow."""
+    global _social_lead_follow_grumpy_gate
+    _social_lead_follow_grumpy_gate = fn
+
+
+def actor_has_purgatory_scar(character) -> bool:
+    """True when *character* carries the Purgatory veteran scar (flag or trait)."""
+    if getattr(character, "purgatory_scarred", False):
+        return True
+    traits = getattr(character, "traits", None) or []
+    return "purgatory_scarred" in traits
+
+
+def ashkin_tag_blocked_message() -> str:
+    """Player-facing reject when the tagger lacks purgatory_scarred."""
+    return (
+        "Ashkin names a Purgatory war-bond -- you need your own scar on that "
+        "plane before you can tag someone that way. (See help ashkin.)"
+    )
 
 
 def ensure_defaults(character):
@@ -65,7 +103,6 @@ def normalize_kind(value):
     if value is None:
         return None
     text = str(value).strip().lower().replace("-", "_").replace(" ", "_")
-    # Soft aliases players might type.
     aliases = {
         "love": "lover",
         "loves": "lover",
@@ -106,11 +143,7 @@ def normalize_kind(value):
 
 
 def get_kind(character, other):
-    """Return the kind character has tagged other with, or None.
-
-    `other` may be a Character or a name key string. Migrates legacy
-    ``brother`` stamps to ``sibling`` in place.
-    """
+    """Return the kind character has tagged other with, or None."""
     ensure_defaults(character)
     key = other if isinstance(other, str) else getattr(other, "key", None)
     if not key:
@@ -119,7 +152,6 @@ def get_kind(character, other):
     kind_id = normalize_kind(raw)
     if kind_id is None:
         return None
-    # In-place migrate so old brother tags become sibling without a save.
     if raw != kind_id:
         character.relationships[key] = kind_id
     return kind_id
@@ -139,12 +171,7 @@ def set_kind(character, other, kind):
 
 
 def ensure_kind(character, other, kind):
-    """Stamp `kind` only when character has no tag toward other yet.
-
-    Immersion `ensure_*_bonds` helpers use this so a GM/`relate` edit
-    survives reboot -- boot must fill missing canon edges, not overwrite
-    rivals back to lovers every Game.__init__.
-    """
+    """Stamp `kind` only when character has no tag toward other yet."""
     existing = get_kind(character, other)
     if existing is not None:
         return existing
@@ -193,7 +220,7 @@ def reciprocal_kind(character, other):
 def asymmetry(character, other):
     """Classify the tag pair for flavor pickers.
 
-    Returns a short id string used as a key into FLAVOR['asymmetry'],
+    Returns a short id string used as a key into game flavor pools,
     or None when there is no tag either way.
     """
     a = get_kind(character, other)
@@ -251,6 +278,14 @@ def asymmetry(character, other):
     return "one_way_rival"
 
 
+def is_grumpy_for_partners(character):
+    """True when partner preference should skip forcing a lover."""
+    if _is_grumpy_for_partners is not None:
+        return bool(_is_grumpy_for_partners(character))
+    traits = getattr(character, "traits", None) or []
+    return "grumpy" in traits
+
+
 def _zone_of(character):
     """Room.zone of character's location, or None."""
     loc = getattr(character, "location", None)
@@ -289,6 +324,49 @@ def pick_nearest(actor, candidates):
     return living[0]
 
 
+def pick_hunt_partner(actor, candidates, *, grumpy=None):
+    """Choose a hunt buddy from CLOSE_KINDS (lover first unless grumpy)."""
+    if _wants_solo_hunt is not None and _wants_solo_hunt(actor):
+        return None
+    if grumpy is None:
+        grumpy = is_grumpy_for_partners(actor)
+    ensure_defaults(actor)
+    order = (
+        "lover", "sibling", "parent", "best_friend", "ashkin", "friend",
+    )
+    for kind in order:
+        if kind == "lover" and grumpy:
+            continue
+        pool = [c for c in candidates if get_kind(actor, c) == kind]
+        picked = pick_nearest(actor, pool)
+        if picked is not None:
+            return picked
+    return None
+
+
+def pick_rest_bar_buddy(actor, candidates, *, grumpy=None, game=None):
+    """Prefer favorite_person, else CLOSE_KINDS ladder for rest/bar."""
+    if grumpy is None:
+        grumpy = is_grumpy_for_partners(actor)
+    ensure_defaults(actor)
+    if game is not None:
+        fav = resolve_favorite_person(actor, game)
+        if fav is not None and fav in candidates:
+            if not (grumpy and get_kind(actor, fav) == "lover"):
+                return fav
+    order = (
+        "lover", "sibling", "parent", "best_friend", "ashkin", "friend",
+    )
+    for kind in order:
+        if kind == "lover" and grumpy:
+            continue
+        pool = [c for c in candidates if get_kind(actor, c) == kind]
+        picked = pick_nearest(actor, pool)
+        if picked is not None:
+            return picked
+    return None
+
+
 def are_siblings(a, b):
     """True when both have tagged each other as sibling (mutual)."""
     if a is None or b is None or a is b:
@@ -299,6 +377,40 @@ def are_siblings(a, b):
 def are_brothers(a, b):
     """Alias for are_siblings (legacy call sites / smoke)."""
     return are_siblings(a, b)
+
+
+def are_ashkin(a, b):
+    """True when both have tagged each other as ashkin (mutual war-bond)."""
+    if a is None or b is None or a is b:
+        return False
+    return get_kind(a, b) == "ashkin" and get_kind(b, a) == "ashkin"
+
+
+def ashkin_partners_in_room(character, *, exclude=None):
+    """Living mutual-ashkin partners sharing character's room."""
+    if character is None:
+        return []
+    room = getattr(character, "location", None)
+    if room is None:
+        return []
+    found = []
+    for other in room.characters():
+        if other is character or other is exclude:
+            continue
+        if getattr(other, "hp", 0) <= 0:
+            continue
+        if getattr(other, "spirit", False):
+            continue
+        if are_ashkin(character, other):
+            found.append(other)
+    return found
+
+
+def ashkin_incoming_mult(defender, attacker=None):
+    """Incoming damage mult: 1.0 - ASHKIN_SOAK when an ashkin ally is present."""
+    if not ashkin_partners_in_room(defender, exclude=attacker):
+        return 1.0
+    return max(0.0, 1.0 - ASHKIN_SOAK)
 
 
 def is_enemy_tier(kind):
@@ -322,11 +434,7 @@ def get_favorite_person_key(character):
 
 
 def set_favorite_person(character, other):
-    """Set explicit favorite_person to other's key. Returns the key.
-
-    Pass None / 'clear' / '' to clear the override (Cadence falls back to
-    ladder auto-resolve).
-    """
+    """Set explicit favorite_person to other's key. Returns the key."""
     ensure_defaults(character)
     if other is None:
         character.favorite_person = None
@@ -350,12 +458,7 @@ def set_favorite_person(character, other):
 
 
 def resolve_favorite_person(character, game):
-    """Return the Character this actor favors, or None.
-
-    Explicit ``favorite_person`` wins when that body still exists and is
-    living. Otherwise scan tags by FAVORITE_PRIORITY (lover first … mortal
-    enemy last); among the same kind prefer co-located, then same-zone.
-    """
+    """Return the Character this actor favors, or None."""
     ensure_defaults(character)
     if game is None:
         return None
@@ -377,9 +480,7 @@ def resolve_favorite_person(character, game):
         body = finder(explicit)
         if _living(body):
             return body
-        # Stale override -- fall through to ladder (do not clear; player set it).
 
-    # Collect living tagged targets by kind.
     by_kind = {k: [] for k in FAVORITE_PRIORITY}
     for other_key, kind in list_of(character):
         if kind not in by_kind:
@@ -394,6 +495,41 @@ def resolve_favorite_person(character, game):
         if picked is not None:
             return picked
     return None
+
+
+def social_lead_follow_roles(a, b):
+    """Decide (leader, follower) for a social hangout pair."""
+    if a is None or b is None or a is b:
+        return (None, None)
+    from engine.systems import persona_registry as personas_mod
+
+    assert_a = personas_mod.assertiveness(a)
+    assert_b = personas_mod.assertiveness(b)
+    if assert_a > assert_b:
+        leader, follower = a, b
+    elif assert_b > assert_a:
+        leader, follower = b, a
+    else:
+        social_a = float(getattr(a, "social", 0.0) or 0.0)
+        social_b = float(getattr(b, "social", 0.0) or 0.0)
+        if social_a > social_b:
+            leader, follower = b, a
+        elif social_b > social_a:
+            leader, follower = a, b
+        else:
+            if (getattr(a, "key", "") or "") <= (getattr(b, "key", "") or ""):
+                leader, follower = a, b
+            else:
+                leader, follower = b, a
+
+    traits = getattr(follower, "traits", None) or []
+    if "grumpy" in traits:
+        if _social_lead_follow_grumpy_gate is not None:
+            if not _social_lead_follow_grumpy_gate(follower):
+                return (None, None)
+        else:
+            return (None, None)
+    return (leader, follower)
 
 
 def enemy_tier_targets(actor, game):
@@ -417,3 +553,89 @@ def enemy_tier_targets(actor, game):
             continue
         out.append(other)
     return out
+
+
+def can_brother_rescue(actor):
+    """True when actor may run kinship Limbo / afterlife rescue."""
+    traits = getattr(actor, "traits", None) or []
+    if "loyal" not in traits:
+        return False
+    return "reckless" in traits or "resolute" in traits
+
+
+def can_ashkin_rescue(actor):
+    """True when actor may run the ashkin afterlife rescue."""
+    return can_brother_rescue(actor)
+
+
+def _is_living_embodied(character):
+    """True when character can act in the world (not spirit / dead / clinic)."""
+    if character is None:
+        return False
+    if getattr(character, "spirit", False):
+        return False
+    if float(getattr(character, "hp", 0) or 0) <= 0:
+        return False
+    if getattr(character, "hospitalized", False):
+        return False
+    if getattr(character, "collapsed", False):
+        return False
+    return True
+
+
+def living_mutual_brothers(character, game):
+    """Living mutual siblings of `character` found in `game` (may be empty)."""
+    if character is None or game is None:
+        return []
+    ensure_defaults(character)
+    found = []
+    for other_key in list_of_kind(character, "sibling"):
+        other = game.find_character(other_key)
+        if other is None or other is character:
+            continue
+        if get_kind(other, character) != "sibling":
+            continue
+        if not _is_living_embodied(other):
+            continue
+        found.append(other)
+    return found
+
+
+def has_living_mutual_brother(character, game):
+    """True when at least one living mutual sibling exists in `game`."""
+    return bool(living_mutual_brothers(character, game))
+
+
+def living_mutual_ashkin(character, game):
+    """Living mutual ashkin partners of `character` in `game` (may be empty)."""
+    if character is None or game is None:
+        return []
+    ensure_defaults(character)
+    found = []
+    for other_key in list_of_kind(character, "ashkin"):
+        other = game.find_character(other_key)
+        if other is None or other is character:
+            continue
+        if get_kind(other, character) != "ashkin":
+            continue
+        if not _is_living_embodied(other):
+            continue
+        found.append(other)
+    return found
+
+
+def has_living_mutual_ashkin(character, game):
+    """True when at least one living mutual ashkin partner exists in `game`."""
+    return bool(living_mutual_ashkin(character, game))
+
+
+def ensure_brother_bond(a, b):
+    """Stamp mutual sibling; upgrades legacy friend tags to sibling."""
+    if a is None or b is None or a is b:
+        return
+    ensure_defaults(a)
+    ensure_defaults(b)
+    for left, right in ((a, b), (b, a)):
+        existing = get_kind(left, right)
+        if existing in (None, "friend"):
+            set_kind(left, right, "sibling")

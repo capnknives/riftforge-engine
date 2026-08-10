@@ -69,7 +69,11 @@
         "lake",
         "forest",
         "plains",
-        "furnace"
+        "furnace",
+        "highway",
+        "desert",
+        "wetland",
+        "void"
       ]
     },
     "bestiary_categories": {

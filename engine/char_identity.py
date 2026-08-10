@@ -75,6 +75,102 @@ def normalize_surname(raw: str):
     return cleaned, None
 
 
+def normalize_surname_optional(raw: str):
+    """Validate surname when empty is allowed (unique given names).
+
+    Returns ``(cleaned, error_or_None)`` where ``cleaned`` may be ``""``.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return "", None
+    return normalize_surname(text)
+
+
+def surname_required_for_create(game, given_name: str) -> bool:
+    """True when another login body already uses this given name."""
+    return len(find_players_by_given_name(game, given_name)) > 0
+
+
+
+def can_drop_surname(game, char) -> bool:
+    """True when this body may clear surname and keep a unique given-name login.
+
+    Same rule as skipping surname at creation: no other login body shares
+    the given name.
+    """
+    if char is None:
+        return False
+    given = character_given_name(char)
+    if not given:
+        return False
+    others = [
+        body
+        for body in find_players_by_given_name(game, given)
+        if body is not char
+    ]
+    return len(others) == 0
+
+
+# Tokens for ``namechange`` when the player wants a mononym (no surname).
+_NAMECHANGE_DROP_SURNAME_TOKENS = frozenset({
+    "none",
+    "clear",
+    "remove",
+    "drop",
+    "mononym",
+    "-",
+    "(none)",
+    "no",
+    "nosurname",
+    "no surname",
+})
+
+
+def is_namechange_drop_surname(raw: str) -> bool:
+    """True when ``namechange`` args mean remove surname, not set a new one."""
+    text = (raw or "").strip().lower()
+    if not text:
+        return False
+    return text in _NAMECHANGE_DROP_SURNAME_TOKENS
+
+
+def validate_new_character_identity(game, given_name: str, surname: str):
+    """Return a player-facing error string, or None when identity is valid."""
+    given = (given_name or "").strip()
+    if not given:
+        return "A first name is required."
+    sur = (surname or "").strip()
+    if surname_required_for_create(game, given):
+        if not sur:
+            return (
+                f"Another character already uses the name {given}. "
+                "Pick a surname to tell them apart."
+            )
+        cleaned, err = normalize_surname(sur)
+        if err:
+            return err
+        if given_surname_taken(game, given, cleaned):
+            return (
+                f"{given} {cleaned} is already taken. "
+                "Choose a different name."
+            )
+        return None
+    if sur:
+        cleaned, err = normalize_surname(sur)
+        if err:
+            return err
+        sur = cleaned
+        if given_surname_taken(game, given, sur):
+            return (
+                f"{given} {sur} is already taken. "
+                "Choose a different name."
+            )
+    else:
+        if key_is_taken(game, given):
+            return f"The name {given} is already taken."
+    return None
+
+
 def character_given_name(char) -> str:
     """Resolved given name for a Character (legacy falls back to key face)."""
     if char is None:
@@ -645,20 +741,39 @@ def heal_all_character_identities(game) -> dict:
     return stats
 
 
+def _sheriff_office_identity_match(label) -> bool:
+    """True when a room key or legacy_key names the sheriff desk lobby."""
+    if not label or not isinstance(label, str):
+        return False
+    # Bare label after optional map qualify (``lebanon:Sheriff's Office``).
+    bare = label.split(":", 1)[-1].strip()
+    low = bare.lower()
+    if "cell" in low or "lot" in low:
+        return False
+    return low in ("sheriff's office", "sherrif's office")
+
+
 def is_sheriff_office_room(room) -> bool:
     """True when ``room`` is a sheriff's office lobby (not lot / cell).
 
     Matches Lebanon / Lawrence SoT keys ending in ``Sheriff's Office``
     (and legacy dig typo ``Sherrif's Office``) without Cell / Lot suffixes.
+    After VNUM rekey the live ``room.key`` may be ``SE00008`` while
+    ``legacy_key`` stays ``lebanon:Sheriff's Office`` -- check both.
     """
     if room is None:
         return False
-    key = getattr(room, "key", None) or ""
-    if not isinstance(key, str):
+    for attr in ("key", "legacy_key"):
+        if _sheriff_office_identity_match(getattr(room, attr, None)):
+            return True
+    return False
+
+
+def is_justice_desk_room(room) -> bool:
+    """True at courthouse clerk / registry desks (payfine parity)."""
+    if room is None:
         return False
-    # Bare key after optional map qualify.
-    bare = key.split(":", 1)[-1].strip()
-    low = bare.lower()
-    if "cell" in low or "lot" in low:
-        return False
-    return low in ("sheriff's office", "sherrif's office")
+    if bool(getattr(room, "id_registry", False)):
+        return True
+    title = str(getattr(room, "title", "") or "").lower()
+    return "clerk window" in title

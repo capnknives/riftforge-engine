@@ -208,6 +208,32 @@ def _levenshtein(a, b):
     return prev[-1]
 
 
+def closest_match(query, candidates, *, max_distance=3):
+    """Return the single closest candidate string within ``max_distance``.
+
+    Shared by help miss suggestions and unknown-command verb hints. Pure
+    string math -- no DB required (unlike ``fuzzy_suggest``).
+    """
+    query = (query or "").strip().lower()
+    if not query:
+        return None
+    best = None
+    best_distance = max_distance + 1
+    seen = set()
+    for candidate in candidates or ():
+        if not isinstance(candidate, str):
+            continue
+        key = candidate.strip().lower()
+        if not key or key == query or key in seen:
+            continue
+        seen.add(key)
+        distance = _levenshtein(query, key)
+        if distance < best_distance:
+            best = key
+            best_distance = distance
+    return best
+
+
 def fuzzy_suggest(conn, query, *, is_gm=False, extra_candidates=None, max_distance=3):
     """Layer 3: closest known keyword/alias by edit distance ("Did you
     mean?"). Returns the single closest candidate string, or None when
@@ -233,11 +259,8 @@ def fuzzy_suggest(conn, query, *, is_gm=False, extra_candidates=None, max_distan
     candidates.update(extra_candidates or ())
     candidates.discard(query)
 
-    best = None
-    best_distance = max_distance + 1
-    for candidate in candidates:
-        distance = _levenshtein(query, candidate)
-        if distance < best_distance:
-            best = candidate
-            best_distance = distance
-    return best
+    return closest_match(
+        query,
+        candidates,
+        max_distance=max_distance,
+    )

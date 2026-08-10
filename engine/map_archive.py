@@ -17,7 +17,7 @@ import shutil
 import time
 from datetime import date, datetime, timezone
 
-import maps as maps_mod
+from engine import world_maps as maps_mod
 
 from engine import map_backups
 

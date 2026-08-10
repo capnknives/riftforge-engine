@@ -7,7 +7,7 @@ altitude layer where a Stellar pilots the brass globe with n/s/e/w.
 
 from __future__ import annotations
 
-from world import Room
+from engine.world import Room
 
 from engine.systems import globe as globe_mod
 from engine.systems import overland as overland_mod

@@ -985,6 +985,20 @@ def mission_pocket_blocks_overland_move(character):
     return room is not None and getattr(room, "mission_instance", False)
 
 
+def pit_pocket_blocks_overland_move(character):
+    """True in generated Purgatory pit floors -- always use Room.exits.
+
+    Runners can carry stale ``macro_pos`` / ``micro_pos`` from Earth travel
+    into the pocket. Clear those coords so ``try_overland_move`` never
+    hijacks compass steps away from the ephemeral spine graph.
+    """
+    room = getattr(character, "location", None)
+    if room is None or not getattr(room, "purgatory_pit", False):
+        return False
+    clear_overland_coords(character)
+    return True
+
+
 def classic_zone_room_blocks_overland_move(character):
     """True when the body stands in a static zone room, not on the dual layer.
 
@@ -1010,6 +1024,28 @@ def classic_zone_room_blocks_overland_move(character):
     return True
 
 
+def _apply_relocate_hooks_before(character):
+    """Cancel training / attune / recover before an overland step.
+
+    Classic Room.exits moves run the same hooks from
+    ``command_support._move_one``; dual-layer foot and flight hops bypass
+    that path (bug report 388).
+    """
+    from engine.hooks import before_relocate
+
+    msg = before_relocate(character)
+    if msg and character.session is not None:
+        character.session.send(msg)
+    return getattr(character, "working", False)
+
+
+def _apply_relocate_hooks_after(character, dest, game, was_working):
+    """Post-arrival side effects (stop work, drag body, …) after overland."""
+    from engine.hooks import after_arrive
+
+    after_arrive(character, dest, game, was_working)
+
+
 def try_overland_move(character, direction, game):
     """Handle N/S/E/W (and diagonals) while on the dual layer.
 
@@ -1017,6 +1053,8 @@ def try_overland_move(character, direction, game):
     Returns False when the caller should use classic Room.exits movement.
     """
     if mission_pocket_blocks_overland_move(character):
+        return False
+    if pit_pocket_blocks_overland_move(character):
         return False
     if classic_zone_room_blocks_overland_move(character):
         if overland_mode(character) != "zone":
@@ -1067,9 +1105,13 @@ def try_overland_move(character, direction, game):
                 f"{face} flies {direction}.",
                 exclude=character,
             )
+        was_working = _apply_relocate_hooks_before(character)
         character.macro_pos = (nx, ny)
         character.stellar_flight_macro = [nx, ny]
         character.move_to(get_aerial_room(game, (nx, ny)))
+        _apply_relocate_hooks_after(
+            character, character.location, game, was_working,
+        )
         _send(
             character,
             f"You fly {direction} -- now hovering over ({nx}, {ny}).",
@@ -1123,8 +1165,10 @@ def try_overland_move(character, direction, game):
             f"{face} leaves to the {direction}.",
             exclude=character,
         )
+    was_working = _apply_relocate_hooks_before(character)
     place_on_overland(character, game, (mx, my), (ux, uy))
     new_room = character.location
+    _apply_relocate_hooks_after(character, new_room, game, was_working)
     if new_room is not None and not stealth:
         new_room.broadcast(
             f"{face} arrives from the "
@@ -1538,18 +1582,42 @@ def cadence_homeward_from_overland(game, actor, dest_room_key=None):
         return False
 
     dist = overland_macro_distance(macro, home_macro)
-    if dist is None or dist > WILD_ROAM_MACRO_RADIUS:
-        if not dest_key:
-            return False
-        return hooks_mod.overland_cadence_travel_toward(
-            game, actor, dest_key,
-        )
+    loc = getattr(actor, "location", None)
+    on_virtual_foot = is_virtual_room(loc)
 
-    # Local hike: at landmark micro of the home tile -> enter pocket.
+    # Hub taxi montages cannot pick up on ephemeral wilderness cells -- they
+    # re-stamp ``_taxi_until`` every Cadence tick without ever landing.
+    if on_virtual_foot and getattr(actor, "_taxi_until", None) is not None:
+        actor._taxi_until = None
+        actor._taxi_dest_key = None
+        actor._taxi_kind = None
+        actor._taxi_scenic_path = None
+        actor._taxi_scenic_last_step = None
+
+    # Drive / taxi only from settlement rooms; virtual foot always hikes.
+    if (
+        not on_virtual_foot
+        and dist is not None
+        and dist > WILD_ROAM_MACRO_RADIUS
+        and dest_key
+    ):
+        before_far = (macro, micro)
+        mode_before = overland_mode(actor)
+        if hooks_mod.overland_cadence_travel_toward(
+            game, actor, dest_key,
+        ):
+            after_macro = _parse_pos_pair(getattr(actor, "macro_pos", None))
+            after_micro = _parse_pos_pair(getattr(actor, "micro_pos", None))
+            if (
+                (after_macro, after_micro) != before_far
+                or overland_mode(actor) != mode_before
+            ):
+                return True
+
+    # Local or virtual far hike: one dual-layer step toward the home hub.
     if macro == home_macro and micro == LANDMARK_MICRO:
         return _enter_alias_at_landmark(game, actor, dest_key)
 
-    # One dual-layer step toward the home hub (npc_do so look/encounters fire).
     from engine.npc_act import npc_do
 
     direction = _next_overland_foot_direction(macro, micro, home_macro)
@@ -1624,14 +1692,16 @@ def cadence_local_overland_roam(game, actor):
 
 
 def heal_stranded_overland_cadence(game):
-    """Boot-heal: yank far dual-layer foot travelers back to settlement.
+    """Boot reconcile: start Cadence homeward for far dual-layer foot travelers.
 
     Targets characters whose ``home_zone`` is a starter settlement and who
     sit more than ``WILD_ROAM_MACRO_RADIUS`` America macros from their
-    pocket mouth. Clears dual-layer coords and stamps a legal zone_entry
-    hub so ``exit`` works later. Idempotent. Never deletes characters.
+    pocket mouth. Runs one ``cadence_homeward_from_overland`` beat (drive /
+    taxi / ``npc_do`` foot step) per stranded body -- no silent ``move_to``.
+    Clears invalid ``zone_entry_hub_key`` stamps. Idempotent when nobody is
+    stranded. Cadence ``_step_toward_home`` continues on tick.
     """
-    stats = {"yanked": 0, "cleared_entry": 0}
+    stats = {"homeward": 0, "cleared_entry": 0, "still_stranded": 0}
     if game is None:
         return stats
     ensure_game_overland(game)
@@ -1678,18 +1748,17 @@ def heal_stranded_overland_cadence(game):
             mouth = lebanon_mouth
         if dest is None:
             continue
-        clear_overland_coords(char)
-        # Drop a stale wastes / missing entry stamp so exit works at S9.
         stamped = getattr(char, "zone_entry_hub_key", None)
         if stamped and stamped not in rooms:
             char.zone_entry_hub_key = None
             stats["cleared_entry"] += 1
-        if mouth is not None:
+        dest_key = getattr(dest, "key", None)
+        if cadence_homeward_from_overland(game, char, dest_room_key=dest_key):
+            stats["homeward"] += 1
+        if overland_mode(char) == "zone" and mouth is not None:
             char.zone_entry_hub_key = mouth.key
-        loc = getattr(char, "location", None)
-        if loc is not dest:
-            char.move_to(dest)
-        stats["yanked"] += 1
+        elif is_far_from_home_hub(game, char):
+            stats["still_stranded"] += 1
     return stats
 
 

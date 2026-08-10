@@ -29,6 +29,13 @@ class _FakeSession:
     def __init__(self, replies):
         self.lines = []
         self._replies = list(replies)
+        self.alive = True
+        self.character = None
+
+    def attach(self, character):
+        self.character = character
+        character.session = self
+        return self
 
     def send(self, message):
         self.lines.append(message)
@@ -52,7 +59,7 @@ async def _run_chargen(game, class_index, class_id):
 
     char = Character(f"Smoke{class_id.capitalize()}")
     session = _FakeSession(_chargen_replies(class_index))
-    char.session = session
+    session.attach(char)
     ok = await hooks.run_chargen(session, char)
     assert ok, f"chargen for {class_id!r} should succeed"
     assert char.classic_class == class_id
@@ -141,7 +148,7 @@ def main():
     assert defender.hp == before_hp, "instant tick should skip auto-swing"
 
     walker = placed[0]
-    walker.session = _FakeSession([])
+    _FakeSession([]).attach(walker)
     dispatch = hooks.get_dispatch()
     dispatch(walker, "south", game)
     assert walker.location.key == "MB00010"
@@ -150,7 +157,7 @@ def main():
 
     from classic import spells as spells_module
     mage = placed[2]
-    mage.session = _FakeSession([])
+    _FakeSession([]).attach(mage)
     dispatch(mage, "score", game)
     assert any("Known spells:" in line for line in mage.session.lines)
     assert any("bolt" in line for line in mage.session.lines)

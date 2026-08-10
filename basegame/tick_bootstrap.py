@@ -57,6 +57,10 @@ def register_default_ticks(game):
     register_tick(game, _demo_needs_tick, order=82, name="demo_needs")
     from basegame import spawn_nests as spawn_nests_mod
     register_tick(game, spawn_nests_mod.tick_nests, order=83, name="spawn_nests")
+    from engine.systems import room_reset as room_reset_mod
+    from engine.systems import status_effects as status_effects_mod
+    room_reset_mod.register_tick(game)
+    status_effects_mod.register_tick(game)
     from engine.systems import paced_travel as paced_travel_mod
     register_tick(game, paced_travel_mod.tick_walks, order=66, name="paced_walk")
     # economy lands in a later stage.

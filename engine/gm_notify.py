@@ -198,16 +198,8 @@ def append_wiznet_history(game, plain_line):
 
 def send_wiznet_history(character, game):
     """Replay the global wiznet ring buffer to one staff session."""
-    session = getattr(character, "session", None)
-    if session is None:
-        return
-    if channel_history.is_empty(game, "wiznet"):
-        channel_history.send_empty_hint(character, "wiznet")
-        return
-    channel_history.send_replay_header(character, "wiznet")
-    for plain in channel_history.entries(game, "wiznet"):
-        session.send(channel_history.replay_wiznet_entry(plain))
-    session.send("")
+    from engine import channels
+    channels.replay_global(character, game, "wiznet")
 
 
 def wiznet_broadcast(game, speaker, message, *, exclude=None):
