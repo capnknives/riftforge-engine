@@ -44,6 +44,11 @@
       "type": "bool",
       "required": false,
       "doc": "Dark room (needs light). Sewers default dark."
+    },
+    "foundry_amenity": {
+      "type": "bool",
+      "required": false,
+      "doc": "Smelter/forge station (room_has_smelter); map JSON foundry_amenity."
     }
   }
 }

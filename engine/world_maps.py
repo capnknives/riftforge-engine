@@ -927,6 +927,9 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
             room.layout_x = None
             room.layout_y = None
             room.layout_z = None
+    # Engine forge/smelter stations (smithing, mining help).
+    if game_fields is not None and game_fields.get("foundry_amenity"):
+        room.foundry_amenity = True
     # SUPERS (or any game) authored flavor flags -- Stage G hook.
     from engine import hooks as _hooks
     _hooks.stamp_map_room(room, game_fields or {}, filename=filename)

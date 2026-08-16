@@ -148,6 +148,9 @@ def register_all_hooks():
                 room_reset_mod.reset_room(room, game)
         from basegame import vehicles as vehicles_mod
         vehicles_mod.ensure_basegame_vehicles(game)
+        from engine.systems import civic_shops as civic_shops_mod
+
+        civic_shops_mod.ensure_demo_newsstand(game)
         combat_runtime_mod.ensure_game_combat_backend(
             game, default=combat_runtime_mod.get_default_combat_backend(),
         )

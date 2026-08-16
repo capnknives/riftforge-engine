@@ -37,8 +37,9 @@ def ensure_registry(game):
 def shop_record_to_fixture(shop):
     """Convert a SUPERS ``player_shops`` dict into a registry record."""
     meta = shop.get("meta") or {}
+    fixture_id = str(shop.get("fixture_id") or shop["shop_id"])
     return {
-        "fixture_id": shop["shop_id"],
+        "fixture_id": fixture_id,
         "host_room_key": shop.get("host_room_key"),
         "hub_room_key": shop.get("hub_room_key"),
         "enter_alias": shop.get("enter_alias"),

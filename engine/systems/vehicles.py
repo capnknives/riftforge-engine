@@ -319,6 +319,16 @@ def save_parking_state(game):
                 interior_key = veh.get("interior_key")
                 if not park_key:
                     continue
+                from engine.room_vnum import lookup_room
+                from engine.systems.vehicles import canonical_park_key
+
+                park_room = rooms.get(park_key)
+                if park_room is None:
+                    park_room = lookup_room(game, park_key)
+                if park_room is None:
+                    park_room = lookup_room(
+                        game, canonical_park_key(game, park_key),
+                    )
                 nested = bool(
                     (interior_key and park_key == interior_key)
                     or (
@@ -326,10 +336,9 @@ def save_parking_state(game):
                         and park_key.startswith("Inside ")
                     )
                 )
-                if not nested and park_key in rooms:
-                    nested = is_vehicle_interior_room(rooms[park_key], game)
-                if not nested and park_key in rooms:
-                    park_room = rooms[park_key]
+                if not nested and park_room is not None:
+                    nested = is_vehicle_interior_room(park_room, game)
+                if not nested and park_room is not None:
                     if not room_is_valid_park_spot(park_room, game):
                         nested = True
                 if not nested:
@@ -340,18 +349,20 @@ def save_parking_state(game):
                     find = getattr(game, "find_character", None)
                     if callable(find):
                         owner = find(owner_key)
-                park_room = rooms.get(park_key)
                 if park_room is None:
-                    from engine.room_vnum import lookup_room
+                    park_room = rooms.get(park_key)
+                if park_room is None:
                     park_room = lookup_room(game, park_key)
                 rehome = hooks_mod.vehicle_invalid_park_rehome(
                     game, veh, park_room, owner,
                 )
-                if rehome and rehome in rooms and rehome != park_key:
-                    veh["parked_room"] = rehome
-                    veh["macro_pos"] = None
-                    veh["micro_pos"] = None
-                    continue
+                if rehome and rehome != park_key:
+                    rehome_room = lookup_room(game, rehome) or rooms.get(rehome)
+                    if rehome_room is not None:
+                        veh["parked_room"] = rehome
+                        veh["macro_pos"] = None
+                        veh["micro_pos"] = None
+                        continue
                 dest = nearest_driveable_park_key(
                     game, park_room or rooms.get(park_key), character=owner,
                 )

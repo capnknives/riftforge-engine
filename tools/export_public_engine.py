@@ -68,14 +68,14 @@ briefs, body parts, content kinds, travel, economy, …). Game-specific lore,
 catalogs, and prose live in a **separate** consumer repo and pin **tagged
 releases** of this package.
 
-**Current release: [`v0.5.2`](https://github.com/capnknives/riftforge-engine/releases/tag/v0.5.2)** — mine/chargen vault + forge recipe hooks (purity P0); `engine/` map callers use `world_maps` / `map_ui` directly. Builds on **`v0.5.1`** (body-parts demo, clinic strangler hooks, justice adapter spike) and **`v0.5.0`** (OLC, phone/appearance/persona/relationship frameworks, kind grandparents). Pin `@v0.5.2` until the next semver tag ships from `main`.
+**Current release: [`v0.5.3`](https://github.com/capnknives/riftforge-engine/releases/tag/v0.5.3)** — street-collapse FSM (`engine/systems/collapse.py`), robbery till peel via `attempt_theft` + `justice_on_robbery`, civic `fixture_id` registry mirror. Builds on **`v0.5.2`** (mine/chargen hooks + maps peel) and **`v0.5.1`** (body-parts demo, clinic strangler hooks). Pin `@v0.5.3` until the next semver tag ships from `main`.
 
 ## Install
 
 ```bash
 pip install -e .
 # or pin from another project:
-#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.5.2
+#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.5.3
 ```
 
 Requires **Python 3.11+**.
@@ -124,6 +124,12 @@ python tools/scaffold_game_mode.py --slug mygame --label "My Game"
 ```
 
 See [`docs/GAME_MODE_SCHEMA_CHECKLIST.md`](docs/GAME_MODE_SCHEMA_CHECKLIST.md).
+
+## What's new in v0.5.3
+
+- **Collapse FSM** — `engine/systems/collapse.py` for sustained critical-need street coma timers; games register eligibility / needs-frozen gates.
+- **Theft peel** — `engine/systems/theft.attempt_theft` + `justice_on_robbery` hook for till telemetry.
+- **Civic fixture_id** — registry records use explicit `fixture_id` (defaults to shop id); sync from SUPERS shop rows at boot.
 
 ## What's new in v0.5.2
 
@@ -233,7 +239,7 @@ CI runs all three on every push.
 
 ## Building your own game
 
-1. `pip install -e .` (or pin `@v0.5.2`).
+1. `pip install -e .` (or pin `@v0.5.3`).
 2. Read [`docs/ENGINE_CONSUMER.md`](docs/ENGINE_CONSUMER.md) — hooks for chargen, persist, help, `register_all_hooks()`.
 3. Copy `basegame/` or `classic/` as a skeleton, or register your package via `RIFTFORGE_GAME=yourgame`.
 4. Put catalogs in your repo (`content/kinds/`, maps, NPCs); register kind dirs with `set_content_kinds_dirs`. Run `tools/scaffold_game_mode.py` for a fresh tree.

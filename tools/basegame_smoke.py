@@ -278,6 +278,21 @@ def main():
         economy_mod.wallet_total_cents(walker), before_wallet, lantern
     )
 
+    from engine.systems import civic_shops as civic_shops_mod
+
+    civic_shops_mod.ensure_demo_newsstand(game)
+    plaza = game.rooms.get("NB00001")
+    assert plaza is not None, "Main Street hub NB00001 missing"
+    assert (plaza.zone_entries or {}).get("newsstand") is not None, (
+        "plaza should wire enter newsstand after civic fixture demo"
+    )
+    walker.move_to(plaza)
+    _FakeSession([]).attach(walker)
+    dispatch(walker, "enter newsstand", game)
+    assert walker.location.key == "BGNewsstandHub", walker.location.key
+    dispatch(walker, "exit", game)
+    assert walker.location is plaza
+
     from engine.systems import needs as needs_engine
     from basegame import needs as basegame_needs
 

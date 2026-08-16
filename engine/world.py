@@ -290,6 +290,10 @@ class Room(GameObject):
         # buildings, nests, and flats stay False (indoor / covered). Also
         # read by engine/systems/weather.py's generic ambient weather.
         self.outdoor = False
+        # Smelter / forge station (engine/systems/smelter.room_has_smelter).
+        # Authored as "foundry_amenity" in map JSON for town yards and
+        # pocket foundries (Hell Slag Forge, Lawrence highway shoulder, …).
+        self.foundry_amenity = False
         # Thin light / vision (D67): dark rooms need a carried light source
         # to see look contents. Authored as "dark": true; default False.
         self.dark = False

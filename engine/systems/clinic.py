@@ -137,15 +137,85 @@ def tick(game):
         if not getattr(character, "hospitalized", False):
             continue
 
-        until = int(getattr(character, "hospital_until_tick", 0) or 0)
-        max_hp = _hp_cap(character)
-        character.hp = min(
-            max_hp,
-            float(getattr(character, "hp", 0) or 0) + RECOVERY_HP_PER_TICK,
-        )
-        ready_hp = max_hp * DISCHARGE_HP_FRACTION
-        if (until and now >= until) or float(character.hp) >= ready_hp:
-            discharge(character, game=game)
+        tick_hospitalized_patient(character, game, now)
+
+
+# --- Ward pacing registrars (games override engine defaults) -------------
+
+_ward_recovery_gain = None
+_discharge_hp_fraction = None
+_discharge_grace_ticks = None
+
+
+def set_ward_recovery_gain(fn):
+    """Register ``fn(character, game, max_hp) -> float`` HP gain per tick."""
+    global _ward_recovery_gain
+    _ward_recovery_gain = fn
+
+
+def set_discharge_hp_fraction(fn):
+    """Register ``fn(character, game) -> float`` discharge HP fraction."""
+    global _discharge_hp_fraction
+    _discharge_hp_fraction = fn
+
+
+def set_discharge_grace_ticks(fn):
+    """Register ``fn(game) -> int`` grace ticks after stay timer before discharge."""
+    global _discharge_grace_ticks
+    _discharge_grace_ticks = fn
+
+
+def _ward_hp_gain(character, game, max_hp):
+    if _ward_recovery_gain is not None:
+        return float(_ward_recovery_gain(character, game, max_hp))
+    return RECOVERY_HP_PER_TICK
+
+
+def _discharge_fraction(character, game):
+    if _discharge_hp_fraction is not None:
+        return float(_discharge_hp_fraction(character, game))
+    return DISCHARGE_HP_FRACTION
+
+
+def _grace_ticks(game):
+    if _discharge_grace_ticks is not None:
+        return int(_discharge_grace_ticks(game))
+    return 0
+
+
+def tick_hospitalized_patient(character, game, now, room=None):
+    """One hospitalized heartbeat: recovery, ward hook, discharge gate.
+
+    SUPERS ``hospital.tick`` calls this instead of duplicating fractional
+    recovery and discharge thresholds (strangler step D).
+    """
+    if not getattr(character, "hospitalized", False):
+        return False
+    room = room or getattr(character, "location", None)
+    max_hp = _resolve_max_hp(character, None)
+    gain = _ward_hp_gain(character, game, max_hp)
+    character.hp = round(
+        min(max_hp, float(getattr(character, "hp", 0) or 0) + gain),
+        2,
+    )
+    frac = _discharge_fraction(character, game)
+    ready = is_ready_to_discharge(
+        character,
+        now_tick=now,
+        discharge_hp_frac=frac,
+    )
+    from engine import hooks
+
+    hooks.clinic_ward_tick(character, room, game, now=now, ready=ready)
+    if not ready:
+        return False
+    until = int(getattr(character, "hospital_until_tick", 0) or 0)
+    overdue = now - until if until else 0
+    grace = _grace_ticks(game)
+    if overdue >= grace or float(character.hp) >= max_hp * frac:
+        discharge(character, game=game)
+        return True
+    return False
 
 
 # --- Ward selection + discharge bookkeeping (generic peel) ---------------
