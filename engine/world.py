@@ -111,11 +111,18 @@ class Item(GameObject):
         # skips it instead of re-exhuming and re-burying the same corpse. Only
         # ever meaningful when is_body is True.
         self.is_buried = is_buried
-        # Scavenger harvest flags (supers/scavenge.py): meat/blood can each be
-        # taken once from an unburied body without destroying it -- Moss can
-        # still bury, spirits can still anchor. Only meaningful when is_body.
+        # Scavenger harvest flags (supers/scavenge.py): meat/blood/DMB can
+        # each be taken once from an unburied body without destroying it --
+        # Moss can still bury, spirits can still anchor. Only meaningful
+        # when is_body.
         self.body_harvested_meat = False
         self.body_drained = False
+        self.body_siphoned = False
+        self.body_dmb_drawn = False
+        # Duck-typed from the fallen Character (engine has no Origin catalog).
+        # Hunters use this to refuse vampire corpses for dead man's blood.
+        self.body_origin = None
+        self.body_path = None
         # Divine relic id (supers.faith.DIVINE_RELICS) or None. Carried
         # relics keep a Divine congregation happier -- see faith.py.
         self.relic = relic
@@ -197,6 +204,10 @@ class Room(GameObject):
         # nothing; the Cadence loop (supers/cadence.py) reads this to decide
         # where a hungry/thirsty/sleepy NPC should walk.
         self.resources = []
+        # Optional authored pick pools (Earth herbalism Phase 1b/2).
+        # None = use terrain / tag defaults; a list limits strains/reagents.
+        self.herb_pick_pool = None
+        self.magi_forage_pool = None
         # Optional job ids this room supports when someone clocks `work`
         # (map JSON "jobs": ["cook"]). First entry is the default claim.
         # Validated against supers/jobs.py at Cadence boot (not at map load
@@ -821,13 +832,23 @@ def make_body(character):
     #49). locked=True marks residual wards; is_body=True gates body-specific
     verbs in commands.py.
     """
-    return Item(
+    body = Item(
         f"the body of {character.key}",
         f"The body of {character.key} lies here, faint wards flickering "
         "across it. Whatever made this happen, they aren't gone for good.",
         locked=True,
         is_body=True,
     )
+    # Opaque Origin/Path stamps -- SUPERS harvest gates (dead man's blood
+    # is a dead human's blood, not a vampire's) read these without the
+    # engine importing game catalogs.
+    origin = getattr(character, "origin", None)
+    path = getattr(character, "path", None)
+    if origin:
+        body.body_origin = str(origin).strip().lower()
+    if path:
+        body.body_path = str(path).strip().lower()
+    return body
 
 
 def break_follows(character):

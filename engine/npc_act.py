@@ -135,11 +135,17 @@ def npc_do(character, raw, game):
             logger.you(silent.lines)
         except Exception:
             _log_activity_error("logger.you", character)
-    # Relay AI verb feedback to an idlemode spectator (not SilentSession).
+    # Relay AI verb feedback to a watching Session (idlemode / dothepit).
+    def _watcher_wants_echo_relay():
+        if getattr(character, "idle_mode", False):
+            return True
+        state = getattr(character, "dothepit_autopilot", None)
+        return isinstance(state, dict) and bool(state.get("active"))
+
     if (
         previous is not None
         and not isinstance(previous, SilentSession)
-        and getattr(character, "idle_mode", False)
+        and _watcher_wants_echo_relay()
         and silent.lines
         and hasattr(previous, "send")
     ):

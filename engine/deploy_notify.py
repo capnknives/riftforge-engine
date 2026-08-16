@@ -676,12 +676,12 @@ def _reconcile_missed_fix_resolves_from_auto_deploy_state(game):
         with open(state_path, encoding="utf-8") as f:
             state = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
-        return reconcile_open_bugs_from_deployed_fixes(game)
+        return reconcile_deployed_ticket_heals(game)
 
     last_sha = (state.get("last_deploy") or {}).get("sha") or ""
     origin_sha = state.get("origin_main") or ""
     if not last_sha or not origin_sha or last_sha == origin_sha:
-        return reconcile_open_bugs_from_deployed_fixes(game)
+        return reconcile_deployed_ticket_heals(game)
 
     from engine import auto_deploy
 
@@ -689,12 +689,12 @@ def _reconcile_missed_fix_resolves_from_auto_deploy_state(game):
         directory, last_sha, origin_sha,
     )
     if not missed:
-        return reconcile_open_bugs_from_deployed_fixes(game)
+        return reconcile_deployed_ticket_heals(game)
 
     completed = _load_completed_keys(directory)
     pending = [fix for fix in missed if fix["sha"] not in completed]
     if not pending:
-        return reconcile_open_bugs_from_deployed_fixes(game)
+        return reconcile_deployed_ticket_heals(game)
 
     # Normalize keys for _apply_catchup_fixes (file hand-off uses commit_sha).
     fixes = [
@@ -714,7 +714,7 @@ def _reconcile_missed_fix_resolves_from_auto_deploy_state(game):
             f"commit(s) from auto_deploy state",
             flush=True,
         )
-    return applied or reconcile_open_bugs_from_deployed_fixes(game)
+    return applied or reconcile_deployed_ticket_heals(game)
 
 
 def reconcile_open_bugs_from_deployed_fixes(game):
@@ -755,6 +755,54 @@ def reconcile_open_bugs_from_deployed_fixes(game):
             print(
                 f"[deploy_notify] deployed-fix heal could not mark bug "
                 f"#{bug_id} resolved: {exc}",
+                flush=True,
+            )
+    return bool(to_close)
+
+
+def reconcile_deployed_ticket_heals(game):
+    """Boot/copyover heal for open bugs and suggestions already on disk."""
+    applied = reconcile_open_bugs_from_deployed_fixes(game)
+    return reconcile_open_suggestions_from_deployed_fixes(game) or applied
+
+
+def reconcile_open_suggestions_from_deployed_fixes(game):
+    """Close open ideas whose Ship subjects are already on the deployed tree.
+
+    Mirrors :func:`reconcile_open_bugs_from_deployed_fixes` for
+    ``suggestions.log`` — heals tickets missed when squash subjects used
+    Oxford lists (``#154, #179, and #189``) or hash-free agent subjects.
+    """
+    directory = game.report_dir
+    from engine import auto_deploy
+
+    git_root = auto_deploy.git_root_for(directory)
+    open_ids = set(auto_deploy.open_suggestion_ids(directory))
+    if not open_ids:
+        return False
+
+    deployed_ids = set(
+        auto_deploy.deployed_fix_suggestion_ids(git_root, directory),
+    )
+    to_close = sorted(open_ids & deployed_ids)
+    if not to_close:
+        return False
+
+    for suggestion_id in to_close:
+        try:
+            reports.mark(
+                reports.SUGGEST, int(suggestion_id), "resolved",
+                directory=directory, game=game,
+            )
+            print(
+                f"[deploy_notify] deployed-ship heal marked suggestion "
+                f"#{suggestion_id} resolved",
+                flush=True,
+            )
+        except (ValueError, IndexError) as exc:
+            print(
+                f"[deploy_notify] deployed-ship heal could not mark suggestion "
+                f"#{suggestion_id} resolved: {exc}",
                 flush=True,
             )
     return bool(to_close)

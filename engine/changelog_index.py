@@ -12,7 +12,21 @@ import json
 import os
 
 # Bump when the on-disk JSON shape changes.
-INDEX_VERSION = 1
+# v2: list metadata only; ``full`` bodies lazy-load from CHANGELOG.d (Option A).
+INDEX_VERSION = 2
+
+# Fields kept in the compiled index (``changes detail`` loads ``full`` on demand).
+_INDEX_LIST_KEYS = frozenset({
+    "category",
+    "id",
+    "date",
+    "sort_ts",
+    "summary",
+    "file_index",
+    "slug",
+    "audience",
+    "staff_only",
+})
 
 # Git-tracked compiled feed (auto-deploy ships it to live with code).
 INDEX_REL_PATH = os.path.join("content", "changelog_index.json")
@@ -204,9 +218,22 @@ def _enrich_index_entries(entries):
     return entries
 
 
+def _slim_index_entry(entry: dict) -> dict:
+    """Drop ``full`` prose for fragment slugs; keep monolith rows intact."""
+    slim = {k: entry[k] for k in _INDEX_LIST_KEYS if k in entry}
+    slug = (slim.get("slug") or "").strip()
+    if not slug:
+        full = entry.get("full")
+        if full:
+            slim["full"] = full
+    return slim
+
+
 def write_index(repo_root: str, sig: tuple, entries: list) -> str:
     """Write the compiled index; return the path written."""
-    entries = _enrich_index_entries(list(entries))
+    entries = [
+        _slim_index_entry(row) for row in _enrich_index_entries(list(entries))
+    ]
     path = index_path(repo_root)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {

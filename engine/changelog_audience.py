@@ -11,8 +11,9 @@ markdown lead-in):
 
 Untagged bullets default to SUPERS. When agents forget ``[ops]``, the same
 heuristics as ``tools/changelog_player_pass.py`` still hide obvious repo /
-builder / Area Studio noise from non-GM players while keeping real bug-fix
-blurbs that mention peels or autodeploy in passing.
+builder / Area Studio noise, and staff playtest verbs such as ``dothepit``,
+from non-GM players while keeping real bug-fix blurbs that mention peels or
+autodeploy in passing.
 """
 
 from __future__ import annotations
@@ -40,7 +41,8 @@ OPS_SUMMARY_HINT_RE = re.compile(
     r"targeted-smoke rule|clean-working-tree rule|semantic-index|"
     r"instruction harden|copilot-instructions|\.cursor/rules/|"
     r"\barea studio\b|builder audit|builder \(wave|jobs builder|"
-    r"quest builder|vendor_stock builder|content builder|schema completion)",
+    r"quest builder|vendor_stock builder|content builder|schema completion|"
+    r"\bdothepit\b)",
 )
 
 # Drop sentences that read like dev notes / implementation logs.

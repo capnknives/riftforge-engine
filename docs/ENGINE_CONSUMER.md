@@ -94,6 +94,18 @@ Call these **before** constructing `Character`s or loading a save:
 | Appearance no-crown hair styles | `set_appearance_no_crown_styles(mapping)` | `{}` | `supers.appearance._NO_CROWN_STYLES` |
 | Appearance kit inference | `set_kit_for_character_resolver(fn)` | `None` | `supers.appearance` (Cosmic Elemental Aspect inference) |
 | Appearance age phrase | `set_appearance_age_phrase_fn(fn)` | `None` | `supers.appearance` (decade phrase for `build_description`) |
+| Mine stratum tables | `register_mine_stratum_table(realm_id, table)` | empty `{}` table | `supers/mine/stratum_tables.py` |
+| Mine marker stumble chance | `set_mine_marker_chance(fn)` | `0.0` | `supers/mine/companies.py` |
+| Mine geology seed | `set_mine_geology_seed(fn)` | deterministic hash default | `supers/mine/stratum_tables.py` |
+| Mine tool requirement | `set_mine_tool_check(fn)` | requires pick/shovel item | `supers/mine/stratum_tables.py` (Origin overrides) |
+| Mine carry weight cap | `set_mine_carry_weight_cap(fn)` | unlimited (`None`) | `supers/mine/stratum_tables.py` |
+| Mine gate job permission | `set_mine_company_job_gate_permission(fn)` | always `False` | `supers/mine/companies.py` (v1 seam) |
+| Mine discoverable roll | `set_roll_mine_discoverable(fn)` | `None` | `supers/mine/discoverables.py` |
+| Mine face cleared | `set_on_mine_face_cleared(fn)` | no-op | `supers/mine/discoverables.py` |
+| Mine support catalog | `set_mine_support_catalog(fn)` | timber/steel defaults | `supers/mine/stratum_tables.py` |
+| Mine alloy recipes | `set_mine_alloy_recipes(fn)` | `[]` | `supers/mine/forge_recipes.py` |
+| Mine forge recipes | `set_mine_forge_recipes(fn)` | `[]` | `supers/mine/forge_recipes.py` |
+| Mine blast (parked) | `set_mine_blast(fn)` | no-op | GM `gm mine blast` test only in v1 |
 
 SUPERS auto-registers attach + blob when the `supers` package is imported
 (`supers.bootstrap.register_core_hooks`). Everything else (chargen, help,
@@ -278,14 +290,19 @@ The engine owns sheet **schema**, **assembly**, and **framing**:
 | Piece | Location |
 |-------|----------|
 | Field catalog | `engine/content/sheet_profile.json` |
+| Engine wallet rows | `engine:cash`, `engine:bank` in the catalog — resolved in `engine/systems/sheet.py`; games must not duplicate Cash/Bank strings |
+| Resolve API | `resolve_field_by_id`, `resolve_profile_slot`, `append_profile_slots` |
 | Assembly | `engine/systems/sheet.py` (`SheetContext`, `render_score`, `format_assembled`) |
 | Game rows | `hooks.register_sheet_field(id, fn)` — `fn(ctx) -> str \| None` |
 | Game sections | `hooks.register_sheet_contributor(id, fn, priority=…)` — `fn(ctx) -> SheetSection \| list \| None` |
 
 Basegame registers Path + HP field hooks in `basegame/sheet_score.py`.
-SUPERS body rows still build in `supers/verbs/character.py`; framing
-routes through `engine.systems.sheet.format_assembled`. Peel SUPERS
-blocks into `supers/sheet_score.py` contributors over time.
+Wallet lines come from the engine catalog (`engine:cash`, `engine:bank`), not
+hand-rolled in game contributors. SUPERS body rows assemble in
+`supers/sheet_score.py` (`format_score`, pane filter registry, Origin
+contributors in `supers/sheet_score_hooks.py`); wallet and resource rows merge
+via `resolve_profile_slot` / `append_profile_slots`. World Tide / eclipse
+never belong on `score` or `time` — see `.cursor/rules/score-sheet-schema.mdc`.
 
 ```python
 from engine.systems.sheet import SheetContext, render_score

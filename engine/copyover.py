@@ -162,7 +162,7 @@ def reload_world_save_modules():
     try:
         import game_select
 
-        game_select.reregister_blob_codec()
+        game_select.reregister_hooks_after_reload()
     except ImportError:
         hooks.reload_blob_codec()
     return ep
@@ -216,7 +216,33 @@ async def _perform(game):
                 flush=True,
             )
         return
-    game.save(copyover=True)
+    try:
+        game.save(copyover=True)
+    except Exception as exc:
+        import traceback
+
+        print(
+            f"[copyover] save failed -- restoring gameplay hooks and staying up: "
+            f"{exc!r}",
+            flush=True,
+        )
+        traceback.print_exc()
+        try:
+            import game_select
+
+            game_select.restore_hooks_after_copyover_abort()
+            print(
+                "[copyover] restored full hooks after save failure "
+                "(process continues; schedule game-only restart)",
+                flush=True,
+            )
+        except Exception as restore_exc:
+            print(
+                f"[copyover] failed to restore hooks after save failure: "
+                f"{restore_exc!r}",
+                flush=True,
+            )
+        return
 
     if gateway_enabled():
         # Watcher holds :4000; exiting is the reload. Players already got
@@ -264,6 +290,22 @@ async def _perform(game):
         # process is still fully intact at this point, so keep running on
         # the old code rather than losing the whole server.
         print(f"[copyover] execv failed, staying on current code: {e}", flush=True)
+        # reload_world_save_modules() cleared gameplay hooks; restore so
+        # staff GM form / Monster night-sight work until the next restart.
+        try:
+            import game_select
+
+            game_select.restore_hooks_after_copyover_abort()
+            print(
+                "[copyover] restored full hooks after execv failure",
+                flush=True,
+            )
+        except Exception as exc:
+            print(
+                f"[copyover] failed to restore hooks after execv failure: "
+                f"{exc!r}",
+                flush=True,
+            )
         try:
             os.remove(STATE_PATH)
         except OSError:

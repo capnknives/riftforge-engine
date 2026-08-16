@@ -289,9 +289,13 @@ class Game:
             map_runtime_mod.restore_runtime_maps(self)
             map_runtime_mod.ensure_deferred_maps_for_saved_rooms(self)
 
-        # D41: rebuild homestead pockets + gather nodes BEFORE load_world
+        # D41: demesnes + homestead pockets + gather nodes BEFORE load_world
         # so character room_key / floor items inside a shack resolve.
+        # Demesnes must load before homesteads: demesne wilds plots wire
+        # their enter mouth via game.demesnes (see homestead._resolve_mouth_room).
         if _HAS_SUPERS:
+            from supers.demesne import load_demesnes
+            load_demesnes(self.db, self)
             from supers import homestead as homestead_mod
             from supers import gathering as gathering_mod
             homestead_mod.load_homesteads(self.db, self)
@@ -302,8 +306,6 @@ class Game:
             township_mod.load_townships(self.db, self)
             from supers import personal_realm as personal_realm_mod
             personal_realm_mod.load_personal_realms(self.db, self)
-            from supers.demesne import load_demesnes
-            load_demesnes(self.db, self)
         boot_profile_mod.mark("load_personal_realms")
 
         # Persistable runtime rooms (vehicle interiors, charter cabins, …)
@@ -323,6 +325,19 @@ class Game:
                 try:
                     from supers.demesne.persist import resolve_pending_demesne_exits
                     resolve_pending_demesne_exits(self)
+                except Exception:
+                    traceback.print_exc()
+                # Floor items load after player_shops heal — re-strip Dallas
+                # townforge fixtures that save_world persisted on Lebanon VNUMs.
+                try:
+                    from supers import player_shops as player_shops_mod
+                    civic_stats = player_shops_mod.heal_townforge_civic_shop_hosts(
+                        self,
+                    )
+                    if civic_stats.get("purged") or civic_stats.get(
+                        "fixtures_removed",
+                    ):
+                        self.save()
                 except Exception:
                     traceback.print_exc()
         else:

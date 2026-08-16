@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from engine import accounts as accounts_mod
 from engine import auth
 from engine import hooks
+from engine import account_chargen_draft as draft_mod
 from engine.command_support import _presence_face
 
 
@@ -153,12 +154,17 @@ def _menu_face(game, entry):
         return "Link an existing character"
     if getattr(entry, "is_vaulted_menu_entry", False):
         tag = getattr(entry, "identity_tag", None) or ""
+        if draft_mod.is_chargen_draft_vault(game, getattr(entry, "key", "")):
+            return f"{entry.face} (resume chargen)"
         if tag:
             return f"{entry.face} ({tag}) (folded)"
         return f"{entry.face} (folded)"
-    return hooks.account_roster_label_for(
+    face = hooks.account_roster_label_for(
         game, getattr(entry, "key", None), entry,
     )
+    if draft_mod.is_chargen_draft_character(game, entry):
+        return f"{face} (resume chargen)"
+    return face
 
 
 def _resolve_menu_pick(game, entry):
@@ -200,6 +206,10 @@ async def _prompt_account_name(session, *, allow_back=False):
 async def _prompt_create_account(session, game):
     """Register a new account. Returns Account or None on disconnect."""
     while True:
+        limit_err = draft_mod.account_create_rate_limit_error(session)
+        if limit_err:
+            session.send(limit_err)
+            return None
         session.send("Choose an account name (2-16 letters):")
         while True:
             raw = await _read_player_line(session)
@@ -237,6 +247,7 @@ async def _prompt_create_account(session, game):
                     f"Choose an account password (at least {min_len} characters):"
                 )
                 continue
+            draft_mod.note_account_created(session)
             break
         await _persist_account_change(game, reason="account_register")
         session.send(
@@ -425,6 +436,67 @@ def _find_unlinked_body(game, given_name, surname):
     return None
 
 
+async def _finish_new_character_after_chargen(session, game, account, char):
+    """Place a body that just finished create-flow chargen."""
+    from engine import char_identity as identity_mod
+    from engine import gm_notify
+
+    start_key = getattr(char, "chargen_start_room_key", None)
+    start_room = None
+    if start_key:
+        from engine.room_vnum import lookup_room
+
+        start_room = lookup_room(game, start_key)
+        if start_room is None and start_key in game.rooms:
+            start_room = game.rooms[start_key]
+    if start_room is None:
+        start_room = game.start_room
+    char.chargen_start_room_key = None
+    char.chargen_draft = False
+    draft_mod.finish_chargen_draft(account, game)
+    char.move_to(start_room)
+    session._promote_to_sessions()
+    legal = identity_mod.legal_public_name(char, force_surname=True)
+    start_room.broadcast(f"{legal} materializes.", exclude=char)
+    gm_notify.ping_gms(
+        game,
+        f"{legal} finished chargen and entered the world{{from}}.",
+        exclude=char,
+        peer_session=session,
+    )
+    session.send(
+        f"\r\nWelcome, {legal}! Type 'help newbie' to get started "
+        f"(or 'help' for the topic list)."
+    )
+    hooks.after_new_character(char, game)
+    hooks.after_session_attach(char, game)
+    return AccountLoginResult(character=char, is_new=True)
+
+
+async def _flow_resume_chargen(session, game, account, char):
+    """Resume create-flow chargen for a draft body."""
+    from engine import char_identity as identity_mod
+    from engine import gm_notify
+
+    char.session = session
+    session.character = char
+    session._set_creating()
+    legal = identity_mod.legal_public_name(char, force_surname=True)
+    session.send(f"Resuming character creation for {legal}...")
+    gm_notify.ping_gms(
+        game,
+        f"{legal} is resuming chargen{{from}}.",
+        exclude=char,
+        peer_session=session,
+    )
+    if not await hooks.run_chargen(session, char):
+        draft_mod.vault_chargen_draft(char, game, account)
+        return None
+    return await _finish_new_character_after_chargen(
+        session, game, account, char,
+    )
+
+
 async def _flow_create_character(session, game, account):
     """Create + chargen + place a new body on ``account``."""
     from engine import char_identity as identity_mod
@@ -453,6 +525,7 @@ async def _flow_create_character(session, game, account):
     char.session = session
     session.character = char
     session._set_creating()
+    draft_mod.stamp_chargen_draft(account, char, game)
 
     from engine import gm_notify
 
@@ -464,35 +537,12 @@ async def _flow_create_character(session, game, account):
         peer_session=session,
     )
     if not await hooks.run_chargen(session, char):
+        draft_mod.vault_chargen_draft(char, game, account)
         return None
 
-    start_key = getattr(char, "chargen_start_room_key", None)
-    start_room = None
-    if start_key:
-        from engine.room_vnum import lookup_room
-
-        start_room = lookup_room(game, start_key)
-        if start_room is None and start_key in game.rooms:
-            start_room = game.rooms[start_key]
-    if start_room is None:
-        start_room = game.start_room
-    char.chargen_start_room_key = None
-    char.move_to(start_room)
-    session._promote_to_sessions()
-    start_room.broadcast(f"{legal} materializes.", exclude=char)
-    gm_notify.ping_gms(
-        game,
-        f"{legal} finished chargen and entered the world{{from}}.",
-        exclude=char,
-        peer_session=session,
+    return await _finish_new_character_after_chargen(
+        session, game, account, char,
     )
-    session.send(
-        f"\r\nWelcome, {legal}! Type 'help newbie' to get started "
-        f"(or 'help' for the topic list)."
-    )
-    hooks.after_new_character(char, game)
-    hooks.after_session_attach(char, game)
-    return AccountLoginResult(character=char, is_new=True)
 
 
 async def _flow_link_existing(session, game, account):
@@ -623,6 +673,14 @@ async def run_account_login_flow(session, *, known_account=None):
             if picked is None:
                 session.send("Could not restore that character.")
                 continue
+
+            if draft_mod.is_chargen_draft_character(game, picked):
+                result = await _flow_resume_chargen(
+                    session, game, account, picked,
+                )
+                if result is None:
+                    return None
+                return result
 
             live_holder = picked if getattr(picked, "session", None) else None
             takeover = False

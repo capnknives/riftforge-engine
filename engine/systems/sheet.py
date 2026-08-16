@@ -145,7 +145,71 @@ def _resolve_engine_field(field_id: str, ctx: SheetContext) -> str | None:
     if field_id == "tier":
         tier = getattr(ctx.target, "tier", 0)
         return f"  Tier: {tier}"
+    if field_id in ("cash", "bank"):
+        from engine.systems import economy as economy_mod
+
+        economy_mod.migrate_wallet_fields(ctx.target)
+        if field_id == "cash":
+            return f"  Cash: {economy_mod.format_carry_cash(ctx.target)}"
+        bank = economy_mod.format_bank(ctx.target)
+        if not bank or bank in ("$0", "$0.00"):
+            return None
+        return f"  Bank: {bank}"
     return None
+
+
+def resolve_field_by_id(field_id: str, ctx: SheetContext) -> str | None:
+    """Resolve one catalog row by ``id`` for the active pane (engine:* + hook:*)."""
+    pane = ctx.filter_mode or ctx.pane or "default"
+    for field_row in _load_profile().get("fields") or []:
+        if str(field_row.get("id") or "") != str(field_id):
+            continue
+        if not _field_applies(field_row, pane):
+            return None
+        return _resolve_field(field_row, ctx)
+    return None
+
+
+def resolve_profile_slot(ctx: SheetContext, slot: str) -> list[str]:
+    """Resolve every catalog row in ``slot`` for the active pane (schema assembly)."""
+    pane = ctx.filter_mode or ctx.pane or "default"
+    lines: list[str] = []
+    for field_row in _load_profile().get("fields") or []:
+        row_slot = str(field_row.get("slot") or "body")
+        if row_slot != str(slot):
+            continue
+        if not _field_applies(field_row, pane):
+            continue
+        line = _resolve_field(field_row, ctx)
+        if line:
+            lines.append(line)
+    return lines
+
+
+def append_profile_slots(ctx: SheetContext, body: list[str], *slots: str) -> None:
+    """Merge schema slot rows onto a custom-layout body in catalog order."""
+    for slot in slots:
+        body.extend(resolve_profile_slot(ctx, slot))
+
+
+def resolve_profile_lines(
+    ctx: SheetContext,
+    *,
+    field_ids: frozenset[str] | None = None,
+) -> list[str]:
+    """Resolve profile rows in catalog order (optional ``field_ids`` filter)."""
+    pane = ctx.filter_mode or ctx.pane or "default"
+    lines: list[str] = []
+    for field_row in _load_profile().get("fields") or []:
+        fid = str(field_row.get("id") or "")
+        if field_ids is not None and fid not in field_ids:
+            continue
+        if not _field_applies(field_row, pane):
+            continue
+        line = _resolve_field(field_row, ctx)
+        if line:
+            lines.append(line)
+    return lines
 
 
 def _resolve_field(field: dict, ctx: SheetContext) -> str | None:

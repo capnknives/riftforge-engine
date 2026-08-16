@@ -149,7 +149,7 @@ ASLEEP_BLOCK = frozenset({
 
 ASLEEP_SPECTATOR = (IDLE_SPECTATOR - ASLEEP_BLOCK) | frozenset({
     "wake", "logout", "hp", "fuel", "where", "coins",
-    "account", "combatnumbers", "bigmap", "atlas", "brief",
+    "account", "combatnumbers", "scoremeters", "bigmap", "atlas", "brief",
     "dominion", "bounty", "cases", "quests", "journal", "mail",
     # Spirit Expert dream lane: sleep gate requires dreamenter while
     # the body is still closed to the waking world (magic_basics §4.4).
@@ -199,6 +199,29 @@ def parse(raw):
 # define the same verb in the first place. When no game is active,
 # COMMANDS is engine-only.
 COMMANDS = {**ENGINE_COMMANDS, **GAME_COMMANDS}
+
+
+def _verb_disabled_for_actor(game, verb, actor):
+    """True when staff disabled this verb for the actor.
+
+    Catalog immersion cast (Dean, Chuck, …) always bypass the global
+    ``dothepit`` disable so pit autopilot stays available on cast logins.
+    """
+    from engine import command_disable as _cmd_disable
+
+    if not _cmd_disable.is_disabled(game, verb):
+        return False
+    if game_select.game_name() == "supers" and verb == "dothepit":
+        try:
+            from supers.purgatory_dungeon.leaderboard import (
+                is_cast_immersion_body,
+            )
+            if is_cast_immersion_body(actor):
+                return False
+        except ImportError:
+            pass
+    return True
+
 
 def dispatch(character, raw, game, *, force_actor=None):
     """Route one line of input to the right handler.
@@ -601,7 +624,7 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
         entry = COMMANDS.get(verb)
     if entry:
         from engine import command_disable as _cmd_disable
-        if _cmd_disable.is_disabled(game, verb):
+        if _verb_disabled_for_actor(game, verb, actor):
             character.session.send(
                 f"'{verb}' is temporarily disabled by staff."
             )

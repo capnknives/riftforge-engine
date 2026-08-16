@@ -10,6 +10,7 @@ Stdlib only; zero ``supers`` imports.
 
 from __future__ import annotations
 
+from engine import map_ui
 from engine.systems import breach as breach_mod
 from engine.systems import readiness as readiness_mod
 
@@ -119,9 +120,7 @@ def _resolve_direction(room, game, raw):
     if needle in exits:
         dest = exits[needle]
         return needle, dest
-    import maps
-
-    dest = maps.find_room_by_layout_direction(
+    dest = map_ui.find_room_by_layout_direction(
         getattr(game, "rooms", None) or {}, room, needle,
     )
     if dest is not None:

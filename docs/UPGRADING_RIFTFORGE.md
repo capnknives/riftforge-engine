@@ -1,9 +1,9 @@
 # Upgrading Riftforge from SUPERS
 
 **Status:** Phase 6 remotes **done**; Phase 7 peels **done**; core
-expansion Phases 1-8 **done**; two-repo purity H1-H9 extraction track
+expansion Phases 1-8 **done**; two-repo purity H1-H10 extraction track
 **done**. SUPERS pins public **`capnknives/riftforge-engine`** at
-**`@v0.5.0`**.
+**`@v0.5.2`** (mine/chargen vault + forge hooks; engine maps peel).
 
 ## Today (during the split)
 
@@ -23,7 +23,7 @@ editable path for dual-checkout hacking.
 2. Private SUPERS (`capnknives/RiftForge`): set in `supers/pyproject.toml`::
 
        dependencies = [
-           "riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.5.0",
+           "riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.5.2",
        ]
 
 3. Run SUPERS targeted smoke (or full `smoke_test.py` when approved).

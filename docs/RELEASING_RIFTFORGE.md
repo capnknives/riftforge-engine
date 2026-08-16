@@ -1,13 +1,15 @@
 # Releasing Riftforge (public engine)
 
 **Status:** Phase 6 remotes **done**; Phase 7 framework peels **done**;
-`riftforge_core_expansion.md` Phases 1-8 **done**; two-repo purity H1-H9
+`riftforge_core_expansion.md` Phases 1-8 **done**; two-repo purity H1-H10
 extraction track (`docs/plans/two_repo_purity_extractions_plan.md`)
 **done**. Public remote **`capnknives/riftforge-engine`**. Current SUPERS
-pin: **`v0.5.1`** (basegame body-parts demo, clinic strangler hooks,
+monorepo pin preparing **`v0.5.2`** (mine/chargen vault + forge hooks from
+purity P0, `engine/` maps callers on `world_maps` / `map_ui`). Shipped
+**`v0.5.1`** adds basegame body-parts demo, clinic strangler hooks,
 optional gateway `wss://`, MSSP catalog fields, justice adapter spike,
-instance-room teardown migration for purgatory/rowena). Prior **`v0.5.0`**
-adds map-authoring OLC helpers plus generic phone,
+instance-room teardown migration for purgatory/rowena. **`v0.5.0`** adds
+map-authoring OLC helpers plus generic phone,
 appearance-builder, persona-trait, and relationship-tag frameworks, and
 abstract item/NPC/creature/map generic kind grandparents, on top of
 `v0.4.0`'s elemental planes + rotating gates, dual-root content-kind
@@ -25,10 +27,10 @@ parts region state machine).
    `python tools/classic_smoke.py`.
 3. Tag `vX.Y.Z` (semver; breaking hook API = major)::
 
-       git tag -a v0.5.0 -m "riftforge-engine v0.5.0 — map-store OLC + phone/appearance/persona/relationship frameworks"
-       git push origin v0.5.0
+       git tag -a v0.5.2 -m "riftforge-engine v0.5.2 — mine/chargen hooks + engine maps peel"
+       git push origin v0.5.2
 
-   Prefer **`v0.5.0`** over older tags for new consumers.
+   Prefer the **latest** tag for new consumers.
    Re-exports via `tools/export_public_engine.py` ignore `__pycache__` /
    `*.pyc` and rewrite a lean root `help_topics.py` facade + public README +
    `.github/workflows/ci.yml` (player help content stays in private SUPERS:
@@ -41,6 +43,8 @@ parts region state machine).
 ## Purity checklist before a tag
 
 - No `supers` imports under the `engine` package
+- No lazy `import maps` under `engine/` — use `engine.world_maps` /
+  `engine.map_ui` (root `maps.py` facade remains for monorepo tools)
 - No `content/npcs`, Origins catalogs, or SUPERS help pages
 - Demo map: export writes `content/maps/demo.json` from canonical
   `engine/demo/content/maps/demo.json`; monorepo lean boot uses
@@ -51,9 +55,8 @@ parts region state machine).
   ``register_sheet_field`` / ``register_sheet_contributor``.
 - Optional env: ``RIFTFORGE_DB`` (SQLite path), ``RIFTFORGE_PORT`` (telnet)
 - Optional WebSocket TLS: ``RIFTFORGE_WSS_CERT`` + ``RIFTFORGE_WSS_KEY`` (pair)
-- Monorepo engine version / next public tag: **v0.5.1** (strangler pass +
-  basegame body-parts demo). Export via ``tools/export_public_engine.py``,
-  then tag ``riftforge-engine`` remote.
+- Monorepo engine version / next public tag: **v0.5.2**. Export via
+  ``tools/export_public_engine.py``, then tag ``riftforge-engine`` remote.
 - `tools/engine_smoke.py` / `tools/basegame_smoke.py` /
   `tools/classic_smoke.py` pass
 

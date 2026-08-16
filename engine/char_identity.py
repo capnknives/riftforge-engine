@@ -86,8 +86,14 @@ def normalize_surname_optional(raw: str):
     return normalize_surname(text)
 
 
-def surname_required_for_create(game, given_name: str) -> bool:
-    """True when another login body already uses this given name."""
+def surname_required_for_create(game, given_name: str, *, origin=None) -> bool:
+    """True when another login body already uses this given name.
+
+    Immortal Origins never require a mortal surname, even when the given
+    name collides with another login body.
+    """
+    if origin in ("celestial", "cosmic"):
+        return False
     return len(find_players_by_given_name(game, given_name)) > 0
 
 
@@ -484,16 +490,37 @@ def find_legacy_name_login(game, given_name: str):
     return hit
 
 
+def identity_skips_surname(char) -> bool:
+    """True when surnames are not part of this body's identity fiction.
+
+    Celestial and Cosmic Origins (Angels, Gods, Reapers, Cosmic beings) are
+    not mortal registry bodies -- they do not need sheriff-desk surnames for
+    login disambiguation or who-list flavor.
+    """
+    if char is None:
+        return False
+    origin = getattr(char, "origin", None)
+    return origin in ("celestial", "cosmic")
+
+
+def surname_alert_suppressed(char) -> bool:
+    """True when the player opted out of the no-surname login reminder."""
+    return bool(getattr(char, "suppress_surname_alert", False))
+
+
 def legacy_surname_login_notice(char) -> str | None:
     """Post-login hint when a body still has no surname on file."""
     if char is None or character_surname(char):
+        return None
+    if identity_skips_surname(char) or surname_alert_suppressed(char):
         return None
     return (
         "[ALERT] You have no surname on file yet. "
         "Visit a sheriff's office and type: namechange YourSurname "
         "(see help namechange). "
         "Use surname on|off to show or hide it on who. "
-        "See help surname."
+        "See help surname. "
+        "Type config surname_alert off to silence this reminder."
     )
 
 

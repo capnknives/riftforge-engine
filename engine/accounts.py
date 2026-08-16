@@ -79,6 +79,8 @@ class Account:
         self.last_seen_changelog_sort_ts = ""
         # Legacy numeric watermark (pre Aug 2026 timestamp-only feed).
         self.last_seen_changelog_id = 0
+        # Phase 5: storage key of a body mid create-flow chargen (resume draft).
+        self.chargen_draft_key = ""
 
     def to_blob(self):
         """JSON-serializable extras for the accounts.data column."""
@@ -101,6 +103,9 @@ class Account:
             ),
             "last_seen_changelog_sort_ts": str(
                 getattr(self, "last_seen_changelog_sort_ts", "") or ""
+            ),
+            "chargen_draft_key": str(
+                getattr(self, "chargen_draft_key", "") or ""
             ),
         }
 
@@ -142,6 +147,7 @@ class Account:
         self.last_seen_changelog_sort_ts = str(
             data.get("last_seen_changelog_sort_ts", "") or ""
         )
+        self.chargen_draft_key = str(data.get("chargen_draft_key", "") or "")
 
 
 def normalize_account_name(raw):
@@ -390,6 +396,40 @@ def _playable_account_link_key(char):
     if key_low.startswith("husk:") or key_low.startswith("gmspirit:"):
         return None
     return key
+
+
+def list_orphan_characters(game, *, limit=50):
+    """Playable bodies with no ``character.account`` link (live roster only).
+
+    Returns a list of dicts ``{key, face, location, vaulted}`` sorted by key.
+    """
+    if game is None:
+        return []
+    from engine.command_support import _presence_face
+
+    rows = []
+    seen = set()
+    for char in list(getattr(game, "characters", None) or []):
+        key = _playable_account_link_key(char)
+        if not key:
+            continue
+        if (getattr(char, "account", None) or "").strip():
+            continue
+        low = key.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        room = getattr(char, "location", None)
+        rows.append({
+            "key": key,
+            "face": _presence_face(char),
+            "location": getattr(room, "key", None) or "(nowhere)",
+            "vaulted": False,
+        })
+    rows.sort(key=lambda row: row["key"].lower())
+    if limit and len(rows) > limit:
+        return rows[:limit]
+    return rows
 
 
 def reconcile_accounts(game):

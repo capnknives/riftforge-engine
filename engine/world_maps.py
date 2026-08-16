@@ -168,6 +168,8 @@ KNOWN_RESOURCE_TAGS = frozenset({
     "storm_shelter",
     # Wild herb pick patches (Earth tagged cells; plane maps auto-seed).
     "herb_node",
+    # Magi reagent site harvest (Earth herbalism Phase 2; pick yields catalog ids).
+    "magi_forage",
     # Cross-room ranged combat (line_of_fire.py): nest/overlook extend reach;
     # hard_cover taxes shots through intermediate rooms; ranged_lane marks
     # authored shoot corridors (content hook; no Cadence need meter).
@@ -629,6 +631,31 @@ def _validate_slam_targets(targets, *, filename, key):
                 f"hp_max must be a positive integer, got {hp_max!r}"
             )
 
+def _stamp_harvest_pools(room, data, *, key):
+    """Copy optional herb_pick_pool / magi_forage_pool from authored JSON.
+
+    Lists of catalog ids. Omitted keeps Room default (None = use terrain /
+    tag defaults). Empty list is valid (no strains).
+    """
+    blob = data or {}
+    for field in ("herb_pick_pool", "magi_forage_pool"):
+        raw = blob.get(field)
+        if raw is None:
+            continue
+        if not isinstance(raw, list):
+            raise ValueError(
+                f"room {key!r}: {field} must be a list of catalog id strings"
+            )
+        cleaned = []
+        for entry in raw:
+            if not isinstance(entry, str) or not entry.strip():
+                raise ValueError(
+                    f"room {key!r}: each {field} entry must be a non-empty string"
+                )
+            cleaned.append(entry.strip())
+        setattr(room, field, cleaned)
+
+
 def _add_room(rooms, filename, key, description, gravity=1.0,
               wilderness=None, area_type=None, bestiary_categories=None,
               plane=None, realm=None, map_id=None,
@@ -792,6 +819,8 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
                     f"must be one of {sorted(KNOWN_RESOURCE_TAGS)}"
                 )
         room.resources = list(resources)
+    # Optional harvest pools (Earth herbalism Phase 1b/2). Omitted keeps None.
+    _stamp_harvest_pools(room, game_fields, key=key)
     if jobs is not None:
         if not isinstance(jobs, list):
             raise ValueError(

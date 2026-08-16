@@ -59,7 +59,17 @@
     "resources": {
       "type": "list",
       "required": false,
-      "doc": "Need-meter tags (food, vendor, sleep, \u2026)."
+      "doc": "Need-meter tags (food, vendor, sleep, \u2026). herb_node / magi_forage mark outdoor harvest sites."
+    },
+    "herb_pick_pool": {
+      "type": "list",
+      "required": false,
+      "doc": "Optional smokable herb catalog ids for herb_node rooms (e.g. herb_sativa)."
+    },
+    "magi_forage_pool": {
+      "type": "list",
+      "required": false,
+      "doc": "Optional Magi reagent item ids for magi_forage rooms (e.g. graveyard_dirt)."
     },
     "jobs": {
       "type": "list",

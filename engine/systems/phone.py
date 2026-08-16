@@ -420,6 +420,70 @@ def _send(character, text):
         session.send(text)
 
 
+def _idlemode_watcher(character):
+    """True when this body has a watching Session (idle_mode on).
+
+    Includes SilentSession during npc_do so Cadence phone verbs still
+    produce second-person lines for the [Echo] relay.
+    """
+    if character is None:
+        return False
+    if not getattr(character, "idle_mode", False):
+        return False
+    return getattr(character, "session", None) is not None
+
+
+def _peer_name(peer, fallback="someone"):
+    """Display name for a call peer."""
+    name = (getattr(peer, "key", None) or fallback or "someone").strip()
+    return name or "someone"
+
+
+def _third_person_to_you(third_line, actor_key):
+    """Rewrite ``{Name} verbs…`` / ``{Name}'s …`` for idlemode watchers."""
+    if not third_line or not actor_key:
+        return third_line
+    name = str(actor_key)
+    text = str(third_line)
+    possessive = f"{name}'s "
+    if text.startswith(possessive):
+        return "Your " + text[len(possessive):]
+    prefix = f"{name} "
+    if not text.startswith(prefix):
+        return text
+    rest = text[len(prefix):]
+    if not rest:
+        return "You"
+    parts = rest.split(None, 1)
+    verb = parts[0]
+    rem = parts[1] if len(parts) > 1 else ""
+    tail = ""
+    word = verb
+    if verb and not verb[-1].isalpha():
+        tail = verb[-1]
+        word = verb[:-1]
+    if word.endswith("s") and len(word) > 1:
+        you_verb = word[:-1]
+    elif word.endswith("ies") and len(word) > 3:
+        you_verb = word[:-3] + "y"
+    else:
+        you_verb = word
+    you = you_verb + tail
+    if rem:
+        return f"You {you} {rem}"
+    return f"You {you}"
+
+
+def _send_phone_watcher(character, text):
+    """Paragraph-style phone feedback for idlemode spectators."""
+    line = (text or "").strip()
+    if not line:
+        return
+    _send(character, f"[Echo] {line}")
+    _send(character, "")
+
+
+
 def _room_emote_phone(character, verb_phrase):
     """Roommates see a labeled emote; caller also gets it if Sessioned."""
     room = getattr(character, "location", None)
@@ -433,7 +497,13 @@ def _room_emote_phone(character, verb_phrase):
         pass
     line = f"{face} {verb_phrase}."
     room.broadcast(line, exclude=character)
-    _send(character, f"{tag_phone(character)} {line}")
+    if _idlemode_watcher(character):
+        _send_phone_watcher(
+            character,
+            _third_person_to_you(line, getattr(character, "key", None) or face),
+        )
+    else:
+        _send(character, f"{tag_phone(character)} {line}")
 
 
 def hangup_pair(a, b, *, reason="hangup"):
@@ -445,14 +515,25 @@ def hangup_pair(a, b, *, reason="hangup"):
         if call:
             clear_call(ch)
             if reason == "hangup":
-                _send(ch, f"{tag_call(ch)} Call ended.")
+                if _idlemode_watcher(ch):
+                    _send_phone_watcher(ch, "You hang up the phone.")
+                else:
+                    _send(ch, f"{tag_call(ch)} Call ended.")
             elif reason == "busy":
-                _send(ch, f"{tag_call(ch)} Line went dead.")
+                if _idlemode_watcher(ch):
+                    _send_phone_watcher(ch, "The line goes dead.")
+                else:
+                    _send(ch, f"{tag_call(ch)} Line went dead.")
             elif reason == "plane":
-                _send(
-                    ch,
-                    f"{tag_call(ch)} The signal dies at the plane's edge.",
-                )
+                if _idlemode_watcher(ch):
+                    _send_phone_watcher(
+                        ch, "The signal dies at the plane's edge.",
+                    )
+                else:
+                    _send(
+                        ch,
+                        f"{tag_call(ch)} The signal dies at the plane's edge.",
+                    )
 
 
 def begin_ring(caller, callee, *, caller_number, callee_number):
@@ -472,10 +553,15 @@ def begin_ring(caller, callee, *, caller_number, callee_number):
         "outbound": False,
     }
     _room_emote_phone(caller, "dials a number and holds a phone to their ear")
-    _send(
-        caller,
-        f"{tag_phone(caller)} Ringing {callee_number}…",
-    )
+    if _idlemode_watcher(caller):
+        who = _peer_name(callee, callee_number)
+        _send_phone_watcher(caller, f"You dial {who}.")
+        _send_phone_watcher(caller, "The line rings…")
+    else:
+        _send(
+            caller,
+            f"{tag_phone(caller)} Ringing {callee_number}…",
+        )
     _send(
         callee,
         f"{tag_phone(callee)} Incoming call from {caller_number} — "
@@ -497,8 +583,15 @@ def connect_call(caller, callee):
         call["state"] = "connected"
         call["peer_key"] = getattr(peer, "key", None)
         ch.phone_call = call
-    _send(caller, f"{tag_call(caller)} Connected.")
-    _send(callee, f"{tag_call(callee)} Connected.")
+    if _idlemode_watcher(caller):
+        _send_phone_watcher(caller, "Connected.")
+    else:
+        _send(caller, f"{tag_call(caller)} Connected.")
+    if _idlemode_watcher(callee):
+        peer = _peer_name(caller)
+        _send_phone_watcher(callee, f"{peer} is on the line.")
+    else:
+        _send(callee, f"{tag_call(callee)} Connected.")
 
 
 def peer_on_call(character, game):
@@ -564,7 +657,6 @@ def _voicemail_stub(caller, callee_number):
 def try_echo_auto_answer(caller, callee, game):
     """If callee is an answering Echo, auto-connect. Returns message or None."""
     session = getattr(callee, "session", None)
-    idle = bool(getattr(callee, "idle_mode", False))
     acts_echo = False
     if hasattr(callee, "acts_as_echo"):
         try:
@@ -574,9 +666,7 @@ def try_echo_auto_answer(caller, callee, game):
     else:
         acts_echo = session is None
 
-    if session is not None and not idle and not acts_echo:
-        return None
-    if session is not None and idle:
+    if session is not None and not acts_echo:
         return None
 
     if getattr(callee, "folded", False):
@@ -590,11 +680,15 @@ def try_echo_auto_answer(caller, callee, game):
             caller, (active_call(caller) or {}).get("peer_number") or "the line"
         )
     connect_call(caller, callee)
-    _send(
-        caller,
-        f"{tag_call(caller)} Their Echo picks up. "
-        "Try 'phone ask group|food|water|help'.",
-    )
+    callee_name = _peer_name(callee)
+    if _idlemode_watcher(caller):
+        _send_phone_watcher(caller, f"{callee_name}'s Echo picks up.")
+    else:
+        _send(
+            caller,
+            f"{tag_call(caller)} Their Echo picks up. "
+            "Try 'phone ask group|food|water|help'.",
+        )
     return None
 
 

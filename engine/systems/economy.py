@@ -186,7 +186,10 @@ def format_wallet_ledger_lines(character, game=None, *, limit=15):
         except ImportError:
             cal_mod = None
     for row in rows:
-        tick = int(row.get("tick", 0) or 0)
+        try:
+            tick = int(row.get("tick", 0) or 0)
+        except (TypeError, ValueError):
+            tick = 0
         if cal_mod is not None and tick > 0:
             cal = cal_mod.breakdown(tick)
             stamp = (

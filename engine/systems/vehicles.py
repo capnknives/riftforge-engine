@@ -340,8 +340,20 @@ def save_parking_state(game):
                     find = getattr(game, "find_character", None)
                     if callable(find):
                         owner = find(owner_key)
+                park_room = rooms.get(park_key)
+                if park_room is None:
+                    from engine.room_vnum import lookup_room
+                    park_room = lookup_room(game, park_key)
+                rehome = hooks_mod.vehicle_invalid_park_rehome(
+                    game, veh, park_room, owner,
+                )
+                if rehome and rehome in rooms and rehome != park_key:
+                    veh["parked_room"] = rehome
+                    veh["macro_pos"] = None
+                    veh["micro_pos"] = None
+                    continue
                 dest = nearest_driveable_park_key(
-                    game, rooms.get(park_key), character=owner,
+                    game, park_room or rooms.get(park_key), character=owner,
                 )
                 if not dest:
                     dest = safe_park_room_key(
@@ -589,6 +601,8 @@ def room_is_valid_park_spot(room, game=None, *, character=None):
         return False
     if hooks_mod.vehicle_park_spot_blocked_extra(room, game, character):
         return False
+    if getattr(room, "no_park", False):
+        return False
     if getattr(room, "outdoor", False):
         return True
     if getattr(room, "vehicle_berth", False):
@@ -723,7 +737,9 @@ def _vehicle_parked_in_room(game, veh, room):
     interior_key = veh.get("interior_key")
     if park_key and interior_key and park_key == interior_key:
         return False
-    park = game.rooms.get(park_key)
+    canon = canonical_park_key(game, park_key)
+    from engine.room_vnum import lookup_room
+    park = lookup_room(game, canon) or game.rooms.get(canon) or game.rooms.get(park_key)
     if park is None:
         return False
     interior = veh.get("interior")
@@ -1057,6 +1073,19 @@ def try_board(character, args, game):
     return True
 
 
+def eject_before_relocate(character, game):
+    """Leave a boarded vehicle before cosmic teleport or plane hops.
+
+    Vehicles do not follow characters across planes; clearing ``in_vehicle``
+    prevents cabin/curb desync (bug report 438).
+    """
+    if character is None or game is None:
+        return
+    if not getattr(character, "in_vehicle", None):
+        return
+    leave_vehicle(character, game, pull_followers=False)
+
+
 def leave_vehicle(character, game, *, pull_followers=True):
     """Exit the vehicle onto its park room (generic room-graph curb)."""
     ensure_game_vehicles(game)
@@ -1315,7 +1344,7 @@ def look_vehicle_hint(room, game, character=None):
     sr = bool(getattr(character, "screenreader", False)) if character else False
     if len(parked) == 1:
         alias = _board_alias_for(parked[0])
-        verb = "mount" if mc_mod.is_motorcycle(parked[0]) else "board"
+        verb = "mount" if vehicle_is_motorcycle(parked[0]) else "board"
         if sr:
             return f"Vehicle: {names[0]}. {verb.capitalize()}: enter {alias}."
         return f"Parked: {names[0]}. {verb.capitalize()}: enter {alias}."

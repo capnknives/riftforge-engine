@@ -24,6 +24,8 @@ DEFAULT_DELAY_TICKS = {
     "cook": 15,
     "diner_ticket": 12,
     "library_research": 15,
+    "hack_records": 20,
+    "language_learn": 20,
     "storm_research": 30,
     # P1 — investigation / subterfuge / medic / mechanic
     "investigate": 12,
@@ -60,6 +62,8 @@ VERB_LABELS = {
     "cook": "cooking",
     "diner_ticket": "diner tickets",
     "library_research": "library research",
+    "hack_records": "hacking records",
+    "language_learn": "language study",
     "storm_research": "storm desk research",
     "investigate": "investigation",
     "thievery_lock": "lock work",

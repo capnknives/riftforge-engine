@@ -76,6 +76,32 @@ def history_line_for_storage(line):
     return text
 
 
+def _activity_logger_call(character, method, *args):
+    """Duck-typed activity_logger side channel; never abort play or logout.
+
+    Engine must not import supers.activity_log. Player pacelog CMD / SESSION
+    lines use the same attach slot as Echo kit soaks.
+    """
+    if character is None:
+        return
+    logger = getattr(character, "activity_logger", None)
+    if logger is None:
+        return
+    fn = getattr(logger, method, None)
+    if not callable(fn):
+        return
+    try:
+        fn(*args)
+    except Exception:
+        import traceback
+        key = getattr(character, "key", None)
+        print(
+            f"[connection] activity {method} failed for {key!r}:",
+            flush=True,
+        )
+        traceback.print_exc()
+
+
 def _login_fail_key(name, peer):
     """Stable tracker key for failed-password backoff."""
     return f"{(name or '').lower()}|{(peer or '')}"
@@ -296,6 +322,10 @@ class Session:
         self._soft_logout_account = None
         # Character key of whoever last sent this Session a tell (for ``reply``).
         self.last_tell_from = None
+        # Nesting depth for read_password_line telnet ECHO masking. While >0,
+        # handle_negotiate may accept DO ECHO; during normal play we refuse
+        # server-side echo so clients keep local keystroke echo (bug report 423).
+        self._echo_password_mask = 0
 
     def _register_connecting(self, stage="login"):
         """Track this socket on game.connecting_sessions for GM users.
@@ -572,11 +602,13 @@ class Session:
         """
         from engine import telnet
 
+        self._echo_password_mask += 1
         telnet.set_client_echo(self, False)
         try:
             line = await self.read_line()
         finally:
             telnet.set_client_echo(self, True)
+            self._echo_password_mask = max(0, self._echo_password_mask - 1)
         if line is None:
             return None
         return strip_client_session_tags(line or "")
@@ -762,6 +794,8 @@ class Session:
         # also pushes Room.Info -- sync identity/vitals once more first.
         from engine import gmcp
         gmcp.on_session_attach(self.character, self.game)
+        # Player pace log: SESSION start (copyover resume included).
+        _activity_logger_call(self.character, "note", "SESSION", "start")
         try:
             dispatch(self.character, "look", self.game)   # show them the room right away
         except Exception:
@@ -808,6 +842,8 @@ class Session:
             # redact setpass so plaintext never hits bug reports (H2).
             entry = [history_line_for_storage(line), None]
             self.history.append(entry)
+            # Player pace log: what they typed (already redacted for setpass).
+            _activity_logger_call(self.character, "cmd", entry[0])
             # Classic snoop: GMs watching this character also see what they type.
             from engine import snoop
             snoop.mirror_input(self.character, line)
@@ -1177,6 +1213,8 @@ class Session:
             getattr(leaving, "key", None) or disconnect_name or "?"
         )
         _log_connection(f"disconnect char={char_key} reason={reason}")
+        if leaving is not None:
+            _activity_logger_call(leaving, "note", "SESSION", f"end reason={reason}")
         if self.character:
             # Drop any snoop THIS character was running (they're leaving);
             # keep snoopers aimed *at* them -- an Echo is still watchable.

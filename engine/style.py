@@ -93,6 +93,7 @@ COLORS = {
     "combat_other": "\x1b[37m",
     "combat_mitigate": "\x1b[90m",
     "ooc": "\x1b[90m",
+    "say": "\x1b[37m",
     "alert": "\x1b[93m",
     "prose": "\x1b[37m",
     "item": "\x1b[36m",
@@ -143,6 +144,7 @@ COLORS_XTERM256 = {
     "combat_other": "\x1b[38;5;250m",
     "combat_mitigate": "\x1b[38;5;242m",
     "ooc": "\x1b[38;5;245m",
+    "say": "\x1b[38;5;111m",
     "alert": "\x1b[38;5;220m",
     "prose": "\x1b[38;5;250m",
     "item": "\x1b[38;5;73m",
@@ -1005,7 +1007,7 @@ HELP_START_HERE = (
     ("paths", "list every Path / Background"),
     ("protection", "newbie safety window"),
     ("echo", "your body stays when you log out"),
-    ("stuck", "emergency teleport to Garth's pawn shop"),
+    ("stuck", "emergency teleport to your origin-safe hub"),
     ("bug", "file a bug report"),
 )
 
@@ -1267,6 +1269,55 @@ def format_commands_list(entries, *, gm_entries=None, width=TOME_WIDTH,
     ))
     lines.append(heavy)
     return lines
+
+
+def sheet_band(label, *, width=67, indent=2):
+    """Inner Blood & Velvet section rule with a gold inset label.
+
+    Sighted score uses this *inside* ``format_sheet`` (crimson equals
+    frame stays the outer family -- do not invent a sixth chrome). Example::
+
+        ``  · identity ·------------------------------``
+
+    Screenreader callers should skip decorative bands entirely (TTS
+    already gets ``Label: value.`` rows). Color is decoration; the
+    ``· label ·`` words remain if ANSI is stripped.
+    """
+    w = max(32, int(width))
+    inner = max(16, w - 1 - int(indent))
+    jewel = f"· {label} · "
+    dash_n = max(3, inner - len(jewel))
+    return (
+        (" " * int(indent))
+        + paint("gold", jewel)
+        + paint("dark_grey", "-" * dash_n)
+    )
+
+
+def sheet_two_col(left, right="", *, width=67, indent=2, min_pair=56):
+    """Pack two labeled cells onto one row, or stack when the sheet is narrow.
+
+    ``left`` / ``right`` are already-indented-or-not cell strings (no
+    leading spaces -- this helper adds ``indent``). Returns a list of
+    one or two lines so callers can ``extend``. Empty ``right`` yields a
+    single left row. Below ``min_pair`` visible columns the pair stacks
+    so ``config width 40`` never orphans a label mid-stat.
+    """
+    left = str(left or "")
+    right = str(right or "")
+    pad_indent = " " * int(indent)
+    if not left and not right:
+        return []
+    if not right:
+        return [pad_indent + left]
+    inner = max(16, int(width) - 1)
+    if inner < int(min_pair):
+        return [pad_indent + left, pad_indent + right]
+    # Half the inner budget for the left cell; leftover is the right cell.
+    budget = max(8, inner - int(indent))
+    half = budget // 2
+    left_cell = pad(left, half)
+    return [pad_indent + left_cell + right]
 
 
 def format_sheet(title, body_lines, *, width=48, screenreader=False):

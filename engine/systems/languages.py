@@ -88,3 +88,38 @@ def set_speaking_language(character, lang_id):
         )
     character.speaking_language = lang_id
     return True, f"You switch to speaking {display(lang_id)}. Use say to talk."
+
+
+def known_language_ids(character):
+    """Return normalized language ids the character understands."""
+    raw = getattr(character, "languages", None)
+    if not raw:
+        return list(default_languages())
+    out = []
+    for lid in raw:
+        token = str(lid or "").lower().replace(" ", "_")
+        if token in valid_ids() and token not in out:
+            out.append(token)
+    if _DEFAULT_LANG not in out:
+        out.insert(0, _DEFAULT_LANG)
+    return out
+
+
+def learnable_language_ids(character):
+    """Catalog tongues the character could still study."""
+    known = set(known_language_ids(character))
+    return sorted(lid for lid in valid_ids() if lid not in known)
+
+
+def add_language(character, lang_id):
+    """Append one catalog language. Returns (ok, message)."""
+    token = str(lang_id or "").lower().replace(" ", "_")
+    if token not in valid_ids():
+        options = ", ".join(sorted(valid_ids()))
+        return False, f"Unknown language '{lang_id}'. Known catalog: {options}."
+    if token in known_language_ids(character):
+        return False, f"You already know {display(token)}."
+    langs = list(known_language_ids(character))
+    langs.append(token)
+    character.languages = langs
+    return True, f"You add {display(token)} to your tongues."

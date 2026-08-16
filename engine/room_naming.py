@@ -479,8 +479,9 @@ def meta_from_room(room, game=None) -> dict:
         registry = getattr(game, "map_registry", None)
     if not registry:
         try:
-            import maps as maps_mod
-            registry = getattr(maps_mod, "LAST_MAP_REGISTRY", None)
+            from engine import world_maps
+
+            registry = getattr(world_maps, "LAST_MAP_REGISTRY", None)
         except Exception:
             registry = None
     if isinstance(registry, dict) and map_id in registry:

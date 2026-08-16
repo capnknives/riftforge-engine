@@ -228,10 +228,17 @@ def handle_negotiate(session, cmd: int, option: int) -> bool:
             pass
         return True
     if option == TELOPT_ECHO:
-        # Acknowledge client ECHO negotiation without fighting local echo
-        # policy (password masking uses set_client_echo on the server side).
+        # During play we never echo keystrokes character-by-character -- only
+        # read_line() consumes whole commands. Accepting DO ECHO (WILL ECHO)
+        # makes clients turn off local echo with nothing to show (bug report
+        # 423; copyover briefly fixed it via set_client_echo in play()).
+        # Password prompts bump _echo_password_mask so masking still works.
+        masking = getattr(session, "_echo_password_mask", 0) > 0
         if cmd == DO:
-            session._write_raw(will(TELOPT_ECHO))
+            if masking:
+                session._write_raw(will(TELOPT_ECHO))
+            else:
+                session._write_raw(wont(TELOPT_ECHO))
         elif cmd == WILL:
             session._write_raw(do(TELOPT_ECHO))
         elif cmd == DONT:

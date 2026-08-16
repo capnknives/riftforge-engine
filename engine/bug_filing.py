@@ -105,6 +105,11 @@ def record_and_confirm(
             f"Thanks — help idea #{entry_id} is logged. A GM will review "
             "it and, if it's added, write it up with 'hedit'."
         )
+    elif kind == reports.TYPO:
+        character.session.send(
+            f"Thanks — typo ticket #{entry_id} is logged. "
+            "Staff will triage it separately from crash reports."
+        )
     else:
         character.session.send(
             f"Thanks — suggestion #{entry_id} is logged. "
@@ -118,6 +123,8 @@ def record_and_confirm(
         label = f"bug #{entry_id}"
     elif kind == reports.HELP:
         label = f"help idea #{entry_id}"
+    elif kind == reports.TYPO:
+        label = f"typo #{entry_id}"
     else:
         label = f"suggestion #{entry_id}"
     if game is not None:

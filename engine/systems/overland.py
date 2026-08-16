@@ -20,6 +20,8 @@ import os
 import re
 
 from engine import hooks as hooks_mod
+from engine import map_ui
+from engine import world_maps
 from engine.world import Room
 
 _FALLBACK_PLAZA_KEY = "Lebanon Square"
@@ -131,8 +133,7 @@ _VEHICLE_BLOCKED = frozenset({"ocean", "lake"})
 
 def _content_maps_dir():
     """Absolute path to the active maps/ directory (game-selectable)."""
-    import maps as maps_mod
-    return maps_mod.get_maps_dir()
+    return world_maps.get_maps_dir()
 
 
 def _parse_pos_pair(value):
@@ -260,8 +261,7 @@ def america_macro_from_room(room, game=None):
     if pair is not None and clamp_macro(*pair):
         return pair
     # Authored America Overland (x, y) cell.
-    import maps as maps_mod
-    parsed = maps_mod.parse_grid_key(getattr(room, "key", "") or "")
+    parsed = map_ui.parse_grid_key(getattr(room, "key", "") or "")
     if parsed and parsed[0] in _AMERICA_PREFIXES:
         try:
             mx, my = int(parsed[1]), int(parsed[2])
@@ -784,6 +784,24 @@ def get_virtual_room(game, macro, micro):
     return room
 
 
+def resolve_wilderness_saved_room_key(game, room_key):
+    """Materialize a dual-layer foot cell from a saved ``room_key``.
+
+    Virtual wilderness rooms live in ``game.overland_rooms``, not
+    ``game.rooms``. Without this, ``persistence._resolve_saved_room``
+    registers a ``map_missing_stub`` that has no exits -- copyover /
+    reboot looked like being stranded on a blank tile (bug report 502).
+    """
+    parsed = parse_wilderness_room_key(room_key)
+    if parsed is None:
+        return None
+    macro, micro = parsed
+    try:
+        return get_virtual_room(game, macro, micro)
+    except Exception:
+        return None
+
+
 def get_aerial_room(game, macro):
     """Return (create if needed) the sky Room hovering over a macro tile."""
     ensure_game_overland(game)
@@ -1016,9 +1034,7 @@ def classic_zone_room_blocks_overland_move(character):
         return False
     if parse_wilderness_room_key(getattr(room, "key", "") or ""):
         return False
-    import maps as maps_mod
-
-    parsed = maps_mod.parse_grid_key(getattr(room, "key", "") or "")
+    parsed = map_ui.parse_grid_key(getattr(room, "key", "") or "")
     if parsed and parsed[0] in _AMERICA_PREFIXES:
         return False
     return True
@@ -1303,8 +1319,7 @@ def _room_zone_exit_macro(room):
         return macro
     dest = getattr(room, "zone_exit_to", None)
     if dest is not None:
-        import maps as maps_mod
-        parsed = maps_mod.parse_grid_key(dest.key)
+        parsed = map_ui.parse_grid_key(dest.key)
         if parsed and parsed[0] in _AMERICA_PREFIXES:
             return (parsed[1], parsed[2])
     return None
@@ -1470,16 +1485,14 @@ def home_hub_macro(game, actor):
         exit_to = getattr(room, "zone_exit_to", None)
         if exit_to is not None:
             parsed = None
-            import maps as maps_mod
-            parsed = maps_mod.parse_grid_key(getattr(exit_to, "key", "") or "")
+            parsed = map_ui.parse_grid_key(getattr(exit_to, "key", "") or "")
             if parsed and parsed[0] in _AMERICA_PREFIXES:
                 return (parsed[1], parsed[2])
 
     # Hard fallbacks from starter SoT (Lebanon / bunker road).
     if zone == "men-of-letters":
         parsed = None
-        import maps as maps_mod
-        parsed = maps_mod.parse_grid_key(bunker_overland_key)
+        parsed = map_ui.parse_grid_key(bunker_overland_key)
         if parsed:
             return (parsed[1], parsed[2])
         return (35, 11)
@@ -1491,8 +1504,7 @@ def home_hub_macro(game, actor):
             return macro
         exit_to = getattr(mouth, "zone_exit_to", None)
         if exit_to is not None:
-            import maps as maps_mod
-            parsed = maps_mod.parse_grid_key(getattr(exit_to, "key", "") or "")
+            parsed = map_ui.parse_grid_key(getattr(exit_to, "key", "") or "")
             if parsed and parsed[0] in _AMERICA_PREFIXES:
                 return (parsed[1], parsed[2])
     return (35, 10)

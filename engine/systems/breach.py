@@ -2,7 +2,7 @@
 breach.py -- generic slam/throw wall-floor breach shell.
 
 Uses ``engine.systems.room_structure`` for HP state and
-``maps.find_room_by_layout_direction`` for eject targets. Orthogonal to
+``engine.map_ui.find_room_by_layout_direction`` for eject targets. Orthogonal to
 the combat-engine plugin registry (Phase 1).
 
 Stdlib only; zero ``supers`` imports.
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import random
 
+from engine import map_ui
 from engine.systems import room_structure
 
 
@@ -92,9 +93,7 @@ def breach_eject(character, room, target, *, game=None):
     direction = target.get("direction")
     if not direction:
         return False
-    import maps
-
-    neighbor = maps.find_room_by_layout_direction(
+    neighbor = map_ui.find_room_by_layout_direction(
         getattr(game, "rooms", None) or {}, room, direction,
     )
     if neighbor is None:

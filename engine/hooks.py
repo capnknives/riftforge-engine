@@ -61,6 +61,14 @@ _gmcp_char_vitals = None
 _gmcp_char_status = None
 # Prompt %Tg: fn(character, game) -> foe lifeforce band str or "".
 _prompt_target_band = None
+# Prompt %Nd: fn(character, game) -> lifestyle need word or "".
+_prompt_need_band = None
+# Origin default prompt: fn(character) -> template str.
+_origin_default_prompt = None
+# Factory prompt check: fn(template) -> bool (shipped default, safe to refresh).
+_is_factory_prompt = None
+# Prompt supplemental bands: fn(character, game) -> dict[str, str].
+_prompt_supplemental_bands = None
 
 # System topic pages for bare `help` (game content; engine verbs read these).
 _help_topics = {}
@@ -119,6 +127,7 @@ _clinic_ward_tick = None
 _justice_on_robbery = None
 _justice_fine_schedule = None
 _identity_verify_hook = None
+_identity_pierce_supernatural = None
 _disguise_pierce_check = None
 _follow_pull_skip = None
 _report_context_extra = None
@@ -196,6 +205,9 @@ _can_see_spirit = None
 # Deal hellhound invis pierce. Default False (no Deal kit in bare engine).
 # fn(viewer, hound) -> bool.
 _can_see_hellhound = None
+# Hidden attacker return-fire gate (hellhound blind-swing / kill-tool).
+# fn(viewer, other) -> bool when other is hidden but swinging at viewer.
+_can_target_hidden_attacker = None
 _can_notice_stealth = None
 
 # Veil-layer membership + sight pierce (death spirits, faded Ghosts, veiled
@@ -933,6 +945,83 @@ def prompt_target_band(character, game=None):
     return ""
 
 
+def set_prompt_need_band(fn):
+    """Register fn(character, game) -> str for prompt token %Nd.
+
+    Pass None to restore the no-op default (segment omits itself).
+    """
+    global _prompt_need_band
+    _prompt_need_band = fn
+
+
+def prompt_need_band(character, game=None):
+    """Most urgent lifestyle need for %Nd, or \"\" when content."""
+    if _prompt_need_band is not None:
+        try:
+            return _prompt_need_band(character, game) or ""
+        except Exception:
+            return ""
+    return ""
+
+
+def set_origin_default_prompt(fn):
+    """Register fn(character) -> prompt template for Origin defaults.
+
+    Pass None to fall back to display_prefs.DEFAULT_PROMPT only.
+    """
+    global _origin_default_prompt
+    _origin_default_prompt = fn
+
+
+def origin_default_prompt(character):
+    """Origin-specific default prompt template, or engine DEFAULT_PROMPT."""
+    if _origin_default_prompt is not None:
+        try:
+            return _origin_default_prompt(character)
+        except Exception:
+            pass
+    from engine import display_prefs
+    return display_prefs.DEFAULT_PROMPT
+
+
+def set_is_factory_prompt(fn):
+    """Register fn(template) -> bool for factory prompt detection."""
+    global _is_factory_prompt
+    _is_factory_prompt = fn
+
+
+def is_factory_prompt(template):
+    """True when template is still a shipped factory default."""
+    if _is_factory_prompt is not None:
+        try:
+            return bool(_is_factory_prompt(template))
+        except Exception:
+            pass
+    from engine import display_prefs
+    return display_prefs.is_generic_prompt(template)
+
+
+def set_prompt_supplemental_bands(fn):
+    """Register fn(character, game) -> dict of optional prompt band strings.
+
+    Keys consumed by engine/display_prefs._prompt_vitals: form_band,
+    vessel_band, affliction_band, integrity_band, favor_band, hospital_band.
+    Pass None to restore the no-op default (all segments omit).
+    """
+    global _prompt_supplemental_bands
+    _prompt_supplemental_bands = fn
+
+
+def prompt_supplemental_bands(character, game=None):
+    """Optional prompt segment values from the game hook (empty dict default)."""
+    if _prompt_supplemental_bands is not None:
+        try:
+            return _prompt_supplemental_bands(character, game) or {}
+        except Exception:
+            return {}
+    return {}
+
+
 def set_gmcp_char_status(fn):
     """Register fn(character) -> dict of extra Char.Status fields (Origin…).
 
@@ -1308,6 +1397,19 @@ def identity_verify_hook(subject, doc, *, context="local", game=None):
     return None
 
 
+def set_identity_pierce_supernatural(fn):
+    """Register fn(viewer, subject) -> bool for angel/vampire ID pierce."""
+    global _identity_pierce_supernatural
+    _identity_pierce_supernatural = fn
+
+
+def identity_pierce_supernatural(viewer, subject):
+    """True when a supernatural sense should pierce paperwork / costume."""
+    if _identity_pierce_supernatural is not None:
+        return bool(_identity_pierce_supernatural(viewer, subject))
+    return False
+
+
 def set_disguise_pierce_check(fn):
     """Register fn(viewer, subject) -> bool when disguise fails."""
     global _disguise_pierce_check
@@ -1333,6 +1435,26 @@ def follow_pull_skip(follower, leader, game):
     if _follow_pull_skip is not None:
         return bool(_follow_pull_skip(follower, leader, game))
     return False
+
+
+_follow_survival_peel_message = None
+
+
+def set_follow_survival_peel_message(fn):
+    """Register fn(follower, leader) -> str when follower peels off for needs."""
+    global _follow_survival_peel_message
+    _follow_survival_peel_message = fn
+
+
+def follow_survival_peel_message(follower, leader):
+    """Player message when a live follower stops trailing for critical needs.
+
+    Default (no game installed): None (no peel). SUPERS registers survival
+  meter checks from ``supers.needs``.
+    """
+    if _follow_survival_peel_message is not None:
+        return _follow_survival_peel_message(follower, leader)
+    return None
 
 
 def set_report_context_extra(fn):
@@ -1782,6 +1904,26 @@ def can_see_hellhound(viewer, hound=None):
     if _can_see_hellhound is not None:
         return bool(_can_see_hellhound(viewer, hound))
     return False
+
+
+def set_can_target_hidden_attacker(fn):
+    """Register fn(viewer, other) -> bool for hidden-attacker targeting.
+
+  Pass None to restore the default: allow return fire (True).
+    """
+    global _can_target_hidden_attacker
+    _can_target_hidden_attacker = fn
+
+
+def can_target_hidden_attacker(viewer, other):
+    """May ``viewer`` target ``other`` when hidden but already attacking?
+
+    Default (no game installed): True. SUPERS registers Deal hellhound
+    sight / kill-tool gates from ``supers.hellhounds``.
+    """
+    if _can_target_hidden_attacker is not None:
+        return bool(_can_target_hidden_attacker(viewer, other))
+    return True
 
 
 def set_in_veil(fn):
@@ -2258,6 +2400,46 @@ def is_tutorial_incomplete_vault(game, name):
     return bool(_is_tutorial_incomplete_vault(game, name))
 
 
+# Chargen-draft vault + generic hard-fold extract (account_chargen_draft).
+# fn(game, name) -> folded_by tag str | None
+_vault_folded_by = None
+
+
+def set_vault_folded_by(fn):
+    """Register fn(game, storage_key) -> vault tag string or empty."""
+    global _vault_folded_by
+    _vault_folded_by = fn
+
+
+def vault_folded_by(game, storage_key):
+    """Return the ``folded_by`` tag for a vaulted key, or ``None`` when unset."""
+    if _vault_folded_by is None:
+        return None
+    return _vault_folded_by(game, storage_key)
+
+
+# fn(character, game, folded_by=None, skip_save=False) -> (ok, msg)
+_extract_to_vault = None
+
+
+def set_extract_to_vault(fn):
+    """Register hard-fold extract for partial bodies / chargen drafts."""
+    global _extract_to_vault
+    _extract_to_vault = fn
+
+
+def extract_to_vault(character, game, *, folded_by=None, skip_save=False):
+    """Vault ``character`` off-world; default refuses when no game registered."""
+    if _extract_to_vault is None:
+        return False, "Vault unavailable."
+    return _extract_to_vault(
+        character,
+        game,
+        folded_by=folded_by,
+        skip_save=skip_save,
+    )
+
+
 # Account login menu: hard-folded bodies still listed on an account roster.
 # fn(game, account, live_character_keys_low: set[str])
 #     -> list[(section, entry)]
@@ -2543,6 +2725,29 @@ def vehicle_park_spot_blocked_extra(room, game, character):
     if _vehicle_park_spot_extra_gate is not None:
         return bool(_vehicle_park_spot_extra_gate(room, game, character))
     return False
+
+
+_vehicle_invalid_park_rehome = None
+
+
+def set_vehicle_invalid_park_rehome(fn):
+    """Register fn(game, veh, park_room, owner) -> room_key or None.
+
+    When ``save_parking_state`` scrubs an invalid curb, the hook may send
+    no-park plazas to municipal impound instead of a random neighbor exit.
+    Pass None to clear.
+    """
+    global _vehicle_invalid_park_rehome
+    _vehicle_invalid_park_rehome = fn
+
+
+def vehicle_invalid_park_rehome(game, veh, park_room, owner):
+    """Return a replacement curb key for invalid plaza parks, or None."""
+    if _vehicle_invalid_park_rehome is not None:
+        key = _vehicle_invalid_park_rehome(game, veh, park_room, owner)
+        if isinstance(key, str) and key.strip():
+            return key.strip()
+    return None
 
 
 def set_try_vehicle_nested_in_out(fn):
@@ -3609,6 +3814,8 @@ _containers_gear_acquire_refusal = None
 _containers_relic_acquire_refusal = None
 _containers_room_is_character_home = None
 _containers_heal_folded_kit_bags = None
+_containers_consolidate_ammo_stack = None
+_containers_heal_folded_gear_bag_stacks = None
 
 
 def set_item_catalog_get(fn):
@@ -3783,6 +3990,30 @@ def set_containers_heal_folded_kit_bags(fn):
 def containers_heal_folded_kit_bags(game):
     if _containers_heal_folded_kit_bags is not None:
         return _containers_heal_folded_kit_bags(game)
+    return 0
+
+
+def set_containers_consolidate_ammo_stack(fn):
+    global _containers_consolidate_ammo_stack
+    _containers_consolidate_ammo_stack = fn
+
+
+def containers_consolidate_ammo_stack(pieces, catalog_id):
+    """Merge ammo box rows into one Item, or None when not ammo / no game."""
+    if _containers_consolidate_ammo_stack is not None:
+        return _containers_consolidate_ammo_stack(pieces, catalog_id)
+    return None
+
+
+def set_containers_heal_folded_gear_bag_stacks(fn):
+    global _containers_heal_folded_gear_bag_stacks
+    _containers_heal_folded_gear_bag_stacks = fn
+
+
+def containers_heal_folded_gear_bag_stacks(game):
+    """Boot heal: collapse duplicate kit-bag rows in folded vault blobs."""
+    if _containers_heal_folded_gear_bag_stacks is not None:
+        return _containers_heal_folded_gear_bag_stacks(game)
     return 0
 
 
@@ -4550,4 +4781,322 @@ def channel_audience_ok(viewer, audience_token, game):
     """Extension hook for origin:/custom channel audience (default deny)."""
     if _channel_audience_ok is not None:
         return bool(_channel_audience_ok(viewer, audience_token, game))
+    return False
+
+
+# --- Mining system hooks (docs/plans/mine_system.md) -----------------------
+
+_mine_stratum_tables = {}
+_mine_marker_chance = None
+_mine_geology_seed = None
+_mine_tool_check = None
+_mine_carry_weight_cap = None
+_mine_company_job_gate_permission = None
+_roll_mine_discoverable = None
+_on_mine_face_cleared = None
+_mine_support_catalog = None
+_mine_alloy_recipes = None
+_mine_forge_recipes = None
+_mine_blast = None
+_mine_company_layout = None
+_mine_gate_breach = None
+_pick_mine_ambient_line = None
+_maybe_mine_job_bark = None
+
+
+def register_mine_stratum_table(realm_id, table):
+    """Register element depth-band table for ``realm_id`` (earth, hell, …)."""
+    _mine_stratum_tables[str(realm_id)] = table or {}
+
+
+def mine_stratum_table(realm_id):
+    """Return registered stratum table or empty dict."""
+    return dict(_mine_stratum_tables.get(str(realm_id), {}) or {})
+
+
+def set_mine_marker_chance(fn):
+    """Register fn(room, character) -> float stumble chance 0..1."""
+    global _mine_marker_chance
+    _mine_marker_chance = fn
+
+
+def mine_marker_chance(room, character):
+    """Wilderness marker stumble chance; default 0."""
+    if _mine_marker_chance is not None:
+        try:
+            return float(_mine_marker_chance(room, character) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
+def set_mine_geology_seed(fn):
+    """Register fn(mouth_key, area_type) -> geology dict."""
+    global _mine_geology_seed
+    _mine_geology_seed = fn
+
+
+def mine_geology_seed(mouth_key, area_type):
+    """Geology seed for a mouth; engine hash fallback when unset."""
+    if _mine_geology_seed is not None:
+        return _mine_geology_seed(mouth_key, area_type)
+    import hashlib
+    digest = hashlib.sha256(f"{mouth_key}:{area_type}".encode()).hexdigest()
+    elements = ("coal", "copper", "iron", "lead", "tin")
+    primary = elements[int(digest[:2], 16) % len(elements)]
+    secondary = elements[int(digest[2:4], 16) % len(elements)]
+    return {
+        "primary_element": primary,
+        "secondary_element": secondary,
+        "contamination_tag": None,
+    }
+
+
+def set_mine_tool_check(fn):
+    """Register fn(character, action) -> (ok, slow_mult, tell_line|None)."""
+    global _mine_tool_check
+    _mine_tool_check = fn
+
+
+def mine_tool_check(character, action):
+    """Tool gate for carve/harvest; default requires pick/shovel in inventory."""
+    if _mine_tool_check is not None:
+        return _mine_tool_check(character, action)
+    from engine.systems import material_instances as mat_mod
+    needles = ("pick", "shovel", "pickaxe", "mining pick")
+    for item in mat_mod.iter_carried_items(character):
+        key = (getattr(item, "key", "") or "").lower()
+        if any(n in key for n in needles):
+            return True, 1.0, None
+    return True, 2.5, None
+
+
+def set_mine_carry_weight_cap(fn):
+    """Register fn(character) -> max weight or None for unlimited."""
+    global _mine_carry_weight_cap
+    _mine_carry_weight_cap = fn
+
+
+def mine_carry_weight_cap(character):
+    """Character-level carry cap; default unlimited."""
+    if _mine_carry_weight_cap is not None:
+        return _mine_carry_weight_cap(character)
+    return None
+
+
+def set_mine_company_job_gate_permission(fn):
+    """Register fn(character) -> bool for NPC gate hang/lock (v1: False)."""
+    global _mine_company_job_gate_permission
+    _mine_company_job_gate_permission = fn
+
+
+def mine_company_job_gate_permission(character):
+    """Whether Cadence actors may hang/lock mine gates; default False."""
+    if _mine_company_job_gate_permission is not None:
+        return bool(_mine_company_job_gate_permission(character))
+    return False
+
+
+def set_roll_mine_discoverable(fn):
+    """Register fn(context) -> discoverable dict or None."""
+    global _roll_mine_discoverable
+    _roll_mine_discoverable = fn
+
+
+def roll_mine_discoverable(context):
+    """Roll a room discoverable; default nothing."""
+    if _roll_mine_discoverable is not None:
+        return _roll_mine_discoverable(context)
+    return None
+
+
+def set_on_mine_face_cleared(fn):
+    """Register fn(room, direction, miner, game) after a carve completes."""
+    global _on_mine_face_cleared
+    _on_mine_face_cleared = fn
+
+
+def on_mine_face_cleared(room, direction, miner, game):
+    """Post-carve hook; default no-op."""
+    if _on_mine_face_cleared is not None:
+        _on_mine_face_cleared(room, direction, miner, game)
+
+
+def set_mine_support_catalog(fn):
+    """Register fn(realm) -> {timber: rating, steel: rating, …}."""
+    global _mine_support_catalog
+    _mine_support_catalog = fn
+
+
+def mine_support_catalog(realm):
+    """Support material ratings; generic timber/steel defaults."""
+    if _mine_support_catalog is not None:
+        return dict(_mine_support_catalog(realm) or {})
+    return {"timber": 1, "steel": 2}
+
+
+def set_mine_alloy_recipes(fn):
+    """Register fn() -> list of alloy recipe dicts."""
+    global _mine_alloy_recipes
+    _mine_alloy_recipes = fn
+
+
+def mine_alloy_recipes():
+    """Alloy smelt recipes; default empty."""
+    if _mine_alloy_recipes is not None:
+        return list(_mine_alloy_recipes() or ())
+    return []
+
+
+def set_mine_forge_recipes(fn):
+    """Register fn() -> list of forge recipe dicts."""
+    global _mine_forge_recipes
+    _mine_forge_recipes = fn
+
+
+def mine_forge_recipes():
+    """Forge recipes; default empty."""
+    if _mine_forge_recipes is not None:
+        return list(_mine_forge_recipes() or ())
+    return []
+
+
+def set_mine_blast(fn):
+    """Register fn(game, mouth, room_id, direction) -> message (parked v1)."""
+    global _mine_blast
+    _mine_blast = fn
+
+
+def mine_blast(game, mouth, room_id, direction):
+    """Staff blast test hook; default reports unavailable."""
+    if _mine_blast is not None:
+        return _mine_blast(game, mouth, room_id, direction)
+    return "Blasting is not available."
+
+
+_smelt_handler = None
+_forge_handler = None
+
+
+def set_smelt_handler(fn):
+    """Register fn(character, game, ore_item, smelt_tier) -> (ok, msg, item)."""
+    global _smelt_handler
+    _smelt_handler = fn
+
+
+def smelt_ore(character, game, ore_item, *, smelt_tier=1):
+    if _smelt_handler is None:
+        return False, "Smelting is not available.", None
+    return _smelt_handler(character, game, ore_item, smelt_tier)
+
+
+def set_forge_handler(fn):
+    """Register fn(character, game, recipe_id, ingot) -> (ok, msg, item)."""
+    global _forge_handler
+    _forge_handler = fn
+
+
+def forge_at_station(character, game, recipe_id, ingot, *, impress=False):
+    if _forge_handler is None:
+        return False, "Forging is not available.", None
+    return _forge_handler(character, game, recipe_id, ingot, impress=impress)
+
+
+_mine_forge_type_lines = None
+_mine_find_ingot = None
+_gain_skill = None
+
+
+def set_mine_forge_type_lines(fn):
+    """Register fn() -> list[str] for bare ``forge`` type catalog help."""
+    global _mine_forge_type_lines
+    _mine_forge_type_lines = fn
+
+
+def mine_forge_type_lines():
+    """Player forge type listing; empty when no game catalog is registered."""
+    if _mine_forge_type_lines is not None:
+        return list(_mine_forge_type_lines() or ())
+    return []
+
+
+def set_mine_find_ingot(fn):
+    """Register fn(character, needle=None) -> ingot Item | None."""
+    global _mine_find_ingot
+    _mine_find_ingot = fn
+
+
+def mine_find_ingot(character, needle=None):
+    """Find a carried ingot for ``forge <type> with <metal>``."""
+    if _mine_find_ingot is not None:
+        return _mine_find_ingot(character, needle)
+    return None
+
+
+def set_gain_skill(fn):
+    """Register fn(character, skill_key, amount, **kwargs) for profession XP."""
+    global _gain_skill
+    _gain_skill = fn
+
+
+def gain_skill(character, skill_key, amount, **kwargs):
+    """Award profession/survival skill XP when a game registers the hook."""
+    if _gain_skill is not None:
+        _gain_skill(character, skill_key, amount, **kwargs)
+
+
+def set_mine_company_layout_resolver(fn):
+    """Register fn(company_id) -> layout dict or None."""
+    global _mine_company_layout
+    _mine_company_layout = fn
+
+
+def mine_company_layout(company_id):
+    if _mine_company_layout is not None:
+        return _mine_company_layout(company_id)
+    return None
+
+
+def set_mine_gate_breach(fn):
+    """Register fn(character, verb) -> bool for gate pick/force/bypass."""
+    global _mine_gate_breach
+    _mine_gate_breach = fn
+
+
+def mine_gate_breach(character, verb):
+    if _mine_gate_breach is not None:
+        return bool(_mine_gate_breach(character, verb))
+    import random
+    if verb == "bypass":
+        return random.random() < 0.7
+    if verb == "pick":
+        return random.random() < 0.5
+    if verb == "force":
+        return random.random() < 0.4
+    return False
+
+
+def set_pick_mine_ambient_line(fn):
+    """Register fn(room, game, *, rng=None) -> str|None for mine tick ambience."""
+    global _pick_mine_ambient_line
+    _pick_mine_ambient_line = fn
+
+
+def pick_mine_ambient_line(room, game, *, rng=None):
+    """Return one ambient line for an occupied virtual mine room, or None."""
+    if _pick_mine_ambient_line is not None:
+        return _pick_mine_ambient_line(room, game, rng=rng)
+    return None
+
+
+def set_maybe_mine_job_bark(fn):
+    """Register fn(character, game, action) -> bool for mine-action job barks."""
+    global _maybe_mine_job_bark
+    _maybe_mine_job_bark = fn
+
+
+def maybe_mine_job_bark(character, game, action):
+    """Maybe broadcast a job-flavored line during mine carve/harvest dispatch."""
+    if _maybe_mine_job_bark is not None:
+        return bool(_maybe_mine_job_bark(character, game, action))
     return False

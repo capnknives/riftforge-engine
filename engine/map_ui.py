@@ -1397,8 +1397,41 @@ def render_local_map(
         # Drop header + legend -- look only needs the glyph window.
         lines = rendered.split("\n")
         if len(lines) >= 3:
-            return "\n".join(lines[1:-1])
-    return rendered
+            rendered = "\n".join(lines[1:-1])
+    return append_mapzone_overlay(
+        rendered, center_room, game, character=character,
+    )
+
+
+def zone_overlay_footer_lines(center_room, game, character=None):
+    """Plain nearby-zone bearings for ASCII map footer (suggestion 179)."""
+    if character is None:
+        return []
+    from engine import display_prefs
+    from engine import hooks
+    from engine.systems import overland as overland_mod
+
+    display_prefs.ensure_display_defaults(character)
+    if not getattr(character, "mapzone_overlay", False):
+        return []
+    room = center_room
+    lines = overland_mod.look_nearby_zone_lines(room, game)
+    if lines:
+        return lines
+    resolved = hooks.map_center_room(character, game)
+    if resolved is not None and resolved is not room:
+        return overland_mod.look_nearby_zone_lines(resolved, game)
+    return []
+
+
+def append_mapzone_overlay(rendered, center_room, game, *, character=None):
+    """Append optional zone-bearing footer to a rendered map string."""
+    if not rendered:
+        return rendered
+    extra = zone_overlay_footer_lines(center_room, game, character)
+    if not extra:
+        return rendered
+    return rendered + "\n" + "\n".join(extra)
 
 
 def render_full_grid(
@@ -1410,6 +1443,8 @@ def render_full_grid(
     use_color=True,
     wrap=False,
     mark_you=True,
+    character=None,
+    game=None,
 ):
     """Build an ASCII dump of an entire overland grid (giant map).
 
@@ -1480,7 +1515,10 @@ def render_full_grid(
     if width >= 10:
         ruler = "".join(str(x % 10) for x in range(width))
         rows.append(ruler)
-    return "\n".join([header, *rows, legend])
+    rendered = "\n".join([header, *rows, legend])
+    return append_mapzone_overlay(
+        rendered, center_room, game, character=character,
+    )
 
 
 

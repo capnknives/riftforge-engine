@@ -456,8 +456,12 @@ def stow_in_loot_bag(character, item, *, loot_bag=None):
     loot_refusal = loot_bag_refusal(character, item, loot_bag=bag)
     if loot_refusal:
         return False, loot_refusal
+    if try_merge_carried_stack(character, item, dest="loot"):
+        inv.remove(item)
+        return True, f"You stow {item.key} in {bag.key}."
     inv.remove(item)
     bag_contents(bag).append(item)
+    consolidate_loot_bag_stacks(character)
     return True, f"You stow {item.key} in {bag.key}."
 
 
@@ -589,7 +593,7 @@ def _ensure_open_inventory_holds(character, item):
         return
     if try_merge_carried_stack(character, item):
         return
-    if open_inventory_would_add_stack(character, item):
+    if pickup_needs_new_open_stack(character, item):
         if open_inventory_stack_count(character) >= OPEN_INVENTORY_CAPACITY:
             return
     inv = getattr(character, "inventory", None)
@@ -605,8 +609,13 @@ def _item_stack_merge_eligible(item):
 
     Reagents and gather crumbs stack. Weapons and armor never merge -- even
     when catalog metadata is thin after map spawn (bug reports 329 / 350).
+    Locked containers with their own loot tables (dungeon / pit strongboxes)
+    must stay separate rows -- merging folds ``stack_charges`` onto one Item
+    and discards the merged copy's loot (bug report 488).
     """
     if item is None:
+        return False
+    if getattr(item, "locked", False) and getattr(item, "loot", None):
         return False
     if item_carry_size(item) != "small":
         return False
@@ -655,6 +664,7 @@ def route_acquired_item(character, item):
         if item in inv:
             inv.remove(item)
         bag_contents(bag_item).append(item)
+        consolidate_gear_bag_stacks(character)
         return (
             f"You tuck {item.key} into your gear bag. Type 'gear' to look."
         )
@@ -666,6 +676,7 @@ def route_acquired_item(character, item):
         if item in inv:
             inv.remove(item)
         bag_contents(loot).append(item)
+        consolidate_loot_bag_stacks(character)
         return f"You tuck {item.key} into {loot.key}."
     if dest == "hands":
         if item not in inv:
@@ -683,7 +694,7 @@ def placement_destination(character, item):
         if designated_gear_bag(character) is None:
             return None
         return "gear"
-    if not open_inventory_would_add_stack(character, item):
+    if not pickup_needs_new_open_stack(character, item):
         return "hands"
     if open_inventory_stack_count(character) < OPEN_INVENTORY_CAPACITY:
         return "hands"
@@ -727,6 +738,18 @@ def open_inventory_would_add_stack(character, item):
     return key not in open_stack_keys(character)
 
 
+def pickup_needs_new_open_stack(character, item):
+    """True when ``item`` cannot fold into an existing open-inventory row.
+
+    Stack keys can match across weapons and armor that intentionally stay
+    separate rows (bug reports 329 / 350). Those pickups still need a free
+    stack slot even when ``open_inventory_would_add_stack`` is false.
+    """
+    if open_inventory_would_add_stack(character, item):
+        return True
+    return not _item_stack_merge_eligible(item)
+
+
 def _stack_unit_count(item):
     """How many units one Item row represents (``stack_charges`` or 1)."""
     raw = getattr(item, "stack_charges", None)
@@ -737,6 +760,16 @@ def _stack_unit_count(item):
                 return count
         except (TypeError, ValueError):
             pass
+    catalog_id = getattr(item, "catalog_id", None)
+    if catalog_id:
+        spec = hooks_mod.get_item_spec(str(catalog_id))
+        if isinstance(spec, dict) and spec.get("ammo"):
+            try:
+                cap = int(spec.get("stack_charges") or 0)
+                if cap > 0:
+                    return cap
+            except (TypeError, ValueError):
+                pass
     return 1
 
 
@@ -843,10 +876,15 @@ def try_merge_carried_stack(character, item, *, dest=None):
         return False
     if not _item_stack_merge_eligible(item):
         return False
-    if open_inventory_would_add_stack(character, item):
-        return False
     if dest is None:
         dest = placement_destination(character, item)
+    # Open-inventory slot math applies only to surface ``hands`` routing.
+    # Gear and loot bags merge against their own contents — otherwise every
+    # reagent/ammo pickup spawns a new row (Dean's kit bag bloat).
+    if dest not in ("gear", "loot") and open_inventory_would_add_stack(
+        character, item,
+    ):
+        return False
     if dest == "gear":
         bag = designated_gear_bag(character)
         if bag is None:
@@ -891,7 +929,7 @@ def open_inventory_refusal(character, item):
         return None
     if item_carry_size(item) == "large":
         if (
-            open_inventory_would_add_stack(character, item)
+            pickup_needs_new_open_stack(character, item)
             and open_inventory_stack_count(character) >= OPEN_INVENTORY_CAPACITY
         ):
             return LOOT_BAG_TOO_LARGE
@@ -1095,6 +1133,105 @@ def heal_all_kit_bags(game):
     return count
 
 
+def _consolidate_stackable_item_list(items, viewer):
+    """Fold duplicate stack-eligible rows in ``items`` (mutates in place).
+
+    Returns how many redundant rows were absorbed. Idempotent when already
+    tidy. Ammo boxes sum ``stack_charges`` into one row per catalog id.
+    """
+    if not items or len(items) < 2:
+        return 0
+    groups = OrderedDict()
+    passthrough = []
+    for piece in list(items):
+        if _item_stack_merge_eligible(piece):
+            groups.setdefault(stack_key(piece, viewer), []).append(piece)
+        else:
+            passthrough.append(piece)
+    merged = 0
+    rebuilt = list(passthrough)
+    for pieces in groups.values():
+        if len(pieces) == 1:
+            rebuilt.append(pieces[0])
+            continue
+        sample = pieces[0]
+        catalog_id = getattr(sample, "catalog_id", None)
+        spec = None
+        if catalog_id:
+            spec = hooks_mod.get_item_spec(str(catalog_id))
+        if isinstance(spec, dict) and spec.get("ammo") and catalog_id:
+            merged_item = hooks_mod.containers_consolidate_ammo_stack(
+                pieces, str(catalog_id),
+            )
+            if merged_item is not None:
+                rebuilt.append(merged_item)
+                merged += len(pieces) - 1
+                continue
+        target = pieces[0]
+        for incoming in pieces[1:]:
+            _merge_stack_items(target, incoming)
+            merged += 1
+        rebuilt.append(target)
+    if merged <= 0:
+        return 0
+    items[:] = rebuilt
+    return merged
+
+
+def consolidate_gear_bag_stacks(character):
+    """Fold duplicate stack-eligible rows inside the worn kit bag."""
+    if character is None:
+        return 0
+    bag_item = designated_gear_bag(character)
+    if bag_item is None:
+        return 0
+    return _consolidate_stackable_item_list(
+        bag_contents(bag_item), character,
+    )
+
+
+def consolidate_loot_bag_stacks(character):
+    """Fold duplicate stack-eligible rows inside the worn loot backpack."""
+    if character is None:
+        return 0
+    bag_item = designated_loot_bag(character)
+    if bag_item is None:
+        return 0
+    return _consolidate_stackable_item_list(
+        bag_contents(bag_item), character,
+    )
+
+
+def consolidate_home_stash_stacks(character):
+    """Fold duplicate stack-eligible rows in the claimed-home stash."""
+    if character is None:
+        return 0
+    return _consolidate_stackable_item_list(
+        ensure_home_stash(character), character,
+    )
+
+
+def consolidate_item_list_stacks(items, viewer):
+    """Public wrapper for any mutable item list (pit stash, chest, …)."""
+    if items is None:
+        return 0
+    return _consolidate_stackable_item_list(items, viewer)
+
+
+def heal_all_gear_bag_stack_consolidation(game):
+    """One-time boot sweep: collapse duplicate gear-bag reagent/ammo rows."""
+    from engine.char_index import iter_characters
+
+    total = 0
+    for char in iter_characters(game):
+        total += consolidate_gear_bag_stacks(char)
+    try:
+        total += hooks_mod.containers_heal_folded_gear_bag_stacks(game)
+    except Exception:
+        pass
+    return total
+
+
 def stash_at_home(character, item, game):
     """Move one carried item into ``character.home_stash`` at home."""
     if character is None or item is None:
@@ -1130,6 +1267,7 @@ def stash_at_home(character, item, game):
     if not removed:
         return False, "You aren't carrying that."
     ensure_home_stash(character).append(item)
+    consolidate_home_stash_stacks(character)
     return True, f"You stash {item.key} at home."
 
 
@@ -1164,6 +1302,7 @@ def retrieve_from_stash(character, needle, game):
 def stash_list_lines(character):
     """Lines for ``stash list`` / bare ``stash``."""
     stash = ensure_home_stash(character)
+    consolidate_home_stash_stacks(character)
     lines = ["Home stash (claimed residence only)."]
     if not stash:
         lines.append("Empty.")

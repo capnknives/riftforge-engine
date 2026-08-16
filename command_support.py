@@ -20,16 +20,22 @@ from engine.command_support import (
     SELF_NAME_ALIASES,
     _can_see_gm_away,
     _can_see_spirit,
+    _can_target_for_combat,
+    _combat_target_candidates,
     # Re-export for engine/verbs/basic.py look-at ordinals (#629).
     # Missing this name from the facade makes `look <person>` ImportError
     # at runtime even though the helper lives in engine/command_support.
     _collect_character_matches,
+    _collect_item_matches,
+    _item_name_matches,
+    parse_bulk_item_query,
     _display_name,
     _maybe_append_account_tag,
     floor_item_look_lines,
     format_floor_items_for_look,
     _find_character,
     _find_item,
+    _find_carried_item_prefer_locked,
     _find_item_prefer_locked,
     _is_gm,
     _is_head_gm,

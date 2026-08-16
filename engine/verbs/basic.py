@@ -31,6 +31,8 @@ import os
 import re
 
 import engine.systems.economy as economy_wallet
+from engine import map_ui
+from engine import world_maps
 
 from command_support import (
     _can_see_spirit,
@@ -41,6 +43,8 @@ from command_support import (
     _find_character,
     _find_item,
     _find_item_prefer_locked,
+    _collect_item_matches,
+    parse_bulk_item_query,
     _is_gm,
     _presence_face,
     _public_label,
@@ -252,14 +256,12 @@ def cmd_look(character, args, game, *, after_move=False):
         # so engine/ never imports supers (Phase 2 purity).
         # Distant named pockets (visible_as) by 8-way bearing + range band.
         # Pass character so staff gm_mode keeps long vista; players stay local.
-        import maps as maps_mod
-        for vista_line in maps_mod.landmark_vista_lines(room, character):
+        for vista_line in map_ui.landmark_vista_lines(room, character):
             extras.append(vista_line)
     # Pocket zone travel is separate from cardinal / in-out moves.
     zone_entries = getattr(room, "zone_entries", None) or {}
     if zone_entries:
-        import maps as maps_mod
-        hints = maps_mod.zone_entry_look_hints(zone_entries)
+        hints = world_maps.zone_entry_look_hints(zone_entries)
         if hints:
             extras.append(
                 f"Enter: enter <name> -- here: {', '.join(hints)}"
@@ -451,9 +453,8 @@ def cmd_look(character, args, game, *, after_move=False):
         and getattr(prefs, "show_minimap", True)
         and not getattr(prefs, "screenreader", False)
     ):
-        import maps as maps_mod
         map_center = _local_map_center_room(character, game, room)
-        rendered = maps_mod.render_local_map(
+        rendered = map_ui.render_local_map(
             game.rooms,
             map_center,
             use_color=getattr(prefs, "use_color", True),
@@ -549,10 +550,8 @@ def maybe_map_after_move(character, game):
     room = getattr(character, "location", None)
     if room is None:
         return
-    import maps as maps_mod
-
     map_center = _local_map_center_room(character, game, room)
-    rendered = maps_mod.render_local_map(
+    rendered = map_ui.render_local_map(
         game.rooms,
         map_center,
         use_color=getattr(prefs, "use_color", True),
@@ -678,7 +677,22 @@ def cmd_map(character, args, game):
     from engine import pager as pager_mod
 
     display_prefs.ensure_display_defaults(character)
+    want_zone = _map_wants_zone(args)
     want_full = _map_wants_full(args)
+    if want_zone:
+        lines = list(_directional_map_lines(character, game))
+        from engine.systems import overland as overland_mod
+        room = _local_map_center_room(character, game)
+        if room is None:
+            room = getattr(character, "location", None)
+        zone_lines = overland_mod.look_nearby_zone_lines(room, game)
+        if zone_lines:
+            lines.extend(zone_lines)
+        elif len(lines) <= 2:
+            lines.append("No nearby zone mouths from here.")
+        lines.append("")
+        character.session.send("\r\n".join(lines))
+        return
     if (
         not want_full
         and not _map_wants_local(args)
@@ -691,6 +705,13 @@ def cmd_map(character, args, game):
     if getattr(character, "screenreader", False):
         # ASCII dump is unusable for TTS -- local exits plus atlas size.
         lines = list(_directional_map_lines(character, game))
+        from engine.systems import overland as overland_mod
+        room = _local_map_center_room(character, game)
+        if room is None:
+            room = getattr(character, "location", None)
+        zone_lines = overland_mod.look_nearby_zone_lines(room, game)
+        if zone_lines:
+            lines.extend(zone_lines)
         if want_full:
             lines.extend(_full_map_sr_lines(character, game))
         character.session.send("\r\n".join(lines))
@@ -700,7 +721,6 @@ def cmd_map(character, args, game):
             "Map is off. Type 'config map on' to show the ASCII minimap."
         )
         return
-    import maps as maps_mod
     use_color = getattr(character, "use_color", True)
     if want_full:
         room = _overland_map_center_room(character, game)
@@ -717,7 +737,7 @@ def cmd_map(character, args, game):
     # Respect the player's color preference (#51) -- letter glyphs stay the
     # primary signal either way (section 8 a11y).
     room = _local_map_center_room(character, game)
-    rendered = maps_mod.render_local_map(
+    rendered = map_ui.render_local_map(
         game.rooms,
         room,
         use_color=use_color,
@@ -731,6 +751,17 @@ def cmd_map(character, args, game):
         return
     # render_* joins with \\n; convert to telnet \\r\\n for the wire.
     character.session.send(rendered.replace("\n", "\r\n"))
+
+
+def cmd_zone(character, args, game):
+    """Plain nearby-zone bearings for screenreader / VI navigation."""
+    cmd_map(character, "zone", game)
+
+
+def _map_wants_zone(args):
+    """True when the player asked for nearby zone bearings only."""
+    token = (args or "").strip().lower().split(None, 1)[0] if args else ""
+    return token == "zone"
 
 
 def _map_wants_full(args):
@@ -814,19 +845,19 @@ def _overland_map_center_room(character, game):
 
 def _render_full_map_for(character, game, *, use_color=True):
     """Render the full-grid atlas string, or None if not on a sized grid."""
-    import maps as maps_mod
-
     room = _overland_map_center_room(character, game)
     width, height, wrap = _grid_meta_for_room(game, room)
     if width is None or height is None:
         return None
-    return maps_mod.render_full_grid(
+    return map_ui.render_full_grid(
         game.rooms,
         room,
         width=width,
         height=height,
         use_color=use_color,
         wrap=wrap,
+        character=character,
+        game=game,
     )
 
 
@@ -1029,10 +1060,15 @@ def _look_in_item_resolved(character, item, game):
                 f"You look in {item.key} -- nothing of note."
             )
             return
-        names = ", ".join(o.key for o in contents)
-        character.session.send(
-            f"Looking in {item.key}, you find: {names}."
-        )
+        from engine.systems import containers as containers_mod
+        if containers_mod.is_gear_bag_item(item):
+            containers_mod.consolidate_gear_bag_stacks(character)
+        elif containers_mod.is_bag_item(item):
+            containers_mod.consolidate_loot_bag_stacks(character)
+        stacked = hooks.containers_stacked_carry_lines(contents, character)
+        character.session.send(f"You look in {item.key}:")
+        for line in stacked:
+            character.session.send(line)
         return
     if not getattr(item, "is_body", False):
         character.session.send(f"You can't look in {item.key}.")
@@ -1067,7 +1103,15 @@ def _look_in(character, query, game=None):
         return
     if game is None:
         game = getattr(getattr(character, "session", None), "game", None)
-    # Carried inventory first -- same targeting as ``look <bag>`` (bug #211).
+    # Generic ``backpack`` / ``loot bag`` tokens match put/get: the worn loot
+    # bag wins over loose empty duplicates in open inventory (bug report 487).
+    from engine.systems import containers as containers_mod
+    if containers_mod.is_generic_loot_bag_query(query):
+        worn_loot = containers_mod.resolve_loot_bag(character, query)
+        if worn_loot is not None:
+            _look_in_item_resolved(character, worn_loot, game)
+            return
+    # Carried inventory -- specific bag names; unworn bags when none worn.
     item = _find_item(query, character.inventory, character=character)
     if item is not None:
         _look_in_item_resolved(character, item, game)
@@ -1566,6 +1610,31 @@ def cmd_exit_zone(character, args, game):
     )
 
 
+def heal_nested_enter_exits(game):
+    """Migrate legacy exits['enter'] nested mouths to exits['in'].
+
+    Look lists exit directions literally; ``in`` is the player verb for
+    nested indoor travel (``enter <zone>`` stays pocket-zone travel).
+    Idempotent -- safe every boot.
+    """
+    if game is None:
+        return 0
+    rooms = getattr(game, "rooms", None) or {}
+    touched = 0
+    for room in rooms.values():
+        exits = getattr(room, "exits", None)
+        if not isinstance(exits, dict):
+            continue
+        enter_dest = exits.get("enter")
+        if enter_dest is None:
+            continue
+        if exits.get("in") is None:
+            exits["in"] = enter_dest
+            touched += 1
+        exits.pop("enter", None)
+    return touched
+
+
 def cmd_go_in(character, args, game):
     """Nested indoor enter via exits['in'] (gym annex, chapel sacristy, …).
 
@@ -1579,7 +1648,9 @@ def cmd_go_in(character, args, game):
         if hooks.try_vehicle_nested_in_out(character, game, direction="in"):
             return
     room = character.location
-    dest = room.exits.get("in")
+    # Nested mouths use exits['in'] (porch → living). Realm-town templates
+    # historically wired parent_exit='enter' -- accept that alias too.
+    dest = room.exits.get("in") or room.exits.get("enter")
     if not dest:
         character.session.send("You can't go in from here.")
         return
@@ -1971,6 +2042,7 @@ def cmd_config(character, args, game):
         config color on|off|16|256
         config combatgag on|off
         config combattags on|off
+        config combathints on|off
         config channel ooc <role>
         config prompt|alias|timeformat|whofull|whohide|…
     """
@@ -2173,6 +2245,28 @@ def cmd_config(character, args, game):
                 "Usage: config mapview atlas|minimap"
             )
         return
+    if key in ("mapzone", "map_zone", "mapzones"):
+        if not rest:
+            state = "on" if getattr(character, "mapzone_overlay", False) else "off"
+            character.session.send(
+                f"Map zone overlay is {state}. "
+                "Usage: config mapzone on|off "
+                "(nearby zone bearings under ASCII maps)"
+            )
+            return
+        choice = rest.split(None, 1)[0].lower()
+        if choice in ("on", "yes", "true", "1"):
+            character.mapzone_overlay = True
+            character.session.send(
+                "Map zone overlay on -- nearby zone bearings print under "
+                "ASCII maps on overland."
+            )
+        elif choice in ("off", "no", "false", "0"):
+            character.mapzone_overlay = False
+            character.session.send("Map zone overlay off.")
+        else:
+            character.session.send("Usage: config mapzone on|off")
+        return
     if key in ("maplook", "map_on_look"):
         # Embed local map inside look (default off -- short classic look).
         if not rest:
@@ -2323,6 +2417,30 @@ def cmd_config(character, args, game):
             )
         else:
             character.session.send("Usage: config combattags on|off")
+        return
+    if key in ("combathints", "combat_hints", "combathelp"):
+        if not rest:
+            state = "on" if display_prefs.wants_combat_hints(character) else "off"
+            character.session.send(
+                f"Combat hints are {state}. "
+                "Usage: config combathints on|off"
+            )
+            return
+        choice = rest.split(None, 1)[0].lower()
+        if choice in ("on", "yes", "true", "1"):
+            character.show_combat_hints = True
+            character.session.send(
+                "Combat hints on -- engage and knock-out lines include "
+                "clinic/lethal reminders."
+            )
+        elif choice in ("off", "no", "false", "0"):
+            character.show_combat_hints = False
+            character.session.send(
+                "Combat hints off -- shorter engage/KO lines without "
+                "repeat tutorial text."
+            )
+        else:
+            character.session.send("Usage: config combathints on|off")
         return
     if key == "items":
         sub = (rest or "").split(None, 1)
@@ -2480,35 +2598,68 @@ def cmd_config(character, args, game):
             character.session.send("Usage: config seeaccounts on|off")
         return
     if key == "channel":
-        # config channel ooc <role>
-        bits = rest.split(None, 1)
+        # config channel ooc|say <role>
+        bits = rest.split(None, 2)
         if not bits:
+            ooc_role = character.channel_colors.get("ooc", "ooc")
+            say_role = character.channel_colors.get("say", "say")
             character.session.send(
-                "Usage: config channel ooc <role>  "
-                "(roles: muted, ooc, alert, teal, gold, …)"
+                f"OOC channel role is {ooc_role}. "
+                f"Say channel role is {say_role}."
+            )
+            character.session.send(
+                "Usage: config channel ooc|say <role>  "
+                "(roles: muted, ooc, say, alert, teal, gold, …)"
             )
             return
         sub = bits[0].lower()
-        if sub != "ooc":
+        if sub not in ("ooc", "say"):
             character.session.send(
-                "Only channel 'ooc' is configurable today."
+                "Configurable channels: ooc, say. "
+                "Usage: config channel ooc|say <role>"
             )
             return
         if len(bits) < 2:
-            cur = character.channel_colors.get("ooc", "ooc")
+            cur = character.channel_colors.get(sub, sub)
             character.session.send(
-                f"OOC channel role is {cur}. "
-                "Usage: config channel ooc <role>"
+                f"{sub.upper()} channel role is {cur}. "
+                f"Usage: config channel {sub} <role>"
             )
             return
         role = bits[1].strip().lower()
         if role not in style.COLORS and role not in style.COLORS_XTERM256:
             character.session.send(
-                f"Unknown role '{role}'. Try muted, ooc, alert, teal."
+                f"Unknown role '{role}'. Try muted, ooc, say, alert, teal."
             )
             return
-        character.channel_colors["ooc"] = role
-        character.session.send(f"OOC channel color role set to {role}.")
+        character.channel_colors[sub] = role
+        character.session.send(f"{sub.upper()} channel color role set to {role}.")
+        return
+
+    if key in ("surname_alert", "surnamealert", "surname_reminder"):
+        if not rest:
+            state = "off" if character.suppress_surname_alert else "on"
+            character.session.send(
+                f"Surname login reminder is {state}. "
+                "Usage: config surname_alert on|off"
+            )
+            return
+        choice = rest.split(None, 1)[0].lower()
+        if choice in ("on", "yes", "true", "1"):
+            character.suppress_surname_alert = False
+            character.session.send(
+                "Surname reminder on -- you will be nudged when no surname "
+                "is on file (mortals only)."
+            )
+            return
+        if choice in ("off", "no", "false", "0"):
+            character.suppress_surname_alert = True
+            character.session.send(
+                "Surname reminder off -- no more login alerts about "
+                "missing surnames."
+            )
+            return
+        character.session.send("Usage: config surname_alert on|off")
         return
 
     # --- Forward to sibling preference verbs (same session messages) ----
@@ -2525,6 +2676,7 @@ def cmd_config(character, args, game):
         "whofull": "whofull",
         "whohide": "whohide",
         "combatnumbers": "combatnumbers",
+        "scoremeters": "scoremeters",
         "combatdiag": "combatdiag",
         "fightlog": "fightlog",
         "autoidle": "autoidle",
@@ -2593,6 +2745,9 @@ def _config_status_lines(character):
         f"  mapview: "
         f"{'atlas' if getattr(character, 'map_view_full', False) else 'minimap'}  "
         "-- config mapview atlas|minimap (bare map default)",
+        f"  mapzone: "
+        f"{'on' if getattr(character, 'mapzone_overlay', False) else 'off'}  "
+        "-- config mapzone on|off (zone bearings under ASCII map)",
         f"  exits: "
         f"{'verbose' if character.exits_verbose else 'compact'}  "
         "-- config exits compact|verbose",
@@ -2603,6 +2758,9 @@ def _config_status_lines(character):
         f"{'on' if character.combat_gag_other else 'off'}  "
         "-- config combatgag on|off",
         f"  combattags: {tags_state}  -- config combattags on|off",
+        f"  combathints: "
+        f"{'on' if display_prefs.wants_combat_hints(character) else 'off'}  "
+        "-- config combathints on|off (engage/KO tutorial lines)",
         f"  autokill: "
         f"{'on' if getattr(character, 'autokill', False) else 'off'}  "
         "-- config autokill on|off (dungeon fodder KO finish)",
@@ -2612,6 +2770,11 @@ def _config_status_lines(character):
         f"  autoloot dungeon: "
         f"{'on' if getattr(character, 'autoloot_dungeon', True) else 'off'}  "
         "-- config autoloot dungeon on|off",
+        f"  autoloot relics: "
+        f"{'on' if getattr(character, 'autoloot_relics', False) else 'off'}  "
+        "-- config autoloot relics on|off",
+        "  autoloot categories: bare autoloot lists weapons/armor/coins/… "
+        "-- config autoloot <category> on|off",
         f"  autosplit: "
         f"{'on' if getattr(character, 'autosplit', True) else 'off'}  "
         "-- config autosplit on|off (party coin/salvage split)",
@@ -2620,6 +2783,12 @@ def _config_status_lines(character):
         f"  combatnumbers: "
         f"{'on' if getattr(character, 'combat_numbers', False) else 'off'}  "
         "-- config combatnumbers on|off",
+        f"  scoremeters: "
+        f"{'on' if getattr(character, 'score_meters', True) else 'off'}  "
+        "-- config scoremeters on|off (gothic bars on score)",
+        f"  surname_alert: "
+        f"{'off' if getattr(character, 'suppress_surname_alert', False) else 'on'}  "
+        "-- config surname_alert on|off (mortals; silences no-surname login nag)",
         f"  combatdiag: "
         f"{'on' if getattr(character, 'combat_diag', False) else 'off'}  "
         "-- config combatdiag on|off",
@@ -2627,6 +2796,8 @@ def _config_status_lines(character):
         f"{'on' if getattr(character, 'fightlog_enabled', False) else 'off'}  "
         "-- config fightlog on|off (cinematic replay after fights)",
         f"  channel ooc: {ch}  -- config channel ooc <role>",
+        f"  channel say: {character.channel_colors.get('say', 'say')}  "
+        "-- config channel say <role>",
         "",
         "Account / OOC:",
         "  oocname: account|character  -- config oocname … "
@@ -3058,9 +3229,9 @@ def cmd_prompt(character, args, game):
         character.session.send("Prompt cleared.")
         return
     if lower == "default":
-        character.prompt_format = display_prefs.DEFAULT_PROMPT
+        display_prefs.apply_origin_default_prompt(character, force=True)
         character.session.send(
-            f"Prompt reset to default: {display_prefs.DEFAULT_PROMPT}"
+            f"Prompt reset to default: {character.prompt_format}"
         )
         return
     if len(raw) > display_prefs._MAX_PROMPT_LEN:
@@ -3810,7 +3981,7 @@ def deliver_changes_unread_on_login(character, game):
 
 def _changelog_detail_body(entry):
     """Full text for ``changes detail`` without repeating the timestamp."""
-    parts = list(entry.get("full") or [])
+    parts = list(_changelog_entry_full_lines(entry) or [])
     if parts:
         first = parts[0]
         bold = re.match(r"\*\*(.+?)\*\*(.*)$", first, re.DOTALL)
@@ -3826,6 +3997,50 @@ def _changelog_detail_body(entry):
             _id, _date, _sort_ts, remainder = _strip_changelog_stamps(first)
             parts[0] = _changelog_display_summary(remainder)
     return " ".join(parts).strip()
+
+
+def _changelog_entry_full_lines(entry, repo_root=None):
+    """Resolve ``full`` bullet lines for one index row (lazy v2 index)."""
+    full = entry.get("full")
+    if full:
+        return list(full)
+    root = repo_root or _changelog_repo_root()
+    slug = (entry.get("slug") or "").strip()
+    if slug:
+        frag_path = os.path.join(root, "CHANGELOG.d", f"{slug}.md")
+        try:
+            frag_entries = _parse_unreleased_entries(
+                _read_changelog_text(frag_path).splitlines(keepends=True),
+                fragment=True,
+                file_index_start=int(entry.get("file_index") or 0),
+                slug=slug,
+            )
+        except OSError:
+            frag_entries = []
+        want_ts = entry.get("sort_ts")
+        for frag_entry in frag_entries:
+            if want_ts and frag_entry.get("sort_ts") == want_ts:
+                return list(frag_entry.get("full") or [])
+        if len(frag_entries) == 1:
+            return list(frag_entries[0].get("full") or [])
+        if frag_entries:
+            return list(frag_entries[0].get("full") or [])
+    main_path = os.path.join(root, "CHANGELOG.md")
+    try:
+        main_entries = _parse_unreleased_entries(
+            _read_changelog_text(main_path).splitlines(keepends=True),
+            file_index_start=0,
+        )
+    except OSError:
+        return []
+    want_ts = entry.get("sort_ts")
+    want_index = entry.get("file_index")
+    for main_entry in main_entries:
+        if want_ts and main_entry.get("sort_ts") == want_ts:
+            return list(main_entry.get("full") or [])
+        if want_index is not None and main_entry.get("file_index") == want_index:
+            return list(main_entry.get("full") or [])
+    return []
 
 
 def cmd_changes(character, args, game):
@@ -4367,9 +4582,14 @@ def cmd_commands(character, args, game):
     # handler function itself. Sort each alias group and the final listing
     # alphabetically so 'commands' is easy to scan (bug #25).
     grouped = {}
+    hidden_handlers = set()
+    for _verb, (handler, help_text) in COMMANDS.items():
+        # Bare Magic / Hellcraft kit aliases stay dispatchable; advertise
+        # via cast / spells / ritual / help magic / help hellcraft.
+        if help_text.startswith("Magic:") or help_text.startswith("Occultist:"):
+            hidden_handlers.add(handler)
     for cmd_verb, (handler, _help_text) in COMMANDS.items():
-        # Bare Magic rite aliases stay dispatchable; advertise via cast/spells.
-        if _help_text.startswith("Magic: cast "):
+        if handler in hidden_handlers:
             continue
         grouped.setdefault(handler, []).append(cmd_verb)
 
@@ -4437,13 +4657,40 @@ def cmd_get(character, args, game):
             return
     if " from " in stripped:
         _left, _, _right = stripped.partition(" from ")
-        if _left.strip() in _BULK_TOKENS:
-            bag = hooks.containers_resolve_loot_bag(character, _right.strip())
-            if bag is not None:
-                ok, msg = hooks.containers_unstow_all_from_loot_bag(
-                    character, loot_bag=bag,
+        bag = hooks.containers_resolve_loot_bag(character, _right.strip())
+        if bag is not None:
+            bulk_tok, frag = parse_bulk_item_query(_left.strip())
+            if bulk_tok:
+                if not frag:
+                    ok, msg = hooks.containers_unstow_all_from_loot_bag(
+                        character, loot_bag=bag,
+                    )
+                    character.session.send(msg)
+                    return
+                names = []
+                while len(names) < 200:
+                    taken = hooks.containers_find_in_loot_bag(
+                        character, frag, loot_bag=bag,
+                    )
+                    if taken is None:
+                        break
+                    ok, msg = hooks.containers_unstow_from_loot_bag(
+                        character, taken, loot_bag=bag,
+                    )
+                    if not ok:
+                        if not names:
+                            character.session.send(msg)
+                            return
+                        break
+                    names.append(taken.key)
+                if not names:
+                    character.session.send(
+                        f"You don't find that in {bag.key}."
+                    )
+                    return
+                character.session.send(
+                    f"You pull from {bag.key}: " + ", ".join(names) + "."
                 )
-                character.session.send(msg)
                 return
 
     # `get <item> from <backpack>` -- before body nested loot (#49).
@@ -4517,21 +4764,75 @@ def cmd_get(character, args, game):
     # Only consider Items in the room (skip other characters).
     items_here = [o for o in room.contents if isinstance(o, Item)]
 
-    # `get all` / `get *` / `get everything` -- scoop every pocketable item
+    # `get all.sword backpack` / `get <item> backpack` shorthand -- last word
+    # names a loot bag. Must run before floor ``all.thing`` so the bag is
+    # not treated as part of the name fragment.
+    parts = args.rsplit(None, 1)
+    if len(parts) == 2:
+        item_query, container_query = parts[0].strip(), parts[1].strip()
+        bag = hooks.containers_resolve_loot_bag(character, container_query)
+        if bag is not None and item_query:
+            bulk_tok, frag = parse_bulk_item_query(item_query)
+            if bulk_tok:
+                if not frag:
+                    ok, msg = hooks.containers_unstow_all_from_loot_bag(
+                        character, loot_bag=bag,
+                    )
+                    character.session.send(msg)
+                    return
+                names = []
+                while len(names) < 200:
+                    taken = hooks.containers_find_in_loot_bag(
+                        character, frag, loot_bag=bag,
+                    )
+                    if taken is None:
+                        break
+                    ok, msg = hooks.containers_unstow_from_loot_bag(
+                        character, taken, loot_bag=bag,
+                    )
+                    if not ok:
+                        if not names:
+                            character.session.send(msg)
+                            return
+                        break
+                    names.append(taken.key)
+                if not names:
+                    character.session.send(
+                        f"You don't find that in {bag.key}."
+                    )
+                    return
+                character.session.send(
+                    f"You pull from {bag.key}: " + ", ".join(names) + "."
+                )
+                return
+            taken = hooks.containers_find_in_loot_bag(
+                character, item_query, loot_bag=bag,
+            )
+            if taken is not None:
+                ok, msg = hooks.containers_unstow_from_loot_bag(
+                    character, taken, loot_bag=bag,
+                )
+                character.session.send(msg)
+                return
+
+    # `get all` / `get all.sword` / `get *` -- scoop matching pocketable items
     # on the floor. Bodies stay for `drag`; furniture stays put (beds, etc.).
-    # Exact token only so a named item containing "all" still matches via
-    # the single-item path below.
-    if args.strip().lower() in ("all", "*", "everything"):
+    bulk_tok, frag = parse_bulk_item_query(args.strip())
+    if bulk_tok:
         from engine import hooks
         takeable = [
             o for o in items_here
             if not getattr(o, "is_body", False)
             and not getattr(o, "furniture", False)
         ]
+        if frag:
+            takeable = _collect_item_matches(frag, takeable)
         if not takeable:
-            character.session.send("There's nothing here you can pick up.")
+            if frag:
+                character.session.send("You don't see that here.")
+            else:
+                character.session.send("There's nothing here you can pick up.")
             return
-        # Snapshot first: room.remove mutates contents while we iterate.
         names = []
         stow_msgs = []
         for item in list(takeable):
@@ -4544,30 +4845,22 @@ def cmd_get(character, args, game):
             names.append(item.key)
             if stow_msg:
                 stow_msgs.append(stow_msg)
+        if not names:
+            return
         character.session.send("You pick up: " + ", ".join(names) + ".")
         for msg in stow_msgs:
             character.session.send(msg)
-        room.broadcast(
-            f"{_presence_face(character)} scoops up everything on the ground.",
-            exclude=character,
-        )
-        return
-
-    # `get <item> backpack` shorthand when the last word names a loot bag.
-    parts = args.rsplit(None, 1)
-    if len(parts) == 2:
-        item_query, container_query = parts[0].strip(), parts[1].strip()
-        bag = hooks.containers_resolve_loot_bag(character, container_query)
-        if bag is not None and item_query:
-            taken = hooks.containers_find_in_loot_bag(
-                character, item_query, loot_bag=bag,
+        if frag:
+            room.broadcast(
+                f"{_presence_face(character)} scoops up matching items.",
+                exclude=character,
             )
-            if taken is not None:
-                ok, msg = hooks.containers_unstow_from_loot_bag(
-                    character, taken, loot_bag=bag,
-                )
-                character.session.send(msg)
-                return
+        else:
+            room.broadcast(
+                f"{_presence_face(character)} scoops up everything on the ground.",
+                exclude=character,
+            )
+        return
 
     item = _find_item(args, items_here)
     if not item:
@@ -4626,21 +4919,29 @@ def cmd_drop(character, args, game):
         )
         return
 
-    # `drop all` / `drop *` / `drop everything` -- dump every carried item
-    # onto the floor. Exact token only so a named item containing "all"
-    # still matches via the single-item path below. Items that refuse
-    # (loaners, etc.) stay in inventory and get a separate line.
-    if args.strip().lower() in ("all", "*", "everything"):
+    # Bulk drop: ``all`` / ``*`` / ``everything``, plus Classic ``all.thing``
+    # / ``all thing`` name matching (bug reports 469 and 491).
+    bulk_tok, frag = parse_bulk_item_query(args.strip())
+    if bulk_tok is not None:
         inv = list(getattr(character, "inventory", None) or [])
-        if not inv:
-            character.session.send("You aren't carrying anything.")
-            return
+        if frag:
+            targets = _collect_item_matches(frag, inv)
+            if not targets:
+                character.session.send("You aren't carrying that.")
+                return
+        else:
+            if not inv:
+                character.session.send("You aren't carrying anything.")
+                return
+            targets = inv
         dropped = []
         refused = []
-        for item in inv:
+        for item in list(targets):
             refuse = item_drop_refusal(character, item)
             if refuse:
                 refused.append((item.key, refuse))
+                continue
+            if item not in character.inventory:
                 continue
             character.inventory.remove(item)
             character.location.add(item)
@@ -4649,10 +4950,16 @@ def cmd_drop(character, args, game):
             dropped.append(item.key)
         if dropped:
             character.session.send("You drop: " + ", ".join(dropped) + ".")
-            character.location.broadcast(
-                f"{_presence_face(character)} drops everything they can.",
-                exclude=character,
-            )
+            if frag:
+                character.location.broadcast(
+                    f"{_presence_face(character)} drops several things.",
+                    exclude=character,
+                )
+            else:
+                character.location.broadcast(
+                    f"{_presence_face(character)} drops everything they can.",
+                    exclude=character,
+                )
         else:
             character.session.send("You can't drop anything you're carrying.")
         for name, reason in refused:
@@ -4819,13 +5126,11 @@ def cmd_open(character, args, game):
         character.session.send("Open what?")
         return
 
-    # Inventory first: only Items count; prefer a locked container when
-    # several keys match (e.g. two "strongbox" Items in the same pile).
-    item = _find_item_prefer_locked(
-        args, [o for o in character.inventory if isinstance(o, Item)],
-        character=character,
-    )
-    holder = character.inventory
+    # Carried first (open inv, loot backpack, gear bag) -- then room floor.
+    # Prefer a locked container when several keys match (bug report 21).
+    from command_support import _find_carried_item_prefer_locked
+
+    item, holder = _find_carried_item_prefer_locked(character, args)
     if not item:
         item = _find_item_prefer_locked(
             args, [o for o in character.location.contents if isinstance(o, Item)]
@@ -5144,7 +5449,8 @@ def _report_history(character):
     if entries:
         last_line = entries[-1][0].strip().lower()
         if last_line.startswith("bug ") or last_line.startswith("suggest ") \
-                or last_line in ("bug", "suggest"):
+                or last_line.startswith("typo ") \
+                or last_line in ("bug", "suggest", "typo"):
             entries = entries[:-1]
     # Defense in depth: redact any setpass lines that predate storage redaction.
     from engine.connection import history_line_for_storage
@@ -5227,6 +5533,16 @@ def cmd_suggest(character, args, game):
     """
     from engine import reports
     _file_or_capture_report(character, args, game, reports.SUGGEST, "suggestion")
+
+
+def cmd_typo(character, args, game):
+    """Log a copy typo to typos.log -- not a crash, not a feature idea.
+
+    Same one-line / paste-capture UX as suggest. Staff prioritize these
+    separately from bugs (idea 194).
+    """
+    from engine import reports
+    _file_or_capture_report(character, args, game, reports.TYPO, "typo")
 
 
 def cmd_helpsubmit(character, args, game):
@@ -5452,6 +5768,16 @@ def cmd_ideas(character, args, game):
     )
 
 
+def cmd_typos(character, args, game):
+    """List typo reports this character filed that are still open."""
+    from engine import reports
+    _cmd_my_reports(
+        character, args, game, reports.TYPO,
+        noun="typo reports", file_verb="typo", cmd_name="typos",
+        title="YOUR TYPOS",
+    )
+
+
 def _reports_section(header, label, entries, game=None):
     """Build the lines for one 'reports' section (all bugs, or all ideas).
 
@@ -5504,7 +5830,7 @@ def cmd_reports(character, args, game):
         cmd_report_show(character, raw[5:].strip(), game)
         return
 
-    usage = "Usage: reports [n] [all]  |  reports show <bug|suggest|help> <id>"
+    usage = "Usage: reports [n] [all]  |  reports show <bug|suggest|help|typo> <id>"
     n = 5
     show_all = False
     for token in args.split():
@@ -5530,6 +5856,7 @@ def cmd_reports(character, args, game):
     all_help_ideas = reports.recent(
         reports.HELP, None, directory=game.report_dir
     )
+    all_typos = reports.recent(reports.TYPO, None, directory=game.report_dir)
     if not show_all:
         all_bugs = [e for e in all_bugs if e.get("status", "open") == "open"]
         all_suggestions = [
@@ -5538,11 +5865,13 @@ def cmd_reports(character, args, game):
         all_help_ideas = [
             e for e in all_help_ideas if e.get("status", "open") == "open"
         ]
+        all_typos = [e for e in all_typos if e.get("status", "open") == "open"]
     bugs = all_bugs[-n:]
     suggestions = all_suggestions[-n:]
     help_ideas = all_help_ideas[-n:]
+    typos = all_typos[-n:]
 
-    if not bugs and not suggestions and not help_ideas:
+    if not bugs and not suggestions and not help_ideas and not typos:
         character.session.send(
             "No open reports."
             if not show_all
@@ -5558,6 +5887,8 @@ def cmd_reports(character, args, game):
     body += _reports_section("Bugs:", "BUG", bugs, game=game)
     body.append(style.wrought_rule(48))
     body += _reports_section("Ideas:", "IDEA", suggestions, game=game)
+    body.append(style.wrought_rule(48))
+    body += _reports_section("Typos:", "TYPO", typos, game=game)
     body.append(style.wrought_rule(48))
     body += _reports_section("Help ideas:", "HELP", help_ideas, game=game)
     lines = style.format_sheet(
@@ -5580,7 +5911,7 @@ def cmd_report_show(character, args, game):
         return
 
     usage = (
-        "Usage: reports show <bug|suggest|help> <id>  "
+        "Usage: reports show <bug|suggest|help|typo> <id>  "
         "(see help gm-reports)"
     )
     parts = (args or "").split()
@@ -5632,7 +5963,7 @@ def cmd_resolve(character, args, game):
         return
 
     usage = (
-        "Usage: resolve <bug|suggest|help> <id> [open|resolved|rejected] "
+        "Usage: resolve <bug|suggest|help|typo> <id> [open|resolved|rejected] "
         "(default: resolved)"
     )
     parts = args.split()

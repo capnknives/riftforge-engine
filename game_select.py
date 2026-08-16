@@ -107,11 +107,16 @@ def register_all_hooks():
 
 
 def reregister_blob_codec():
-    """Re-wire critical hooks after ``importlib.reload(engine.hooks)``.
+    """Re-wire persist/load hooks after ``importlib.reload(engine.hooks)``.
 
     Copyover reloads hooks before persistence; that clears bootstrap
     callbacks. Must run before ``game.save(copyover=True)``. Restores
     blob codec plus character attacher (and SUPERS Game meta).
+
+    **Not sufficient alone** for a live game process: gameplay hooks
+    (``can_see_in_dark``, chargen, combat, move gates, dispatch, …) stay
+    ``None`` until ``register_all_hooks``. Call ``reregister_hooks_after_reload``
+    from copyover paths instead of this helper directly.
     """
     name = _resolve()
     if name == "supers":
@@ -128,13 +133,24 @@ def reregister_blob_codec():
         hooks.reload_blob_codec()
 
 
-def restore_hooks_after_copyover_abort():
-    """Full ``register_all_hooks`` after a refused copyover save.
+def reregister_hooks_after_reload():
+    """Restore **all** game hooks after ``importlib.reload(engine.hooks)``.
 
-    ``reload_world_save_modules`` clears every bootstrap callback. The light
-    ``reregister_blob_codec`` path may still leave combat/chargen/help hooks
-    empty when we abort without ``os._exit``. Re-running full registration
-    keeps the live process playable until the next real restart.
+    Copyover and any in-process reload must call this (not
+    ``reregister_blob_codec`` alone) so staff GM night-sight, Monster dark
+    vision, chargen, combat, and dispatch keep working if save/exit stalls.
+    Idempotent.
+    """
+    reregister_blob_codec()
+    register_all_hooks()
+
+
+def restore_hooks_after_copyover_abort():
+    """Full hook restore after a refused copyover save or execv failure.
+
+    ``reload_world_save_modules`` clears every bootstrap callback. Prefer
+    ``reregister_hooks_after_reload`` on the happy path; this alias exists
+    for abort / failure recovery call sites.
     """
     register_all_hooks()
 

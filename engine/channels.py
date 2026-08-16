@@ -862,6 +862,7 @@ register_channel(
         builtin=True,
         gateway_stitch=False,
         format=FORMAT_SAY,
+        color_role="say",
         title="say",
     )
 )

@@ -77,6 +77,14 @@ _SECONDARY_ROOM_TOKENS = frozenset({
     "overflow", "corridor", "entryway", "foyer",
 })
 
+# Motel unit codes / plane interiors -- not player-facing run targets.
+_LODGING_UNIT_RE = re.compile(r"^b\d+[a-z]$", re.I)
+_VEHICLE_INTERIOR_RE = re.compile(r"^\d+\s+(cabin|cargo|cockpit)$", re.I)
+_LIST_NOISE_LABELS = frozenset({
+    "approach", "apron", "access spur", "bend north", "backroom",
+    "apparatus bay", "bar floor", "car", "ride", "truck", "vehicle",
+})
+
 
 def normalize_pace(raw):
     """Return a valid travel pace id (default walk)."""
@@ -138,6 +146,12 @@ def _token_is_noisy(token):
     if not token:
         return True
     if _is_vnum_token(token):
+        return True
+    if token in _LIST_NOISE_LABELS:
+        return True
+    if _LODGING_UNIT_RE.match(token):
+        return True
+    if _VEHICLE_INTERIOR_RE.match(token):
         return True
     return bool(_NOISY_LAST_WORD.match(token))
 
@@ -551,6 +565,108 @@ def path_hop_count(start, dest, actor=None, game=None, max_nodes=600):
     ).get(dest_key)
 
 
+def _topo_neighbors(room, game):
+    """Graph neighbors for distance planning (ignores actor passability)."""
+    if room is None:
+        return []
+    out = []
+    seen = set()
+    for neighbor in (room.exits or {}).values():
+        if neighbor is None:
+            continue
+        key = getattr(neighbor, "key", None)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(neighbor)
+    entries = getattr(room, "zone_entries", None) or {}
+    for hub in entries.values():
+        if hub is None:
+            continue
+        key = getattr(hub, "key", None)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(hub)
+    exit_to = getattr(room, "zone_exit_to", None)
+    if exit_to is not None:
+        key = getattr(exit_to, "key", None)
+        if key and key not in seen:
+            out.append(exit_to)
+    return out
+
+
+def _topo_distances_from(start, game, *, max_nodes=800):
+    """Hop counts on the settlement graph (no actor gates)."""
+    if start is None:
+        return {}
+    seen = {start}
+    queue = deque([(start, 0)])
+    distances = {start.key: 0}
+    expanded = 0
+    while queue:
+        room, dist = queue.popleft()
+        expanded += 1
+        if expanded > max_nodes:
+            break
+        next_dist = dist + 1
+        for neighbor in _topo_neighbors(room, game):
+            if neighbor in seen:
+                continue
+            seen.add(neighbor)
+            distances[neighbor.key] = next_dist
+            queue.append((neighbor, next_dist))
+    return distances
+
+
+def nearest_reachable_toward(start, dest, actor=None, game=None, max_nodes=600):
+    """When ``dest`` is blocked, return the closest reachable room toward it.
+
+    Returns ``(frontier_room, None)`` or ``(None, None)`` when no partial
+    path exists (caller should fall back to the usual refuse line).
+    """
+    if start is None or dest is None:
+        return None, None
+    dest_key = getattr(dest, "key", None)
+    if not dest_key:
+        return None, None
+    if start is dest or start.key == dest_key:
+        return dest, None
+    if path_hop_count(start, dest, actor=actor, game=game, max_nodes=max_nodes) is not None:
+        return dest, None
+
+    reachable = path_hop_distances_from(
+        start, actor=actor, game=game, max_nodes=max_nodes,
+    )
+    if dest_key in reachable:
+        return dest, None
+
+    topo = _topo_distances_from(dest, game, max_nodes=max_nodes)
+    dest_dist = topo.get(dest_key)
+    if dest_dist is None:
+        return None, None
+
+    best_key = None
+    best_dist = None
+    for key, _hop in reachable.items():
+        d = topo.get(key)
+        if d is None:
+            continue
+        if best_dist is None or d < best_dist:
+            best_dist = d
+            best_key = key
+    if not best_key or best_key == start.key:
+        return None, None
+    if best_key == dest_key:
+        return dest, None
+
+    rooms = getattr(game, "rooms", None) or {}
+    frontier = rooms.get(best_key)
+    if frontier is None:
+        return None, None
+    return frontier, None
+
+
 def get_walk_focus(actor):
     """Return the live paced-walk focus dict, or None."""
     focus = getattr(actor, "walk_focus", None)
@@ -598,7 +714,8 @@ def format_walk_focus_status(actor, game=None):
 
 
 def _stamp_walk_focus(actor, game, *, mode, dest_label, dest_room_key=None,
-                      overland_macro=None, enter_alias=None, pace="walk"):
+                      overland_macro=None, enter_alias=None, pace="walk",
+                      arrival_notice=None, intended_label=None):
     """Replace walk_focus with a fresh paced journey stamp."""
     tick = 0
     if game is not None:
@@ -607,6 +724,7 @@ def _stamp_walk_focus(actor, game, *, mode, dest_label, dest_room_key=None,
         "mode": mode,
         "dest_room_key": dest_room_key,
         "dest_label": dest_label,
+        "intended_label": intended_label or dest_label,
         "overland_macro": (
             list(overland_macro) if overland_macro is not None else None
         ),
@@ -615,6 +733,7 @@ def _stamp_walk_focus(actor, game, *, mode, dest_label, dest_room_key=None,
         "started_tick": tick,
         "last_step_tick": tick,
         "steps": 0,
+        "arrival_notice": arrival_notice,
     }
     actor.walk_focus = focus
     return focus
@@ -692,7 +811,8 @@ def step_toward_room(actor, dest, game, *, mode="player", quiet=True):
 
 
 def start_paced_walk(character, dest_room, game, *, label=None, pace="walk",
-                     engaged_check=None, in_vehicle_check=None):
+                     engaged_check=None, in_vehicle_check=None,
+                     arrival_notice=None, intended_label=None):
     """Begin (or replace) a paced walk to ``dest_room``; take one hop now."""
     from engine import group as group_mod
 
@@ -716,14 +836,17 @@ def start_paced_walk(character, dest_room, game, *, label=None, pace="walk",
         return "You're asleep -- type 'wake' before you can move."
 
     dest_label = label or _player_walk_room_label(dest_room)
+    intended = intended_label or dest_label
     _stamp_walk_focus(
         character, game,
         mode="room",
         dest_label=dest_label,
         dest_room_key=dest_room.key,
         pace=pace,
+        arrival_notice=arrival_notice,
+        intended_label=intended,
     )
-    _send(character, f"{pace_gerund(pace)} toward {dest_label}...")
+    _send(character, f"{pace_gerund(pace)} toward {intended}...")
     before = character.location
     moved = step_toward_room(
         character, dest_room, game, mode="player", quiet=True,
@@ -777,7 +900,13 @@ def _advance_room_walk(character, game, focus, engaged_check=None):
         clear_walk_focus(character)
         from engine.verbs.basic import cmd_look
 
-        _send(character, f"You arrive at {label}.")
+        notice = focus.get("arrival_notice")
+        intended = focus.get("intended_label") or label
+        if notice:
+            _send(character, f"You arrive near {intended}.")
+            _send(character, notice)
+        else:
+            _send(character, f"You arrive at {label}.")
         cmd_look(character, "", game, after_move=True)
         return False
     if engaged_check is not None and engaged_check(character):
@@ -815,7 +944,13 @@ def _advance_room_walk(character, game, focus, engaged_check=None):
         clear_walk_focus(character)
         from engine.verbs.basic import cmd_look
 
-        _send(character, f"You arrive at {label}.")
+        notice = focus.get("arrival_notice")
+        intended = focus.get("intended_label") or label
+        if notice:
+            _send(character, f"You arrive near {intended}.")
+            _send(character, notice)
+        else:
+            _send(character, f"You arrive at {label}.")
         cmd_look(character, "", game, after_move=True)
         return False
     if not moved or character.location is before:

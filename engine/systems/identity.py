@@ -30,6 +30,8 @@ class ForgedId:
     forged_name: str
     forged_home: str
     appearance_hash: str | None = None
+    forged_address: str | None = None
+    portrait_desc: str | None = None
     expires_tick: int | None = None
     burned: bool = False
 
@@ -41,7 +43,42 @@ class VerifyResult:
     reason: str | None = None
 
 
-_APPEARANCE_SLOTS = ("height", "physique", "hair", "eyes", "skin")
+# Core body slots used for federal photo-hash checks (not clothing).
+from engine.systems.appearance import CORE_SLOTS as _APPEARANCE_SLOTS
+
+REGISTRATION_ADDRESS_MAX = 80
+
+ZONE_COUNTY_LABEL = {
+    "lebanon": "Lebanon, KS",
+    "lawrence": "Lawrence, KS",
+}
+
+
+def normalize_registration_address(text) -> str | None:
+    """Clean a player-typed registration / mailing address for IDs."""
+    if text is None:
+        return None
+    cleaned = " ".join(str(text).split())
+    if not cleaned:
+        return None
+    if len(cleaned) > REGISTRATION_ADDRESS_MAX:
+        return None
+    low = cleaned.lower()
+    if low in (
+        "transient",
+        "none",
+        "no address",
+        "no fixed address",
+        "no fixed home",
+    ):
+        return "Transient (no fixed address)"
+    return cleaned
+
+
+def zone_county_label(home_zone: str | None) -> str:
+    """Player-facing county line for Kansas IDs."""
+    zone = str(home_zone or "lebanon").strip().lower()
+    return ZONE_COUNTY_LABEL.get(zone, "Kansas")
 
 
 def appearance_hash(character) -> str:
@@ -52,6 +89,61 @@ def appearance_hash(character) -> str:
         parts.append(f"{slot}={appearance.get(slot, '')}")
     blob = "|".join(parts)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def format_id_card_lines(
+    *,
+    card_kind: str,
+    portrait_desc: str | None,
+    name_line: str | None,
+    address_line: str | None,
+    id_number: str | None,
+    tier: int | None = None,
+    screenreader: bool = False,
+    card_title: str | None = None,
+) -> list[str]:
+    """Immersive state ID layout for look / showid / wallet examine.
+
+    ``name_line`` is omitted when the viewer has not learned the holder's
+    name (legal IDs). Forged cards always print the forged name on the doc.
+    """
+    if card_title:
+        title = card_title
+    elif card_kind == "forged":
+        title = "Forged Kansas ID"
+        if tier is not None and int(tier) > 0:
+            title = f"Tier {int(tier)} forged Kansas ID"
+    else:
+        title = "Kansas driver's license"
+
+    portrait = (portrait_desc or "").strip() or "a blurred laminate portrait"
+    addr = (address_line or "").strip() or "Address not listed"
+    number = (id_number or "").strip()
+
+    if screenreader:
+        lines = [f"[ID] {title}"]
+        lines.append(f"[PHOTO] {portrait}")
+        if name_line:
+            lines.append(f"[NAME] {name_line}")
+        lines.append(f"[ADDRESS] {addr}")
+        if number:
+            lines.append(f"[ID#] {number}")
+        if tier is not None and int(tier) > 0 and card_kind == "forged":
+            lines.append(f"[TIER] {int(tier)}")
+        return lines
+
+    from engine import style
+
+    lines = [style.paint("gold", title)]
+    lines.append(f"Photo: {portrait}")
+    if name_line:
+        lines.append(f"Name: {name_line}")
+    lines.append(f"Address: {addr}")
+    if number:
+        lines.append(f"ID#: {number}")
+    if tier is not None and int(tier) > 0 and card_kind == "forged":
+        lines.append(f"Seal: tier {int(tier)}")
+    return lines
 
 
 def _doc_tier(doc: Any) -> int:
@@ -95,6 +187,8 @@ def verify_id(viewer, subject, doc, *, context: str = "local", game=None) -> Ver
     subj_key = getattr(subject, "key", None)
     if subj_key and subj_key in known:
         return VerifyResult(ok=False, pierced=True, reason="known_face")
+    if hooks_mod.identity_pierce_supernatural(viewer, subject):
+        return VerifyResult(ok=False, pierced=True, reason="supernatural_pierce")
     tier = _doc_tier(doc)
     if context == "federal_db":
         if tier < 4:

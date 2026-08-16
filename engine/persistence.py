@@ -185,6 +185,16 @@ def _resolve_saved_room(game, room_key, character_name):
     demesne_room = hooks.demesne_resolve_room_key(game, room_key)
     if demesne_room is not None:
         return demesne_room
+    from engine.systems.overland import resolve_wilderness_saved_room_key
+
+    wild_room = resolve_wilderness_saved_room_key(game, room_key)
+    if wild_room is not None:
+        return wild_room
+    from engine.systems.mine_rooms import resolve_mine_saved_room_key
+
+    mine_room = resolve_mine_saved_room_key(game, room_key)
+    if mine_room is not None:
+        return mine_room
     print(
         f"[persistence] saved room {room_key!r} missing for "
         f"{character_name!r} -- keeping a stub so they are not dumped "
@@ -236,10 +246,9 @@ def heal_map_missing_stub_occupants(game):
     """Boot heal: move bodies off persistence ``map_missing_stub`` rooms.
 
     ``_resolve_saved_room`` can register a thin stub when the saved
-    ``room_key`` is absent from map JSON at load. Vehicle ensure and pit
-    reaping replace many of those keys later in boot, but stale DB rows
-    (old Purgatory pits, removed vehicle interiors, …) can still leave
-    Echoes/NPCs on stubs every restart until their ``room_key`` is healed.
+    ``room_key`` is absent from map JSON at load. Wilderness foot keys
+    (``Wilderness (mx,my)/ux,uy``) are re-bound via ``place_on_overland``
+    when possible before falling back to home / start relocation.
     """
     if game is None:
         return 0
@@ -249,14 +258,24 @@ def heal_map_missing_stub_occupants(game):
     roster = getattr(game, "characters", None) or []
     if isinstance(roster, dict):
         roster = roster.values()
+    from engine.systems.overland import parse_wilderness_room_key, place_on_overland
+
     for character in list(roster):
         loc = getattr(character, "location", None)
         if loc is None or not getattr(loc, "map_missing_stub", False):
             continue
+        stub_key = getattr(loc, "key", None) or ""
+        parsed = parse_wilderness_room_key(stub_key)
+        if parsed is not None and place_on_overland(
+            character, game, parsed[0], parsed[1],
+        ):
+            moved += 1
+            if stub_key and stub_key not in emptied_stub_keys:
+                emptied_stub_keys.append(stub_key)
+            continue
         dest = _safe_relocation_room(game, character)
         if dest is None:
             continue
-        stub_key = getattr(loc, "key", None)
         try:
             character.move_to(dest)
         except Exception:
@@ -1872,6 +1891,22 @@ def _restore_bag_fields(item, state):
     item.wallet_contents = wallet_restored
 
 
+def _restore_body_harvest_fields(item, state):
+    """Re-apply corpse harvest flags + Origin stamps from a container blob."""
+    if state.get("body_harvested_meat"):
+        item.body_harvested_meat = True
+    if state.get("body_drained"):
+        item.body_drained = True
+    if state.get("body_siphoned"):
+        item.body_siphoned = True
+    if state.get("body_dmb_drawn"):
+        item.body_dmb_drawn = True
+    if state.get("body_origin"):
+        item.body_origin = str(state["body_origin"]).strip().lower()
+    if state.get("body_path"):
+        item.body_path = str(state["body_path"]).strip().lower()
+
+
 def _item_container_blob(item):
     """JSON for the items.container column: an Item's locked/loot state (a
     dungeon lockbox's whole reward, world.make_lockbox), same reasoning as
@@ -1919,10 +1954,16 @@ def _item_container_blob(item):
         ),
         "cloth_material": getattr(item, "cloth_material", None),
         "warmth": getattr(item, "warmth", None),
-        "cover": list(getattr(item, "cover", None) or [])
-        if getattr(item, "cover", None) else None,
-        "conceal": list(getattr(item, "conceal", None) or [])
-        if getattr(item, "conceal", None) else None,
+        "cover": (
+            [str(c).strip().lower() for c in item.cover if c]
+            if isinstance(getattr(item, "cover", None), list)
+            else None
+        ),
+        "conceal": (
+            [str(c).strip().lower() for c in item.conceal if c]
+            if isinstance(getattr(item, "conceal", None), list)
+            else None
+        ),
         "dirty": bool(getattr(item, "dirty", False))
         if hasattr(item, "dirty") else None,
         # Home grocery stock window (fridge furniture); None / absent = empty.
@@ -1933,6 +1974,13 @@ def _item_container_blob(item):
         ),
         # Corpse floor age (Wendigo larder stock gate); absent = unstamped.
         "body_dropped_tick": getattr(item, "body_dropped_tick", None),
+        # Corpse harvest flags (supers/scavenge.py) -- one take each.
+        "body_harvested_meat": bool(getattr(item, "body_harvested_meat", False)),
+        "body_drained": bool(getattr(item, "body_drained", False)),
+        "body_siphoned": bool(getattr(item, "body_siphoned", False)),
+        "body_dmb_drawn": bool(getattr(item, "body_dmb_drawn", False)),
+        "body_origin": getattr(item, "body_origin", None),
+        "body_path": getattr(item, "body_path", None),
         # Abandoned floor loot grace (Cadence scavengers); absent = legacy pile.
         "floor_dropped_tick": getattr(item, "floor_dropped_tick", None),
         # Beneath Lucifer's Cage TTL; absent = stamp on next vault decay tick.
@@ -1967,6 +2015,9 @@ def _item_container_blob(item):
         ),
         "loaded_ammo_id": getattr(item, "loaded_ammo_id", None),
         "ammo_kind": getattr(item, "ammo_kind", None),
+        "dmb_coated": bool(getattr(item, "dmb_coated", False)),
+        "lambs_blood_coated": bool(getattr(item, "lambs_blood_coated", False)),
+        "dmb_spiked": bool(getattr(item, "dmb_spiked", False)),
         "stack_charges": (
             int(item.stack_charges)
             if getattr(item, "stack_charges", None) is not None
@@ -3120,6 +3171,7 @@ def load_world(conn, game):
                 item.body_dropped_tick = int(state["body_dropped_tick"])
             except (TypeError, ValueError):
                 pass
+        _restore_body_harvest_fields(item, state)
         # Abandoned floor loot grace / vault TTL (supers.floor_loot).
         if state.get("floor_dropped_tick") is not None:
             try:
@@ -3171,6 +3223,12 @@ def load_world(conn, game):
             item.loaded_ammo_id = str(state["loaded_ammo_id"]).strip()
         if state.get("ammo_kind"):
             item.ammo_kind = str(state["ammo_kind"]).strip().lower()
+        if state.get("dmb_coated"):
+            item.dmb_coated = True
+        if state.get("lambs_blood_coated"):
+            item.lambs_blood_coated = True
+        if state.get("dmb_spiked"):
+            item.dmb_spiked = True
         if state.get("stack_charges") is not None:
             try:
                 item.stack_charges = int(state["stack_charges"])
@@ -3404,6 +3462,7 @@ def item_from_saved_container(key, description, container):
             item.body_dropped_tick = int(state["body_dropped_tick"])
         except (TypeError, ValueError):
             pass
+    _restore_body_harvest_fields(item, state)
     if state.get("floor_dropped_tick") is not None:
         try:
             item.floor_dropped_tick = int(state["floor_dropped_tick"])
@@ -3423,9 +3482,33 @@ def item_from_saved_container(key, description, container):
         item.furniture = True
     if state.get("is_ethereal"):
         item.is_ethereal = True
+    if state.get("ammo_charges") is not None:
+        try:
+            item.ammo_charges = int(state["ammo_charges"])
+        except (TypeError, ValueError):
+            pass
+    if state.get("max_ammo") is not None:
+        try:
+            item.max_ammo = int(state["max_ammo"])
+        except (TypeError, ValueError):
+            pass
+    if state.get("loaded_ammo_id"):
+        item.loaded_ammo_id = str(state["loaded_ammo_id"]).strip()
+    if state.get("ammo_kind"):
+        item.ammo_kind = str(state["ammo_kind"]).strip().lower()
+    if state.get("stack_charges") is not None:
+        try:
+            item.stack_charges = int(state["stack_charges"])
+        except (TypeError, ValueError):
+            pass
+    if state.get("weapon_voice"):
+        item.weapon_voice = str(state["weapon_voice"]).strip().lower()
+    if state.get("artifact_lexicon"):
+        item.artifact_lexicon = str(state["artifact_lexicon"]).strip()
     _restore_relic_fields(item, state)
     _restore_pit_mimic_fields(item, state)
     _restore_on_use_fields(item, state)
+    _restore_herb_fields(item, state)
     _restore_bag_fields(item, state)
     upgrade_legacy_container(item)
     return item

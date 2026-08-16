@@ -1046,15 +1046,29 @@ def heal_persisted_room_key_blobs(game) -> dict:
 
     shops = getattr(game, "player_shops", None)
     if isinstance(shops, dict):
+        rooms = getattr(game, "rooms", None) or {}
+
+        def _civic_zone(owner_key):
+            owner = str(owner_key or "")
+            if owner.startswith("@civic:"):
+                return owner[7:]
+            return None
+
         for shop in shops.values():
             if not isinstance(shop, dict):
                 continue
+            want_zone = _civic_zone(shop.get("owner_key"))
             for field in ("host_room_key", "hub_room_key"):
                 raw = shop.get(field)
                 new, ch = _remap(raw)
-                if ch:
-                    shop[field] = new
-                    stats["player_shops"] += 1
+                if not ch:
+                    continue
+                if want_zone:
+                    target = rooms.get(new)
+                    if target is not None and (getattr(target, "zone", None) or "") != want_zone:
+                        continue
+                shop[field] = new
+                stats["player_shops"] += 1
 
     towns = getattr(game, "townships", None)
     if isinstance(towns, dict):

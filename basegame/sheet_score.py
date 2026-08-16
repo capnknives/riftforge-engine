@@ -127,14 +127,6 @@ def contribute_basegame(ctx):
         lines.append(f"  Origin: Alien ({blood})")
     elif origin != "mundane":
         lines.append(f"  Origin: {str(origin).title()}")
-    from engine.systems import economy as economy_mod
-
-    economy_mod.migrate_wallet_fields(target)
-    cash = economy_mod.format_carry_cash(target)
-    lines.append(f"  Cash: {cash}")
-    bank = economy_mod.format_bank(target)
-    if bank and bank not in ("$0", "$0.00"):
-        lines.append(f"  Bank: {bank}")
     if not lines:
         return None
     return sheet_mod.SheetSection(

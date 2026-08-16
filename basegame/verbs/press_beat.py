@@ -41,7 +41,9 @@ def cmd_storyboard(character, args, game):
     if not pb.is_news_desk_room(room):
         character.session.send("The storyboard is at the News Office.")
         return
-    character.session.send(pb.board_lines(game, character))
+    character.session.send(
+        "\r\n".join(pb.board_lines(game, character))
+    )
 
 
 def cmd_takestory(character, args, game):

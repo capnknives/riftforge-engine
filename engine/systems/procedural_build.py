@@ -14,6 +14,7 @@ import re
 
 from engine import hooks
 from engine import map_store
+from engine import world_maps
 from engine.command_support import DIRECTIONS
 from engine.room_naming import split_structured_title, street_hub_leaf
 
@@ -1566,12 +1567,11 @@ def populate_fix_beds(game):
     """
     if game is None:
         return False, "No game."
-    import maps as maps_mod
 
     total_fixed = 0
     files_touched = 0
     sample_keys = []
-    for path in maps_mod.iter_map_json_paths():
+    for path in world_maps.iter_map_json_paths():
         try:
             doc = map_store.load_doc(path)
         except (OSError, ValueError):
@@ -1823,13 +1823,12 @@ def populate_fix_shell(game):
     """
     if game is None:
         return False, "No game."
-    import maps as maps_mod
 
     total_rooms = 0
     total_exits = 0
     files_touched = 0
     sample = []
-    for path in maps_mod.iter_map_json_paths():
+    for path in world_maps.iter_map_json_paths():
         try:
             doc = map_store.load_doc(path)
         except (OSError, ValueError):

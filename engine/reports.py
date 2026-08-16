@@ -25,6 +25,9 @@ SUGGEST = "suggest"
 # GM reviews these the exact same way as a bug/suggestion (docs/plans/
 # helpfile_editing_system.md), instead of a bespoke proposal table + queue UI.
 HELP = "help"
+# Copy typos / grammar in rooms, help, and combat lines -- separate from
+# bugs so staff can prioritize them without mixing crash reports (idea 194).
+TYPO = "typo"
 
 # Optional post-append hooks: list of callback(kind, payload). Kept for
 # future side effects; bug_webhook POSTs are GM-on-demand (squashbugs), not
@@ -38,6 +41,7 @@ _FILENAMES = {
     BUG: "bug_reports.log",
     SUGGEST: "suggestions.log",
     HELP: "help_proposals.log",
+    TYPO: "typos.log",
 }
 
 # A report starts "open"; a GM later marks it "resolved" (fixed/built) or
@@ -50,6 +54,7 @@ DISPLAY_LABELS = {
     BUG: "BUG",
     SUGGEST: "IDEA",
     HELP: "HELP",
+    TYPO: "TYPO",
 }
 
 # Parse words staff type after ``show`` / ``resolve`` (bug, idea, …).
@@ -62,11 +67,13 @@ KIND_ALIASES = {
     "idea": SUGGEST,
     "ideas": SUGGEST,
     "help": HELP,
+    "typo": TYPO,
+    "typos": TYPO,
 }
 
 
 def parse_kind_word(kind_word):
-    """Map a staff-facing kind token to BUG / SUGGEST / HELP, or None."""
+    """Map a staff-facing kind token to BUG / SUGGEST / HELP / TYPO, or None."""
     return KIND_ALIASES.get((kind_word or "").lower())
 
 

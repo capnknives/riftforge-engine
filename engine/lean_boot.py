@@ -30,8 +30,8 @@ def lean_maps_dir():
 
 
 def configure_lean_maps():
-    """Redirect maps.py to the one-file lean demo set (demo.json only)."""
-    import maps
+    """Redirect world_maps loader to the one-file lean demo set (demo.json only)."""
+    from engine import world_maps
 
     lean_dir = lean_maps_dir()
     if not os.path.isdir(lean_dir):
@@ -39,10 +39,10 @@ def configure_lean_maps():
             f"lean demo maps missing: {lean_dir} "
             "(expected engine/demo/content/maps/demo.json)"
         )
-    maps.set_maps_dir(lean_dir)
+    world_maps.set_maps_dir(lean_dir)
     # Empty zones — lean demo has no pocket JSON.
     empty_zones = os.path.join(
         os.path.dirname(lean_dir), "zones"
     )
     os.makedirs(empty_zones, exist_ok=True)
-    maps.set_zones_dir(empty_zones)
+    world_maps.set_zones_dir(empty_zones)

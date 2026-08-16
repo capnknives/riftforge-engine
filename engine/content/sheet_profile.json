@@ -1,8 +1,8 @@
 {
   "id": "sheet.engine",
-  "version": 1,
+  "version": 2,
   "title": "SCORE",
-  "description": "Engine character-sheet field catalog. Games register hook providers for hook:* sources; engine:* rows are generic.",
+  "description": "Engine character-sheet field catalog. Games register hook providers for hook:* sources; engine:* rows are generic. SUPERS custom layout merges rows by slot via resolve_profile_slot.",
   "fields": [
     {
       "id": "header",
@@ -32,6 +32,126 @@
       "id": "hp",
       "slot": "body",
       "source": "hook:hp",
+      "panes": ["default", "vitals", "full"]
+    },
+    {
+      "id": "cash",
+      "slot": "economy",
+      "source": "engine:cash",
+      "panes": ["default", "vitals", "full"]
+    },
+    {
+      "id": "bank",
+      "slot": "economy",
+      "source": "engine:bank",
+      "panes": ["default", "vitals", "full"]
+    },
+    {
+      "id": "supers_fuel_tank",
+      "slot": "path_resource",
+      "source": "hook:supers_fuel_tank",
+      "panes": ["default", "vitals", "full"]
+    },
+    {
+      "id": "supers_true_form_regen",
+      "slot": "path_resource",
+      "source": "hook:supers_true_form_regen",
+      "panes": ["full"]
+    },
+    {
+      "id": "supers_larder",
+      "slot": "path_resource",
+      "source": "hook:supers_larder",
+      "panes": ["full"]
+    },
+    {
+      "id": "supers_vessel",
+      "slot": "vessel",
+      "source": "hook:supers_vessel",
+      "panes": ["full"]
+    },
+    {
+      "id": "supers_deal_urgent",
+      "slot": "deal_urgent",
+      "source": "hook:supers_deal_urgent",
+      "panes": ["default", "vitals", "full"]
+    },
+    {
+      "id": "supers_souls_ferried",
+      "slot": "lifetime",
+      "source": "hook:supers_souls_ferried",
+      "panes": ["full"]
+    },
+    {
+      "id": "supers_souls_taken",
+      "slot": "lifetime",
+      "source": "hook:supers_souls_taken",
+      "panes": ["full"]
+    },
+    {
+      "id": "supers_deal_clock",
+      "slot": "lifetime",
+      "source": "hook:supers_deal_clock",
+      "panes": ["full"]
+    },
+    {
+      "id": "supers_deal_edge",
+      "slot": "lifetime",
+      "source": "hook:supers_deal_edge",
+      "panes": ["full"]
+    },
+    {
+      "id": "supers_deal_ward",
+      "slot": "lifetime",
+      "source": "hook:supers_deal_ward",
+      "panes": ["full"]
+    },
+    {
+      "id": "supers_victims_drained",
+      "slot": "lifetime",
+      "source": "hook:supers_victims_drained",
+      "panes": ["full"]
+    },
+    {
+      "id": "supers_integrity",
+      "slot": "origin_meters",
+      "source": "hook:supers_integrity",
+      "panes": ["default", "vitals", "full"]
+    },
+    {
+      "id": "supers_favor",
+      "slot": "origin_meters",
+      "source": "hook:supers_favor",
+      "panes": ["default", "vitals", "full"]
+    },
+    {
+      "id": "supers_solar_charge",
+      "slot": "origin_meters",
+      "source": "hook:supers_solar_charge",
+      "panes": ["default", "vitals", "full"]
+    },
+    {
+      "id": "supers_umbral_charge",
+      "slot": "origin_meters",
+      "source": "hook:supers_umbral_charge",
+      "panes": ["default", "vitals", "full"]
+    },
+    {
+      "id": "supers_mutation",
+      "slot": "origin_meters",
+      "source": "hook:supers_mutation",
+      "panes": ["default", "vitals", "full"]
+    },
+    {
+      "id": "supers_spirit",
+      "slot": "origin_meters",
+      "source": "hook:supers_spirit",
+      "panes": ["default", "vitals", "full"]
+    },
+    {
+      "id": "supers_mana",
+      "slot": "origin_meters",
+      "source": "hook:supers_mana",
       "panes": ["default", "vitals", "full"]
     }
   ],

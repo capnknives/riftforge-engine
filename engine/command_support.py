@@ -29,10 +29,13 @@ from engine.hooks import (
     can_see_spirit,
     encounter_check,
     follow_pull_skip,
+    follow_survival_peel_message,
     in_veil,
     move_gate_block,
     veil_visible_to,
 )
+import re
+
 from engine.world import Character
 
 
@@ -187,6 +190,54 @@ def _is_presence_hidden(viewer, other):
         if not hooks.can_notice_stealth(viewer, other):
             return True
     return False
+
+
+def _is_attacking_viewer(viewer, other):
+    """True when ``other`` shares a room with ``viewer`` and focuses them."""
+    if viewer is None or other is None or other is viewer:
+        return False
+    room = getattr(viewer, "location", None)
+    if room is None or getattr(other, "location", None) is not room:
+        return False
+    return getattr(other, "target", None) is viewer
+
+
+def _can_target_for_combat(viewer, other):
+    """True when ``viewer`` may pick ``other`` for fight verbs (attack, hex, …).
+
+    Hidden presences stay off ``look`` / ``who``, but a body already swinging
+    at you is targetable -- you can return fire at the foe you feel. Deal
+    hellhounds keep their blind-swing / sight / kill-tool gates.
+    """
+    if other is None or viewer is None:
+        return False
+    if other is viewer:
+        return True
+    if not _is_presence_hidden(viewer, other):
+        return True
+    if not _is_attacking_viewer(viewer, other):
+        return False
+    from engine import hooks
+    return hooks.can_target_hidden_attacker(viewer, other)
+
+
+def _combat_target_candidates(actor, base_candidates):
+    """Extend visible fight picks with hidden bodies actively attacking ``actor``."""
+    merged = list(base_candidates or [])
+    seen = {id(c) for c in merged}
+    room = getattr(actor, "location", None)
+    if room is None:
+        return merged
+    for other in room.characters():
+        if other is actor or id(other) in seen:
+            continue
+        if not _can_target_for_combat(actor, other):
+            continue
+        if not _is_presence_hidden(actor, other):
+            continue
+        merged.append(other)
+        seen.add(id(other))
+    return merged
 
 
 def _presence_hears(actor):
@@ -899,6 +950,14 @@ def _pull_followers(leader, origin, direction, game):
         moved.add(id(follower))
         if follower.location is not origin or follower.spirit:
             continue
+        # Live followers peel off when survival meters spike -- do not drag
+        # Sam past bunk/gym while Dean walks (bug report 464).
+        if getattr(follower, "session", None) is not None:
+            peel_msg = follow_survival_peel_message(follower, leader)
+            if peel_msg:
+                stop_following(follower, silent=True)
+                follower.session.send(peel_msg)
+                continue
         # SUPERS pack: follower on their own haunt/mission must not be
         # yanked when the companion leader walks for food (hooked).
         if follow_pull_skip(follower, leader, game):
@@ -954,6 +1013,32 @@ def _collect_item_matches(query, items):
     return [item for item in items if _item_name_matches(needle, item)]
 
 
+# Classic MUD bulk: ``all``, ``all.sword``, ``all sword``, ``*.coin``.
+# Digit ordinals (``2.backpack``) stay with parse_target_ordinal.
+_BULK_ITEM_QUERY_RE = re.compile(
+    r"^(all|\*|everything)(?:[.\s]+(.+))?$",
+    re.IGNORECASE,
+)
+
+
+def parse_bulk_item_query(query):
+    """Return ``('all', name_fragment)`` for Classic bulk forms, else ``(None, query)``.
+
+    ``name_fragment`` is empty for plain ``all`` / ``*`` / ``everything``.
+    Does not consume ``2.item`` ordinals.
+    """
+    text = (query or "").strip()
+    if not text:
+        return None, text
+    if text[:1].isdigit() and "." in text:
+        return None, text
+    match = _BULK_ITEM_QUERY_RE.match(text)
+    if not match:
+        return None, text
+    fragment = (match.group(2) or "").strip()
+    return "all", fragment
+
+
 def _find_item(query, items, character=None):
     """Return an Item whose key (or aliases) contains ``query``.
 
@@ -1005,6 +1090,49 @@ def _find_item_prefer_locked(query, items, character=None):
         if item.locked:
             return item
     return matches[0]
+
+
+def _find_carried_item_prefer_locked(character, query):
+    """Return ``(item, holder)`` for ``open`` / force-unlock targeting.
+
+    Searches open inventory, worn loot-bag contents, and the gear kit bag --
+    same places ``get … from backpack`` can reach. ``holder`` is the mutable
+    list ``cmd_open`` must ``remove`` from (inventory row or ``bag_contents``).
+    """
+    from world import Item
+    from engine.systems import containers as containers_mod
+
+    if character is None:
+        return None, None
+
+    def _pick(items, holder):
+        found = _find_item_prefer_locked(query, items, character=character)
+        if found is not None:
+            return found, holder
+        return None, None
+
+    inv = getattr(character, "inventory", None) or []
+    inv_items = [obj for obj in inv if isinstance(obj, Item)]
+    item, holder = _pick(inv_items, inv)
+    if item is not None:
+        return item, holder
+
+    for bag in containers_mod.worn_bags(character):
+        contents = containers_mod.bag_contents(bag)
+        nested = [obj for obj in contents if isinstance(obj, Item)]
+        item, holder = _pick(nested, contents)
+        if item is not None:
+            return item, holder
+
+    from engine import hooks
+    gear = hooks.containers_ensure_gear_bag(character)
+    if gear:
+        nested = [obj for obj in gear if isinstance(obj, Item)]
+        item, holder = _pick(nested, gear)
+        if item is not None:
+            return item, holder
+
+    return None, None
 
 
 # Classic MUD self-target tokens -- never search the world for these names.
@@ -1089,11 +1217,12 @@ def resolve_fight_target(
     Returns ``(target, error_message)``; on success the error is ``None``.
     """
     raw = (query or "").strip()
+    pool = _combat_target_candidates(actor, candidates)
     if raw:
-        target = _find_character(raw, candidates, self_character=actor)
+        target = _find_character(raw, pool, self_character=actor)
         if target is None:
             return None, missing_msg
-        if _is_presence_hidden(actor, target):
+        if not _can_target_for_combat(actor, target):
             return None, missing_msg
         return target, None
 
@@ -1106,7 +1235,7 @@ def resolve_fight_target(
             actor.target = None
         gone = _public_label(target)
         return None, f"{gone} is no longer here."
-    if _is_presence_hidden(actor, target):
+    if not _can_target_for_combat(actor, target):
         if clear_stale_target:
             actor.target = None
         return None, missing_msg

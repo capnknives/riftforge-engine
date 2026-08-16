@@ -168,16 +168,20 @@ How you play:
 
 See also: help paths (ranger path)
 """,
-    "breach": """Notbigville -- slam / throw wall breach
+    "breach": """
+breach -- Leviathan Bone Gate OR Soldier Master combat breach
 
-How you play:
-  1. Walk to the Saloon (east from the Post Office).
-  2. slam [wall]       chip the saloon wall (8 HP); wreck it to burst into the alley.
-  3. throw <name> [wall]   hurl someone into the same surface.
+Usage: breach
 
-Layout-stamped rooms use the engine breach kit with persisted wall HP.
+Two Paths share this verb (same word, different gates):
 
-See also: help paths
+  Leviathan Master+ Stand in the Bone Gate with a bone-white seal key (canonical or a fraying mendkey craft) and Master+ Devouring. Costs heavy fuel. Success clears the Purgatory bind so plane exits work; the fraying key crumbles.
+  Paying the Ledger never frees a Leviathan.
+
+  Human Soldier Master Committed combat breach buff (mundane ladder). See help soldier.
+    Requires Path soldier and Adept+ rank on the Soldier ladder.
+
+See also: help leviathan | help purgatory | help soldier
 """,
     "active-combat": """Notbigville -- active (twitch) combat
 

@@ -91,12 +91,16 @@ DEFAULT_FETCH_TIMEOUT = 60
 # Examples that do NOT: "Merge origin/main: ... with bug #25."
 #                       "Enhance auto-deploy (#5)"  (PR number, not bug id)
 #                       "Fix overnight Cadence… (#63-#67)" (parenthetical only)
+# Comma / Oxford-list tails on Fix and Ship subjects:
+# ``#79, #80``, ``#154, #179, and #189``, ``179, 154, and 189``.
+_TICKET_ID_COMMA_TAIL_RE = r"((?:\s*,\s*(?:and\s+)?#?\d+)*)"
+_TICKET_ID_COMMA_TAIL_BARE_RE = r"((?:\s*,\s*(?:and\s+)?\d+)*)"
 _FIX_SUBJECT_RE = re.compile(
     r"^(?:fix(?:es|ed)?)\s+"
     r"(?:(?:in-game\s+)?bugs?|bug_reports\.log)\s*#?"
     r"(\d+)"
     r"(?:\s*[-–—]\s*#?(\d+))?"
-    r"((?:\s*,\s*#?\d+)*)"
+    rf"{_TICKET_ID_COMMA_TAIL_RE}"
     r"\b",
     re.IGNORECASE,
 )
@@ -106,7 +110,7 @@ _FIX_BUG_REPORT_SUBJECT_RE = re.compile(
     r"bug\s+reports?\s+"
     r"#?(\d+)"
     r"(?:\s*[-–—]\s*#?(\d+))?"
-    r"((?:\s*,\s*#?\d+)*)"
+    rf"{_TICKET_ID_COMMA_TAIL_RE}"
     r"(?:\b|:)",
     re.IGNORECASE,
 )
@@ -128,7 +132,7 @@ _SHIP_SUGGESTION_SUBJECT_RE = re.compile(
     r"(?:suggestions?|ideas?|suggestions\.log)\s*#"
     r"(\d+)"
     r"(?:\s*[-–—]\s*#?(\d+))?"
-    r"((?:\s*,\s*#?\d+)*)"
+    rf"{_TICKET_ID_COMMA_TAIL_RE}"
     r"\b",
     re.IGNORECASE,
 )
@@ -138,7 +142,29 @@ _SHIP_SUGGESTION_REPORT_SUBJECT_RE = re.compile(
     r"suggestion\s+reports?\s+"
     r"#?(\d+)"
     r"(?:\s*[-–—]\s*#?(\d+))?"
-    r"((?:\s*,\s*#?\d+)*)"
+    rf"{_TICKET_ID_COMMA_TAIL_RE}"
+    r"(?:\b|:)",
+    re.IGNORECASE,
+)
+# Hash-free idea ranges / lists without ``#`` (agent squash subjects):
+# ``Ship ideas 191-195: autoloot preset``
+# ``Ship suggestions 179, 154, and 189 tip retune: …``
+# Must run before slash subjects — ``[\d/]+`` would steal a lone leading id.
+_SHIP_SUGGESTION_BARE_RANGE_RE = re.compile(
+    r"^(?:ship(?:ped|s)?)\s+"
+    r"(?:player\s+)?(?:suggestions?|ideas?)\s+"
+    r"(\d+)"
+    r"(?:\s*[-–—]\s*(\d+))?"
+    rf"{_TICKET_ID_COMMA_TAIL_BARE_RE}"
+    r"\b",
+    re.IGNORECASE,
+)
+# Squash bodies that list ids with slashes (agent mistake on PR 2218):
+# ``Ship player suggestions 164/169/122: …``
+_SHIP_PLAYER_SUGGESTIONS_SLASH_RE = re.compile(
+    r"^(?:ship(?:ped|s)?)\s+"
+    r"(?:player\s+)?(?:suggestions?|ideas?)\s+"
+    r"(\d+(?:/\d+)+)"
     r"(?:\b|:)",
     re.IGNORECASE,
 )
@@ -192,6 +218,50 @@ def _expand_fix_subject_bug_ids(start: int, end: int | None, extras: str) -> lis
                 _add(n)
     for chunk in re.findall(r"\d+", extras or ""):
         _add(int(chunk))
+    return ids
+
+
+def _expand_slash_subject_ids(slash_blob: str) -> list[int]:
+    """Build ids from ``164/169/122`` tails on Ship suggestion subjects."""
+    ids: list[int] = []
+    for chunk in re.split(r"[/\s]+", (slash_blob or "").strip()):
+        if not chunk or not chunk.isdigit():
+            continue
+        n = int(chunk)
+        if n not in ids:
+            ids.append(n)
+    return ids
+
+
+def parse_ticket_id_blob(blob: str, *, max_range: int | None = None) -> list[int]:
+    """Expand hash-free ticket id tokens from PR/squash prose.
+
+    Supports ``191-195``, ``191, 192``, ``164/169/122``, and lone ``92``.
+    Used by ``tools/open_pr.py`` body validation and agent helpers.
+    """
+    cap = _MAX_BUG_ID_RANGE if max_range is None else max_range
+    text = (blob or "").strip().replace("#", "")
+    text = re.sub(r"[.,;:]+$", "", text)
+    if not text:
+        return []
+    if "/" in text:
+        return _expand_slash_subject_ids(text)
+    match = re.match(
+        rf"^(\d+)(?:\s*[-–—]\s*(\d+))?{_TICKET_ID_COMMA_TAIL_BARE_RE}$",
+        text,
+    )
+    if match:
+        start = int(match.group(1))
+        end = int(match.group(2)) if match.group(2) else None
+        ids = _expand_fix_subject_bug_ids(start, end, match.group(3) or "")
+        if end is not None and len(ids) > cap + 1:
+            return [start, end]
+        return ids
+    ids: list[int] = []
+    for chunk in re.findall(r"\d+", text):
+        n = int(chunk)
+        if n not in ids:
+            ids.append(n)
     return ids
 
 # Values accepted in the override file / GM command (normalized to these).
@@ -1495,6 +1565,23 @@ def _parse_line_deploy_ids(line: str) -> tuple[list[int], list[int], str]:
         summary = _parse_subject_ticket_tail(text, match)
         return [], suggestion_ids, summary
 
+    match = _SHIP_PLAYER_SUGGESTIONS_SLASH_RE.match(text)
+    if match:
+        suggestion_ids = _expand_slash_subject_ids(match.group(1) or "")
+        if suggestion_ids:
+            summary = _parse_subject_ticket_tail(text, match)
+            return [], suggestion_ids, summary
+
+    match = _SHIP_SUGGESTION_BARE_RANGE_RE.match(text)
+    if match:
+        start = int(match.group(1))
+        end = int(match.group(2)) if match.group(2) else None
+        suggestion_ids = _expand_fix_subject_bug_ids(
+            start, end, match.group(3) or "",
+        )
+        summary = _parse_subject_ticket_tail(text, match)
+        return [], suggestion_ids, summary
+
     return [], [], ""
 
 
@@ -1506,16 +1593,33 @@ def _first_subject_line(text: str) -> str:
     return ""
 
 
+def _merge_ticket_ids(into: list[int], extra: list[int]) -> None:
+    """Append unique ticket ids, preserving first-seen order."""
+    for n in extra or []:
+        if n not in into:
+            into.append(n)
+
+
 def _parse_deploy_text_lines(text: str) -> tuple[list[int], list[int], str]:
-    """Scan commit/PR text line-by-line for Fix/Ship ticket headers."""
+    """Scan commit/PR text line-by-line for Fix/Ship ticket headers.
+
+    Mixed ships put bugs on one line and suggestions on another (squash
+    subject plus PR body). Collect both instead of stopping at the first
+    matching header.
+    """
+    all_bugs: list[int] = []
+    all_suggestions: list[int] = []
+    summary = ""
     for raw_line in (text or "").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        bug_ids, suggestion_ids, summary = _parse_line_deploy_ids(line)
-        if bug_ids or suggestion_ids:
-            return bug_ids, suggestion_ids, summary
-    return [], [], ""
+        bug_ids, suggestion_ids, line_summary = _parse_line_deploy_ids(line)
+        _merge_ticket_ids(all_bugs, bug_ids)
+        _merge_ticket_ids(all_suggestions, suggestion_ids)
+        if not summary and line_summary:
+            summary = line_summary
+    return all_bugs, all_suggestions, summary
 
 
 def _merged_pr_number_from_subject(subject: str) -> int | None:
@@ -1552,6 +1656,8 @@ def _fetch_merged_pr_text_via_gh(pr_number: int) -> str:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=20,
             check=True,
         )
@@ -1571,12 +1677,30 @@ def _fetch_merged_pr_text_via_gh(pr_number: int) -> str:
     return f"{title}\n{body}".strip() if body else title
 
 
-def _fetch_merged_pr_text(pr_number: int) -> str:
+def _fetch_merged_pr_text(pr_number: int, *, allow_network: bool = True) -> str:
     """Fetch PR title + body for squash commits that omit the bug id."""
     pr_number = int(pr_number)
     cached = _PR_TEXT_CACHE.get(pr_number)
     if cached is not None:
         return cached
+    # Local map first — live may lack GITHUB_TOKEN or hit API rate limits.
+    from engine import deploy_pr_ticket_map
+
+    mapped = deploy_pr_ticket_map.synthetic_pr_text(pr_number, root=_repo_root())
+    if mapped:
+        _PR_TEXT_CACHE[pr_number] = mapped
+        return mapped
+    if not allow_network:
+        _PR_TEXT_CACHE[pr_number] = ""
+        return ""
+    # Prefer gh (maintainer auth) before unauthenticated REST (404/403 on private).
+    text = _fetch_merged_pr_text_via_gh(pr_number)
+    if text:
+        _PR_TEXT_CACHE[pr_number] = text
+        return text
+    if not (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")):
+        _PR_TEXT_CACHE[pr_number] = ""
+        return ""
     url = f"{_GITHUB_PULL_API}/{pr_number}"
     req = urllib.request.Request(url, headers=_github_api_headers(), method="GET")
     try:
@@ -1584,20 +1708,17 @@ def _fetch_merged_pr_text(pr_number: int) -> str:
             raw = resp.read().decode("utf-8", errors="replace")
         row = json.loads(raw)
     except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            text = _fetch_merged_pr_text_via_gh(pr_number)
-            _PR_TEXT_CACHE[pr_number] = text
-            if not text:
-                print(
-                    f"[auto_deploy] GitHub PR #{pr_number} lookup failed: "
-                    f"{exc} (set GITHUB_TOKEN or run gh auth login)",
-                    flush=True,
-                )
-            return text
-        print(
-            f"[auto_deploy] GitHub PR #{pr_number} lookup failed: {exc}",
-            flush=True,
-        )
+        if exc.code in (403, 404, 429):
+            print(
+                f"[auto_deploy] GitHub PR #{pr_number} lookup failed: {exc} "
+                f"(add ops/deploy_pr_ticket_map.json row or GITHUB_TOKEN)",
+                flush=True,
+            )
+        else:
+            print(
+                f"[auto_deploy] GitHub PR #{pr_number} lookup failed: {exc}",
+                flush=True,
+            )
         _PR_TEXT_CACHE[pr_number] = ""
         return ""
     except (
@@ -1607,14 +1728,12 @@ def _fetch_merged_pr_text(pr_number: int) -> str:
         ValueError,
         json.JSONDecodeError,
     ) as exc:
-        text = _fetch_merged_pr_text_via_gh(pr_number)
-        _PR_TEXT_CACHE[pr_number] = text
-        if not text:
-            print(
-                f"[auto_deploy] GitHub PR #{pr_number} lookup failed: {exc}",
-                flush=True,
-            )
-        return text
+        print(
+            f"[auto_deploy] GitHub PR #{pr_number} lookup failed: {exc}",
+            flush=True,
+        )
+        _PR_TEXT_CACHE[pr_number] = ""
+        return ""
     if not isinstance(row, dict):
         _PR_TEXT_CACHE[pr_number] = ""
         return ""
@@ -1629,29 +1748,35 @@ def parse_deploy_metadata(
     text: str,
     *,
     pr_fallback: bool = True,
+    pr_network: bool = True,
 ) -> tuple[list[int], list[int], str]:
     """Extract bug/suggestion ids + short summary from deploy text.
 
     Scans the commit subject, body lines, and (when ``pr_fallback``) the
     linked GitHub PR title/body when the squash subject ends with
-    ``(#NNNN)`` but omits ``Fix bug #N``.
+    ``(#NNNN)``. Mixed Fix + Ship bundles collect both id lists.
 
     Recognized headers include ``Fix bug #N:``, ``Fix in-game bug N:``,
-    and agent PR prose ``Fixes bug report N`` (no ``#``).
+    and agent PR prose ``Fixes bug report N`` / ``Ships suggestion report N``
+    (no ``#``).
 
     Returns ``(bug_ids, suggestion_ids, summary)``.
     """
     subject_line = _first_subject_line(text)
     bug_ids, suggestion_ids, summary = _parse_deploy_text_lines(text)
 
-    if not bug_ids and not suggestion_ids and pr_fallback:
+    if pr_fallback and (not bug_ids or not suggestion_ids):
         pr_number = _merged_pr_number_from_subject(subject_line)
         if pr_number:
-            pr_text = _fetch_merged_pr_text(pr_number)
+            pr_text = _fetch_merged_pr_text(pr_number, allow_network=pr_network)
             if pr_text:
-                bug_ids, suggestion_ids, summary = _parse_deploy_text_lines(
+                pr_bugs, pr_sugs, pr_summary = _parse_deploy_text_lines(
                     pr_text,
                 )
+                _merge_ticket_ids(bug_ids, pr_bugs)
+                _merge_ticket_ids(suggestion_ids, pr_sugs)
+                if not summary:
+                    summary = pr_summary
 
     if len(summary) > 120:
         summary = summary[:117] + "..."
@@ -1920,7 +2045,7 @@ def _commits_between(from_sha, to_sha, root):
     return [line.strip() for line in out.splitlines() if line.strip()]
 
 
-def _fix_commits_from_shas(root, shas):
+def _fix_commits_from_shas(root, shas, *, pr_network: bool = True):
     """Parse Fix/Ship subjects from an ordered SHA list."""
     fixes = []
     for sha in shas:
@@ -1931,6 +2056,7 @@ def _fix_commits_from_shas(root, shas):
             continue
         bug_ids, suggestion_ids, summary = parse_deploy_metadata(
             message or subject,
+            pr_network=pr_network,
         )
         if not bug_ids and not suggestion_ids:
             continue
@@ -1985,6 +2111,7 @@ _FIX_SHIP_GREP_TERMS = (
     "Fixes bug report",
     "Ship suggestion",
     "Ship suggestions",
+    "Ship player suggestions",
     "Ships suggestion report",
     "Stop nest dens",
 )
@@ -2012,19 +2139,28 @@ def _load_bug_resolve_cache(directory):
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
-        return {"tip_sha": "", "bug_ids": []}
+        return {"tip_sha": "", "bug_ids": [], "suggestion_ids": []}
     bug_ids = data.get("bug_ids") or []
+    suggestion_ids = data.get("suggestion_ids") or []
     return {
         "tip_sha": (data.get("tip_sha") or "").strip(),
         "bug_ids": [int(x) for x in bug_ids if str(x).isdigit()],
+        "suggestion_ids": [
+            int(x) for x in suggestion_ids if str(x).isdigit()
+        ],
     }
 
 
-def _save_bug_resolve_cache(directory, *, tip_sha, bug_ids):
+def _save_bug_resolve_cache(
+    directory, *, tip_sha, bug_ids, suggestion_ids=None,
+):
     path = _bug_resolve_cache_path(directory)
     payload = {
         "tip_sha": tip_sha,
         "bug_ids": sorted({int(x) for x in bug_ids}),
+        "suggestion_ids": sorted(
+            {int(x) for x in (suggestion_ids or [])},
+        ),
     }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
@@ -2126,30 +2262,12 @@ def refresh_deployed_bug_id_cache(
     full_rebuild=False,
 ):
     """Update cached deployed Fix-bug ids incrementally (fast boot path)."""
-    tip = _deployed_tip_sha(git_root)
-    cache = _load_bug_resolve_cache(report_directory)
-    bug_ids = list(cache.get("bug_ids") or [])
-    cached_tip = cache.get("tip_sha") or ""
-
-    if not tip:
-        return bug_ids
-
-    if cached_tip == tip and bug_ids and not full_rebuild:
-        return bug_ids
-
-    if full_rebuild or not cached_tip:
-        scan_from = None
-        if full_rebuild:
-            bug_ids = []
-    else:
-        scan_from = cached_tip
-
-    shas = _collect_fix_ship_shas(git_root, tip, from_sha=scan_from)
-    for fix in _fix_commits_from_shas(git_root, shas):
-        bug_ids = _merge_bug_id_list(bug_ids, fix.get("bug_ids"))
-    bug_ids = _merge_bug_id_list(bug_ids, _hook_bug_ids_from_shas(git_root, shas))
-    _save_bug_resolve_cache(report_directory, tip_sha=tip, bug_ids=bug_ids)
-    return bug_ids
+    bugs, _suggestions = refresh_deployed_ticket_id_cache(
+        git_root,
+        report_directory,
+        full_rebuild=full_rebuild,
+    )
+    return bugs
 
 
 def collect_all_deployed_fix_commits(root, to_sha=None):
@@ -2173,14 +2291,90 @@ def open_bug_ids(directory="."):
     )
 
 
+def open_suggestion_ids(directory="."):
+    """Return sorted ids of still-open rows in ``suggestions.log``."""
+    from engine import reports
+
+    return sorted(
+        entry["id"]
+        for entry in reports.recent(reports.SUGGEST, None, directory=directory)
+        if entry.get("status", "open") == "open"
+    )
+
+
 def deployed_fix_bug_ids(git_root, report_directory=None, *, full_rebuild=False):
     """De-duplicated bug ids from deployed Fix subjects (cached, incremental)."""
-    report_directory = report_directory or git_root
-    return refresh_deployed_bug_id_cache(
+    bugs, _suggestions = refresh_deployed_ticket_id_cache(
         git_root,
         report_directory,
         full_rebuild=full_rebuild,
     )
+    return bugs
+
+
+def deployed_fix_suggestion_ids(
+    git_root, report_directory=None, *, full_rebuild=False,
+):
+    """De-duplicated suggestion ids from deployed Ship subjects (cached)."""
+    _bugs, suggestions = refresh_deployed_ticket_id_cache(
+        git_root,
+        report_directory,
+        full_rebuild=full_rebuild,
+    )
+    return suggestions
+
+
+def refresh_deployed_ticket_id_cache(
+    git_root,
+    report_directory,
+    *,
+    full_rebuild=False,
+):
+    """Update cached deployed Fix/Ship ticket ids incrementally (boot path)."""
+    report_directory = report_directory or git_root
+    tip = _deployed_tip_sha(git_root)
+    cache = _load_bug_resolve_cache(report_directory)
+    bug_ids = list(cache.get("bug_ids") or [])
+    suggestion_ids = list(cache.get("suggestion_ids") or [])
+    cached_tip = cache.get("tip_sha") or ""
+
+    if not tip:
+        return bug_ids, suggestion_ids
+
+    if cached_tip == tip and bug_ids and not full_rebuild:
+        try:
+            with open(
+                _bug_resolve_cache_path(report_directory),
+                encoding="utf-8",
+            ) as f:
+                raw = json.load(f)
+            if "suggestion_ids" in raw:
+                return bug_ids, suggestion_ids
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
+    if full_rebuild or not cached_tip:
+        scan_from = None
+        if full_rebuild:
+            bug_ids = []
+            suggestion_ids = []
+    else:
+        scan_from = cached_tip
+
+    shas = _collect_fix_ship_shas(git_root, tip, from_sha=scan_from)
+    for fix in _fix_commits_from_shas(git_root, shas, pr_network=False):
+        bug_ids = _merge_bug_id_list(bug_ids, fix.get("bug_ids"))
+        suggestion_ids = _merge_bug_id_list(
+            suggestion_ids, fix.get("suggestion_ids"),
+        )
+    bug_ids = _merge_bug_id_list(bug_ids, _hook_bug_ids_from_shas(git_root, shas))
+    _save_bug_resolve_cache(
+        report_directory,
+        tip_sha=tip,
+        bug_ids=bug_ids,
+        suggestion_ids=suggestion_ids,
+    )
+    return bug_ids, suggestion_ids
 
 
 def _catchup_from_sha(state):

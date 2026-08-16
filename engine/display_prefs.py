@@ -48,7 +48,16 @@ WIDTH_DEFAULT = 67
 
 # Two-character optional-field tokens (checked before single-letter codes).
 _SEGMENT_TOKENS = frozenset({
-    "Hp", "En", "St", "Mn", "Fu", "Mo", "Tg", "Ex", "Gr",
+    "Hp", "En", "St", "Mn", "Fu", "Mo", "Tg", "Ex", "Gr", "Nd",
+    "Fm", "Vs", "Af", "In", "Fv", "Hs",
+})
+
+# Templates treated as "still on factory default" for Origin migration.
+_GENERIC_PROMPT_TEMPLATES = frozenset({
+    DEFAULT_PROMPT,
+    _OLD_DEFAULT_PROMPT,
+    _OLD_BRACKET_PROMPT,
+    _OLD_EXITS_PROMPT,
 })
 
 
@@ -67,6 +76,30 @@ def preference_character(character, game=None):
     except Exception:
         pass
     return character
+
+
+def is_generic_prompt(template):
+    """True when the player still has a factory prompt (eligible for Origin default)."""
+    if template is None:
+        return True
+    return template in _GENERIC_PROMPT_TEMPLATES
+
+
+def apply_origin_default_prompt(character, *, force=False):
+    """Stamp Origin-appropriate prompt when still on generic default.
+
+    ``force=True`` is used by ``prompt default`` to reset custom templates.
+    Empty string (prompt off) is never overwritten unless forced.
+    """
+    ensure_display_defaults(character)
+    if not force:
+        if character.prompt_format == "":
+            return
+        from engine import hooks
+        if not hooks.is_factory_prompt(character.prompt_format):
+            return
+    from engine import hooks
+    character.prompt_format = hooks.origin_default_prompt(character)
 
 
 def ensure_display_defaults(character):
@@ -112,6 +145,9 @@ def ensure_display_defaults(character):
         # Pref: bare `map` shows the local minimap (default) vs the full
         # atlas grid -- config mapview atlas|minimap.
         character.map_view_full = False
+    if not hasattr(character, "mapzone_overlay"):
+        # Pref: append nearby zone bearings under ASCII maps (default off).
+        character.mapzone_overlay = False
     if not hasattr(character, "exits_verbose"):
         # Pref: LOTJ-style Exits: / North - Dest (default); compact opt-in.
         character.exits_verbose = True
@@ -133,6 +169,9 @@ def ensure_display_defaults(character):
     if not hasattr(character, "show_combat_tags"):
         # Default on (a11y). Any player may opt out via config combattags.
         character.show_combat_tags = True
+    if not hasattr(character, "show_combat_hints"):
+        # Tutorial nudges on engage/KO/score/connect reads; config combathints off.
+        character.show_combat_hints = True
     if not hasattr(character, "compact_floor_items"):
         # config items compact on|off -- one paragraph for floor loot on look.
         character.compact_floor_items = False
@@ -151,6 +190,9 @@ def ensure_display_defaults(character):
     if not hasattr(character, "channel_colors") or character.channel_colors is None:
         # Prefs #26: channel id -> style role name (e.g. ooc -> muted).
         character.channel_colors = {}
+    if not hasattr(character, "suppress_surname_alert"):
+        # Mortal mononyms: silence the login no-surname reminder (config).
+        character.suppress_surname_alert = False
 
 
 def drive_map_render_args(character):
@@ -177,6 +219,16 @@ def wants_combat_tags(character):
     """
     ensure_display_defaults(character)
     return bool(getattr(character, "show_combat_tags", True))
+
+
+def wants_combat_hints(character):
+    """True when repeat combat tutorial lines should show (engage/KO/score).
+
+    Default on; ``config combathints off`` silences the long KO/engage
+    reminders and help-topic pointers on connect reads.
+    """
+    ensure_display_defaults(character)
+    return bool(getattr(character, "show_combat_hints", True))
 
 
 def wants_compact_floor_items(character):
@@ -471,7 +523,7 @@ def _prompt_vitals(character, game=None):
         name = _display_name(character)
     except Exception:
         name = getattr(character, "key", "?")
-    return {
+    bands = {
         "hp": hp,
         "max_hp": max_hp,
         "energy": energy,
@@ -492,7 +544,10 @@ def _prompt_vitals(character, game=None):
         "exits": format_exit_abbrevs(character, game),
         "group": format_group_names(character),
         "target_band": hooks.prompt_target_band(character, game),
+        "need_band": hooks.prompt_need_band(character, game),
     }
+    bands.update(hooks.prompt_supplemental_bands(character, game))
+    return bands
 
 
 def _seg(space_markup, colored_inner):
@@ -552,6 +607,41 @@ def _expand_segment(code, v):
         if not names:
             return ""
         return _seg("<dark_grey> ", f"<white>[{names}]")
+    if code == "Nd":
+        band = (v.get("need_band") or "").strip()
+        if not band:
+            return ""
+        return _seg("<dark_grey> ", f"<silver>[{band}]")
+    if code == "Fm":
+        band = (v.get("form_band") or "").strip()
+        if not band:
+            return ""
+        return _seg("<dark_grey> ", f"<white>[{band}]")
+    if code == "Vs":
+        band = (v.get("vessel_band") or "").strip()
+        if not band:
+            return ""
+        return _seg("<dark_grey> ", f"<violet>[{band}]")
+    if code == "Af":
+        band = (v.get("affliction_band") or "").strip()
+        if not band:
+            return ""
+        return _seg("<dark_grey> ", f"<gold>[{band}]")
+    if code == "In":
+        band = (v.get("integrity_band") or "").strip()
+        if not band:
+            return ""
+        return _seg("<dark_grey> ", f"<silver>[{band}]")
+    if code == "Fv":
+        band = (v.get("favor_band") or "").strip()
+        if not band:
+            return ""
+        return _seg("<dark_grey> ", f"<pale_blue>[{band}]")
+    if code == "Hs":
+        band = (v.get("hospital_band") or "").strip()
+        if not band:
+            return ""
+        return _seg("<dark_grey> ", f"<dark_red>[{band}]")
     return ""
 
 
@@ -581,6 +671,13 @@ def format_prompt(character, game=None):
       %Fu  [80blood]   (fuel Origins only; Path noun)
       %Mo  [66mo]      (fight Momentum; omits at 0)
       %Tg  [bloodied]  foe lifeforce band while fighting (RP only; omits when unscathed)
+      %Nd  [hungry]    most urgent lifestyle need (omits when content)
+      %Fm  [true]      guise / true form / frenzy (fuel Origins; omits in guise)
+      %Vs  [strained]  vessel strain (Mantle embodied; omits when settled)
+      %Af  [winded]    first active combat condition (omits when clean)
+      %In  [damaged]   Constructed Integrity state (omits when stable)
+      %Fv  [waning]    Cosmic Favor state (omits when attuned)
+      %Hs  [clinic]     hospitalized at Town Clinic (omits when ambulatory)
       %Ex  [n,e,s,w]
       %Gr  [Sam, Dean] (colocated groupmates only; omits when solo/apart)
 
@@ -701,3 +798,16 @@ def channel_role(character, channel, default="muted"):
         if custom in style.COLORS or custom in style.COLORS_XTERM256:
             return custom
     return default
+
+
+def paint_channel_line(character, channel, text, *, default="muted"):
+    """Paint one chat line for ``channel`` respecting viewer prefs."""
+    from engine import style
+
+    ensure_display_defaults(character)
+    if getattr(character, "screenreader", False) or not getattr(
+        character, "use_color", True,
+    ):
+        return text
+    role = channel_role(character, channel, default=default)
+    return style.paint_for(character, role, text)
