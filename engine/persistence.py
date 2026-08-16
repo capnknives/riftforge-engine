@@ -1993,12 +1993,22 @@ def _item_container_blob(item):
         "is_spirit_mirror": bool(getattr(item, "is_spirit_mirror", False)),
         "spirit_mirror_source_key": getattr(item, "spirit_mirror_source_key", None),
         "body_equipment": {
-            str(slot): getattr(piece, "key", None)
+            str(slot): {
+                "key": getattr(piece, "key", None),
+                "created_seq": int(getattr(piece, "created_seq", 0) or 0),
+            }
             for slot, piece in (getattr(item, "body_equipment", None) or {}).items()
             if piece is not None
         },
         "body_clothing": {
-            str(slot): [getattr(p, "key", None) for p in (stack or [])]
+            str(slot): [
+                {
+                    "key": getattr(p, "key", None),
+                    "created_seq": int(getattr(p, "created_seq", 0) or 0),
+                }
+                for p in (stack or [])
+                if p is not None
+            ]
             for slot, stack in (getattr(item, "body_clothing", None) or {}).items()
             if isinstance(stack, list)
         },
@@ -3299,6 +3309,96 @@ def load_world(conn, game):
         resolve_pending_body_link(game, char, body_room_key, body_key)
 
 
+def _corpse_worn_key(piece):
+    """Normalize a persisted worn ref (str or {key, created_seq}) to a key."""
+    if piece is None:
+        return None
+    if isinstance(piece, str):
+        text = piece.strip()
+        return text or None
+    if isinstance(piece, Item):
+        return getattr(piece, "key", None)
+    if isinstance(piece, dict):
+        text = str(piece.get("key") or "").strip()
+        return text or None
+    return None
+
+
+def _corpse_worn_created_seq(piece):
+    """Optional created_seq from a persisted worn ref for disambiguation."""
+    if isinstance(piece, dict):
+        try:
+            return int(piece.get("created_seq") or 0)
+        except (TypeError, ValueError):
+            return 0
+    if isinstance(piece, Item):
+        try:
+            return int(getattr(piece, "created_seq", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _find_corpse_worn_piece(room, piece_ref):
+    """Resolve one worn ref to a live Item in ``room`` (or return Item as-is)."""
+    if room is None or piece_ref is None:
+        return None
+    if isinstance(piece_ref, Item):
+        return piece_ref
+    key = _corpse_worn_key(piece_ref)
+    if not key:
+        return None
+    want_seq = _corpse_worn_created_seq(piece_ref)
+    matches = []
+    for obj in getattr(room, "contents", None) or []:
+        if not isinstance(obj, Item) or getattr(obj, "is_body", False):
+            continue
+        if getattr(obj, "key", None) != key:
+            continue
+        if want_seq and int(getattr(obj, "created_seq", 0) or 0) != want_seq:
+            continue
+        matches.append(obj)
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+    flagged = [
+        m for m in matches
+        if getattr(m, "equipped", False) or getattr(m, "worn", False)
+    ]
+    if len(flagged) == 1:
+        return flagged[0]
+    return matches[0]
+
+
+def rehydrate_corpse_worn_refs(body, room):
+    """Replace string worn keys on a corpse Item with live room Item refs."""
+    if body is None or room is None:
+        return
+    equipment = getattr(body, "body_equipment", None) or {}
+    if equipment:
+        resolved = {}
+        for slot, piece in equipment.items():
+            live = _find_corpse_worn_piece(room, piece)
+            if live is not None:
+                resolved[slot] = live
+        body.body_equipment = resolved
+    clothing_map = getattr(body, "body_clothing", None) or {}
+    if clothing_map:
+        resolved_cl = {}
+        for slot, stack in clothing_map.items():
+            if not isinstance(stack, list):
+                continue
+            live_stack = []
+            for entry in stack:
+                live = _find_corpse_worn_piece(room, entry)
+                if live is not None:
+                    live_stack.append(live)
+            if live_stack:
+                resolved_cl[slot] = live_stack
+        body.body_clothing = resolved_cl
+
+
 def resolve_pending_body_link(game, char, body_room_key, body_key):
     """Relink one spirit's ``body`` / ``body_room`` object refs by key.
 
@@ -3351,6 +3451,7 @@ def resolve_pending_body_link(game, char, body_room_key, body_key):
         # vacant Cadence husks wander after vacate.
         live_room = getattr(body, "location", None)
         char.body_room = live_room if live_room is not None else room
+        rehydrate_corpse_worn_refs(body, char.body_room)
     else:
         char.spirit = False
         char.spirit_state = None
