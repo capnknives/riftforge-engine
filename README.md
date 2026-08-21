@@ -67,6 +67,15 @@ python tools/scaffold_game_mode.py --slug mygame --label "My Game"
 
 See [`docs/GAME_MODE_SCHEMA_CHECKLIST.md`](docs/GAME_MODE_SCHEMA_CHECKLIST.md).
 
+## What's new in v0.6.0
+
+- **Command dispatch hook** — `hooks.get_dispatch()` / `set_dispatch()` so games own merged `COMMANDS` tables without engine imports of game packages.
+- **Universal closable doors** — `engine/systems/doors.py` + room `doors[]` schema; open/close/knock through engine verbs with game hooks for locks and prose.
+- **Copyover cache + boot-content gates** — hot-reload skips re-reading unchanged JSON; boot probes validate autoload maps before tick.
+- **Channel speech block hook** — `hooks.channel_speech_blocked(character, game)` replaces lazy game imports in `engine/channels.py` (SUPERS wires biokinesis mute).
+- **MSSP + Discord ops hooks** — `default_mssp_description()` and `discord_staff_op_executor(game, op, args)` keep `server.py` and Discord inbox game-agnostic.
+- **Lag / cooperative-save hardening** — tick budget deferrals, autosave yield points, gateway IPC heartbeat desync guard (watch_and_run).
+
 ## What's new in v0.5.3
 
 - **Collapse FSM** — `engine/systems/collapse.py` for sustained critical-need street coma timers; games register eligibility / needs-frozen gates.
