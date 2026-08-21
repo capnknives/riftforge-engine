@@ -54,15 +54,15 @@ STATE_PATH = ".copyover_state.json"
 # execv copyover, gateway graceful restart, and gateway reattach.
 # Player-facing arc (keep in sync with deploy_notify / gateway hold music):
 #   warn+countdown → pause-coming → MSG_BEFORE → [WAIT] while IPC down →
-#   MSG_AFTER (connected) → soft stitch (optional) → "Rewrite complete"
-# after deferred boot. Do not reuse "holds" for success.
+#   MSG_AFTER ([WAIT] reattached, still frozen) → soft stitch (optional) →
+#   "Rewrite complete" after deferred boot. Reserve "thread holds" for
+#   gateway hold music only — not reattach (players type verbs here).
 MSG_BEFORE = (
-    "*** The Veil shudders. Something ancient is rewriting the bones of "
-    "this world — hold on. ***"
+    "*** The Veil shudders — hold on while the world rewrites. ***"
 )
 MSG_AFTER = (
-    "*** The Veil swallows you whole. You are still here — "
-    "your thread holds. ***"
+    "*** [WAIT] You are still here — hold still; commands wait while "
+    "the world stitches. ***"
 )
 
 
@@ -134,6 +134,21 @@ async def _notify_gateway_planned_restart(game):
         )
 
 
+def clear_content_caches_for_copyover():
+    """Drop in-memory catalog caches before copyover hook re-register.
+
+    Auto-deploy overlays update ``earth_america.json`` and
+    ``supers/content/dungeons/catalog.json`` on the bind-mount while this
+    process still holds pre-overlay ``load_catalog()`` results.
+    ``validate_mouth_alignment_at_boot`` reads the atlas fresh from disk but
+    used the stale catalog cache — false drift aborts copyover after
+    MSG_BEFORE (players see Veil lines then nothing happens).
+    """
+    from engine import hooks
+
+    hooks.clear_content_caches_for_copyover()
+
+
 def reload_world_save_modules():
     """Reload persistence + blob codec from disk before a copyover snapshot.
 
@@ -152,6 +167,8 @@ def reload_world_save_modules():
 
     from engine import hooks
     from engine import persistence as ep
+
+    clear_content_caches_for_copyover()
 
     # Hooks first: persistence's top-level ``from engine.hooks import …``
     # must see the on-disk hooks module, not the pre-overlay cache.
@@ -189,7 +206,32 @@ async def _perform(game):
 
     # Persist the world NOW -- the new process's Game.__init__ reloads from
     # disk, so whatever isn't saved here is lost, same as any other restart.
-    reload_world_save_modules()
+    try:
+        reload_world_save_modules()
+    except Exception as exc:
+        import traceback
+
+        print(
+            f"[copyover] module reload failed -- restoring gameplay hooks "
+            f"and staying up: {exc!r}",
+            flush=True,
+        )
+        traceback.print_exc()
+        try:
+            import game_select
+
+            game_select.restore_hooks_after_copyover_abort()
+            print(
+                "[copyover] restored full hooks after module reload failure",
+                flush=True,
+            )
+        except Exception as restore_exc:
+            print(
+                f"[copyover] failed to restore hooks after module reload "
+                f"failure: {restore_exc!r}",
+                flush=True,
+            )
+        return
     from engine import hooks as _hooks
 
     if not _hooks.blob_codec_registered():

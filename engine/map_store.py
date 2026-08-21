@@ -71,7 +71,7 @@ RSET_BOOL_FLAGS = frozenset({
 # String / free-text fields for rset.
 RSET_TEXT_FIELDS = frozenset({
     "title", "description", "zone", "area_type", "spawn_nest", "spawn_hub",
-    "spawn_prey",
+    "spawn_prey", "citizen_nest",
     "main_homeroom",
 })
 
@@ -153,8 +153,7 @@ def format_rset_help_page():
         "Hospitals: populate hospitals on Hospital Floor N → "
         "Hospital NA-NF recovery wards (hospital + sleep).",
         "",
-        "See: help room | help lodging | help hospital | help populate | "
-        "help content | help build-maps",
+        "See also: help room | help lodging | help hospital | help populate",
     ])
     return "\n".join(lines)
 

@@ -190,12 +190,21 @@ def broadcast_emote(actor, raw_args, game, *, mode="emote"):
     room = getattr(actor, "location", None)
     if room is None:
         return
+
+    def _send_emote_line(viewer, line):
+        from engine import display_prefs as display_prefs_mod
+
+        painted = display_prefs_mod.paint_channel_line(
+            viewer, "emote", line, default="emote",
+        )
+        viewer.session.send(painted)
+        viewer.session.send("")
+
     session = getattr(actor, "session", None)
     if session is not None:
         line = format_emote_line(actor, raw_args, actor, game, mode=mode)
         if line:
-            session.send(line)
-            session.send("")
+            _send_emote_line(actor, line)
             try:
                 from engine import rp_transcript as transcript_mod
                 transcript_mod.capture(actor, line)
@@ -212,8 +221,7 @@ def broadcast_emote(actor, raw_args, game, *, mode="emote"):
         line = format_emote_line(actor, raw_args, watcher, game, mode=mode)
         if not line:
             continue
-        w_sess.send(line)
-        w_sess.send("")
+        _send_emote_line(watcher, line)
         try:
             from engine import rp_transcript as transcript_mod
             transcript_mod.capture(watcher, line)

@@ -39,6 +39,9 @@ ooc           -- global ``ooc`` channel (Town Square ``#ooc``)
 wknz          -- WKNZ Discord radio: host talk, weather/warnings,
                  rare music-flow line (never lyrics / ads / fluff),
                  gateway outage down/up ([WKNZ] Wits)
+bug_report    -- brief player ``bug`` filing to Discord #staff (no debug)
+suggestion    -- brief player ``suggest`` filing to Discord #staff
+patch_notes   -- short player changelog summaries after auto-deploy (#patch-notes)
 
 Add a Discord channel + env mapping when you wire a new tag; keep the
 in-game call site one line: ``schedule_discord(tag, text)``.
@@ -521,3 +524,8 @@ def schedule_wknz_outage_down() -> bool:
 def schedule_wknz_outage_up() -> bool:
     """Discord: game IPC is back after an announced outage. Fail-soft."""
     return schedule_wknz(WKNZ_OUTAGE_UP, kind="outage")
+
+
+def schedule_patch_notes(body: str) -> bool:
+    """Convenience: deploy changelog brief → tag ``patch_notes`` (#patch-notes)."""
+    return schedule_discord("patch_notes", body, kind=None)

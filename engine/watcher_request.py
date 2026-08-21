@@ -5,6 +5,7 @@ each second and acts without dropping the gateway.
 
 Ops:
   restart_game  -- kill + respawn (optional backup; default off)
+  restart_gateway -- stop gateway + game, respawn both (drops all clients)
   revert_stable -- git reset to ``.boot_stable.json`` SHA, then respawn
                    (never writes to ``backups/``)
   clear_revert_hold -- clear crash revert hold + queue auto-deploy catch-up
@@ -56,6 +57,22 @@ def queue_restart_game(*, by="", backup=False, root=None):
     print(
         f"[watcher_request] queued restart_game backup={backup} "
         f"by={payload['by']!r}",
+        flush=True,
+    )
+    return True
+
+
+def queue_restart_gateway(*, by="", root=None):
+    """Ask the watcher to respawn gateway + game (every client drops briefly)."""
+    payload = {
+        "op": "restart_gateway",
+        "by": (by or "staff").strip() or "staff",
+        "at": time.time(),
+    }
+    if not _write_request(payload, root=root):
+        return False
+    print(
+        f"[watcher_request] queued restart_gateway by={payload['by']!r}",
         flush=True,
     )
     return True

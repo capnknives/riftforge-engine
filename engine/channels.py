@@ -45,6 +45,11 @@ FORMAT_TELL = "tell"
 FORMAT_PLAIN = "plain"
 
 _VERB_RE = re.compile(r"^[a-z][a-z0-9_]{1,15}$")
+MAX_PLAYER_CHANNELS_PER_ACCOUNT = 3
+RESERVED_CHANNEL_VERBS = frozenset({
+    "say", "tell", "ooc", "wiznet", "emote", "who", "help", "block",
+    "unblock", "blocks", "chans", "channel", "reply", "whisper",
+})
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,7 @@ class ChannelSpec:
     prefix: str = ""
     color_role: str = "muted"
     title: str = ""
+    owner_account: str = ""
 
 
 _BUILTIN: dict[str, ChannelSpec] = {}
@@ -162,10 +168,49 @@ def room_say_ring(game, room) -> deque:
     return buf
 
 
-def session_tell_ring(session) -> deque:
-    """Per-session tell history (in + out)."""
+def _tell_history_owner(character, game=None):
+    """Return the Character whose private tell ring should hold *character*'s lines.
+
+    GM staff spirits (``gmspirit:`` keys) are not saved to disk; their tell
+    history rides on the linked mortal ``gm_body_key`` body so bare ``tell``
+    survives gateway reattach / copyover like ``ooc`` history does globally.
+    """
+    if character is None:
+        return None
+    key = (getattr(character, "key", "") or "").lower()
+    is_spirit = key.startswith("gmspirit:") or bool(
+        getattr(character, "gm_spirit", False)
+    )
+    if is_spirit and game is not None:
+        body_key = getattr(character, "gm_body_key", None)
+        if isinstance(body_key, str) and body_key.strip():
+            finder = getattr(game, "find_character", None)
+            if callable(finder):
+                body = finder(body_key.strip())
+                if body is not None:
+                    return body
+    return character
+
+
+def character_tell_ring(character, game=None) -> deque:
+    """Per-character tell history (in + out); survives session recreation."""
+    owner = _tell_history_owner(character, game)
+    if owner is None:
+        return deque(maxlen=DEFAULT_RING_MAX)
+    buf = getattr(owner, "tell_history", None)
+    if buf is None:
+        buf = deque(maxlen=DEFAULT_RING_MAX)
+        owner.tell_history = buf
+    return buf
+
+
+def session_tell_ring(session, game=None) -> deque:
+    """Tell ring for the Session's bound character (legacy session field unused)."""
     if session is None:
         return deque(maxlen=DEFAULT_RING_MAX)
+    char = getattr(session, "character", None)
+    if char is not None:
+        return character_tell_ring(char, game)
     buf = getattr(session, "tell_history", None)
     if buf is None:
         buf = deque(maxlen=DEFAULT_RING_MAX)
@@ -203,6 +248,8 @@ def can_speak(character, spec: ChannelSpec, game) -> bool:
         return False
     if _is_muted(character):
         return False
+    if hooks.channel_speech_blocked(character, game):
+        return False
     return audience_ok(character, spec.audience, game)
 
 
@@ -238,18 +285,59 @@ def append(
         _schedule_gateway_mirror(game, channel_name, plain)
 
 
-def append_room_say(game, room, plain_line: str) -> None:
-    text = (plain_line or "").strip()
-    if not text or room is None:
+def append_room_say(game, room, entry) -> None:
+    """Append one room say ring entry (structured dict or legacy plain str)."""
+    if entry is None or room is None:
         return
-    room_say_ring(game, room).append(text)
+    if isinstance(entry, str):
+        text = entry.strip()
+        if not text:
+            return
+        room_say_ring(game, room).append(text)
+        return
+    if isinstance(entry, dict):
+        message = str(entry.get("message") or "").strip()
+        if not message:
+            return
+        room_say_ring(game, room).append(entry)
+        return
+    text = str(entry).strip()
+    if text:
+        room_say_ring(game, room).append(text)
 
 
-def append_tell(session, plain_line: str) -> None:
-    text = (plain_line or "").strip()
-    if not text or session is None:
+def append_tell(session, entry, *, game=None) -> None:
+    """Append one tell history entry (structured dict or legacy plain str)."""
+    if entry is None or session is None:
         return
-    session_tell_ring(session).append(text)
+    if isinstance(entry, str):
+        text = entry.strip()
+        if not text:
+            return
+        char = getattr(session, "character", None)
+        if char is not None:
+            character_tell_ring(char, game).append(text)
+            return
+        session_tell_ring(session, game).append(text)
+        return
+    if isinstance(entry, dict):
+        message = str(entry.get("message") or "").strip()
+        if not message:
+            return
+        char = getattr(session, "character", None)
+        if char is not None:
+            character_tell_ring(char, game).append(entry)
+            return
+        session_tell_ring(session, game).append(entry)
+        return
+    text = str(entry).strip()
+    if not text:
+        return
+    char = getattr(session, "character", None)
+    if char is not None:
+        character_tell_ring(char, game).append(text)
+        return
+    session_tell_ring(session, game).append(text)
 
 
 def is_empty(game, channel_name: str) -> bool:
@@ -412,6 +500,7 @@ def _spec_from_def(defn: dict) -> Optional[ChannelSpec]:
     color = str(defn.get("color_role") or "muted").strip()
     ring_max = int(defn.get("ring_max") or DEFAULT_RING_MAX)
     ring_max = max(5, min(ring_max, 50))
+    owner_account = str(defn.get("owner_account") or "").strip()
     return ChannelSpec(
         name=name,
         verb=verb,
@@ -431,6 +520,7 @@ def _spec_from_def(defn: dict) -> Optional[ChannelSpec]:
         prefix=prefix,
         color_role=color,
         title=title,
+        owner_account=owner_account,
     )
 
 
@@ -468,6 +558,7 @@ def _save_custom_registry(conn, game) -> None:
             "prefix": spec.prefix,
             "color_role": spec.color_role,
             "ring_max": spec.ring_max,
+            "owner_account": spec.owner_account or "",
         })
     payload["defs"] = defs
     blob = json.dumps(payload, separators=(",", ":"))
@@ -480,6 +571,34 @@ def _save_custom_registry(conn, game) -> None:
 
 def list_custom_channels() -> list[ChannelSpec]:
     return [s for s in _BUILTIN.values() if not s.builtin and s.scope == SCOPE_GLOBAL]
+
+
+def list_player_channels(owner_account: str) -> list[ChannelSpec]:
+    """Custom global channels owned by one account name."""
+    owner_key = (owner_account or "").strip().lower()
+    if not owner_key:
+        return []
+    return [
+        s for s in list_custom_channels()
+        if (s.owner_account or "").strip().lower() == owner_key
+    ]
+
+
+def player_channel_count(owner_account: str) -> int:
+    return len(list_player_channels(owner_account))
+
+
+def can_manage_channel(game, account, spec: ChannelSpec) -> bool:
+    """True when *account* may remove a non-built-in global channel."""
+    if spec is None or spec.builtin:
+        return False
+    owner_key = (spec.owner_account or "").strip().lower()
+    if not owner_key:
+        return False
+    if account is None:
+        return False
+    from engine.accounts import account_lookup_key
+    return account_lookup_key(account.name) == owner_key
 
 
 def save_custom_registry(conn, game) -> None:
@@ -497,8 +616,9 @@ def create_custom_channel(
     prefix: str = "",
     color_role: str = "muted",
     ring_max: int = DEFAULT_RING_MAX,
+    owner_account: str = "",
 ) -> tuple[bool, str]:
-    """Staff: register a new global channel. Returns (ok, message)."""
+    """Register a new global channel. Returns (ok, message)."""
     defn = {
         "name": (name or "").strip().lower(),
         "verb": (verb or name or "").strip().lower(),
@@ -507,11 +627,12 @@ def create_custom_channel(
         "prefix": prefix,
         "color_role": color_role,
         "ring_max": ring_max,
+        "owner_account": (owner_account or "").strip(),
     }
     spec = _spec_from_def(defn)
     if spec is None:
         return False, "Invalid channel name/verb (lowercase letters, digits, underscore; 2-16 chars)."
-    if spec.verb in ("say", "tell", "ooc", "wiznet", "emote", "who", "help"):
+    if spec.verb in RESERVED_CHANNEL_VERBS:
         return False, f"Verb '{spec.verb}' is reserved."
     existing = get_channel(spec.name)
     if existing is not None:
@@ -526,14 +647,56 @@ def create_custom_channel(
     return True, f"Channel '{spec.title or spec.name}' created (verb: {spec.verb}, audience: {spec.audience})."
 
 
-def remove_custom_channel(game, name: str) -> tuple[bool, str]:
-    """Staff: remove a non-built-in global channel."""
+def create_player_channel(
+    game,
+    account,
+    *,
+    name: str,
+    verb: str,
+    title: str = "",
+) -> tuple[bool, str]:
+    """Player-owned public channel (audience all). Returns ``(ok, message)``."""
+    if account is None:
+        return False, "Link an account first (help account)."
+    if player_channel_count(account.name) >= MAX_PLAYER_CHANNELS_PER_ACCOUNT:
+        return (
+            False,
+            f"You already own {MAX_PLAYER_CHANNELS_PER_ACCOUNT} public channels. "
+            "Remove one with chans remove <name> before creating another.",
+        )
+    ok, msg = create_custom_channel(
+        game,
+        name=name,
+        verb=verb,
+        title=title or verb or name,
+        audience=AUDIENCE_ALL,
+        owner_account=account.name,
+    )
+    if not ok:
+        return ok, msg
+    return (
+        True,
+        (
+            f"{msg} Anyone online can type {verb} <message>. "
+            f"You own this channel — chans remove {name.strip().lower()} to delete it."
+        ),
+    )
+
+
+def remove_custom_channel(game, name: str, *, account=None) -> tuple[bool, str]:
+    """Remove a non-built-in global channel (owner or unrestricted staff path)."""
     key = (name or "").strip().lower()
     spec = get_channel(key)
     if spec is None:
         return False, f"No channel named '{key}'."
     if spec.builtin:
         return False, f"Built-in channel '{key}' cannot be removed."
+    if account is not None:
+        if not can_manage_channel(game, account, spec):
+            return False, (
+                f"You do not own channel '{key}'. "
+                "Only the creator can remove player public channels."
+            )
     _BUILTIN.pop(key, None)
     _VERB_INDEX.pop(spec.verb, None)
     payload = _custom_payload(game)
@@ -588,21 +751,111 @@ def replay_wiznet_entry(entry) -> str:
     return style.paint("absinthe_green", plain)
 
 
-def render_plain_entry(spec: ChannelSpec, entry, viewer) -> str:
+def render_room_say_entry(entry, viewer, game) -> str:
+    """Render one room say history entry for *viewer*."""
+    from engine import display_prefs
+    from command_support import _display_name
+
+    if isinstance(entry, str):
+        return entry
+    if not isinstance(entry, dict):
+        return str(entry or "")
+    message = str(entry.get("message") or "").strip()
+    if not message:
+        return ""
+    you_verb = str(entry.get("you_verb") or "say")
+    they_verb = str(entry.get("they_verb") or "says")
+    tone = entry.get("tone")
+    prefix = str(entry.get("drunk_tag") or "")
+    face = "?"
+    speaker_key = entry.get("speaker")
+    if speaker_key and game is not None:
+        finder = getattr(game, "find_character", None)
+        speaker = finder(speaker_key) if callable(finder) else None
+        if speaker is not None:
+            face = _display_name(speaker, viewer=viewer)
+    line = display_prefs.format_say_chat(
+        viewer,
+        face,
+        message,
+        you=False,
+        you_verb=you_verb,
+        they_verb=they_verb,
+        tone=tone,
+    )
+    return f"{prefix}{line}" if prefix else line
+
+
+def render_tell_entry(entry, viewer) -> str:
+    """Render one tell history entry for *viewer*."""
+    from engine import display_prefs
+
+    if isinstance(entry, str):
+        return entry
+    if not isinstance(entry, dict):
+        return str(entry or "")
+    message = str(entry.get("message") or "").strip()
+    if not message:
+        return ""
+    peer = str(entry.get("peer") or "?")
+    kind = str(entry.get("kind") or "")
+    if kind == "out":
+        return display_prefs.format_tell_chat(
+            viewer, outgoing=True, peer_face=peer, message=message,
+        )
+    if kind == "in":
+        return display_prefs.format_tell_chat(
+            viewer, outgoing=False, peer_face=peer, message=message,
+        )
+    plain = str(entry.get("plain") or "").strip()
+    return plain
+
+
+def render_plain_entry(spec: ChannelSpec, entry, viewer, game=None) -> str:
     from engine import display_prefs
     from engine import style
+    from command_support import _presence_face
 
     if isinstance(entry, dict):
-        plain = str(entry.get("plain") or "")
+        message = str(entry.get("message") or "").strip()
+        if display_prefs.wants_plain_comms(viewer) and message:
+            face = "?"
+            speaker_key = entry.get("speaker")
+            if speaker_key and game is not None:
+                finder = getattr(game, "find_character", None)
+                speaker = finder(speaker_key) if callable(finder) else None
+                if speaker is not None:
+                    face = _presence_face(speaker)
+            line = display_prefs.format_custom_chat(
+                viewer, spec.title, spec.prefix, face, message,
+            )
+        else:
+            line = str(entry.get("plain") or "")
     else:
-        plain = str(entry or "")
-    plain = plain.strip()
-    if not plain:
+        line = str(entry or "")
+    line = line.strip()
+    if not line:
         return ""
     display_prefs.ensure_display_defaults(viewer)
     if getattr(viewer, "screenreader", False) or not getattr(viewer, "use_color", True):
-        return plain
-    return style.paint_for(viewer, spec.color_role, plain)
+        return line
+    return style.paint_for(viewer, spec.color_role, line)
+
+
+def _entry_speaker_key(entry: Any) -> Optional[str]:
+    if isinstance(entry, dict):
+        speaker = entry.get("speaker")
+        if isinstance(speaker, str) and speaker.strip():
+            return speaker.strip()
+    return None
+
+
+def _should_hide_public_entry(viewer, game, entry) -> bool:
+    from engine.accounts import ooc_should_hide_from_viewer
+    speaker_key = _entry_speaker_key(entry)
+    if speaker_key:
+        return ooc_should_hide_from_viewer(viewer, game, speaker_key)
+    return False
 
 
 def replay_global(character, game, channel_name: str) -> None:
@@ -619,12 +872,14 @@ def replay_global(character, game, channel_name: str) -> None:
         return
     send_replay_header(character, channel_name)
     for entry in entries(game, channel_name):
+        if _should_hide_public_entry(character, game, entry):
+            continue
         if spec.format == FORMAT_OOC:
             line = render_ooc_entry(entry, character, game)
         elif spec.format == FORMAT_WIZNET:
             line = replay_wiznet_entry(entry)
         else:
-            line = render_plain_entry(spec, entry, character)
+            line = render_plain_entry(spec, entry, character, game)
         if line:
             session.send(line)
     session.send("")
@@ -640,22 +895,26 @@ def replay_room_say(character, game) -> None:
         session.send("No recent speech here. Type 'say <message>' to speak.")
         return
     session.send(f"Recent speech here (last {DEFAULT_RING_MAX}):")
-    for line in buf:
-        session.send(line)
+    for entry in buf:
+        line = render_room_say_entry(entry, character, game)
+        if line:
+            session.send(line)
     session.send("")
 
 
-def replay_tells(character) -> None:
+def replay_tells(character, game=None) -> None:
     session = getattr(character, "session", None)
     if session is None:
         return
-    buf = session_tell_ring(session)
+    buf = character_tell_ring(character, game)
     if not buf:
         session.send("No recent tells. Type 'tell <name> <message>' to whisper.")
         return
     session.send(f"Recent tells (last {DEFAULT_RING_MAX}):")
-    for line in buf:
-        session.send(line)
+    for entry in buf:
+        line = render_tell_entry(entry, character)
+        if line:
+            session.send(line)
     session.send("")
 
 
@@ -685,19 +944,34 @@ def speak_custom_global(
     plain = format_custom_plain(spec, speaker_face, message)
     if not plain:
         return False
-    append(game, spec.name, plain, gateway_plain=plain)
+    speaker_key = getattr(speaker, "key", None)
+    entry = {
+        "speaker": speaker_key,
+        "plain": plain,
+        "message": message,
+    }
+    append(game, spec.name, entry, gateway_plain=plain)
     delivered = False
+    from engine.accounts import ooc_should_hide_from_viewer
+
+    def _render_for(viewer):
+        line = display_prefs.format_custom_chat(
+            viewer, spec.title, spec.prefix, speaker_face, message,
+        )
+        if getattr(viewer, "screenreader", False) or not getattr(viewer, "use_color", True):
+            return line
+        return style.paint_for(viewer, spec.color_role, line)
+
     for session in list(getattr(game, "sessions", None) or []):
         other = getattr(session, "character", None)
         if other is None:
             continue
         if not can_hear(other, spec, game):
             continue
+        if ooc_should_hide_from_viewer(other, game, speaker_key):
+            continue
         display_prefs.ensure_display_defaults(other)
-        if getattr(other, "screenreader", False) or not getattr(other, "use_color", True):
-            line = plain
-        else:
-            line = style.paint_for(other, spec.color_role, plain)
+        line = _render_for(other)
         session.send(line)
         session.send("")
         gmcp.push_comm(session, spec.verb, message, speaker_face)
@@ -705,10 +979,7 @@ def speak_custom_global(
     if not delivered and getattr(speaker, "session", None) is not None:
         sess = speaker.session
         display_prefs.ensure_display_defaults(speaker)
-        if getattr(speaker, "screenreader", False) or not getattr(speaker, "use_color", True):
-            line = plain
-        else:
-            line = style.paint_for(speaker, spec.color_role, plain)
+        line = _render_for(speaker)
         sess.send(line)
         sess.send("")
         delivered = True

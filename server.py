@@ -71,10 +71,10 @@ TICKS_PER_GAME_DAY = 9600
 # scale 1 = 1/3 tick/heartbeat), so a tick-count gate silently stretched
 # autosave to ~3x this interval when the world clock defaulted to 1:1
 # real-time. Immediate saves still run on connect/disconnect/shutdown.
-# Default 90s (was 60) -- full SQLite apply still blocks the asyncio thread
-# for a beat; stretching the interval cuts freeze frequency. Override with
-# RIFTFORGE_AUTOSAVE_SECONDS.
-AUTOSAVE_INTERVAL_SECONDS = 90.0
+# Default 180s (was 90) -- cooperative autosave still monopolizes the loop
+# for many seconds when a large dirty backlog builds; stretching the interval
+# cuts freeze frequency. Override with RIFTFORGE_AUTOSAVE_SECONDS.
+AUTOSAVE_INTERVAL_SECONDS = 180.0
 
 
 def _autosave_interval_seconds():
@@ -106,6 +106,15 @@ class Game:
         game_heartbeat.touch_heartbeat("game_init")
         from engine import boot_profile as boot_profile_mod
         boot_profile_mod.reset()
+        try:
+            game_select.run_boot_content_gate()
+        except Exception as exc:
+            from engine import boot_failure
+
+            boot_failure.record_boot_failure(exc, phase="content_gate")
+            raise
+        boot_profile_mod.mark("content_gate")
+        game_heartbeat.touch_heartbeat("pre_build_world")
         # Additive heal from protected content/map_backups BEFORE the map
         # load: auto-deploy reset --hard makes zone/map JSON follow git,
         # and the watcher historically no-op'd heal (hooks reload + no
@@ -133,6 +142,7 @@ class Game:
         # Must land BEFORE load_world / seeding so move_to registers Echoes.
         from engine.char_index import RoomMap
         raw_rooms, self.start_room, seed_items = build_world()
+        game_heartbeat.touch_heartbeat("post_build_world")
         boot_profile_mod.mark("build_world")
         self.characters = set()
         # Monster/Celestial fuel-loop subset (supers/fuel.py) -- kept in sync
@@ -161,9 +171,25 @@ class Game:
         self.started_at = time.time()
         # Telnet listen port for MSSP PORT metadata (engine/mssp.py listen_port).
         self.listen_port = int(os.environ.get("RIFTFORGE_PORT", "4000"))
+        # MSSP DESCRIPTION for listing crawlers (engine/mssp.py build_status).
+        # engine/mssp.py stays game-agnostic, so SUPERS supplies the real
+        # blurb here instead of falling through to the generic engine-demo
+        # default. RIFTFORGE_MSSP_DESCRIPTION (if set) still overrides this.
+        from engine import hooks as hooks_mod
+
+        self.mssp_description = hooks_mod.default_mssp_description()
         # Autosave cadence clock (AUTOSAVE_INTERVAL_SECONDS) -- wall-clock,
         # not persisted; resets on boot same as started_at.
         self._last_autosave_monotonic = time.monotonic()
+        # Cooperative save single-flight (lag save-coop): at most one
+        # ``_run_save_task``; stacked login/autosave/disconnect schedules
+        # set ``_save_pending_after_current`` for one follow-up pass.
+        self._save_task_in_flight = False
+        self._save_pending_after_current = False
+        # Lag P12.1: autosave coalesced follow-ups defer during the
+        # post-deploy window; vault restore uses single-char persist (fold_vault).
+        self._save_deferred_for_deploy = False
+        self._save_deferred_reason = None
         # Global channel rings (ooc, wiznet, …) — see engine/channel_history.py.
         # Deques are created here; meta refill happens after db connect below.
         from engine import channel_history
@@ -177,6 +203,10 @@ class Game:
         # reports across rebuilds (reports.py / commands.py).
         # dirname("riftforge.db") is "" -- use ".".
         self.report_dir = os.path.dirname(db_path) or "."
+        self.db_path = db_path
+        from engine import reports as reports_mod
+
+        reports_mod.ensure_report_logs(self.report_dir)
 
         self.db = persistence.connect(db_path)
         boot_profile_mod.mark("db_connect")
@@ -276,6 +306,7 @@ class Game:
         self.gather_nodes = {}
         self.personal_realms = {}
         self._personal_realms_dirty = False
+        self.dream_pockets = {}
         self._floor_item_room_keys = set()
         self._load_persisted_meta()
 
@@ -306,6 +337,8 @@ class Game:
             township_mod.load_townships(self.db, self)
             from supers import personal_realm as personal_realm_mod
             personal_realm_mod.load_personal_realms(self.db, self)
+            from supers import dream_pocket as dream_pocket_mod
+            dream_pocket_mod.load_dream_pockets(self.db, self)
         boot_profile_mod.mark("load_personal_realms")
 
         # Persistable runtime rooms (vehicle interiors, charter cabins, …)
@@ -352,6 +385,8 @@ class Game:
 
         from engine import persistence as persistence_mod
         persistence_mod.rebuild_floor_item_room_index(self)
+        if persistence.is_seeded(self.db):
+            persistence_mod.seed_snapshot_hashes_after_load(self)
 
         # Engine accounts: load after characters so back-pointers reconcile.
         persistence.load_accounts(self.db, self)
@@ -599,6 +634,11 @@ class Game:
             )
             self._note_save_failure(reason, exc)
             raise
+        wal_stats = persistence.maybe_wal_checkpoint_after_save(
+            self.db, self.db_path, reason=reason,
+        )
+        if wal_stats:
+            self._last_wal_checkpoint_stats = wal_stats
         self._note_save_success()
 
     def _note_save_success(self):
@@ -679,7 +719,7 @@ class Game:
                 try:
                     from supers import homestead as homestead_mod
                     from supers import gathering as gathering_mod
-                    homestead_mod.save_homesteads(self.db, self)
+                    homestead_mod.save_homesteads(self.db, self, force=True)
                     gathering_mod.save_gather_nodes(self.db, self)
                     from supers import player_shops as player_shops_mod
                     player_shops_mod.save_player_shops(self.db, self)
@@ -690,6 +730,8 @@ class Game:
                     self._personal_realms_dirty = False
                     from supers.demesne.persist import save_demesnes
                     save_demesnes(self.db, self)
+                    from supers import dream_pocket as dream_pocket_mod
+                    dream_pocket_mod.save_dream_pockets(self.db, self)
                 except Exception:
                     print("[server] homestead/gather save failed:", flush=True)
                     traceback.print_exc()
@@ -720,6 +762,8 @@ class Game:
                 self._personal_realms_dirty = False
                 from supers.demesne.persist import save_demesnes
                 save_demesnes(self.db, self)
+                from supers import dream_pocket as dream_pocket_mod
+                dream_pocket_mod.save_dream_pockets(self.db, self)
             except Exception:
                 # Never let a homestead codec abort the rest of the snapshot.
                 traceback.print_exc()
@@ -739,6 +783,8 @@ class Game:
         game_heartbeat.touch_heartbeat("tick_loop_start")
         while True:
             await asyncio.sleep(3)        # pause 3s WITHOUT freezing the server
+            from engine import lag_watch
+            lag_watch.check_inter_tick_gap(self)
             # Stamp before work: if the heartbeat blocks forever, the watcher
             # sees this mtime go stale and force-restarts.
             game_heartbeat.touch_heartbeat("pre_tick")
@@ -770,6 +816,7 @@ class Game:
                     metrics_mod.bump(self, "tick_slow")
             # Stamp after work so a completed heavy tick resets the clock.
             game_heartbeat.touch_heartbeat("post_tick")
+            lag_watch.note_post_tick_wall(self)
             from engine import boot_stability
             boot_stability.note_post_tick()
             from engine import world_backup
@@ -790,6 +837,7 @@ class Game:
         game_clock_tuning.advance_game_time_ticks(self)
         await run_ticks_async(self)
         await self._maybe_autosave_async()
+        await self._maybe_flush_deferred_deploy_save()
 
     def on_tick(self):
         """Sync heartbeat for smoke/tools -- no Cadence yields.
@@ -808,6 +856,10 @@ class Game:
         other sessions while JSON rows are built. Only one save runs at a
         time -- concurrent callers spin with ``asyncio.sleep(0)``.
 
+        Heartbeat-scheduled saves use ``_run_save_task``, which contains
+        failures without re-raising. Direct ``await save_async(...)`` from
+        tests or copyover still propagates exceptions after logging.
+
         After the world apply, accounts + SUPERS meta tables are timed and
         yield between slices so Cadence is not starved across a multi-
         second meta wipe (lag P5).
@@ -822,11 +874,30 @@ class Game:
             await asyncio.sleep(0)
         self._autosave_running = True
         meta_stats = {}
+        save_wall_start = _save_time.perf_counter()
+        save_wall_budget_ms = persistence.persist_save_wall_budget_ms()
+        save_meta_deferred = False
         try:
             try:
-                await persistence.save_world_async(self.db, self)
+                await persistence.save_world_async(
+                    self.db, self,
+                    wall_start=save_wall_start,
+                    wall_budget_ms=save_wall_budget_ms,
+                )
 
-                async def _meta_slice(name, fn):
+                async def _meta_slice(name, fn, *, required=True):
+                    nonlocal save_meta_deferred
+                    if (
+                        reason == "autosave"
+                        and not required
+                        and persistence._persist_save_over_wall_budget(
+                            save_wall_start, save_wall_budget_ms,
+                        )
+                    ):
+                        save_meta_deferred = True
+                        meta_stats[f"{name}_deferred"] = "wall_budget"
+                        return
+                    await asyncio.sleep(0)
                     t0 = _save_time.perf_counter()
                     try:
                         fn()
@@ -859,10 +930,22 @@ class Game:
                 acct = getattr(self, "_last_accounts_save_stats", None) or {}
                 meta_stats["accounts_changed"] = acct.get("n_changed")
                 meta_stats["accounts_full"] = acct.get("force_full")
-                await _meta_slice(
-                    "game_meta",
-                    lambda: hooks_mod.save_game_meta(self, self.db),
-                )
+                if _HAS_SUPERS:
+                    t0_gm = _save_time.perf_counter()
+                    try:
+                        from supers.persist_meta import save_supers_meta_async
+                        await save_supers_meta_async(self, self.db)
+                    finally:
+                        meta_stats["game_meta_ms"] = round(
+                            (_save_time.perf_counter() - t0_gm) * 1000.0, 2,
+                        )
+                    await asyncio.sleep(0)
+                else:
+                    await _meta_slice(
+                        "game_meta",
+                        lambda: hooks_mod.save_game_meta(self, self.db),
+                    )
+                    meta_stats["game_meta_ms"] = meta_stats.get("game_meta_ms")
                 gm_meta = getattr(self, "_last_game_meta_save_stats", None) or {}
                 meta_stats["game_meta_skipped"] = gm_meta.get("skipped")
                 meta_stats["game_meta_full"] = gm_meta.get("force_full")
@@ -885,41 +968,55 @@ class Game:
                         from supers import township as township_mod
                         from supers import personal_realm as personal_realm_mod
                         from supers.demesne.persist import save_demesnes
+                        from supers import dream_pocket as dream_pocket_mod
 
                         await _meta_slice(
                             "homesteads",
                             lambda: homestead_mod.save_homesteads(
                                 self.db, self,
                             ),
+                            required=False,
                         )
                         await _meta_slice(
                             "gather",
                             lambda: gathering_mod.save_gather_nodes(
                                 self.db, self,
                             ),
+                            required=False,
                         )
                         await _meta_slice(
                             "player_shops",
                             lambda: player_shops_mod.save_player_shops(
                                 self.db, self,
                             ),
+                            required=False,
                         )
                         await _meta_slice(
                             "township",
                             lambda: township_mod.save_townships(
                                 self.db, self,
                             ),
+                            required=False,
                         )
                         await _meta_slice(
                             "personal_realms",
                             lambda: personal_realm_mod.save_personal_realms(
                                 self.db, self,
                             ),
+                            required=False,
                         )
                         self._personal_realms_dirty = False
                         await _meta_slice(
                             "demesnes",
                             lambda: save_demesnes(self.db, self),
+                            required=False,
+                        )
+                        await _meta_slice(
+                            "dream_pockets",
+                            lambda: dream_pocket_mod.save_dream_pockets(
+                                self.db, self,
+                            ),
+                            required=False,
                         )
                     except Exception:
                         traceback.print_exc()
@@ -932,26 +1029,102 @@ class Game:
                 )
                 self._note_save_failure(reason, exc)
                 raise
+            if (
+                reason == "autosave"
+                and save_wall_budget_ms > 0
+                and persistence._persist_save_over_wall_budget(
+                    save_wall_start, save_wall_budget_ms,
+                )
+            ):
+                meta_stats["wal_checkpoint_deferred"] = "wall_budget"
+            else:
+                wal_stats = persistence.maybe_wal_checkpoint_after_save(
+                    self.db, self.db_path, reason=reason,
+                )
+                if wal_stats:
+                    self._last_wal_checkpoint_stats = wal_stats
+                    if meta_stats is not None:
+                        meta_stats.update(wal_stats)
+                        self._last_meta_save_stats = meta_stats
+            world = getattr(self, "_last_world_save_stats", None) or {}
+            meta_stats["world_ms"] = round(
+                float(world.get("collect_ms") or 0.0)
+                + float(world.get("apply_ms") or 0.0),
+                2,
+            )
+            meta_stats["save_wall_ms"] = round(
+                (_save_time.perf_counter() - save_wall_start) * 1000.0, 2,
+            )
             self._note_save_success()
+            if save_meta_deferred:
+                self._save_pending_after_current = True
         finally:
             self._autosave_running = False
 
-    def schedule_save_async(self):
+    # Save reasons deferred during the post-deploy window (lag P12 / P12.1).
+    _DEPLOY_DEFERRABLE_SAVE_REASONS = frozenset({
+        "autosave",
+        "scheduled",
+    })
+
+    def schedule_save_async(self, *, reason="scheduled"):
         """Queue a cooperative snapshot without blocking the caller.
 
-        ``Session.disconnect`` uses this so other players are not frozen
-        while JSON rows are built. Falls back to sync ``save()`` when no
-        asyncio loop is running (smoke / tests). Shutdown still calls
-        sync ``save()`` so the process exits with a completed write.
+        ``Session.disconnect`` and post-login use this so other players are
+        not frozen while JSON rows are built. Stacked schedules while a save
+        is in flight coalesce to one follow-up pass (lag save-coop). Falls
+        back to sync ``save()`` when no asyncio loop is running (smoke /
+        tests). Shutdown still calls sync ``save()`` so the process exits
+        with a completed write.
         """
         import asyncio
 
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
+            if self._defer_save_for_recent_deploy(reason):
+                return
             self.save()
             return
-        loop.create_task(self.save_async(reason="scheduled"))
+        self._request_save_async(reason=reason)
+
+    def _defer_save_for_recent_deploy(self, reason):
+        """Queue a cooperative save until the post-deploy window clears."""
+        if reason not in self._DEPLOY_DEFERRABLE_SAVE_REASONS:
+            return False
+        import os
+        from engine import auto_deploy
+        from engine import log_util
+
+        blocked, since, window = auto_deploy.deploy_save_defer_status(os.getcwd())
+        if not blocked:
+            return False
+        self._save_deferred_for_deploy = True
+        if reason != "scheduled" or not self._save_deferred_reason:
+            self._save_deferred_reason = reason
+        log_util.ops(
+            "lag_watch",
+            "save_defer "
+            f"reason={reason} since_reset_s={since:.1f} "
+            f"window_s={window} "
+            f"ticks={getattr(self, 'game_time_ticks', '?')}",
+        )
+        return True
+
+    def _request_save_async(self, *, reason="scheduled"):
+        """Start at most one background save; coalesce duplicate schedules."""
+        import asyncio
+
+        if self._defer_save_for_recent_deploy(reason):
+            return
+        if getattr(self, "_save_task_in_flight", False):
+            self._save_pending_after_current = True
+            return
+        if getattr(self, "_autosave_running", False):
+            self._save_pending_after_current = True
+            return
+        self._save_task_in_flight = True
+        asyncio.create_task(self._run_save_task(reason=reason))
 
     async def _maybe_autosave_async(self):
         """Autosave every AUTOSAVE_INTERVAL_SECONDS of wall-clock time.
@@ -963,10 +1136,43 @@ class Game:
         """
         if not self._autosave_due():
             return
-        if getattr(self, "_autosave_running", False):
+        self._request_save_async(reason="autosave")
+
+    async def _maybe_flush_deferred_deploy_save(self):
+        """Run one queued save after the post-deploy defer window expires."""
+        if not getattr(self, "_save_deferred_for_deploy", False):
             return
-        import asyncio
-        asyncio.create_task(self._run_autosave_task())
+        import os
+        from engine import auto_deploy
+
+        blocked, _since, _window = auto_deploy.deploy_save_defer_status(os.getcwd())
+        if blocked:
+            return
+        self._save_deferred_for_deploy = False
+        reason = getattr(self, "_save_deferred_reason", None) or "scheduled"
+        self._save_deferred_reason = None
+        if getattr(self, "_save_task_in_flight", False):
+            self._save_pending_after_current = True
+            return
+        if getattr(self, "_autosave_running", False):
+            self._save_pending_after_current = True
+            return
+        self._request_save_async(reason=reason)
+
+    def _maybe_flush_deferred_deploy_save_sync(self):
+        """Sync heartbeat flush for smoke/tools (production uses async)."""
+        if not getattr(self, "_save_deferred_for_deploy", False):
+            return
+        import os
+        from engine import auto_deploy
+
+        blocked, _since, _window = auto_deploy.deploy_save_defer_status(os.getcwd())
+        if blocked:
+            return
+        self._save_deferred_for_deploy = False
+        reason = getattr(self, "_save_deferred_reason", None) or "scheduled"
+        self._save_deferred_reason = None
+        self.save(reason=reason)
 
     def _merge_autosave_stats(self, total_ms):
         """Combine world + meta slice timings into one autosave stats dict."""
@@ -992,17 +1198,30 @@ class Game:
         }
         for key, value in meta.items():
             stats[key] = value
+        wal = getattr(self, "_last_wal_checkpoint_stats", None) or {}
+        for key, value in wal.items():
+            stats[key] = value
         return stats
 
-    async def _run_autosave_task(self):
-        """Background autosave with rich diag timing (always stores last stats)."""
+    async def _run_save_task(self, *, reason="autosave"):
+        """Background save with rich diag timing (always stores last stats).
+
+        Fail-soft: ``save_async`` already logs and stamps ``_save_fail_streak``
+        before re-raising. This wrapper contains the exception so asyncio does
+        not emit unhandled-task warnings during heartbeat autosave.
+        """
         from engine import diag_export
         import collections
         import time as _save_time
 
         _t_save = _save_time.perf_counter()
         try:
-            await self.save_async(reason="autosave")
+            try:
+                await self.save_async(reason=reason)
+            except Exception:
+                # save_async already called _note_save_failure -- do not
+                # double-stamp the streak or ops webhook.
+                pass
         finally:
             total_ms = (_save_time.perf_counter() - _t_save) * 1000.0
             stats = self._merge_autosave_stats(total_ms)
@@ -1012,6 +1231,11 @@ class Game:
                 ring = collections.deque(maxlen=8)
                 self._autosave_stats = ring
             ring.append(stats)
+            try:
+                from engine import lag_watch
+                lag_watch.note_autosave_stall(self, stats, reason=reason)
+            except Exception:
+                pass
             if diag_export.diag_enabled():
                 diag_export.append_event(
                     "D",
@@ -1019,6 +1243,14 @@ class Game:
                     "autosave_ms",
                     stats,
                 )
+            self._save_task_in_flight = False
+            if getattr(self, "_save_pending_after_current", False):
+                self._save_pending_after_current = False
+                self._request_save_async(reason="scheduled")
+
+    async def _run_autosave_task(self):
+        """Backward-compatible alias for autosave background task."""
+        await self._run_save_task(reason="autosave")
 
     def _autosave_due(self):
         """True once every AUTOSAVE_INTERVAL_SECONDS of wall-clock time.
@@ -1032,7 +1264,27 @@ class Game:
         last = getattr(self, "_last_autosave_monotonic", None)
         if last is not None and (now - last) < _autosave_interval_seconds():
             return False
+        if self._autosave_blocked_by_recent_deploy():
+            return False
         self._last_autosave_monotonic = now
+        return True
+
+    def _autosave_blocked_by_recent_deploy(self):
+        """Defer heartbeat autosave while a deploy reset window is active."""
+        import os
+        from engine import auto_deploy
+        from engine import log_util
+
+        blocked, since, window = auto_deploy.deploy_save_defer_status(os.getcwd())
+        if not blocked:
+            return False
+        log_util.ops(
+            "lag_watch",
+            "autosave_skip "
+            f"reason=recent_deploy since_reset_s={since:.1f} "
+            f"window_s={window} "
+            f"ticks={getattr(self, 'game_time_ticks', '?')}",
+        )
         return True
 
     def _maybe_autosave(self):
@@ -1044,6 +1296,7 @@ class Game:
         """
         if not self._autosave_due():
             return
+        self._maybe_flush_deferred_deploy_save_sync()
         from engine import diag_export
         import time as _save_time
 

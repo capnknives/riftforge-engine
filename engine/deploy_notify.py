@@ -36,7 +36,8 @@ READY_PATH = ".deploy_ready"
 CATCHUP_RESOLVE_PATH = ".catchup_bug_resolve.json"
 
 # Seconds at which to repeat the countdown warning (plus the initial announce).
-_COUNTDOWN_WARN_AT = (15, 10, 5, 3, 2, 1)
+# Keep sparse — milestone spam mid-play felt overbearing on live deploys.
+_COUNTDOWN_WARN_AT = (10, 5)
 
 # Background task handle -- None when idle.
 _deploy_task = None
@@ -245,27 +246,18 @@ KIND_CATCHUP = "catchup"
 # Player-facing catch-up Veil lines (Supernatural gothic — clear arc, same
 # family as copyover MSG_BEFORE / Fix reseal countdowns).
 CATCHUP_COUNTDOWN_OPEN = (
-    "*** The Veil thins. Something ancient stirs — the bones of this world "
-    "will be rewritten. ***\r\n"
-    "*** The Veil will reseal in {total} seconds. Stay put — "
-    "your thread will hold. ***"
+    "*** The Veil thins — the world will rewrite in {total} seconds. "
+    "Stay put if you can. ***"
 )
 GATEWAY_RESTART_WARNING = (
-    "\r\n*** The weave that holds your connection must be torn down and "
-    "rewoven. You will drop to the menu — return after the rewrite. ***"
-)
-CATCHUP_STITCH_LINE = (
-    "*** The Veil is still stitching — hold a moment longer. ***"
+    "\r\n*** [ALERT] The weave that binds you must be torn down and rewoven — "
+    "you will fall back to the menu. Return once the rewrite settles. ***"
 )
 CATCHUP_READY_LINE = (
     "*** The Veil settles. The rewrite is complete — you are still here. ***"
 )
 # Legacy alias for smokes / older callers.
 CATCHUP_COUNTDOWN_LIVE = CATCHUP_READY_LINE
-TREE_SYNC_LINE = (
-    "*** The bones shift beneath you — the ancient rewrite is landing. "
-    "Hold still. ***"
-)
 
 
 def _countdown_tick_line(remaining: int) -> str:
@@ -277,13 +269,10 @@ def _countdown_done_line(*, gateway_restart: bool) -> str:
     """After countdown: game-only pause vs full gateway tear (disconnect)."""
     if gateway_restart:
         return (
-            "*** The countdown ends. The binding Veil must tear free — "
-            "you will disconnect; log in again when the rewrite is done. ***"
+            "*** The countdown ends — you will disconnect. "
+            "Log in again when the rewrite is done. ***"
         )
-    return (
-        "*** The countdown ends. The Veil draws tight — the pause comes now. "
-        "Stay connected. ***"
-    )
+    return "*** The Veil draws tight — the pause comes now. ***"
 
 
 def _fix_countdown_open(
@@ -298,8 +287,8 @@ def _fix_countdown_open(
     lines = [
         f"*** {ticket_ref} {verb}: {summary} ***",
         (
-            f"*** The Veil will reseal in {total} seconds. Stay put — "
-            f"your thread will hold. ***"
+            f"*** The Veil will reseal in {total} seconds. "
+            f"Stay put if you can. ***"
         ),
     ]
     if gateway_restart:
@@ -316,23 +305,24 @@ def _catchup_countdown_open(*, total: int, gateway_restart: bool) -> str:
 
 
 def announce_world_stitching(game):
-    """Broadcast the soft stitch line once per copyover reattach."""
+    """Mark stitch phase once per copyover reattach (no extra broadcast).
+
+    Reattach wait copy lives in copyover MSG_AFTER; success copy in
+    announce_rewrite_ready. Extra stitch lines stacked on hold music.
+    """
     if game is None:
         return
     if getattr(game, "_veil_stitch_announced", False):
         return
     game._veil_stitch_announced = True
-    try:
-        game.broadcast_all(CATCHUP_STITCH_LINE)
-    except Exception as exc:
-        print(
-            f"[deploy_notify] announce_world_stitching failed: {exc!r}",
-            flush=True,
-        )
 
 
 def _maybe_announce_tree_sync(game):
-    """One line while auto_deploy rewrites the tree (between countdown and freeze)."""
+    """Clear the tree-sync marker without another broadcast.
+
+    copyover MSG_BEFORE is the single freeze beat after countdown; a second
+    bones-shift line stacked on it felt redundant on live deploys.
+    """
     if game is None:
         return
     from engine import auto_deploy
@@ -344,13 +334,6 @@ def _maybe_announce_tree_sync(game):
         os.remove(path)
     except OSError:
         pass
-    try:
-        game.broadcast_all(TREE_SYNC_LINE)
-    except Exception as exc:
-        print(
-            f"[deploy_notify] tree_sync announce failed: {exc!r}",
-            flush=True,
-        )
 
 
 def _maybe_announce_disconnect_imminent(game):

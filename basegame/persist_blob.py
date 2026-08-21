@@ -31,6 +31,11 @@ def character_to_blob(character):
         "bg_stats": dict(getattr(character, "bg_stats", {}) or character.stats),
         "hp": character.hp,
         "mail_inbox": list(getattr(character, "mail_inbox", None) or []),
+        "tell_history": [
+            str(line)
+            for line in (getattr(character, "tell_history", None) or [])
+            if line
+        ],
         # Login credentials survive reboot (same contract as supers blob).
         "password_hash": getattr(character, "password_hash", "") or "",
         "account": (getattr(character, "account", None) or "").strip(),
@@ -104,6 +109,15 @@ def apply_character_blob(character, data):
         character.mail_inbox = list(saved_mail)
     elif not hasattr(character, "mail_inbox"):
         character.mail_inbox = []
+    from collections import deque
+    from engine.channels import DEFAULT_RING_MAX
+
+    raw_tell_hist = data.get("tell_history") or []
+    if isinstance(raw_tell_hist, (list, tuple)):
+        character.tell_history = deque(
+            (str(line) for line in raw_tell_hist if line),
+            maxlen=DEFAULT_RING_MAX,
+        )
     _restore_origin_fields(character, data)
     if "tier" in data:
         character.tier = int(data.get("tier") or 0)

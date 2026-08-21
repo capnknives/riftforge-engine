@@ -284,7 +284,10 @@ def _spawn_game(env=None):
     """
     game_heartbeat.clear_heartbeat()
     from engine import boot_stability
+    from engine import env_file
 
+    root = _repo_root()
+    env_file.apply_repo_env(root)
     boot_stability.reset_post_tick_counter()
     child_env = os.environ.copy()
     if env:
@@ -292,7 +295,7 @@ def _spawn_game(env=None):
     proc = subprocess.Popen(
         [sys.executable, "server.py"],
         env=child_env,
-        cwd=_repo_root(),
+        cwd=root,
     )
     return proc, time.time()
 
@@ -369,11 +372,15 @@ def _disconnect_warn_seconds():
 
 
 def _grace_disconnect_warning(root, proc):
-    """Touch marker + wait while game is still up (countdown may have missed)."""
-    if proc is None or proc.poll() is not None:
-        return
+    """Touch markers + wait so game tick or gateway hold loop can warn players."""
     from engine import auto_deploy
 
+    auto_deploy.touch_gateway_disconnect_imminent(root)
+    if proc is None or proc.poll() is not None:
+        # Game already down ([WAIT]) — only the gateway can still speak.
+        time.sleep(_disconnect_warn_seconds())
+        auto_deploy.clear_gateway_disconnect_imminent(root)
+        return
     auto_deploy.touch_disconnect_imminent(root)
     deadline = time.time() + _disconnect_warn_seconds()
     while time.time() < deadline:
@@ -381,6 +388,7 @@ def _grace_disconnect_warning(root, proc):
             break
         time.sleep(0.25)
     auto_deploy.clear_disconnect_imminent(root)
+    auto_deploy.clear_gateway_disconnect_imminent(root)
 
 
 def _reexec_watcher(proc, gateway_proc):
@@ -516,13 +524,21 @@ def _signal_planned_copyover(proc):
         return False
 
 
-def _maybe_watcher_request(proc):
+def _maybe_watcher_request(
+    proc,
+    game_spawn_wall=None,
+    *,
+    gateway_proc=None,
+    use_gateway=False,
+):
     """Head-GM recovery queue: restart and/or code revert, then respawn."""
+    noop = (proc, None, False, gateway_proc)
     req = watcher_request.take_pending()
     if not req:
-        return proc, None, False
+        return noop
     op = req.get("op")
     by = (req.get("by") or "staff").strip() or "staff"
+    root = _repo_root()
     if op == "restart_game":
         if req.get("backup"):
             try:
@@ -541,7 +557,25 @@ def _maybe_watcher_request(proc):
             )
             _stop_game(proc)
         new_proc, wall = _spawn_game()
-        return new_proc, wall, True
+        return new_proc, wall, True, gateway_proc
+    if op == "restart_gateway":
+        print(
+            f"[watch] watcher_request restart_gateway by {by!r} "
+            "-- stopping game + gateway (clients drop briefly)",
+            flush=True,
+        )
+        crash_recovery.mark_planned_restart()
+        if proc is not None and proc.poll() is None:
+            _stop_game(proc)
+            _after_game_exit(proc, root=root)
+        new_gateway = gateway_proc
+        if use_gateway:
+            if gateway_proc is not None:
+                _stop_gateway(gateway_proc)
+            new_gateway = _spawn_gateway()
+            time.sleep(0.4)
+        new_proc, wall = _spawn_game()
+        return new_proc, wall, True, new_gateway
     if op == "revert_stable":
         ok, detail = crash_recovery.revert_to_last_stable(
             reason=f"gm recover revert by {by}",
@@ -552,7 +586,7 @@ def _maybe_watcher_request(proc):
                 f"requested by {by!r}",
                 flush=True,
             )
-            return proc, None, False
+            return noop
         print(
             f"[watch] revert_stable to {detail[:12]} by {by!r} "
             "-- respawning game child",
@@ -562,19 +596,19 @@ def _maybe_watcher_request(proc):
         if proc is not None and proc.poll() is None:
             _stop_game(proc)
         new_proc, wall = _spawn_game()
-        return new_proc, wall, True
+        return new_proc, wall, True, gateway_proc
     if op == "clear_revert_hold":
-        crash_recovery.resume_after_crash_hold(root=_repo_root())
+        crash_recovery.resume_after_crash_hold(root=root)
         print(
             f"[watch] clear_revert_hold by {by!r} — "
             "auto-deploy catch-up queued",
             flush=True,
         )
         if proc is not None and proc.poll() is None:
-            return proc, None, True
+            return proc, game_spawn_wall, True, gateway_proc
         crash_recovery.mark_planned_restart()
         new_proc, wall = _spawn_game()
-        return new_proc, wall, True
+        return new_proc, wall, True, gateway_proc
     if op == "restore_db":
         date = (req.get("date") or "").strip() or None
         if proc is not None and proc.poll() is None:
@@ -586,7 +620,7 @@ def _maybe_watcher_request(proc):
             _stop_game(proc)
         ok, detail = world_backup.restore_live_db(
             date,
-            root=_repo_root(),
+            root=root,
             triggered_by=by,
         )
         if not ok:
@@ -595,9 +629,9 @@ def _maybe_watcher_request(proc):
                 f"requested by {by!r}",
                 flush=True,
             )
-            return proc, None, False
-        crash_recovery.clear_db_hold(root=_repo_root())
-        state = crash_recovery.load_state(root=_repo_root())
+            return noop
+        crash_recovery.clear_db_hold(root=root)
+        state = crash_recovery.load_state(root=root)
         state["recent_exits"] = []
         state["last_db_restore"] = {
             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -605,7 +639,7 @@ def _maybe_watcher_request(proc):
             "by": by,
             "date": date or "(latest)",
         }
-        crash_recovery.save_state(state, root=_repo_root())
+        crash_recovery.save_state(state, root=root)
         print(
             f"[watch] restore_db OK ({detail}) by {by!r} "
             "-- respawning game child",
@@ -613,8 +647,8 @@ def _maybe_watcher_request(proc):
         )
         crash_recovery.mark_planned_restart()
         new_proc, wall = _spawn_game()
-        return new_proc, wall, True
-    return proc, None, False
+        return new_proc, wall, True, gateway_proc
+    return noop
 
 
 def main():
@@ -682,9 +716,15 @@ def main():
     while True:
         time.sleep(POLL_SECONDS)
 
-        proc, new_wall, restarted = _maybe_watcher_request(proc)
+        proc, new_wall, restarted, gateway_proc = _maybe_watcher_request(
+            proc,
+            game_spawn_wall,
+            gateway_proc=gateway_proc,
+            use_gateway=use_gateway,
+        )
         if restarted:
-            game_spawn_wall = new_wall
+            if new_wall is not None:
+                game_spawn_wall = new_wall
             before = _snapshot()
             pending_copyover = False
             settle_deadline = None
@@ -696,7 +736,10 @@ def main():
                 stable_mtime = os.path.getmtime(boot_stability.stable_path())
             except OSError:
                 stable_mtime = 0
-            if stable_mtime >= (game_spawn_wall - 1.0):
+            if (
+                game_spawn_wall is not None
+                and stable_mtime >= (game_spawn_wall - 1.0)
+            ):
                 spawn_failures = 0
                 crash_recovery.clear_gateway_outage()
 
@@ -821,6 +864,62 @@ def main():
 
         # Alive but stuck (no exit): classic autorun never sees this.
         # Heartbeat stamp from tick_loop goes stale → force restart.
+        if use_gateway and proc.poll() is None:
+            kill_desync, desync_reason = crash_recovery.should_kill_for_ipc_desync(
+                game_spawn_wall=game_spawn_wall,
+                root=root,
+            )
+            if kill_desync:
+                crash_recovery.record_ipc_desync_kill(root=root)
+                bounce_gateway, bounce_reason = (
+                    crash_recovery.should_restart_gateway_for_desync(root=root)
+                )
+                if bounce_gateway and gateway_proc is not None:
+                    print(
+                        f"[watch] gateway IPC desync ({desync_reason}; "
+                        f"{bounce_reason}) -- restarting gateway + game "
+                        "(clients held briefly)",
+                        flush=True,
+                    )
+                    _stop_game(proc)
+                    _after_game_exit(proc, root=root)
+                    crash_recovery.record_ipc_desync_gateway_restart(root=root)
+                    _stop_gateway(gateway_proc)
+                    gateway_proc = _spawn_gateway()
+                    time.sleep(0.4)
+                    proc, game_spawn_wall = _spawn_game()
+                    before = _snapshot()
+                    pending_copyover = False
+                    settle_deadline = None
+                    continue
+                print(
+                    f"[watch] gateway IPC desync ({desync_reason}) "
+                    "-- killing game (clients held by gateway)",
+                    flush=True,
+                )
+                _stop_game(proc)
+                _after_game_exit(proc, root=root)
+                if crash_recovery.respawn_paused(root=root):
+                    continue
+                spawn_failures += 1
+                if _maybe_reload_storm_revert(
+                    spawn_failures=spawn_failures,
+                    game_spawn_wall=game_spawn_wall,
+                ):
+                    spawn_failures = 0
+                    proc, game_spawn_wall = _spawn_game()
+                    before = _snapshot()
+                    pending_copyover = False
+                    settle_deadline = None
+                    continue
+                proc, game_spawn_wall = _respawn_game(
+                    proc, game_spawn_wall, spawn_failures=spawn_failures,
+                )
+                before = _snapshot()
+                pending_copyover = False
+                settle_deadline = None
+                continue
+
         kill_hang, hang_reason = game_heartbeat.should_kill_for_hang(
             spawn_wall=game_spawn_wall,
         )

@@ -230,6 +230,8 @@ def _coerce_value(raw, spec, *, field_name):
     if ftype == "object":
         if isinstance(raw, dict):
             return copy.deepcopy(raw)
+        if spec.get("also_list") and isinstance(raw, list):
+            return copy.deepcopy(raw)
         text = str(raw).strip()
         if not text:
             return copy.deepcopy(spec.get("default", {}))
@@ -416,12 +418,15 @@ def lint_kind(kind_id, obj, *, warn_unknown=False):
     return warnings
 
 
-def validate_kind(kind_id, obj, *, strict=False, reject_unknown=False, where=None):
+def validate_kind(kind_id, obj, *, strict=False, reject_unknown=False, where=None,
+                  skip_domain_validate=False):
     """Hard-validate obj against kind profile + optional domain hook.
 
     Raises KindValidationError on failure. Returns obj (possibly normalized)
     on success. When strict=True, policy lint warnings also fail.
     When reject_unknown=True, undeclared keys also fail (new-row authoring).
+    When skip_domain_validate=True, run profile coerce/lint only (used when
+    the caller is already inside a domain hook to avoid recursion).
     """
     where = where or kind_id
     if not isinstance(obj, dict):
@@ -456,5 +461,6 @@ def validate_kind(kind_id, obj, *, strict=False, reject_unknown=False, where=Non
             kind_id,
             f"{where}: policy lint failed (--strict): {msgs}",
         )
-    hooks.content_kind_domain_validate(kind_id, obj, where=where)
+    if not skip_domain_validate:
+        hooks.content_kind_domain_validate(kind_id, obj, where=where)
     return obj

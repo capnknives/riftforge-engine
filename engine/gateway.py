@@ -8,12 +8,12 @@ respawns, clients stay connected; the new game reattaches by session id.
 
 While the game IPC is down, held clients get occasional plain-text
 "elevator music" (Veil hold lines) so a crash/restart does not feel like
-a frozen dead socket. That UX lives here on purpose — the game process
-cannot speak when it is dead. After a longer Discord outage grace (default
-45s; planned SIGUSR1 reloads suppress entirely), Discord #wknz-radio may
-get a one-shot ``[WKNZ] Wits`` apology (and an "we're back" when IPC
-returns) via ``engine.discord_bridge`` — env-gated, GM ``discord crash``
-mute, fail-soft.
+a frozen dead socket. Planned deploy copyovers (``planned_restart`` CTRL)
+skip hold lines — players already saw the deploy countdown arc. After a
+longer Discord outage grace (default 45s; planned SIGUSR1 reloads suppress
+entirely), Discord #wknz-radio may get a one-shot ``[WKNZ] Wits`` apology
+(and an "we're back" when IPC returns) via ``engine.discord_bridge`` —
+env-gated, GM ``discord crash`` mute, fail-soft.
 
 Run:
   python -m engine.gateway
@@ -38,10 +38,13 @@ Env:
     HOLD_GRACE). Planned SIGUSR1 reloads also send ``planned_restart``
     so Discord stays quiet even on slow boots.
   RIFTFORGE_GATEWAY_STITCH_STALE -- seconds without game→client DATA
-    before the gateway handles ``ooc`` / ``wiznet`` / ``gm recover restart``
-    / ``gm recover clearhold`` / ``gm recover revert`` / ``gm recover restoredb``
-    locally.
+    before the gateway handles ``ooc`` / ``wiznet`` / ``gm`` / ``help outage``
+    / ``gm recover status`` / ``gm recover restart`` / ``gm recover clearhold``
+    / ``gm recover revert`` / ``gm recover restoredb`` / ``gm recover gateway confirm``
     locally (default 12; covers hung game with IPC still up)
+  RIFTFORGE_GATEWAY_IPC_DESYNC_KILL -- watcher kills a ticking game child
+    when gateway IPC is down longer than this (default 30s; planned reloads
+    marked via ``planned_restart`` CTRL are exempt)
   DISCORD_BRIDGE_WEBHOOK_WKNZ -- optional; outage down/up Discord posts
 
 Stdlib only. No world / combat logic — sockets, framing, hold UX, and
@@ -77,14 +80,22 @@ from engine.gateway_protocol import (
 # tag (never color alone — gateway has no style palette). Telnet \r\n.
 # Keep them short; clients may sit here for a long boot.
 # [WAIT] = IPC down only. Never say "rewrite complete" / success here.
-# Avoid "holds" colliding with old deploy success lines (veil copyover UX).
+# Avoid "rewrite complete" / success phrasing here. "Holds your thread" is
+# wait-state only (success uses "Rewrite complete" after deferred boot).
 HOLD_MUSIC_LINES = (
-    b"\r\n*** [WAIT] Soft static under the floorboards. Hang on -- "
-    b"you are still connected. ***\r\n",
-    b"\r\n*** [WAIT] The world is still stitching. Stay put. ***\r\n",
-    b"\r\n*** [WAIT] Somewhere a distant elevator chime. The rewrite "
-    b"is still in progress. ***\r\n",
-    b"\r\n*** [WAIT] Please stand by -- the game is reloading. ***\r\n",
+    b"\r\n*** [WAIT] Soft static under the floorboards. The Veil still "
+    b"holds your thread -- stand by for the world to return. ***\r\n",
+    b"\r\n*** [WAIT] The bones are still shifting beneath the Veil. "
+    b"Hold still. ***\r\n",
+    b"\r\n*** [WAIT] Somewhere a distant elevator chime. The ancient "
+    b"rewrite is not finished. ***\r\n",
+    b"\r\n*** [WAIT] The world stitches itself whole again behind the "
+    b"Veil -- please stand by. ***\r\n",
+)
+# Broadcast when the gateway process itself must exit (clients drop).
+CLIENT_DISCONNECT_WARNING = (
+    "*** [ALERT] The binding Veil tears free -- your thread will unravel "
+    "to the menu. Log in again once the rewrite settles. ***"
 )
 
 
@@ -243,6 +254,8 @@ class Gateway:
         # Game sets via CTRL boot_warming during deferred copyover boot --
         # forward commands instead of stitch-intercept while heals run.
         self._boot_warming = False
+        # One-shot client drop warning (gateway restart / SIGTERM).
+        self._client_disconnect_warned = False
 
     async def send_to_game(self, frame: bytes) -> None:
         """Write one framed message to the connected game, if any."""
@@ -367,12 +380,26 @@ class Gateway:
                 flush=True,
             )
 
-    def _mark_game_ipc_down(self) -> None:
+    def _mark_game_ipc_down(self, *, planned_restart: bool = False) -> None:
         """Start tracking downtime when IPC drops."""
+        first_mark = self._hold_down_since_wall is None
         if self._hold_down_since is None:
             self._hold_down_since = time.monotonic()
         if self._hold_down_since_wall is None:
             self._hold_down_since_wall = time.time()
+        if first_mark:
+            try:
+                from engine import crash_recovery
+
+                crash_recovery.write_gateway_ipc_down(
+                    down_since_wall=self._hold_down_since_wall,
+                    planned_restart=bool(planned_restart),
+                )
+            except Exception as exc:
+                print(
+                    f"[gateway] ipc_down stamp skipped: {exc!r}",
+                    flush=True,
+                )
 
     def _clear_game_ipc_down(self) -> None:
         """Clear downtime tracking when IPC returns."""
@@ -383,6 +410,7 @@ class Gateway:
             from engine import crash_recovery
 
             crash_recovery.clear_gateway_outage()
+            crash_recovery.clear_gateway_ipc_down()
         except Exception:
             pass
 
@@ -413,9 +441,12 @@ class Gateway:
                     self._suppress_discord_outage = False
                     self._clear_game_ipc_down()
                     continue
-                self._mark_game_ipc_down()
+                self._mark_game_ipc_down(
+                    planned_restart=self._suppress_discord_outage,
+                )
                 now = time.monotonic()
                 self._maybe_crash_recovery_outage()
+                await self._maybe_broadcast_client_disconnect_warning()
                 self._maybe_discord_outage_down(now, discord_grace)
             return
         interval = max(1, _env_int("RIFTFORGE_GATEWAY_HOLD_INTERVAL", 20))
@@ -429,9 +460,12 @@ class Gateway:
                 self._suppress_discord_outage = False
                 self._clear_game_ipc_down()
                 continue
-            self._mark_game_ipc_down()
+            self._mark_game_ipc_down(
+                planned_restart=self._suppress_discord_outage,
+            )
             now = time.monotonic()
             self._maybe_crash_recovery_outage()
+            await self._maybe_broadcast_client_disconnect_warning()
             if not has_clients:
                 # No telnet holders: still track downtime for Discord so
                 # #wknz-radio hears real outages even when nobody is parked.
@@ -443,6 +477,12 @@ class Gateway:
             # Discord gate is independent of hold-line drip timing.
             self._maybe_discord_outage_down(now, discord_grace)
             if self._hold_next_at is None or now < self._hold_next_at:
+                continue
+            # Planned SIGUSR1 / deploy copyover already ran the Veil countdown
+            # arc — skip elevator music so players are not drowned in [WAIT]
+            # lines on top of MSG_BEFORE / MSG_AFTER.
+            if self._suppress_discord_outage:
+                self._hold_next_at = now + interval
                 continue
             line = HOLD_MUSIC_LINES[
                 self._hold_line_index % len(HOLD_MUSIC_LINES)
@@ -493,6 +533,35 @@ class Gateway:
         payload = (text + "\r\n").encode("utf-8")
         for sid in list(self.clients.keys()):
             await self.send_to_client(sid, payload)
+
+    async def _maybe_broadcast_client_disconnect_warning(
+        self, *, force: bool = False,
+    ) -> None:
+        """Tell held clients the gateway is about to drop their TCP socket."""
+        if self._client_disconnect_warned and not force:
+            return
+        marker_path = None
+        if not force:
+            from engine import auto_deploy
+
+            marker_path = auto_deploy._gateway_disconnect_imminent_path(
+                os.getcwd(),
+            )
+            if not os.path.isfile(marker_path):
+                return
+        if not any(c.alive for c in self.clients.values()):
+            return
+        self._client_disconnect_warned = True
+        if marker_path:
+            try:
+                os.remove(marker_path)
+            except OSError:
+                pass
+        await self._broadcast_plain(CLIENT_DISCONNECT_WARNING)
+
+    async def broadcast_client_disconnect_warning(self) -> None:
+        """SIGTERM / planned gateway bounce — warn even without a marker file."""
+        await self._maybe_broadcast_client_disconnect_warning(force=True)
 
     def _slot_wiznet_face(self, slot: ClientSlot) -> str:
         """Staff label for gateway wiznet while the game is unreachable."""
@@ -654,6 +723,62 @@ class Gateway:
                 return True
             await self._relay_gateway_channel(slot, channel_name, body)
             return True
+        from engine import gateway_outage_cmds as outage_cmds
+
+        if lower in ("help outage", "help gm recover", "help recover"):
+            if not slot.staff_gm:
+                await self._send_plain(slot.session_id, "You aren't a GM.")
+                return True
+            await self._send_plain(slot.session_id, outage_cmds.outage_help_text())
+            return True
+        if lower in ("gm outage", "gm"):
+            if not slot.staff_gm:
+                await self._send_plain(slot.session_id, "You aren't a GM.")
+                return True
+            await self._send_plain(slot.session_id, outage_cmds.outage_cheat_sheet())
+            return True
+        if lower in ("gm recover status", "recover status"):
+            if not slot.staff_gm:
+                await self._send_plain(slot.session_id, "You aren't a GM.")
+                return True
+            await self._send_plain(
+                slot.session_id,
+                outage_cmds.format_recover_status(),
+            )
+            return True
+        if lower.startswith("gm recover gateway") or lower.startswith(
+            "recover gateway"
+        ):
+            if not slot.head_gm:
+                await self._send_plain(
+                    slot.session_id,
+                    "Only the head GM can restart the gateway from here.",
+                )
+                return True
+            if not lower.endswith(" confirm"):
+                await self._send_plain(
+                    slot.session_id,
+                    "Usage: gm recover gateway confirm — full gateway + game "
+                    "bounce (drops every client briefly). Prefer "
+                    "gm recover restart for game-only respawn.",
+                )
+                return True
+            if watcher_request.queue_restart_gateway(
+                by=self._slot_ooc_face(slot),
+            ):
+                await self._send_plain(
+                    slot.session_id,
+                    "*** [ALERT] Gateway restart queued — every client drops "
+                    "briefly, then gateway + game respawn. Reconnect if your "
+                    "thread does not auto-reattach. ***",
+                )
+            else:
+                await self._send_plain(
+                    slot.session_id,
+                    "*** [ALERT] Could not queue gateway restart "
+                    "(watcher request file). ***",
+                )
+            return True
         if lower.startswith("gm recover restart") or lower.startswith(
             "recover restart"
         ):
@@ -767,8 +892,9 @@ class Gateway:
             return True
         if self._game_writer is None:
             wait = (
-                "*** [WAIT] OOC and wiznet work while the game restarts; "
-                "other commands need the rewrite to finish. ***"
+                "*** [WAIT] OOC, wiznet, gm outage, and gm recover status work "
+                "while the game restarts; other commands need the rewrite to "
+                "finish. ***"
                 if slot.staff_gm
                 else "*** [WAIT] OOC works while the game restarts; other "
                 "commands need the rewrite to finish. ***"
@@ -776,6 +902,18 @@ class Gateway:
             await self._send_plain(slot.session_id, wait)
             return True
         return False
+
+    async def _notify_client_game_down(self, session_id: str) -> None:
+        """Immediate feedback when a client connects but game IPC is down."""
+        async with self._game_lock:
+            game_up = self._game_writer is not None
+        if game_up:
+            return
+        await self._send_plain(
+            session_id,
+            "*** [WAIT] The game is reconnecting — hold a moment; "
+            "login resumes when the rewrite finishes. ***",
+        )
 
     async def _forward_client_line(self, session_id: str, line: bytes) -> None:
         """Send one assembled line to the game child."""
@@ -814,6 +952,7 @@ class Gateway:
         if peer:
             open_msg["peer"] = peer
         await self.send_to_game(encode_ctrl(open_msg))
+        await self._notify_client_game_down(session_id)
         try:
             while self._running and slot.alive:
                 data = await reader.read(4096)
@@ -875,6 +1014,7 @@ class Gateway:
         if peer:
             open_msg["peer"] = peer
         await self.send_to_game(encode_ctrl(open_msg))
+        await self._notify_client_game_down(session_id)
         try:
             from engine import websocket as ws_mod
 
@@ -932,6 +1072,9 @@ class Gateway:
             self._discord_outage_up()
             # Clear planned-restart suppress whether or not Discord fired.
             self._suppress_discord_outage = False
+            # Stamp disk markers immediately so the watcher does not
+            # desync-kill a freshly connected game before hold_music runs.
+            self._clear_game_ipc_down()
 
         # Wait for hello, then send welcome snapshot.
         try:
@@ -980,6 +1123,17 @@ class Gateway:
                         # hold music still runs for clients, but WKNZ must
                         # not treat this as a crash/uncrash pair.
                         self._suppress_discord_outage = True
+                        try:
+                            from engine import crash_recovery
+
+                            crash_recovery.write_gateway_ipc_down(
+                                down_since_wall=(
+                                    self._hold_down_since_wall or time.time()
+                                ),
+                                planned_restart=True,
+                            )
+                        except Exception:
+                            pass
                         print(
                             "[gateway] planned restart -- "
                             "Discord outage suppressed",
@@ -1013,6 +1167,10 @@ class Gateway:
             async with self._game_lock:
                 if self._game_writer is writer:
                     self._game_writer = None
+                    # Stamp ipc_down immediately — do not wait for hold_music.
+                    self._mark_game_ipc_down(
+                        planned_restart=bool(self._suppress_discord_outage),
+                    )
             try:
                 writer.close()
                 await writer.wait_closed()
@@ -1099,12 +1257,31 @@ def main() -> None:
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    shutting_down = False
 
     def _stop(*_args):
-        print("[gateway] shutting down…", flush=True)
-        gw._running = False
-        for task in asyncio.all_tasks(loop):
-            task.cancel()
+        nonlocal shutting_down
+        if shutting_down:
+            return
+        shutting_down = True
+
+        async def _shutdown() -> None:
+            try:
+                await gw.broadcast_client_disconnect_warning()
+            except Exception as exc:
+                print(
+                    f"[gateway] client disconnect warn failed: {exc!r}",
+                    flush=True,
+                )
+            # Brief read window before sockets close on process exit.
+            await asyncio.sleep(2.0)
+            print("[gateway] shutting down…", flush=True)
+            gw._running = False
+            for task in asyncio.all_tasks(loop):
+                if task is not asyncio.current_task():
+                    task.cancel()
+
+        loop.create_task(_shutdown())
 
     if hasattr(signal, "SIGTERM"):
         try:

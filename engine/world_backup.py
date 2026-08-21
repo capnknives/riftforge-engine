@@ -22,6 +22,19 @@ Env (optional):
 - ``RIFTFORGE_BACKUP_HOUR`` / ``RIFTFORGE_BACKUP_MINUTE`` -- local run time
 - ``RIFTFORGE_BACKUP_RETENTION_DAYS`` -- prune older trees (default ``14``)
 - ``RIFTFORGE_BACKUP_ACK_SECONDS`` -- wait for game save ack (default ``20``)
+- ``RIFTFORGE_PRE_DEPLOY_SNAPSHOT_KEEP`` -- how many ``backups/pre-deploy/``
+  same-day rollback snapshots to keep (default ``10``); see lag P11 finding
+  below for why this must not be unbounded.
+
+``backups/pre-deploy/<timestamp>/`` holds one full SQLite copy per
+auto-deploy reset (``engine.auto_deploy._snapshot_db_before_tree_sync``) --
+a *same-day* rollback point, distinct from the nightly dated tree above.
+Unlike the dated trees, nothing pruned this directory until lag P11 (2026-08)
+found it had grown to 356 snapshots / 15GB on live, filling the disk to 92%
+and triggering multi-second-to-minute SQLite commit stalls (autosave/cadence
+tick freezes -- the single-threaded event loop blocks on that commit's
+fsync). ``snapshot_live_db_pre_deploy`` now prunes this directory to the
+most recent ``RIFTFORGE_PRE_DEPLOY_SNAPSHOT_KEEP`` snapshots on every call.
 """
 
 from __future__ import annotations
@@ -45,6 +58,7 @@ DEFAULT_HOUR = 0
 DEFAULT_MINUTE = 5
 DEFAULT_RETENTION_DAYS = 14
 DEFAULT_ACK_SECONDS = 20.0
+DEFAULT_PRE_DEPLOY_SNAPSHOT_KEEP = 10
 
 
 def _repo_root():
@@ -103,6 +117,17 @@ def retention_days():
         return max(1, int(raw))
     except ValueError:
         return DEFAULT_RETENTION_DAYS
+
+
+def pre_deploy_snapshot_keep():
+    """How many ``backups/pre-deploy/`` snapshots to retain (lag P11)."""
+    raw = (os.environ.get("RIFTFORGE_PRE_DEPLOY_SNAPSHOT_KEEP") or "").strip()
+    if not raw:
+        return DEFAULT_PRE_DEPLOY_SNAPSHOT_KEEP
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_PRE_DEPLOY_SNAPSHOT_KEEP
 
 
 def ack_timeout_seconds():
@@ -256,11 +281,46 @@ def _sqlite_backup(src_db, dest_db):
         src.close()
 
 
+def prune_pre_deploy_snapshots(*, root=None):
+    """Drop oldest ``backups/pre-deploy/<timestamp>/`` dirs beyond the keep cap.
+
+    Unlike the dated nightly trees (`prune_old_backups`), nothing capped this
+    directory before lag P11 -- it grew once per auto-deploy reset forever,
+    reaching 356 snapshots / 15GB on live and filling the disk to 92% (the
+    root cause of the 2026-08-20 50-60s autosave/cadence stalls: a near-full
+    ext4 disk makes ordinary SQLite commits fsync-stall). Timestamp-named
+    dirs sort correctly as plain strings (``YYYYMMDD-HHMMSS``).
+    """
+    root = root or _repo_root()
+    keep = pre_deploy_snapshot_keep()
+    base = os.path.join(backups_root(root), "pre-deploy")
+    if not os.path.isdir(base):
+        return []
+    snaps = [
+        name for name in os.listdir(base)
+        if os.path.isdir(os.path.join(base, name))
+    ]
+    snaps.sort(reverse=True)
+    removed = []
+    for name in snaps[keep:]:
+        path = os.path.join(base, name)
+        shutil.rmtree(path, ignore_errors=True)
+        removed.append(name)
+    if removed:
+        print(
+            f"[backup] pruned {len(removed)} old pre-deploy snapshot(s)",
+            flush=True,
+        )
+    return removed
+
+
 def snapshot_live_db_pre_deploy(*, root=None, triggered_by="auto_deploy"):
     """Copy live ``riftforge.db`` before catch-up / tree sync.
 
     Same-day restore target when a Veil copyover goes wrong -- does not
-    replace the nightly dated backup tree.
+    replace the nightly dated backup tree. Prunes older same-day snapshots
+    to `pre_deploy_snapshot_keep()` afterward (lag P11 -- see module
+    docstring; this directory used to grow unbounded).
     """
     root = root or _repo_root()
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
@@ -280,6 +340,10 @@ def snapshot_live_db_pre_deploy(*, root=None, triggered_by="auto_deploy"):
         f"[backup] pre-deploy db snapshot -> {rel_path} (by={triggered_by})",
         flush=True,
     )
+    try:
+        prune_pre_deploy_snapshots(root=root)
+    except OSError:
+        pass
     return rel_path, rel_path
 
 

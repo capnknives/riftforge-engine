@@ -30,6 +30,16 @@ Never the reverse. Lazy `from supers import …` inside `engine/` is a
 violation of the purity gate. Game packages may import `engine` only — never
 each other (`supers`, `basegame`, `classic` are mutually exclusive at runtime).
 
+## Stellar / Umbral — basegame only (not SUPERS)
+
+Alien **Stellar** and **Umbral** bloodlines are **public engine demo**
+content (`basegame/`, `engine/systems/umbral.py`, `basegame/content/maps/stellar_orbit.json`).
+They are **not** part of the live supernatural MUD (`supers/`). SUPERS removed
+`solar.py`, `umbral.py`, soak maps, paths, disciplines, and player verbs;
+legacy saves heal to Human/Mortal via `content.heal_retired_alien_bloodline`.
+Do not reintroduce Stellar/Umbral kits into `supers/` without an explicit
+maintainer unpark.
+
 ## Hook registry (`engine.hooks`)
 
 Call these **before** constructing `Character`s or loading a save:
@@ -373,25 +383,24 @@ Phases **H1–H7** landed on `feature/purity-h-track-remaining` (see
 `engine/map_ui.py`, `engine/systems/{vehicles,lodging,paced_travel,phone,appearance,persona_registry,relationships}`,
 `engine/map_store.py`, plus **H4** wiring (`hospital`→`clinic`, `crime`→`justice`).
 **Deep `player_shops` → `civic_shop`** remains DEFERRED. **H8** (kind
-grandparents) and **H9** (`v0.5.0` tag) are still open.
+grandparents) and **H9** (`v0.5.0` tag) **landed**; SUPERS pin is **`@v0.5.3`**.
 
 
-## Planned hook bundles (engine mudlib unification)
+## Hook bundles (engine mudlib unification)
 
-Not yet implemented — tracked in
+Clinic / justice / civic-fixture seams **shipped** 2026-08-16 (strangler
+unpark #2391/#2394). Remaining planned names live in
 [`plans/python_mud_engine_features_plan.md`](plans/python_mud_engine_features_plan.md)
 and [`plans/supers_engine_overlap_audit.md`](plans/supers_engine_overlap_audit.md).
-Each row below becomes real `set_*`/`register_*` entries in the table above
-as its phase lands; listed here now so a bundle name isn't picked twice.
 
-| Bundle | Phase | Key registrations (planned) |
-|--------|-------|------------------------------|
-| Clinic admit | 1 | `clinic_admit_hooks` — ward pick, discharge threshold, `can_hospitalize` resolver; extends [`engine/systems/clinic.py`](engine/systems/clinic.py) |
-| Justice fines | 2 | `justice_fine_schedule` — wanted/jail/fine timers on safe duplicate seam; extends [`engine/systems/justice.py`](engine/systems/justice.py) |
-| Civic fixtures | 3 | `civic_fixture_state` — shared structural-HP/wreck/repair record; extends [`engine/systems/room_structure.py`](engine/systems/room_structure.py) / [`engine/systems/civic_fixture.py`](engine/systems/civic_fixture.py) |
-| Quest flags | 4a | `quest_flags` — generic `quest_progress` dict accessors; new [`engine/systems/quest_flags.py`](engine/systems/quest_flags.py) (planned) |
+| Bundle | Phase | Status | Key registrations |
+|--------|-------|--------|-------------------|
+| Clinic admit | 1 | **Shipped** | `clinic_admit_hooks` — ward pick, discharge, collapse FSM; [`engine/systems/clinic.py`](engine/systems/clinic.py) / [`engine/systems/collapse.py`](engine/systems/collapse.py) |
+| Justice fines | 2 | **Shipped** | Adapter + robbery peel; [`engine/systems/justice.py`](engine/systems/justice.py) / `justice_adapter` |
+| Civic fixtures | 3 | **Shipped** | Structural HP/wreck/repair + `fixture_id`; [`engine/systems/civic_fixture.py`](engine/systems/civic_fixture.py) |
+| Quest flags | 4a | Planned | `quest_flags` — generic `quest_progress` dict accessors |
 
-All bundles: **not yet implemented** — see
+Quest flags remain unimplemented. See
 [`plans/python_mud_engine_features_plan.md`](plans/python_mud_engine_features_plan.md).
 
 ## See also

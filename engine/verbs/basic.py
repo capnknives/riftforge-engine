@@ -49,6 +49,7 @@ from command_support import (
     _presence_face,
     _public_label,
     is_staff_stealth_presence,
+    _staff_tags_hidden_in_look,
     _move_one,
     _pull_followers,
 )
@@ -133,10 +134,8 @@ def _look_room_section(character, game, section):
             continue
         if hooks.in_veil(o):
             if hooks.veil_visible_to(character, o):
-                label = (
-                    f"{hooks.veil_look_tag()} "
-                    f"{_display_name(o, viewer=character)}"
-                )
+                base = _display_name(o, viewer=character)
+                label = hooks.veil_soul_label(character, o, base)
                 souls.append(
                     hooks.room_presence_line(
                         label, o, room, game, viewer=character,
@@ -144,6 +143,14 @@ def _look_room_section(character, game, section):
                 )
             continue
         if _is_presence_hidden(character, o):
+            if not _staff_tags_hidden_in_look(character, o):
+                continue
+            label = f"{_display_name(o, viewer=character)} (hidden)"
+            souls.append(
+                hooks.room_presence_line(
+                    label, o, room, game, viewer=character,
+                )
+            )
             continue
         label = _display_name(o, viewer=character)
         souls.append(
@@ -229,11 +236,15 @@ def cmd_look(character, args, game, *, after_move=False):
     # Area badge: always area_type (bug #26 -- wilderness is a spawn flag,
     # never shown as the terrain label). Plane + zone may relabel for
     # spirit/elemental maps and soak venues (docs/plans/area_type_taxonomy.md).
+    # Vehicle interiors inherit the host curb / atlas cell (bug report 646).
     from engine import map_ui as map_ui_mod
+    from engine.systems import vehicles as vehicles_mod
+
+    area_room = vehicles_mod.look_area_source_room(game, room)
     area_tag = map_ui_mod.area_display_label(
-        getattr(room, "plane", None) or "earth",
-        getattr(room, "area_type", "plains"),
-        zone=getattr(room, "zone", None),
+        getattr(area_room, "plane", None) or "earth",
+        getattr(area_room, "area_type", "plains"),
+        zone=getattr(area_room, "zone", None),
     )
 
     # Client prefs live on the login Mantle even when act focus runs look
@@ -260,6 +271,7 @@ def cmd_look(character, args, game, *, after_move=False):
             extras.append(vista_line)
     # Pocket zone travel is separate from cardinal / in-out moves.
     zone_entries = getattr(room, "zone_entries", None) or {}
+    zone_entries = hooks.filter_zone_entries(character, room, zone_entries, game)
     if zone_entries:
         hints = world_maps.zone_entry_look_hints(zone_entries)
         if hints:
@@ -276,11 +288,14 @@ def cmd_look(character, args, game, *, after_move=False):
     brief_auto = after_move and getattr(prefs, "brief", False)
     if stamped_entry and room.key != stamped_entry:
         if getattr(room, "zone", None) or getattr(room, "zone_exit_to", None):
+            hub_label = _player_place_label(
+                game, stamped_entry, fallback="the zone exit mouth",
+            )
             if screenreader:
-                extras.append(f"Zone exit: {stamped_entry}.")
+                extras.append(f"Zone exit: {hub_label}.")
             else:
                 extras.append(
-                    f"Zone exit at {stamped_entry} -- type exit there."
+                    f"Zone exit at {hub_label} -- type exit there."
                 )
     elif (
         getattr(room, "zone_exit", False)
@@ -290,8 +305,13 @@ def cmd_look(character, args, game, *, after_move=False):
         if screenreader:
             extras.append("Zone exit: type exit.")
         else:
-            dest_key = getattr(room.zone_exit_to, "key", None) or "overland"
-            extras.append(f"Zone exit: type exit ({dest_key}).")
+            dest = getattr(room, "zone_exit_to", None)
+            dest_label = (
+                _player_place_label(game, dest, fallback="overland")
+                if dest is not None
+                else "overland"
+            )
+            extras.append(f"Zone exit: type exit ({dest_label}).")
     # Outdoor ambient sky (open-air rooms: overland + tagged town streets).
     # Spawns still key off wilderness; look flavor keys off outdoor.
     # Weather clause (CONUS climatology) prefers the game's weather model
@@ -356,6 +376,10 @@ def cmd_look(character, args, game, *, after_move=False):
                 continue
             if not hooks.look_exit_visible(dest, game):
                 continue
+            if hooks.look_exit_hidden_from_viewer(
+                character, room, direction, dest, game,
+            ):
+                continue
             if not vision_mod.character_knows_exit(character, room, direction):
                 continue
             # Dual-layer wilderness: exits point at self -- label what that
@@ -368,7 +392,14 @@ def cmd_look(character, args, game, *, after_move=False):
             if str(direction).isdigit():
                 from engine.room_naming import strip_address_from_exit_label
                 title = strip_address_from_exit_label(direction, title)
-            exits.append((direction, title))
+            closed = hooks.look_exit_door_closed(
+                room, direction, dest, game=game, character=character,
+            )
+            if closed:
+                from engine.systems.doors import LOOK_DOOR_CLOSED_SUFFIX
+                if LOOK_DOOR_CLOSED_SUFFIX not in title:
+                    title = f"{title}{LOOK_DOOR_CLOSED_SUFFIX}"
+            exits.append((direction, title, closed))
         for direction, title in hooks.room_look_virtual_exits(
             room, character, game,
         ):
@@ -400,10 +431,8 @@ def cmd_look(character, args, game, *, after_move=False):
                 continue
             if hooks.in_veil(o):
                 if hooks.veil_visible_to(character, o):
-                    label = (
-                        f"{hooks.veil_look_tag()} "
-                        f"{_display_name(o, viewer=character)}"
-                    )
+                    base = _display_name(o, viewer=character)
+                    label = hooks.veil_soul_label(character, o, base)
                     souls.append(
                         hooks.room_presence_line(
                             label, o, room, game, viewer=character,
@@ -411,6 +440,14 @@ def cmd_look(character, args, game, *, after_move=False):
                     )
                 continue
             if _is_presence_hidden(character, o):
+                if not _staff_tags_hidden_in_look(character, o):
+                    continue
+                label = f"{_display_name(o, viewer=character)} (hidden)"
+                souls.append(
+                    hooks.room_presence_line(
+                        label, o, room, game, viewer=character,
+                    )
+                )
                 continue
             label = _display_name(o, viewer=character)
             souls.append(
@@ -600,7 +637,14 @@ def cmd_exits(character, args, game):
         if str(direction).isdigit():
             from engine.room_naming import strip_address_from_exit_label
             title = strip_address_from_exit_label(direction, title)
-        lines.append((direction, title))
+        closed = hooks.look_exit_door_closed(
+            room, direction, dest, game=game, character=character,
+        )
+        if closed:
+            from engine.systems.doors import LOOK_DOOR_CLOSED_SUFFIX
+            if LOOK_DOOR_CLOSED_SUFFIX not in title:
+                title = f"{title}{LOOK_DOOR_CLOSED_SUFFIX}"
+        lines.append((direction, title, closed))
     if not lines:
         character.session.send("Exits: none you can see.")
         return
@@ -610,21 +654,26 @@ def cmd_exits(character, args, game):
 
         tokens = []
         seen = set()
+        closed_dirs = style_mod._exit_closed_set(lines)
         by_dir = style_mod._exit_dir_set(lines)
         for name in style_mod._EXIT_LINE_ORDER:
             if name in by_dir:
-                tokens.append(style_mod._exit_abbrev(name))
+                tokens.append(
+                    style_mod._exit_abbrev(
+                        name, closed=name in closed_dirs,
+                    ),
+                )
                 seen.add(name)
-        for direction, _title in lines:
+        for direction, _title, closed in lines:
             key = str(direction).strip().lower()
             if key in seen:
                 continue
-            tokens.append(style_mod._exit_abbrev(direction))
+            tokens.append(style_mod._exit_abbrev(direction, closed=closed))
             seen.add(key)
         character.session.send(f"Exits: {', '.join(tokens)}")
         return
     character.session.send("Exits:")
-    for direction, title in lines:
+    for direction, title, _closed in lines:
         character.session.send(f"  {direction}: {title}")
 
 
@@ -976,18 +1025,23 @@ def _look_at(character, query):
             query, room.characters(), self_character=character,
         )
         if target and _is_presence_hidden(character, target):
-            # Section 6 spirit-sight + living Reaper Mantle veil: same rule
-            # cmd_look's souls list applies -- you can't examine what you
-            # can't perceive.
-            target = None
+            if not _staff_tags_hidden_in_look(character, target):
+                # Section 6 spirit-sight + living Reaper Mantle veil: same rule
+                # cmd_look's souls list applies -- you can't examine what you
+                # can't perceive.
+                target = None
         if target:
             # Viewer-relative header + body so hood / unintroduced never leak
             # login keys or unique setdesc text to strangers.
             from engine import hooks
             header = _display_name(target, viewer=character)
+            if _staff_tags_hidden_in_look(character, target):
+                header = f"{header} (hidden)"
             body = hooks.look_body_for(character, target)
             if body is None:
-                body = target.description
+                # Game hook unset (lean engine) or chain returned None --
+                # never import supers from engine code (Phase 2 purity).
+                body = ""
             character.session.send(f"{header}\r\n{body}")
             for line in hooks.look_extra_lines(character, target):
                 character.session.send(line)
@@ -1287,17 +1341,17 @@ def cmd_follow(character, args, game):
         character.session.send("You can't follow yourself.")
         return
     if character.following is target:
-        character.session.send(f"You're already following {target.key}.")
+        character.session.send(f"You're already following {_display_name(target)}.")
         return
 
     start_following(character, target)
-    character.session.send(f"You start following {target.key}.")
+    character.session.send(f"You start following {_display_name(target)}.")
     # Live leaders get a private nudge (same gate as beckon auto-follow copy).
     if (
         getattr(target, "session", None) is not None
         and not (hasattr(target, "acts_as_echo") and target.acts_as_echo())
     ):
-        target.session.send(f"{character.key} starts following you.")
+        target.session.send(f"{_display_name(character)} starts following you.")
 
 
 def cmd_unfollow(character, args, game):
@@ -1413,6 +1467,30 @@ def _do_transition(character, dest, game, leave_text, arrive_text):
     return True
 
 
+def _player_place_label(game, key_or_room, *, fallback="somewhere"):
+    """ROOM NAME for player prose from a hub key or Room (never bare VNUM/dig key).
+
+    Zone-exit hints and ``exit`` errors store ``zone_entry_hub_key`` as the
+    graph id (``PM00002``, legacy ``Main Street S9``, …). Players must only
+    see authored titles.
+    """
+    from engine import room_vnum as room_vnum_mod
+
+    if key_or_room is not None and not isinstance(key_or_room, str):
+        label = room_vnum_mod.describe_room(key_or_room, staff=False)
+        if label and label != "?":
+            return label
+        key_or_room = room_vnum_mod.internal_room_key(key_or_room)
+    hub = room_vnum_mod.lookup_room(game, key_or_room)
+    if hub is not None:
+        label = room_vnum_mod.describe_room(hub, staff=False)
+        if label and label != "?":
+            return label
+    return room_vnum_mod.describe_room_key(
+        game, key_or_room, staff=False, fallback=fallback,
+    )
+
+
 def stamp_zone_entry(character, hub_room):
     """Remember which pocket mouth this character entered through.
 
@@ -1493,6 +1571,7 @@ def cmd_enter(character, args, game):
             return
     room = character.location
     entries = getattr(room, "zone_entries", None) or {}
+    entries = hooks.filter_zone_entries(character, room, entries, game)
     raw = (args or "").strip()
     # Prefer this hunter's own stronghold when several hunts share a
     # roadside trailhead (America Overland cell). zone_entries only keeps
@@ -1573,8 +1652,11 @@ def cmd_exit_zone(character, args, game):
     if not can_exit_zone_here(character, room):
         stamped = getattr(character, "zone_entry_hub_key", None)
         if stamped and room.key != stamped:
+            hub_label = _player_place_label(
+                game, stamped, fallback="the zone exit mouth",
+            )
             character.session.send(
-                f"You entered at {stamped}. Walk back there, then type "
+                f"You entered at {hub_label}. Walk back there, then type "
                 f"'exit'. (Indoor returns still use 'out'.)"
             )
         elif getattr(room, "zone", None) and not getattr(room, "zone_exit", False):
@@ -1791,7 +1873,7 @@ def cmd_tell(character, args, game):
     from engine import channels
 
     if not args or not args.strip():
-        channels.replay_tells(character)
+        channels.replay_tells(character, game)
         return
 
     parts = args.split(maxsplit=1)
@@ -1813,27 +1895,40 @@ def cmd_tell(character, args, game):
 
     speaker_face = _display_name(character, viewer=target)
     target_face = _display_name(target, viewer=character)
-    target.session.send(f'{speaker_face} tells you, "{message}"')
-    character.session.send(f'You tell {target_face}, "{message}"')
+    from engine import display_prefs as display_prefs_mod
+
+    incoming = display_prefs_mod.format_tell_chat(
+        target, outgoing=False, peer_face=speaker_face, message=message,
+    )
+    outgoing = display_prefs_mod.format_tell_chat(
+        character, outgoing=True, peer_face=target_face, message=message,
+    )
+    target.session.send(
+        display_prefs_mod.paint_channel_line(
+            target, "tell", incoming, default="tell",
+        )
+    )
+    character.session.send(
+        display_prefs_mod.paint_channel_line(
+            character, "tell", outgoing, default="tell",
+        )
+    )
     target.session.last_tell_from = character.key
     from engine import channels
     channels.append_tell(
         character.session,
-        f'You tell {target_face}, "{message}"',
+        {"kind": "out", "peer": target_face, "message": message},
+        game=game,
     )
     channels.append_tell(
         target.session,
-        f'{speaker_face} tells you, "{message}"',
+        {"kind": "in", "peer": speaker_face, "message": message},
+        game=game,
     )
     try:
         from engine import rp_transcript as transcript_mod
-        transcript_mod.capture(
-            character, f'You tell {target_face}, "{message}"',
-        )
-        transcript_mod.capture(
-            target,
-            f'{speaker_face} tells you, "{message}"',
-        )
+        transcript_mod.capture(character, outgoing)
+        transcript_mod.capture(target, incoming)
     except Exception:
         pass
     from engine import gmcp
@@ -2412,11 +2507,31 @@ def cmd_config(character, args, game):
         elif choice in ("off", "no", "false", "0"):
             character.show_combat_tags = False
             character.session.send(
-                "Combat tags off -- cinematic combat without "
+                "Combat tags off -- combat without "
                 "[DMG]/[HIT] prefixes."
             )
         else:
             character.session.send("Usage: config combattags on|off")
+        return
+    if key in ("plaincomms", "plain_comms", "plainchat"):
+        if not rest:
+            state = "on" if display_prefs.wants_plain_comms(character) else "off"
+            character.session.send(
+                f"Plain comms are {state}. "
+                "Usage: config plaincomms on|off"
+            )
+            return
+        choice = rest.split(None, 1)[0].lower()
+        if choice in ("on", "yes", "true", "1"):
+            character.session.send(
+                display_prefs.apply_plain_comms_mode(character, True)
+            )
+        elif choice in ("off", "no", "false", "0"):
+            character.session.send(
+                display_prefs.apply_plain_comms_mode(character, False)
+            )
+        else:
+            character.session.send("Usage: config plaincomms on|off")
         return
     if key in ("combathints", "combat_hints", "combathelp"):
         if not rest:
@@ -2598,25 +2713,36 @@ def cmd_config(character, args, game):
             character.session.send("Usage: config seeaccounts on|off")
         return
     if key == "channel":
-        # config channel ooc|say <role>
+        # config channel ooc|say|emote|tell <role>
         bits = rest.split(None, 2)
+        channel_names = ("ooc", "say", "emote", "tell")
         if not bits:
-            ooc_role = character.channel_colors.get("ooc", "ooc")
-            say_role = character.channel_colors.get("say", "say")
             character.session.send(
-                f"OOC channel role is {ooc_role}. "
-                f"Say channel role is {say_role}."
+                "OOC channel role is "
+                f"{character.channel_colors.get('ooc', 'ooc')}."
             )
             character.session.send(
-                "Usage: config channel ooc|say <role>  "
-                "(roles: muted, ooc, say, alert, teal, gold, …)"
+                "Say channel role is "
+                f"{character.channel_colors.get('say', 'say')}."
+            )
+            character.session.send(
+                "Emote channel role is "
+                f"{character.channel_colors.get('emote', 'emote')}."
+            )
+            character.session.send(
+                "Tell channel role is "
+                f"{character.channel_colors.get('tell', 'tell')}."
+            )
+            character.session.send(
+                "Usage: config channel ooc|say|emote|tell <role>  "
+                "(roles: muted, ooc, say, emote, tell, alert, teal, gold, …)"
             )
             return
         sub = bits[0].lower()
-        if sub not in ("ooc", "say"):
+        if sub not in channel_names:
             character.session.send(
-                "Configurable channels: ooc, say. "
-                "Usage: config channel ooc|say <role>"
+                "Configurable channels: ooc, say, emote, tell. "
+                "Usage: config channel ooc|say|emote|tell <role>"
             )
             return
         if len(bits) < 2:
@@ -2712,7 +2838,10 @@ def _config_status_lines(character):
     clock = (
         "12h" if getattr(character, "time_format", "24h") == "12h" else "24h"
     )
-    tags_state = "on" if character.show_combat_tags else "off"
+    if getattr(character, "screenreader", False):
+        tags_state = "on (locked)"
+    else:
+        tags_state = "on" if character.show_combat_tags else "off"
     items_compact = (
         "on" if getattr(character, "compact_floor_items", False) else "off"
     )
@@ -2729,6 +2858,9 @@ def _config_status_lines(character):
         f"  screenreader: "
         f"{'on' if character.screenreader else 'off'}  "
         "-- config screenreader on|off",
+        f"  plaincomms: "
+        f"{'on' if display_prefs.wants_plain_comms(character) else 'off'}  "
+        "-- config plaincomms on|off (plain say/tell/OOC sentences)",
         f"  map: {'on' if character.show_minimap else 'off'}  "
         "-- config map on|off (bare map command)",
         f"  maplook: {'on' if character.map_on_look else 'off'}  "
@@ -2798,6 +2930,10 @@ def _config_status_lines(character):
         f"  channel ooc: {ch}  -- config channel ooc <role>",
         f"  channel say: {character.channel_colors.get('say', 'say')}  "
         "-- config channel say <role>",
+        f"  channel emote: {character.channel_colors.get('emote', 'emote')}  "
+        "-- config channel emote <role>",
+        f"  channel tell: {character.channel_colors.get('tell', 'tell')}  "
+        "-- config channel tell <role>",
         "",
         "Account / OOC:",
         "  oocname: account|character  -- config oocname … "
@@ -3313,9 +3449,17 @@ def cmd_date(character, args, game):
 # ``changelog_stamp.py --prefix``), then fragment slug, then file_index.
 # Legacy bullets may still carry an optional hidden ``#N`` id for old
 # ``changes detail <n>`` bookmarks; new ships omit ``#N`` entirely.
-# Read/unread watermarks use ``sort_ts`` (``last_seen_changelog_sort_ts``).
+# Visit-ceiling model (``changes`` UX lock, Aug 2026 — see
+# ``docs/plans/changes_ux_lock.md``): ``last_seen_changelog_sort_ts`` stores
+# the newest ship timestamp this account has acknowledged. Ships with
+# ``sort_ts`` strictly above that ceiling are *new* (``*`` on lists, login
+# MOTD, ``changes new``). Bare ``changes`` always shows the global recent
+# feed; it does not page an unread backlog. ``changes catchup`` raises the
+# ceiling to the newest visible ship. Legacy floor watermarks migrate once via
+# ``changelog_visit_migrated``.
 _CHANGELOG_UNDATED = "0001-01-01"
 _CHANGELOG_WM_MIN = "0000-00-00T00:00:00Z"
+_CHANGELOG_WM_MAX = "9999-99-99T99:99:99Z"
 
 # Hidden change id at the start of a bold lead-in: ``#042 2026-07-16 — …``.
 # Zero-padding is optional (``#42`` and ``#042`` both parse). Players never
@@ -3518,7 +3662,7 @@ def _changes_send_detail(character, game, entry, *, is_gm=False):
     character.session.send(
         f"{_format_changes_detail_prefix(entry, is_gm=is_gm)} {body}".strip()
     )
-    _changes_watermark_bump(game, character, entry.get("sort_ts"))
+    _changes_visit_ts_bump(game, character, entry.get("sort_ts"))
 
 
 def _dedupe_changelog_entries_by_slug(entries):
@@ -3596,11 +3740,18 @@ def _changes_watermark_persist(game, character):
         pass
 
 
-def _changes_watermark_get(game, character):
-    """Return the newest ``sort_ts`` this viewer has already read."""
+def _changes_visit_ts_get(game, character, player_entries=None):
+    """Return the visit ceiling — newest acknowledged ship ``sort_ts``."""
     holder = _changes_watermark_holder(game, character)
     if holder is None:
-        return _CHANGELOG_WM_MIN
+        return ""
+    if player_entries is None:
+        all_entries = _load_unreleased_entries()
+        player_entries = _filter_changelog_entries_for_viewer(
+            all_entries, character, mode="player",
+        )
+    if not getattr(holder, "changelog_visit_migrated", False):
+        _migrate_changelog_visit_model(game, character, player_entries)
     sort_ts = str(getattr(holder, "last_seen_changelog_sort_ts", "") or "").strip()
     if sort_ts:
         return sort_ts
@@ -3609,59 +3760,119 @@ def _changes_watermark_get(game, character):
         legacy = _changelog_entry_by_legacy_id(_load_unreleased_entries(), old_id)
         if legacy and legacy.get("sort_ts"):
             holder.last_seen_changelog_sort_ts = legacy["sort_ts"]
+            holder.changelog_visit_migrated = True
             _changes_watermark_persist(game, character)
             return legacy["sort_ts"]
-    return _CHANGELOG_WM_MIN
+    return ""
 
 
-def _changes_watermark_bump(game, character, sort_ts):
-    """Raise the read watermark to at least *sort_ts* and queue persistence."""
-    target = str(sort_ts or "").strip()
-    if not target or target <= _CHANGELOG_WM_MIN:
-        return
+def _changes_watermark_get(game, character):
+    """Legacy alias — prefer ``_changes_visit_ts_get``."""
+    return _changes_visit_ts_get(game, character)
+
+
+def _migrate_changelog_visit_model(game, character, player_entries):
+    """One-time uplift from the old floor watermark to visit-ceiling semantics."""
     holder = _changes_watermark_holder(game, character)
-    if holder is None:
+    if holder is None or getattr(holder, "changelog_visit_migrated", False):
         return
+    entries = list(player_entries or [])
+    max_ts = max(
+        (entry.get("sort_ts") or "" for entry in entries),
+        default="",
+    )
+    old = str(getattr(holder, "last_seen_changelog_sort_ts", "") or "").strip()
+    if old <= _CHANGELOG_WM_MIN or not old or old >= _CHANGELOG_WM_MAX:
+        new_ts = max_ts
+    else:
+        newer = [
+            entry for entry in entries
+            if (entry.get("sort_ts") or "") > old
+        ]
+        if newer:
+            new_ts = max(entry.get("sort_ts") or "" for entry in newer)
+        else:
+            new_ts = max_ts or old
+    holder.last_seen_changelog_sort_ts = new_ts or _CHANGELOG_WM_MIN
+    holder.changelog_visit_migrated = True
+    _changes_watermark_persist(game, character)
+
+
+def _changes_visit_ts_bump(game, character, sort_ts):
+    """Raise the visit ceiling to at least *sort_ts* and queue persistence."""
+    target = str(sort_ts or "").strip()
+    holder = _changes_watermark_holder(game, character)
+    if holder is None or not target:
+        return
+    holder.changelog_visit_migrated = True
     current = str(getattr(holder, "last_seen_changelog_sort_ts", "") or "").strip()
-    if not current:
-        old_id = int(getattr(holder, "last_seen_changelog_id", 0) or 0)
-        if old_id > 0:
-            legacy = _changelog_entry_by_legacy_id(_load_unreleased_entries(), old_id)
-            current = (legacy or {}).get("sort_ts") or _CHANGELOG_WM_MIN
-    if target <= current:
+    if current and target <= current:
         return
     holder.last_seen_changelog_sort_ts = target
     _changes_watermark_persist(game, character)
 
 
-def _changes_watermark_bump_entries(game, character, entries):
-    """Mark every displayed entry (and any older timestamps) as read."""
+def _changes_watermark_bump(game, character, sort_ts):
+    """Legacy alias — prefer ``_changes_visit_ts_bump``."""
+    _changes_visit_ts_bump(game, character, sort_ts)
+
+
+def _changes_visit_ts_bump_entries(game, character, entries):
+    """Acknowledge *entries* by raising the ceiling to their newest ``sort_ts``."""
     if not entries:
         return
-    peak = max(
+    ceiling = max(
         (entry.get("sort_ts") or _CHANGELOG_WM_MIN for entry in entries),
         default=_CHANGELOG_WM_MIN,
     )
-    _changes_watermark_bump(game, character, peak)
+    _changes_visit_ts_bump(game, character, ceiling)
 
 
-def _changes_unread_entries(entries, watermark):
-    """Entries with a ``sort_ts`` strictly newer than *watermark*."""
-    wm = str(watermark or _CHANGELOG_WM_MIN)
+def _changes_watermark_bump_entries(game, character, entries):
+    """Legacy alias — prefer ``_changes_visit_ts_bump_entries``."""
+    _changes_visit_ts_bump_entries(game, character, entries)
+
+
+def _changes_visit_catchup(game, character, entries):
+    """Mark every visible ship acknowledged (ceiling = newest in *entries*)."""
+    if not entries:
+        _changes_visit_ts_bump(game, character, _CHANGELOG_WM_MIN)
+        return
+    ceiling = max(
+        (entry.get("sort_ts") or _CHANGELOG_WM_MIN for entry in entries),
+        default=_CHANGELOG_WM_MIN,
+    )
+    _changes_visit_ts_bump(game, character, ceiling)
+
+
+def _changes_entry_is_new(entry, visit_ts):
+    """True when *entry* shipped after the viewer's visit ceiling."""
+    vt = str(visit_ts or "").strip()
+    if not vt:
+        return False
+    return (entry.get("sort_ts") or "") > vt
+
+
+def _changes_new_entries(entries, visit_ts):
+    """Player/staff-visible ships newer than the visit ceiling (newest first)."""
     return [
         entry for entry in entries
-        if (entry.get("sort_ts") or _CHANGELOG_WM_MIN) > wm
+        if _changes_entry_is_new(entry, visit_ts)
     ]
 
 
+def _changes_unread_entries(entries, watermark):
+    """Legacy alias — ``watermark`` is now a visit ceiling, not a read floor."""
+    return _changes_new_entries(entries, watermark)
+
+
 def _changes_render_list_lines(
-    character, entries, *, title, watermark, flag_unread=False, is_gm=False,
+    character, entries, *, title, visit_ts, flag_unread=False, is_gm=False,
 ):
     """Build the multi-line body for a ``changes`` list subcommand."""
     lines_out = [title]
     for entry in entries:
-        entry_ts = entry.get("sort_ts") or _CHANGELOG_WM_MIN
-        unread = flag_unread and entry_ts > watermark
+        unread = flag_unread and _changes_entry_is_new(entry, visit_ts)
         prefix = _format_changes_list_prefix(
             entry, is_gm=is_gm, unread=unread,
         )
@@ -3945,36 +4156,36 @@ def _filter_changelog_entries_for_viewer(entries, character, *, mode="player"):
 
 
 def changes_unread_player_entries(character, game):
-    """Player-visible changelog rows newer than this viewer's watermark."""
+    """Player-visible ships newer than this viewer's visit ceiling."""
     all_entries = _load_unreleased_entries()
     player_entries = _filter_changelog_entries_for_viewer(
         all_entries, character, mode="player",
     )
-    watermark = _changes_watermark_get(game, character)
-    return _changes_unread_entries(player_entries, watermark)
+    visit_ts = _changes_visit_ts_get(game, character, player_entries)
+    return _changes_new_entries(player_entries, visit_ts)
 
 
 def deliver_changes_unread_on_login(character, game):
-    """One-line MOTD-style nudge when unread player ships exist (Phase C)."""
+    """One-line MOTD-style nudge when ships landed since the last visit (Phase C)."""
     session = getattr(character, "session", None)
     if session is None:
         return
-    unread = changes_unread_player_entries(character, game)
-    if not unread:
+    new_entries = changes_unread_player_entries(character, game)
+    if not new_entries:
         return
-    count = len(unread)
-    latest = unread[0]
+    count = len(new_entries)
+    latest = new_entries[0]
     summary = _changelog_display_summary(latest.get("summary") or "")
     if len(summary) > 72:
         summary = summary[:69].rstrip() + "..."
     if count == 1:
         session.send(
-            f"[NEWS] 1 unread change since your last visit — {summary} "
+            f"[NEWS] 1 new change since your last visit — {summary} "
             "(type changes or help changes)"
         )
     else:
         session.send(
-            f"[NEWS] {count} unread changes since your last visit — "
+            f"[NEWS] {count} new changes since your last visit — "
             f"newest: {summary} (type changes)"
         )
 
@@ -4053,8 +4264,10 @@ def cmd_changes(character, args, game):
     index when writable. Watermark updates use incremental account/character
     dirty flags — not a full world save.
 
-    Bare ``changes`` lists **unread** player ships when you have any; otherwise
-    the 10 most recent. Use ``changes all`` for scrollback regardless.
+    Bare ``changes`` always lists the **10 most recent** player ships (global
+    feed). Lines newer than your last visit show a ``*`` before the timestamp.
+    Use ``changes new`` for only those ships, or ``changes catchup`` to mark
+    everything read. Use ``changes all`` for longer scrollback.
 
     Shows each top-level '- **...**' BULLET under '## [Unreleased]' (plus
     fragment files under CHANGELOG.d/), tagged
@@ -4087,23 +4300,25 @@ def cmd_changes(character, args, game):
     bullet to that game package. Untagged bullets default to SUPERS.
 
     Usage:
-      changes                 -- unread ships when you have any, else last 10
+      changes                 -- last 10 global ships (* marks new since visit)
       changes all [n]         -- scrollback (alias: changes list; n up to 100)
       changes <n>             -- open the nth newest ship in full (1 = newest, 2 = next, …)
       changes ops [n]       -- staff-only [ops]/[docs]/[easter] ships (GM only)
-      changes unread [n]    -- only unread (same as bare changes when unread exist)
-      changes ops unread [n] -- unread staff-only ships (GM only)
+      changes new [n]       -- ships since your last visit (alias: changes unread)
+      changes unread [n]    -- same as changes new
+      changes ops new [n]   -- new staff-only ships (GM only)
       changes catchup       -- mark everything read without listing
       changes detail <ref>  -- full text (timestamp, slug, or legacy #N)
       changes #<ref>        -- same full-text lookup (legacy #N ok)
 
-    Unread entries show a ``*`` before their timestamp on the default list.
-    The read watermark lives on your account (or this character when unlinked).
+    New ships show a ``*`` before their timestamp on ``changes`` / ``changes all``.
+    The visit ceiling lives on your account (or this character when unlinked).
     """
     usage = (
         "Usage: changes | changes all [n] | changes <n> | changes ops [n] | "
-        "changes unread [n] | changes ops unread [n] | changes catchup | "
-        "changes detail <time|slug|id> | changes #<time|slug|id>"
+        "changes new [n] | changes unread [n] | changes ops new [n] | "
+        "changes catchup | changes detail <time|slug|id> | "
+        "changes #<time|slug|id>"
     )
     raw = args.strip()
     raw_lower = raw.lower()
@@ -4175,17 +4390,10 @@ def cmd_changes(character, args, game):
             character.session.send("Nothing unreleased right now -- all caught up.")
         return
 
-    watermark = _changes_watermark_get(game, character)
+    visit_ts = _changes_visit_ts_get(game, character, player_entries)
 
     if raw_lower in ("catchup", "mark"):
-        peak = (
-            max(
-                (entry.get("sort_ts") or _CHANGELOG_WM_MIN for entry in player_entries),
-                default=_CHANGELOG_WM_MIN,
-            )
-            if player_entries else _CHANGELOG_WM_MIN
-        )
-        _changes_watermark_bump(game, character, peak)
+        _changes_visit_catchup(game, character, entries)
         character.session.send("Marked all visible changes as read.")
         return
 
@@ -4201,11 +4409,11 @@ def cmd_changes(character, args, game):
 
     n = _CHANGES_DEFAULT_LIMIT
     if unread_mode:
-        pool = _changes_unread_entries(entries, watermark)
+        pool = _changes_new_entries(entries, visit_ts)
         if not pool:
             character.session.send(
-                "No unread changes -- you are caught up. "
-                "(Type changes for the full recent list.)"
+                "No new changes since your last visit — you are caught up. "
+                "(Type changes for the recent list.)"
             )
             return
         if count_raw:
@@ -4219,29 +4427,29 @@ def cmd_changes(character, args, game):
                 return
         shown = pool[:n]
         title = (
-            "Unread staff changes (most recent first):"
+            "New staff changes since your last visit (most recent first):"
             if ops_mode else
-            "Unread changes (most recent first):"
+            "New changes since your last visit (most recent first):"
         )
         lines_out = _changes_render_list_lines(
             character,
             shown,
             title=title,
-            watermark=watermark,
+            visit_ts=visit_ts,
             flag_unread=False,
             is_gm=is_gm,
         )
         if len(pool) > len(shown):
-            suffix = "changes ops unread" if ops_mode else "changes unread"
+            suffix = "changes ops new" if ops_mode else "changes new"
             lines_out.append(
-                f"({len(pool) - len(shown)} more unread -- "
+                f"({len(pool) - len(shown)} more new — "
                 f"{suffix} {len(pool)} or changes catchup.)"
             )
         lines_out.append(
             "(changes all 25 — scrollback; changes <n> — open one ship.)"
         )
         character.session.send("\n".join(lines_out))
-        _changes_watermark_bump_entries(game, character, shown)
+        _changes_visit_ts_bump_entries(game, character, shown)
         return
 
     if raw and not ops_mode:
@@ -4303,53 +4511,27 @@ def cmd_changes(character, args, game):
             )
             return
 
-    # Bare ``changes`` (player): unread-first like classic MUD news.
-    if not raw and not ops_mode:
-        unread_pool = _changes_unread_entries(entries, watermark)
-        if unread_pool:
-            shown = unread_pool[:n]
-            title = "Unread changes (most recent first):"
-            lines_out = _changes_render_list_lines(
-                character,
-                shown,
-                title=title,
-                watermark=watermark,
-                flag_unread=False,
-                is_gm=is_gm,
-            )
-            if len(unread_pool) > len(shown):
-                lines_out.append(
-                    f"({len(unread_pool) - len(shown)} more unread — "
-                    f"changes unread {len(unread_pool)} or changes catchup.)"
-                )
-            lines_out.append(
-                "(changes all 25 — full scrollback; changes <n> — open one ship.)"
-            )
-            character.session.send("\n".join(lines_out))
-            _changes_watermark_bump_entries(game, character, shown)
-            return
-
     shown = entries[:n]
-    unread_count = len(_changes_unread_entries(entries, watermark))
+    new_count = len(_changes_new_entries(entries, visit_ts))
     if ops_mode:
         title = "Recent staff changes (most recent first):"
-        if unread_count:
+        if new_count:
             title = (
                 f"Recent staff changes (most recent first; "
-                f"{unread_count} unread -- try changes ops unread):"
+                f"{new_count} new — try changes ops new):"
             )
     else:
         title = "Recent changes (most recent first):"
-        if unread_count:
+        if new_count:
             title = (
                 f"Recent changes (most recent first; "
-                f"{unread_count} unread -- try changes unread):"
+                f"{new_count} new — try changes new or changes catchup):"
             )
     lines_out = _changes_render_list_lines(
         character,
         shown,
         title=title,
-        watermark=watermark,
+        visit_ts=visit_ts,
         flag_unread=True,
         is_gm=is_gm,
     )
@@ -4357,7 +4539,6 @@ def cmd_changes(character, args, game):
         "(changes all 25 — scrollback; changes <n> — open one ship.)"
     )
     character.session.send("\n".join(lines_out))
-    _changes_watermark_bump_entries(game, character, shown)
 
 
 def _format_help_db_entry(character, entry):
@@ -4400,7 +4581,9 @@ def cmd_help(character, args, game):
     Lookup order (docs/plans/helpfile_editing_system.md): a hot-editable
     DB-overlay page (engine/help_db.py) wins over everything -- a GM can
     'hedit' a live typo fix or a brand-new page without a deploy -- then
-    the static HELP_TOPICS page, then a DB full-text search hit, then a
+    the static HELP_TOPICS page, then ``help <topic> <query>`` filters that
+    topic's body (so ``help gm criminal`` does not look up a missing page
+    named "gm criminal"), then a DB full-text search hit, then a
     bare COMMANDS one-liner, and finally a DB fuzzy "did you mean" before
     giving up and logging the miss.
     """
@@ -4490,6 +4673,43 @@ def cmd_help(character, args, game):
             from engine import hooks
             hooks.after_help_topic(character, verb, game)
             return
+        # help <topic> <query> -- filter a long page (help gm criminal)
+        # instead of looking up a topic named "gm criminal".
+        if " " in verb:
+            head, query = verb.split(None, 1)
+            page = topics.get(head)
+            if page is not None:
+                from engine.help_filter import filter_topic_lines
+                filtered = filter_topic_lines(page, query)
+                if filtered:
+                    title = f"{head} -- matches for {query}"
+                    note = [
+                        f"Showing matches for '{query}' on help {head}.",
+                        f"Full page: help {head}.",
+                    ]
+                    # The GM hub also has a live verb search (gm find).
+                    if head == "gm":
+                        note.append(f"Staff verb search: gm find {query}")
+                    note.append("")
+                    framed = style.format_tome(
+                        title, note + filtered, related=f"help {head}",
+                        width=help_w,
+                        screenreader=sr,
+                    )
+                    character.session.send("\r\n".join(framed))
+                    from engine import hooks
+                    hooks.after_help_topic(character, head, game)
+                    return
+                miss = (
+                    f"No lines on help {head} match '{query}'. "
+                    f"Type help {head} for the full page."
+                )
+                if head == "gm":
+                    miss += (
+                        f" Staff: gm find {query} searches the live verb list."
+                    )
+                character.session.send(miss)
+                return
         # DB full-text search -- ahead of the bare COMMANDS one-liner, so a
         # rich DB page (once one exists) beats a one-line command blurb.
         if db is not None:
@@ -4936,18 +5156,23 @@ def cmd_drop(character, args, game):
             targets = inv
         dropped = []
         refused = []
+        from engine.systems import containers as containers_mod
+        from engine import hooks
+
         for item in list(targets):
             refuse = item_drop_refusal(character, item)
             if refuse:
                 refused.append((item.key, refuse))
                 continue
-            if item not in character.inventory:
-                continue
-            character.inventory.remove(item)
-            character.location.add(item)
-            from engine import hooks
-            hooks.after_floor_drop(game, item)
-            dropped.append(item.key)
+            # Peel one unit at a time so merged stack rows (stack_charges>1)
+            # drop every piece -- same rule as single ``drop`` (bug report 329).
+            while containers_mod._item_carried_by_character(character, item):
+                unit = containers_mod.peel_one_carried_unit(character, item)
+                if unit is None:
+                    break
+                character.location.add(unit)
+                hooks.after_floor_drop(game, unit)
+                dropped.append(unit.key)
         if dropped:
             character.session.send("You drop: " + ", ".join(dropped) + ".")
             if frag:
@@ -5677,6 +5902,35 @@ def cmd_hedit(character, args, game):
         "then /save when ready (or /cancel to abort). "
         "See /list /i /d /clear /r /syntax /category /alias /gm /ic /preview."
     )
+
+
+def cmd_hrefresh(character, args, game):
+    """GM: rewrite a help_db overlay from the static HELP_TOPICS page.
+
+    Use this when a saved ``hedit`` row is stale but you still want the
+    overlay layer (not a delete-back-to-static workaround). ``hrefresh
+    catalog`` rebuilds ``help paths`` from ``origins.json`` and pushes it
+    into the ``paths`` / ``path list`` / ``pathlist`` overlay rows.
+    """
+    if not _is_gm(character):
+        character.session.send("You aren't a GM.")
+        return
+    keyword = args.strip().lower()
+    if not keyword:
+        character.session.send(
+            "Usage: hrefresh <keyword|catalog>\r\n"
+            "  hrefresh catalog   refresh help paths from origins.json\r\n"
+            "  hrefresh <keyword> copy static help_topics.py into the overlay"
+        )
+        return
+    author = getattr(character, "key", None) or "gm"
+    from engine import hooks
+
+    ok, message = hooks.refresh_help_overlay(game, keyword, author=author)
+    if ok:
+        character.session.send(f"Help overlay refreshed: {message}")
+    else:
+        character.session.send(f"Help overlay not refreshed: {message}")
 
 
 def _my_reports_lines(kind, entries, *, noun, file_verb):

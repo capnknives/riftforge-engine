@@ -23,6 +23,10 @@ Design notes:
   ``RIFTFORGE_PERSIST_FULL_EVERY`` autosaves (default 30). Dirty queues can
   be capped per save (``RIFTFORGE_PERSIST_DIRTY_*_CAP``) so one busy minute
   cannot force a multi-second SQLite transaction; leftovers stay dirty.
+  After ``load_world``, ``seed_snapshot_hashes_after_load`` (default on via
+  ``RIFTFORGE_PERSIST_SEED_HASHES_ON_LOAD``) fingerprints the loaded roster
+  so the first post-restart autosave can stay incremental instead of forcing
+  a full verify while hash caches re-warm.
 - Rooms themselves are NOT stored. The map is still built in code by
   build_world(); the database records which room each character/item is IN,
   keyed by the room's name. EXTENSION POINT: move the map itself into the DB.
@@ -51,8 +55,68 @@ _PERSIST_FULL_EVERY_DEFAULT = 30
 # Excess keys stay in the dirty sets for the next pass.
 _PERSIST_DIRTY_CHAR_CAP_DEFAULT = 40
 _PERSIST_DIRTY_ROOM_CAP_DEFAULT = 80
-# How many DELETE/INSERT batches between cooperative yields on apply.
-_PERSIST_APPLY_YIELD_EVERY = 8
+# How many DELETE/INSERT batches between cooperative yields on apply/collect.
+_PERSIST_SAVE_YIELD_EVERY_DEFAULT = 1
+# How many changed characters/rooms share one SQLite commit during the
+# incremental async apply (lag P11.3). Each commit is a separate fsync under
+# the default DELETE journal mode; committing per-character (the old
+# behavior) made routine autosave apply_ms cost 3.5-6s whenever ~100+
+# characters were dirty (common right after a game-only restart, before
+# per-character hash caches warm back up -- see `_collect_character_save_pass`
+# "never hashed" bypass). Batching cuts fsync count by ~10-25x. Independent
+# of `_PERSIST_SAVE_YIELD_EVERY_DEFAULT`, which only controls how often the
+# asyncio loop yields, not how often SQLite commits.
+_PERSIST_APPLY_COMMIT_BATCH_DEFAULT = 25
+# Max milliseconds one autosave may spend in save_async before deferring
+# optional meta slices to the next scheduled pass (lag 2026-08 live freezes).
+_PERSIST_SAVE_WALL_BUDGET_MS_DEFAULT = 5000
+
+
+def persist_save_wall_budget_ms():
+    """Wall-clock budget for one cooperative autosave (0 = disabled)."""
+    raw = (os.environ.get("RIFTFORGE_PERSIST_SAVE_WALL_BUDGET_MS") or "").strip()
+    if not raw:
+        return _PERSIST_SAVE_WALL_BUDGET_MS_DEFAULT
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError):
+        return _PERSIST_SAVE_WALL_BUDGET_MS_DEFAULT
+
+
+def _persist_save_over_wall_budget(start_mono, budget_ms):
+    """True when a cooperative save has exceeded its wall budget."""
+    if budget_ms <= 0:
+        return False
+    import time as _time
+
+    elapsed_ms = (_time.perf_counter() - float(start_mono)) * 1000.0
+    return elapsed_ms >= float(budget_ms)
+
+
+def persist_save_yield_every():
+    """Cooperative yield interval for world save collect + apply (lag save-coop).
+
+    ``RIFTFORGE_PERSIST_APPLY_YIELD_EVERY`` wins; ``RIFTFORGE_PERSIST_COLLECT_YIELD_EVERY``
+    is an alias when apply is unset.
+    """
+    for name in (
+        "RIFTFORGE_PERSIST_APPLY_YIELD_EVERY",
+        "RIFTFORGE_PERSIST_COLLECT_YIELD_EVERY",
+    ):
+        raw = (os.environ.get(name) or "").strip()
+        if raw:
+            return _persist_env_int(name, _PERSIST_SAVE_YIELD_EVERY_DEFAULT)
+    return _PERSIST_SAVE_YIELD_EVERY_DEFAULT
+
+
+def persist_apply_commit_batch():
+    """Changed characters/rooms per SQLite commit in the incremental async
+    apply (lag P11.3). ``RIFTFORGE_PERSIST_APPLY_COMMIT_BATCH`` overrides.
+    """
+    return _persist_env_int(
+        "RIFTFORGE_PERSIST_APPLY_COMMIT_BATCH",
+        _PERSIST_APPLY_COMMIT_BATCH_DEFAULT,
+    )
 
 
 def _persist_env_int(name, default):
@@ -76,32 +140,20 @@ def persist_full_every():
 def persist_dirty_char_cap(game=None):
     """Max dirty characters rewritten in one incremental save.
 
-    When a backlog builds past the base cap, raise the per-pass limit so
-    deferred chars drain instead of growing forever (live lag P5).
+    Keep a hard per-pass cap so one autosave cannot serialize 100+ Echo
+    bodies and freeze the asyncio loop for nearly a minute (live lag 2026-08).
+    Backlog drains across successive autosaves instead.
     """
-    base = _persist_env_int(
+    return _persist_env_int(
         "RIFTFORGE_PERSIST_DIRTY_CHAR_CAP", _PERSIST_DIRTY_CHAR_CAP_DEFAULT,
     )
-    if game is None:
-        return base
-    queued = len(getattr(game, "_persist_dirty_characters", None) or ())
-    if queued <= base:
-        return base
-    # Drain up to 3x base or the whole queue (capped at 120) each pass.
-    return min(queued, max(base, min(120, base * 3)))
 
 
 def persist_dirty_room_cap(game=None):
     """Max dirty floor rooms rewritten in one incremental save."""
-    base = _persist_env_int(
+    return _persist_env_int(
         "RIFTFORGE_PERSIST_DIRTY_ROOM_CAP", _PERSIST_DIRTY_ROOM_CAP_DEFAULT,
     )
-    if game is None:
-        return base
-    queued = len(getattr(game, "_persist_dirty_floor_rooms", None) or ())
-    if queued <= base:
-        return base
-    return min(queued, max(base, min(200, base * 3)))
 
 
 def meta_persist_fingerprint(payload):
@@ -151,6 +203,76 @@ from engine.hooks import (
 from engine.world import Character, Item, Room, note_item_created_seq
 
 
+def _boot_log_verbose():
+    """Per-row boot diagnostics when ``RIFTFORGE_BOOT_VERBOSE=1``."""
+    raw = (os.environ.get("RIFTFORGE_BOOT_VERBOSE") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _record_map_missing_stub(game, character_name, room_key):
+    """Queue a map_missing_stub boot line; flush once after character load."""
+    log = getattr(game, "_map_missing_stub_boot_log", None)
+    if log is None:
+        log = []
+        game._map_missing_stub_boot_log = log
+    log.append((character_name, room_key))
+    if _boot_log_verbose():
+        start_key = getattr(game.start_room, "key", None)
+        print(
+            f"[persistence] saved room {room_key!r} missing for "
+            f"{character_name!r} -- keeping a stub so they are not dumped "
+            f"to {start_key!r}. Update map JSON (or restore runtime maps) "
+            f"and restart.",
+            flush=True,
+        )
+
+
+def flush_map_missing_stub_boot_log(game):
+    """Emit one summary line for map_missing_stub occupants still on stubs.
+
+    Call after boot_seed critical heals (pit / slumber resume, stub heal) so
+    transient procedural room keys do not spam the log every boot.
+    """
+    log = getattr(game, "_map_missing_stub_boot_log", None) or []
+    if not log:
+        return
+    game._map_missing_stub_boot_log = []
+    if _boot_log_verbose():
+        return
+    # Drop rows boot heal already moved off stubs (pit hub, generic stub heal).
+    remaining = []
+    for name, key in log:
+        character = game.find_character(name) if game is not None else None
+        if character is None:
+            remaining.append((name, key))
+            continue
+        loc = getattr(character, "location", None)
+        if loc is None or getattr(loc, "map_missing_stub", False):
+            remaining.append((name, key))
+    if not remaining:
+        return
+    log = remaining
+    start_key = getattr(game.start_room, "key", None)
+    n_chars = len(log)
+    n_keys = len({rk for _name, rk in log})
+    examples = []
+    for name, key in log[:5]:
+        if len(key) <= 72:
+            examples.append(f"{name!r} @ {key!r}")
+        else:
+            examples.append(f"{name!r} @ {key[:69]!r}…")
+    extra = f" (+{n_chars - 5} more)" if n_chars > 5 else ""
+    print(
+        f"[persistence] map_missing_stub: {n_chars} character(s) on "
+        f"{n_keys} missing room key(s) -- keeping stubs so they are not "
+        f"dumped to {start_key!r}. Examples: "
+        f"{'; '.join(examples)}{extra}. Update map JSON (or restore "
+        f"runtime maps) and restart. "
+        f"(Set RIFTFORGE_BOOT_VERBOSE=1 for per-character lines.)",
+        flush=True,
+    )
+
+
 def _resolve_saved_room(game, room_key, character_name):
     """Return the Room for a saved character ``room_key``.
 
@@ -185,9 +307,9 @@ def _resolve_saved_room(game, room_key, character_name):
     demesne_room = hooks.demesne_resolve_room_key(game, room_key)
     if demesne_room is not None:
         return demesne_room
-    from engine.systems.overland import resolve_wilderness_saved_room_key
+    from engine.systems.overland import resolve_virtual_overland_room_key
 
-    wild_room = resolve_wilderness_saved_room_key(game, room_key)
+    wild_room = resolve_virtual_overland_room_key(game, room_key)
     if wild_room is not None:
         return wild_room
     from engine.systems.mine_rooms import resolve_mine_saved_room_key
@@ -195,13 +317,7 @@ def _resolve_saved_room(game, room_key, character_name):
     mine_room = resolve_mine_saved_room_key(game, room_key)
     if mine_room is not None:
         return mine_room
-    print(
-        f"[persistence] saved room {room_key!r} missing for "
-        f"{character_name!r} -- keeping a stub so they are not dumped "
-        f"to {getattr(game.start_room, 'key', None)!r}. Update map JSON "
-        f"(or restore runtime maps) and restart.",
-        flush=True,
-    )
+    _record_map_missing_stub(game, character_name, room_key)
     stub = Room(
         room_key,
         "The space you remember is thin here -- the map that held this "
@@ -260,9 +376,13 @@ def heal_map_missing_stub_occupants(game):
         roster = roster.values()
     from engine.systems.overland import parse_wilderness_room_key, place_on_overland
 
+    from engine import hooks
+
     for character in list(roster):
         loc = getattr(character, "location", None)
         if loc is None or not getattr(loc, "map_missing_stub", False):
+            continue
+        if hooks.should_skip_map_missing_stub_heal(character):
             continue
         stub_key = getattr(loc, "key", None) or ""
         parsed = parse_wilderness_room_key(stub_key)
@@ -317,6 +437,13 @@ CREATE TABLE IF NOT EXISTS items (
     holder_key  TEXT NOT NULL,             -- room key or character name
     container   TEXT NOT NULL DEFAULT '{}' -- JSON: {"locked": bool, "loot": [...]}
 );
+-- Lag P11.4: every autosave issues "DELETE FROM items WHERE holder_key=?"
+-- once per changed character/room. Without this index that is a full
+-- table scan of the whole items table per changed holder -- on live
+-- (~16,700 item rows, ~110+ changed characters per autosave right after a
+-- restart) that is what turned the already-batched-commit apply step into
+-- a multi-second stall (see engine/persistence.py commit-batch docs above).
+CREATE INDEX IF NOT EXISTS idx_items_holder_key ON items(holder_key);
 CREATE TABLE IF NOT EXISTS meta (
     key         TEXT PRIMARY KEY,          -- tiny key/value store for flags
     value       TEXT NOT NULL
@@ -457,6 +584,23 @@ CREATE TABLE IF NOT EXISTS township_rooms (
     flags_json     TEXT NOT NULL,
     exits_json     TEXT NOT NULL
 );
+-- Staff-scaffolded lucid dream pockets (docs/plans/dream_realm_expansion.md).
+CREATE TABLE IF NOT EXISTS dream_pockets (
+    pocket_id        TEXT PRIMARY KEY,
+    owner_name       TEXT NOT NULL,
+    anchor_room_key  TEXT NOT NULL,
+    hub_room_key     TEXT,
+    sealed           INTEGER NOT NULL DEFAULT 0,
+    guests_json      TEXT NOT NULL DEFAULT '[]',
+    meta_json        TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS dream_pocket_rooms (
+    room_key       TEXT PRIMARY KEY,
+    pocket_id      TEXT NOT NULL,
+    description    TEXT NOT NULL,
+    flags_json     TEXT NOT NULL,
+    exits_json     TEXT NOT NULL
+);
 -- External-content FTS5 index (keyword + body only -- aliases already get
 -- exact-match coverage via help_aliases, see help_db.get_entry). Kept in
 -- sync by the three triggers below rather than the app re-indexing itself.
@@ -524,9 +668,25 @@ def connect(path):
                 flush=True,
             )
             conn.execute("PRAGMA journal_mode=WAL")
+        from engine import sqlite_wal as sqlite_wal_mod
+
+        sqlite_wal_mod.configure_on_connect(conn, path)
+        sqlite_wal_mod.maybe_checkpoint_on_boot(conn, path)
     conn.executescript(_SCHEMA)   # executescript runs several statements at once
     _migrate(conn)
     return conn
+
+
+def maybe_wal_checkpoint_after_save(conn, db_path, *, reason="save"):
+    """Post-save WAL drain hook (lag P13). Fail-soft — never raises."""
+    try:
+        from engine import sqlite_wal as sqlite_wal_mod
+
+        return sqlite_wal_mod.maybe_checkpoint_after_save(
+            conn, db_path, reason=reason,
+        )
+    except Exception:
+        return {}
 
 
 # Columns added to a table after its original CREATE TABLE already shipped
@@ -670,6 +830,28 @@ _MIGRATIONS = [
     flags_json TEXT NOT NULL,
     exits_json TEXT NOT NULL
 )"""),
+    (18, """CREATE TABLE IF NOT EXISTS dream_pockets (
+    pocket_id TEXT PRIMARY KEY,
+    owner_name TEXT NOT NULL,
+    anchor_room_key TEXT NOT NULL,
+    hub_room_key TEXT,
+    sealed INTEGER NOT NULL DEFAULT 0,
+    guests_json TEXT NOT NULL DEFAULT '[]',
+    meta_json TEXT NOT NULL DEFAULT '{}'
+)"""),
+    (19, """CREATE TABLE IF NOT EXISTS dream_pocket_rooms (
+    room_key TEXT PRIMARY KEY,
+    pocket_id TEXT NOT NULL,
+    description TEXT NOT NULL,
+    flags_json TEXT NOT NULL,
+    exits_json TEXT NOT NULL
+)"""),
+    # Lag P11.4: existing databases predate the index added to _SCHEMA
+    # above -- every autosave's per-holder DELETE was a full table scan
+    # of `items` (live: ~16,700 rows) for each of the ~110+ characters/
+    # rooms changed per cycle, which is what the batched-commit fixes in
+    # P11.3/P11.3b could not address (fewer commits, same O(rows) scans).
+    (20, "CREATE INDEX IF NOT EXISTS idx_items_holder_key ON items(holder_key)"),
 ]
 
 
@@ -2192,6 +2374,17 @@ def _character_save_rows(game, obj, seen_names):
         )
         finder = getattr(game, "find_character", None)
         spirit = finder(spirit_key) if callable(finder) else None
+        if spirit is None:
+            try:
+                from engine import accounts as accounts_mod
+
+                acct = accounts_mod.account_for_character(game, obj)
+                if acct is not None and acct.gm_rank in ("gm", "head_gm"):
+                    alt = accounts_mod.gm_spirit_key_for_account(acct)
+                    if alt and callable(finder):
+                        spirit = finder(alt)
+            except Exception:
+                spirit = None
         spirit_room = getattr(spirit, "location", None) if spirit else None
         if spirit_room is not None and getattr(spirit_room, "key", None):
             obj.gm_spirit_room_key = spirit_room.key
@@ -2485,6 +2678,56 @@ def _persist_snapshot_hashes_ready(game):
     return bool(getattr(game, "_persist_warm", False))
 
 
+def persist_seed_hashes_on_load_enabled():
+    """When true (default), boot stamps snapshot hashes after ``load_world``."""
+    raw = (os.environ.get("RIFTFORGE_PERSIST_SEED_HASHES_ON_LOAD") or "1").strip()
+    return raw.lower() not in ("0", "false", "no", "off")
+
+
+def seed_snapshot_hashes_after_load(game):
+    """Fingerprint the loaded world so the first autosave can stay incremental.
+
+    ``load_world`` clears warm hashes; without this pass every game-only
+    restart forced a full-verify autosave (or rewrote ~100+ bodies while
+    hash caches re-warmed). One boot-time collect matches on-disk state;
+    later saves only touch ``mark_character_dirty`` bodies.
+    """
+    if game is None or not persist_seed_hashes_on_load_enabled():
+        return
+    if _persist_snapshot_hashes_ready(game):
+        return
+    from engine.char_index import iter_characters
+
+    seen_names = set()
+    char_hashes = {}
+    for obj in iter_characters(game):
+        payload = _character_save_rows(game, obj, seen_names)
+        if payload is None:
+            continue
+        char_row, owned_items = payload
+        char_hashes[char_row[0]] = _char_snapshot_hash(char_row, owned_items)
+
+    floor_hashes = {}
+    for room in _iter_floor_item_rooms(game):
+        room_key = getattr(room, "key", None)
+        if not room_key:
+            continue
+        room_rows = []
+        for obj in room.contents:
+            if not _persistable_floor_item(obj):
+                continue
+            room_rows.append((
+                obj.key, obj.description, "room", room_key,
+                _item_container_blob(obj),
+            ))
+        floor_hashes[room_key] = _floor_room_snapshot_hash(room_rows)
+
+    game._persist_char_snapshot_hashes = char_hashes
+    game._persist_floor_room_hashes = floor_hashes
+    game._persist_warm = True
+    game._persist_force_full = False
+
+
 def _persist_store_snapshot_hashes(game, meta):
     """Remember last-written snapshot fingerprints for incremental autosave."""
     if game is None or not meta:
@@ -2589,6 +2832,54 @@ def _collect_floor_save_pass(game, prev_floor_hashes, force_full, dirty_rooms):
     return item_rows, changed_floor_rooms, new_floor_hashes
 
 
+async def _collect_floor_save_pass_async(
+    game, prev_floor_hashes, force_full, dirty_rooms, *, yield_every=None,
+):
+    """Cooperative floor-item snapshot -- yield while scanning many rooms."""
+    import asyncio
+
+    if yield_every is None:
+        yield_every = persist_save_yield_every()
+    item_rows = []
+    changed_floor_rooms = []
+    new_floor_hashes = {}
+    n = 0
+    for room in _iter_floor_item_rooms(game):
+        room_key = getattr(room, "key", None)
+        if not room_key:
+            continue
+        if not force_full and room_key not in dirty_rooms:
+            prev_digest = (prev_floor_hashes or {}).get(room_key)
+            if prev_digest is not None:
+                new_floor_hashes[room_key] = prev_digest
+                n += 1
+                if yield_every and n % yield_every == 0:
+                    await asyncio.sleep(0)
+                continue
+        room_rows = []
+        for obj in room.contents:
+            if not _persistable_floor_item(obj):
+                continue
+            room_rows.append((
+                obj.key, obj.description, "room", room_key,
+                _item_container_blob(obj),
+            ))
+        digest = _floor_room_snapshot_hash(room_rows)
+        new_floor_hashes[room_key] = digest
+        if force_full:
+            item_rows.extend(room_rows)
+        elif (
+            room_key in dirty_rooms
+            or prev_floor_hashes.get(room_key) != digest
+        ):
+            changed_floor_rooms.append(room_key)
+            item_rows.extend(room_rows)
+        n += 1
+        if yield_every and n % yield_every == 0:
+            await asyncio.sleep(0)
+    return item_rows, changed_floor_rooms, new_floor_hashes
+
+
 def _persist_cap_dirty_sets(game, force_full):
     """Return (dirty_chars, dirty_rooms, deferred_chars, deferred_rooms).
 
@@ -2672,10 +2963,15 @@ def _collect_world_save_snapshot(game):
     return char_rows, item_rows, meta
 
 
-async def _collect_world_save_snapshot_async(game, *, yield_every=10):
+async def _collect_world_save_snapshot_async(
+    game, *, yield_every=None, wall_start=None, wall_budget_ms=0,
+):
     """Cooperative snapshot build -- yields so player commands can run."""
     import asyncio
     from engine.char_index import iter_characters
+
+    if yield_every is None:
+        yield_every = persist_save_yield_every()
 
     prev_char = getattr(game, "_persist_char_snapshot_hashes", None)
     prev_floor = getattr(game, "_persist_floor_room_hashes", None)
@@ -2696,7 +2992,24 @@ async def _collect_world_save_snapshot_async(game, *, yield_every=10):
     changed_chars = []
     new_char_hashes = {}
     n = 0
+    wall_budget_hit = False
     for obj in iter_characters(game):
+        if wall_start is not None and _persist_save_over_wall_budget(
+            wall_start, wall_budget_ms,
+        ):
+            wall_budget_hit = True
+            if force_full:
+                # Never apply a partial full-verify wipe.
+                game._persist_force_full = True
+                meta = {
+                    "skipped_wall_budget": True,
+                    "force_full": force_full,
+                    "deferred_chars": sorted(dirty_chars | deferred_chars),
+                    "deferred_rooms": sorted(dirty_rooms | deferred_rooms),
+                }
+                return [], [], meta
+            deferred_chars.update(dirty_chars - set(changed_chars))
+            break
         name = (getattr(obj, "key", None) or getattr(obj, "name", None) or "")
         name = str(name)
         if not name:
@@ -2728,8 +3041,22 @@ async def _collect_world_save_snapshot_async(game, *, yield_every=10):
     if not force_full and prev_char:
         removed_chars = sorted(set(prev_char.keys()) - alive_names)
 
-    floor_rows, changed_floor, new_floor_hashes = _collect_floor_save_pass(
-        game, prev_floor or {}, force_full, dirty_rooms,
+    if (
+        not wall_budget_hit
+        and wall_start is not None
+        and _persist_save_over_wall_budget(wall_start, wall_budget_ms)
+    ):
+        wall_budget_hit = True
+        if not force_full:
+            deferred_chars.update(dirty_chars - set(changed_chars))
+
+    floor_rows, changed_floor, new_floor_hashes = (
+        await _collect_floor_save_pass_async(
+            game, prev_floor or {}, force_full, dirty_rooms,
+            yield_every=yield_every,
+        )
+        if not wall_budget_hit
+        else ([], [], {})
     )
     item_rows.extend(floor_rows)
     await asyncio.sleep(0)
@@ -2742,6 +3069,7 @@ async def _collect_world_save_snapshot_async(game, *, yield_every=10):
         "new_floor_hashes": new_floor_hashes,
         "deferred_chars": deferred_chars,
         "deferred_rooms": deferred_rooms,
+        "wall_budget_hit": wall_budget_hit,
         "n_dirty_chars_queued": len(
             getattr(game, "_persist_dirty_characters", None) or ()
         ),
@@ -2806,26 +3134,92 @@ def _apply_world_save_snapshot(conn, char_rows, item_rows, meta=None):
         raise last_err
 
 
+async def _apply_force_full_snapshot_async(
+    conn, char_rows, item_rows, *, yield_every,
+):
+    """Cooperative full-verify apply for ``save_world_async`` only.
+
+    Fires on the *first* autosave after every game-only restart (hash
+    cache is cold, so ``force_full`` is true) and every
+    ``persist_full_every()`` passes after that. Yields every ``ye``
+    (``yield_every``, default 2) rows for responsiveness, but -- lag
+    P11.3 continued -- used to also *commit* (fsync) every ``ye`` rows,
+    which for a live-sized world (~400 characters + ~5,000+ items) meant
+    roughly (400+5000)/2 ~= 2,700 individual commits in one pass, clocked
+    at 62s on live right after the 2026-08-20 P11.3 deploy (this path
+    fires on every restart, so it wasn't covered by the incremental-path
+    fix above). Commits now batch at ``persist_apply_commit_batch()``
+    (default 25) independently of the yield cadence, matching the
+    incremental path.
+    """
+    import asyncio
+
+    ye = max(1, int(yield_every or 1))
+    commit_batch = max(1, persist_apply_commit_batch())
+    with conn:
+        conn.execute("DELETE FROM characters")
+        conn.execute("DELETE FROM items")
+    await asyncio.sleep(0)
+
+    async def _apply_rows(rows, insert_sql):
+        n_since_commit = 0
+        for i in range(0, len(rows), ye):
+            batch = rows[i : i + ye]
+            if not batch:
+                continue
+            conn.executemany(insert_sql, batch)
+            n_since_commit += len(batch)
+            if n_since_commit >= commit_batch:
+                conn.commit()
+                n_since_commit = 0
+            await asyncio.sleep(0)
+        if n_since_commit:
+            conn.commit()
+
+    try:
+        await _apply_rows(char_rows, _CHAR_INSERT_SQL)
+        await _apply_rows(item_rows, _ITEM_INSERT_SQL)
+    finally:
+        # Best-effort flush of anything left uncommitted on an exception
+        # mid-pass -- mirrors the incremental path's safety net.
+        conn.commit()
+
+
 async def _apply_world_save_snapshot_async(
     conn, char_rows, item_rows, meta=None, *, yield_every=None,
 ):
-    """Incremental apply with yields; full-verify stays one transaction.
+    """Incremental apply with yields; full-verify batches INSERTs.
 
-    Full wipe+rewrite must stay atomic (crash mid-DELETE would empty the
-    roster). Incremental dirty passes commit in small batches so the
-    asyncio loop can serve player commands between SQLite work.
+    Incremental dirty passes yield periodically so the asyncio loop can
+    serve player commands between SQLite work, and commit once every
+    ``persist_apply_commit_batch()`` characters/rooms rather than once per
+    character (lag P11.3) -- each commit is a separate fsync under the
+    default DELETE journal mode, and committing per-character made routine
+    autosave ``apply_ms`` cost 3.5-6s whenever ~100+ characters were dirty
+    (common right after a game-only restart, before hash caches warm back
+    up). The transaction stays open across ``await asyncio.sleep(0)``
+    yields between commits -- safe here because SUPERS is single-writer
+    (hard rule 3) and this is the only coroutine touching ``conn`` for
+    world-save writes.
+
+    Cooperative full-verify (``save_world_async`` only): wipe tables once,
+    then batch INSERT with yields. Copyover / shutdown still use sync
+    ``save()`` which keeps one atomic transaction via
+    ``_apply_world_save_snapshot``.
     """
     import asyncio
 
     meta = meta or {"force_full": True}
     force_full = bool(meta.get("force_full"))
+    yield_every = (
+        persist_save_yield_every() if yield_every is None else int(yield_every)
+    )
     if force_full:
-        _apply_world_save_snapshot(conn, char_rows, item_rows, meta)
+        await _apply_force_full_snapshot_async(
+            conn, char_rows, item_rows, yield_every=yield_every,
+        )
         return
 
-    yield_every = (
-        _PERSIST_APPLY_YIELD_EVERY if yield_every is None else int(yield_every)
-    )
     # Batch DELETE+INSERT per changed character / floor room.
     char_by_name = {row[0]: row for row in char_rows}
     # Items: character/gear vs room floor.
@@ -2840,21 +3234,27 @@ async def _apply_world_save_snapshot_async(
         elif holder_type == "room":
             floor_by_room.setdefault(holder_key, []).append(row)
 
+    commit_batch = max(1, persist_apply_commit_batch())
     n = 0
-    for name in meta.get("removed_chars", ()):
-        with conn:
+    pending_commit = False
+
+    try:
+        for name in meta.get("removed_chars", ()):
             conn.execute("DELETE FROM characters WHERE name=?", (name,))
             conn.execute(
                 "DELETE FROM items WHERE holder_key=? "
                 "AND holder_type IN ('character', 'gear')",
                 (name,),
             )
-        n += 1
-        if yield_every and n % yield_every == 0:
-            await asyncio.sleep(0)
+            pending_commit = True
+            n += 1
+            if n % commit_batch == 0:
+                conn.commit()
+                pending_commit = False
+            if yield_every and n % yield_every == 0:
+                await asyncio.sleep(0)
 
-    for name in meta.get("changed_chars", ()):
-        with conn:
+        for name in meta.get("changed_chars", ()):
             conn.execute("DELETE FROM characters WHERE name=?", (name,))
             conn.execute(
                 "DELETE FROM items WHERE holder_key=? "
@@ -2867,12 +3267,15 @@ async def _apply_world_save_snapshot_async(
             owned = items_by_holder.get(name) or []
             if owned:
                 conn.executemany(_ITEM_INSERT_SQL, owned)
-        n += 1
-        if yield_every and n % yield_every == 0:
-            await asyncio.sleep(0)
+            pending_commit = True
+            n += 1
+            if n % commit_batch == 0:
+                conn.commit()
+                pending_commit = False
+            if yield_every and n % yield_every == 0:
+                await asyncio.sleep(0)
 
-    for room_key in meta.get("changed_floor_rooms", ()):
-        with conn:
+        for room_key in meta.get("changed_floor_rooms", ()):
             conn.execute(
                 "DELETE FROM items WHERE holder_key=? "
                 "AND holder_type='room'",
@@ -2881,14 +3284,29 @@ async def _apply_world_save_snapshot_async(
             floor = floor_by_room.get(room_key) or []
             if floor:
                 conn.executemany(_ITEM_INSERT_SQL, floor)
-        n += 1
-        if yield_every and n % yield_every == 0:
-            await asyncio.sleep(0)
+            pending_commit = True
+            n += 1
+            if n % commit_batch == 0:
+                conn.commit()
+                pending_commit = False
+            if yield_every and n % yield_every == 0:
+                await asyncio.sleep(0)
+    finally:
+        # Always flush whatever completed, even on an exception mid-batch --
+        # never leave more than one row group uncommitted (same worst-case
+        # loss window as the old per-character commit).
+        if pending_commit:
+            conn.commit()
 
 
-async def save_world_async(conn, game, *, yield_every=10):
+async def save_world_async(
+    conn, game, *, yield_every=None, wall_start=None, wall_budget_ms=0,
+):
     """Cooperative autosave: snapshot with yields, then chunked apply."""
     import asyncio
+
+    if yield_every is None:
+        yield_every = persist_save_yield_every()
 
     if _persist_should_skip_world_save(game):
         game._last_world_save_stats = {
@@ -2902,14 +3320,52 @@ async def save_world_async(conn, game, *, yield_every=10):
         return
     t_collect = time.perf_counter()
     char_rows, item_rows, meta = await _collect_world_save_snapshot_async(
-        game, yield_every=yield_every,
+        game,
+        yield_every=yield_every,
+        wall_start=wall_start,
+        wall_budget_ms=wall_budget_ms,
     )
     collect_ms = (time.perf_counter() - t_collect) * 1000.0
+    if meta.get("skipped_wall_budget"):
+        _persist_restore_deferred_dirty(
+            game,
+            set(meta.get("deferred_chars") or ()),
+            set(meta.get("deferred_rooms") or ()),
+        )
+        game._save_pending_after_current = True
+        game._last_world_save_stats = {
+            "skipped": True,
+            "wall_budget": True,
+            "collect_ms": round(collect_ms, 2),
+            "apply_ms": 0.0,
+            "force_full": bool(meta.get("force_full")),
+            "n_char_rows": 0,
+            "n_item_rows": 0,
+        }
+        return
+    if not char_rows and not item_rows and not meta.get("changed_chars"):
+        if meta.get("wall_budget_hit"):
+            _persist_restore_deferred_dirty(
+                game,
+                set(meta.get("deferred_chars") or ()),
+                set(meta.get("deferred_rooms") or ()),
+            )
+            game._save_pending_after_current = True
+            game._last_world_save_stats = {
+                "skipped": True,
+                "wall_budget": True,
+                "collect_ms": round(collect_ms, 2),
+                "apply_ms": 0.0,
+                "force_full": bool(meta.get("force_full")),
+                "n_char_rows": 0,
+                "n_item_rows": 0,
+            }
+            return
     # Let queued player commands run before SQLite work.
     await asyncio.sleep(0)
     t_apply = time.perf_counter()
     await _apply_world_save_snapshot_async(
-        conn, char_rows, item_rows, meta,
+        conn, char_rows, item_rows, meta, yield_every=yield_every,
     )
     apply_ms = (time.perf_counter() - t_apply) * 1000.0
     deferred_chars = set(meta.get("deferred_chars") or ())
@@ -3453,6 +3909,10 @@ def resolve_pending_body_link(game, char, body_room_key, body_key):
         char.body_room = live_room if live_room is not None else room
         rehydrate_corpse_worn_refs(body, char.body_room)
     else:
+        from engine.hooks import relink_living_husk_body
+
+        if relink_living_husk_body(game, char):
+            return
         char.spirit = False
         char.spirit_state = None
         char.spirit_tether = 0.0

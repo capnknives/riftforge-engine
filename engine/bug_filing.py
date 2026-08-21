@@ -143,4 +143,10 @@ def record_and_confirm(
             f"{who} filed {label}{about}: {desc}",
             exclude=character,
         )
+        try:
+            from engine import discord_staff_reports
+
+            discord_staff_reports.schedule_report(kind, payload)
+        except Exception as exc:
+            print(f"[discord_staff_reports] schedule skipped: {exc}", flush=True)
     return payload

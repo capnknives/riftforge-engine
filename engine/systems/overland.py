@@ -802,6 +802,41 @@ def resolve_wilderness_saved_room_key(game, room_key):
         return None
 
 
+def resolve_virtual_overland_room_key(game, room_key):
+    """Materialize any saved dual-layer foot cell key (wilderness or gate).
+
+    Foot cells use either ``Wilderness (mx,my)/ux,uy`` titles or ``Gates of
+    {landmark}`` at the settlement micro center. Both live in
+    ``game.overland_rooms`` only -- ``game.rooms.get`` misses them on
+    copyover (bug report 647).
+    """
+    if game is None:
+        return None
+    key = str(room_key or "").strip()
+    if not key:
+        return None
+    wild = resolve_wilderness_saved_room_key(game, key)
+    if wild is not None:
+        return wild
+    if key.startswith("Gates of "):
+        ensure_game_overland(game)
+        atlas = getattr(game, "overland_atlas", None)
+        needle = key[len("Gates of "):].strip().lower()
+        if atlas is not None and needle:
+            for macro, landmark in (atlas.landmarks or {}).items():
+                visible = str(landmark.get("visible_as") or "").strip().lower()
+                if visible and visible == needle:
+                    try:
+                        return get_virtual_room(game, macro, LANDMARK_MICRO)
+                    except Exception:
+                        return None
+    overland_rooms = getattr(game, "overland_rooms", None) or {}
+    for candidate in overland_rooms.values():
+        if (getattr(candidate, "key", None) or "") == key:
+            return candidate
+    return None
+
+
 def get_aerial_room(game, macro):
     """Return (create if needed) the sky Room hovering over a macro tile."""
     ensure_game_overland(game)
@@ -872,7 +907,12 @@ def place_on_overland(character, game, macro, micro):
     ensure_overland_defaults(character)
     ensure_game_overland(game)
     mx, my = macro
-    ux, uy = micro
+    # Vehicle macro cruises pass micro=None (aboard, not on foot). Default to
+    # landmark center so tick_drives cannot crash unpacking None.
+    pair = _parse_pos_pair(micro)
+    if pair is None:
+        pair = LANDMARK_MICRO
+    ux, uy = pair
     if not clamp_macro(mx, my):
         return False
     if not (0 <= ux < MICRO_SIZE and 0 <= uy < MICRO_SIZE):

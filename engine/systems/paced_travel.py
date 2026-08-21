@@ -158,7 +158,7 @@ def _token_is_noisy(token):
 
 def _player_walk_room_label(room):
     """PLAYER-facing label for walk ambiguity -- never ``NAME[VNUM]`` chrome."""
-    from engine.room_naming import bare_key
+    from engine.room_naming import bare_key, is_opaque_storage_key
     from engine.room_vnum import describe_room
 
     label = describe_room(room, staff=False)
@@ -167,7 +167,15 @@ def _player_walk_room_label(room):
     leg = getattr(room, "legacy_key", None)
     if leg:
         hint = bare_key(str(leg))
-        if hint and normalize_query(hint) != normalize_query(label):
+        # Phase 3 VNUM rekeys keep ``unowned shopN`` / ``amenityN`` on
+        # legacy_key for resolver aliases -- never show those dig ids in
+        # walk / seek prose (bug report 604: Ash Garage (unowned shop5)).
+        if (
+            hint
+            and not is_opaque_storage_key(hint)
+            and not is_opaque_storage_key(str(leg))
+            and normalize_query(hint) != normalize_query(label)
+        ):
             return f"{label} ({hint})"
     return label
 
@@ -714,7 +722,8 @@ def format_walk_focus_status(actor, game=None):
 
 
 def _stamp_walk_focus(actor, game, *, mode, dest_label, dest_room_key=None,
-                      overland_macro=None, enter_alias=None, pace="walk",
+                      overland_macro=None, overland_micro=None,
+                      enter_alias=None, pace="walk",
                       arrival_notice=None, intended_label=None):
     """Replace walk_focus with a fresh paced journey stamp."""
     tick = 0
@@ -727,6 +736,9 @@ def _stamp_walk_focus(actor, game, *, mode, dest_label, dest_room_key=None,
         "intended_label": intended_label or dest_label,
         "overland_macro": (
             list(overland_macro) if overland_macro is not None else None
+        ),
+        "overland_micro": (
+            list(overland_micro) if overland_micro is not None else None
         ),
         "enter_alias": enter_alias,
         "pace": normalize_pace(pace),

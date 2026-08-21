@@ -10,16 +10,15 @@ hook API details grow in [`../ENGINE_CONSUMER.md`](../ENGINE_CONSUMER.md).
 **complete** — Stages **1–10**, A1/A2, Plan B, Stage G, and public tags
 `v0.2.0`–`v0.5.0`. Public
 [`riftforge-engine`](https://github.com/capnknives/riftforge-engine) at
-**`v0.5.0`**; private `capnknives/RiftForge` (SUPERS) pins **`@v0.5.2`**
-(preparing **`v0.5.2`** export — mine/chargen hooks from P0, maps peel).
+**`v0.5.0`**; private `capnknives/RiftForge` (SUPERS) pins **`@v0.5.3`**
+(collapse FSM, robbery theft peel, civic `fixture_id` mirror).
 **Post–`v0.4.0` hygiene track (H1–H10)** **complete** (2026-08-05) —
 execution SoT: [`two_repo_purity_extractions_plan.md`](two_repo_purity_extractions_plan.md);
 closeout inventory: [`two_repo_purity_audit_2026-08-05.md`](two_repo_purity_audit_2026-08-05.md).
 **P0** engine purity regression (mine/chargen hooks) **merged** (PR 2386,
-2026-08-16). **P1/P2:** export + **`v0.5.2`** pin, `engine/` maps callers
-use `world_maps` / `map_ui` directly. Ongoing: export discipline when engine
-APIs change; dual-mount hack when editing both trees; cut public tag on
-`riftforge-engine` after export smokes green. Gateway:
+2026-08-16). **P1/P2 shipped:** **`v0.5.2`** maps peel (#2388) then **`v0.5.3`**
+strangler E/D/D (#2394/#2396). Ongoing: export discipline when engine
+APIs change; dual-mount hack when editing both trees. Gateway:
 [`connection_gateway.md`](connection_gateway.md) (shipped).
 T3 hygiene peels (`persistence-api` / `lean-demo` / dirty-saves **bench**)
 are done in [`refactor_plan.md`](refactor_plan.md); full incremental

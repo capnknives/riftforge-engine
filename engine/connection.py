@@ -267,6 +267,11 @@ class Session:
         self.gateway_bridge = None
         # Short stable id for stderr correlation when not on the gateway.
         self._log_session_id = f"s{next(_log_session_serial)}"
+        # Post-login snapshot is deferred until after the first ``look`` so a
+        # full-world SQLite pass cannot wedge the menu→play handoff (~30s on
+        # large live DBs). See ``_defer_login_save`` / ``play()``.
+        self._deferred_login_save = False
+        self._deferred_attach_done = False
         # Set by gateway_client on reattach: skip login and jump to play().
         self._gateway_reattach_name = None
         # Ring buffer of recent play-loop lines for bug/suggest reports.
@@ -326,6 +331,8 @@ class Session:
         # handle_negotiate may accept DO ECHO; during normal play we refuse
         # server-side echo so clients keep local keystroke echo (bug report 423).
         self._echo_password_mask = 0
+        # True while ``rechargen`` owns read_line (idea 220) -- play() waits.
+        self._rechargen_running = False
 
     def _register_connecting(self, stage="login"):
         """Track this socket on game.connecting_sessions for GM users.
@@ -669,6 +676,8 @@ class Session:
             if char is None:
                 if not hooks.is_tutorial_incomplete_vault(
                     self.game, reattach
+                ) and not hooks.is_chargen_draft_vault(
+                    self.game, reattach
                 ):
                     char = hooks.try_restore_folded_login(self.game, reattach)
             if char is not None and not getattr(char, "is_npc", False):
@@ -702,7 +711,8 @@ class Session:
                 hooks.after_session_attach(char, self.game)
                 notice = identity_mod.legacy_surname_login_notice(char)
                 if notice:
-                    self.send(notice)
+                    from engine import display_prefs as dp_mod
+                    self.send(dp_mod.format_tagged_text(char, notice))
                 await self._wait_veil_world_ready()
                 await self.play()
                 return
@@ -723,7 +733,14 @@ class Session:
         # credits (paint() 16-color -- no Character prefs yet).
         game = getattr(self, "game", None)
         status_text = getattr(game, "login_status_text", None) if game else None
-        for line in style.format_login_banner(status_text=status_text):
+        if game is not None:
+            discord_url = getattr(game, "login_discord_url", None)
+        else:
+            discord_url = (style.LOGIN_DISCORD_URL or "").strip() or None
+        for line in style.format_login_banner(
+            status_text=status_text,
+            discord_url=discord_url,
+        ):
             self.send(line)
         # Soft logout may stamp a linked account for character select.
         prefer_acct = getattr(self, "_soft_logout_account", None)
@@ -741,28 +758,10 @@ class Session:
             await self._attach_returning_character(
                 result.character, takeover=result.takeover,
             )
-        # Queue a snapshot -- never block play() on a full-world save. Large
-        # staging DBs can spend 20-40s in the SQLite bulk rewrite; login must
-        # return prompts immediately (same pattern as disconnect).
-        try:
-            schedule = getattr(self.game, "schedule_save_async", None)
-            if callable(schedule):
-                schedule()
-            else:
-                self.game.save()
-        except Exception as exc:
-            print(
-                f"[connection] post-login save failed ({exc!r}) -- "
-                "entering play anyway",
-                flush=True,
-            )
-            try:
-                self.send(
-                    "(World save hiccup on login -- you are still in. "
-                    "Staff have been notified via the server log.)"
-                )
-            except Exception:
-                pass
+        # Stamp a login snapshot for after the first ``look`` -- scheduling
+        # save_async here still let the task run before room text on large DBs
+        # when force_full SQLite apply monopolizes the loop (lag save-coop).
+        self._defer_login_save()
         # Clients often send Core.Supports.Set during login prompts. Sync
         # Char packages when a character is attached (bootstrap hook ran
         # earlier for new chars; reconnect path attaches above).
@@ -804,10 +803,16 @@ class Session:
             import traceback
             traceback.print_exc()
             self.send("Something went wrong showing the room -- you are still in.")
+        await self._flush_deferred_session_attach()
+        await self._flush_deferred_login_save()
 
         # ---- PLAYING STATE ----
         # Loop forever reading commands until the session stops being 'alive'.
         while self.alive:
+            if getattr(self, "_rechargen_running", False):
+                import asyncio
+                await asyncio.sleep(0.05)
+                continue
             line = await self.read_line()
             if line is None:
                 break                 # client disconnected — leave the loop
@@ -1094,6 +1099,61 @@ class Session:
             "/category /alias /gm /ic /preview /save /cancel"
         )
 
+    def _defer_login_save(self):
+        """Queue a cooperative login snapshot after the first room look."""
+        self._deferred_login_save = True
+
+    async def _flush_deferred_login_save(self):
+        """Run the deferred login snapshot without wedging menu→play."""
+        if not getattr(self, "_deferred_login_save", False):
+            return
+        self._deferred_login_save = False
+        import asyncio
+        await asyncio.sleep(0)
+        try:
+            await self.writer.drain()
+        except Exception:
+            pass
+        try:
+            schedule = getattr(self.game, "schedule_save_async", None)
+            if callable(schedule):
+                schedule(reason="login")
+            else:
+                self.game.save()
+        except Exception as exc:
+            print(
+                f"[connection] post-login save failed ({exc!r}) -- "
+                "entering play anyway",
+                flush=True,
+            )
+            try:
+                self.send(
+                    "(World save hiccup on login -- you are still in. "
+                    "Staff have been notified via the server log.)"
+                )
+            except Exception:
+                pass
+
+    async def _flush_deferred_session_attach(self):
+        """Run heavy login attach hooks after the first room look."""
+        if getattr(self, "_deferred_attach_done", False):
+            return
+        if self.character is None:
+            return
+        self._deferred_attach_done = True
+        import asyncio
+        await asyncio.sleep(0)
+        try:
+            hooks.after_session_attach_deferred(self.character, self.game)
+        except Exception as exc:
+            print(
+                f"[connection] deferred attach failed ({exc!r}) -- "
+                "continuing play",
+                flush=True,
+            )
+            import traceback
+            traceback.print_exc()
+
     async def _attach_returning_character(self, char, *, takeover=False):
         """Wire a returning body after account menu pick."""
         from engine import char_identity as identity_mod
@@ -1138,7 +1198,15 @@ class Session:
             self.send(f"\r\nWelcome back, {face}!")
         notice = identity_mod.legacy_surname_login_notice(char)
         if notice:
-            self.send(notice)
+            from engine import display_prefs as dp_mod
+            self.send(dp_mod.format_tagged_text(char, notice))
+        # Yield so welcome lines reach the client before attach hooks run.
+        import asyncio
+        await asyncio.sleep(0)
+        try:
+            await self.writer.drain()
+        except Exception:
+            pass
         hooks.after_session_attach(char, self.game)
         gm_notify.ping_gms(
             self.game,

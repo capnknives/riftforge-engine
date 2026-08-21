@@ -58,10 +58,17 @@ def send_asleep_world_closed(character):
     """If asleep, tell the player the world is closed. Returns True if blocked."""
     if not asleep_blocks_world(character):
         return False
+    send_if_online(character, ASLEEP_WORLD_CLOSED_MSG)
+    return True
+
+
+def send_if_online(character, message):
+    """Send ``message`` when ``character`` has a live Session (Echo-safe)."""
+    if not message:
+        return
     session = getattr(character, "session", None)
     if session is not None and hasattr(session, "send"):
-        session.send(ASLEEP_WORLD_CLOSED_MSG)
-    return True
+        session.send(message)
 
 
 def _log_hook_error(where, detail=None):
@@ -189,7 +196,32 @@ def _is_presence_hidden(viewer, other):
         from engine import hooks
         if not hooks.can_notice_stealth(viewer, other):
             return True
+    # Trickster withdraw -- real Loki (etc.) folds into the shrine while an
+    # archangel wears their face; casual onlookers should not see two of
+    # them standing in the same room (bug report 632 / docs/LORE.md
+    # "Gabriel/Loki bargain"). Staff, research intel, hunter field codex,
+    # and tier-3+ angel grace-sight still pierce it (pierce_lay_low).
+    if getattr(other, "trickster_laying_low", False):
+        from engine import hooks
+        if not hooks.can_perceive_trickster_laylow(viewer, other):
+            return True
     return False
+
+
+def _staff_tags_hidden_in_look(viewer, other):
+    """True when a hidden presence should appear in look tagged ``(hidden)``.
+
+    Players still omit stealth-hidden bodies entirely. Staff in ``gm on``
+    see them in the Souls section (and may ``look <name>`` them) with the
+    same tag who uses for soft-omitted names -- ops clarity without
+    treating hide/sneak as fully revealed.
+    """
+    if viewer is None or other is None or viewer is other:
+        return False
+    if not _is_presence_hidden(viewer, other):
+        return False
+    from engine import hooks
+    return bool(hooks.staff_tags_hidden_presence(viewer, other))
 
 
 def _is_attacking_viewer(viewer, other):
@@ -213,6 +245,9 @@ def _can_target_for_combat(viewer, other):
         return False
     if other is viewer:
         return True
+    from engine import hooks
+    if hooks.is_untargetable_helper(other):
+        return False
     if not _is_presence_hidden(viewer, other):
         return True
     if not _is_attacking_viewer(viewer, other):

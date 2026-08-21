@@ -85,6 +85,14 @@ _SUMMARY_MAX_LINES = 5000
 AUTO_CAPTURE_RATE_LIMIT_S = 45.0
 AUTO_CAPTURE_MESSAGE = "auto_tick_overrun"
 
+# Lag P11: watcher-process deploy events share this log with game autosave
+# rows so the next ``gm diaglog analyze`` can prove/falsify I/O contention
+# without a manual GitHub commit-log cross-reference.
+DEPLOY_RESET_MESSAGE = "auto_deploy_reset"
+# Autosave pulses within this many seconds of a deploy reset/overlay count
+# as "near" in tick_summary / summarize_ndjson.
+DEPLOY_AUTOSAVE_WINDOW_S = 120.0
+
 # Print the missing-auth warning at most once per process.
 _warned_missing_webhook_auth = False
 
@@ -220,10 +228,11 @@ def maybe_notify_auto_capture(game, total_ms):
         return
     try:
         from world import Character
+        from engine import gm_notify
     except Exception:
         return
     msg = (
-        f"[GM] auto-diag captured (tick {total_ms:.0f}ms) -- "
+        f"auto-diag captured (tick {total_ms:.0f}ms) -- "
         "see gm diaglog analyze"
     )
     for session in list(getattr(game, "sessions", None) or ()):
@@ -232,12 +241,148 @@ def maybe_notify_auto_capture(game, total_ms):
             continue
         if getattr(body, "gm_rank", None) != "head_gm":
             continue
-        send = getattr(session, "send", None)
-        if callable(send):
+        gm_notify.send_gm_player_line(body, msg)
+
+
+def append_deploy_event(
+    *,
+    kind="reset",
+    from_sha=None,
+    to_sha=None,
+    n_files_changed=None,
+    poll_gap_s=None,
+    since_prev_deploy_s=None,
+    extra=None,
+):
+    """Always-on NDJSON row when auto-deploy resets or overlays the tree.
+
+    Independent of ``diag_enabled()`` -- deploy events are rare (one per
+    merge) and lag captures need them even when continuous tick writers
+    were off. Failures never raise; the watcher must not skip a deploy
+    because the diag log could not be written.
+    """
+    data = {
+        "kind": kind,
+        "from_sha": from_sha,
+        "to_sha": to_sha,
+        "n_files_changed": n_files_changed,
+        "poll_gap_s": poll_gap_s,
+    }
+    if since_prev_deploy_s is not None:
+        data["since_prev_deploy_s"] = since_prev_deploy_s
+    if extra:
+        data.update(extra)
+    payload = {
+        "sessionId": DEFAULT_SESSION_ID,
+        "runId": "auto-deploy",
+        "hypothesisId": "P11",
+        "location": "auto_deploy.py",
+        "message": DEPLOY_RESET_MESSAGE,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        return _append_ndjson_line(payload)
+    except Exception:
+        return False
+
+
+def correlate_deploy_autosave(text, *, window_s=DEPLOY_AUTOSAVE_WINDOW_S):
+    """Pair ``autosave_ms`` rows with nearby ``auto_deploy_reset`` timestamps.
+
+    Returns a dict consumed by ``summarize_ndjson`` and the tick-summary
+    line. ``dt_s`` is autosave timestamp minus deploy timestamp: positive
+    means the save ran after the reset.
+    """
+    deploys = []
+    autosaves = []
+    window_ms = float(window_s) * 1000.0
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("("):
+            continue
+        try:
+            row = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        msg = row.get("message") or ""
+        data = row.get("data") or {}
+        try:
+            ts = int(row.get("timestamp") or 0)
+        except (TypeError, ValueError):
+            ts = 0
+        if not ts:
+            continue
+        if msg == DEPLOY_RESET_MESSAGE:
+            deploys.append((ts, data))
+        elif msg == "autosave_ms":
+            autosaves.append((ts, data))
+
+    near = []
+    for ts, data in autosaves:
+        nearest = None
+        nearest_dt = None
+        for dts, ddata in deploys:
+            dt = ts - dts
+            if abs(dt) > window_ms:
+                continue
+            if nearest is None or abs(dt) < abs(nearest_dt):
+                nearest = ddata
+                nearest_dt = dt
+        if nearest is None:
+            continue
+        near.append({
+            "save_ms": data.get("save_ms"),
+            "game_meta_ms": data.get("game_meta_ms"),
+            "dt_s": round(nearest_dt / 1000.0, 1),
+            "deploy_kind": nearest.get("kind"),
+            "n_files": nearest.get("n_files_changed"),
+        })
+
+    worst = None
+    if near:
+        vals = []
+        for item in near:
             try:
-                send(msg)
-            except Exception:
-                pass
+                vals.append(float(item.get("save_ms") or 0))
+            except (TypeError, ValueError):
+                continue
+        if vals:
+            worst = round(max(vals), 2)
+
+    return {
+        "n_deploys": len(deploys),
+        "n_autosaves": len(autosaves),
+        "n_autosaves_near_deploy": len(near),
+        "window_s": window_s,
+        "near": near[:12],
+        "worst_near_save_ms": worst,
+    }
+
+
+def format_deploy_autosave_summary(corr):
+    """One tick_summary line from ``correlate_deploy_autosave``."""
+    if not corr:
+        return "deploy_resets=0"
+    n_deploys = int(corr.get("n_deploys") or 0)
+    if n_deploys <= 0:
+        return "deploy_resets=0"
+    parts = [
+        f"deploy_resets={n_deploys}",
+        f"autosaves_near_deploy={corr.get('n_autosaves_near_deploy') or 0}",
+        f"window_s={int(corr.get('window_s') or DEPLOY_AUTOSAVE_WINDOW_S)}",
+    ]
+    worst = corr.get("worst_near_save_ms")
+    if worst is not None:
+        parts.append(f"worst_near_save_ms={worst}")
+    dts = [
+        item.get("dt_s")
+        for item in (corr.get("near") or [])
+        if item.get("dt_s") is not None
+    ]
+    if dts:
+        parts.append("dt_s=" + ",".join(f"{d:+.1f}" for d in dts[:6]))
+    return " ".join(str(p) for p in parts)
 
 
 def append_event(
@@ -411,8 +556,13 @@ def _http_json(method, url, payload, token):
         return resp.status, body
 
 
-def build_tick_summary(game):
-    """Compact text from ``game._tick_stats`` + Cadence budget + autosave."""
+def build_tick_summary(game, *, log_text=None):
+    """Compact text from ``game._tick_stats`` + Cadence budget + autosave.
+
+    ``log_text`` is the same NDJSON body the Gist ships. When omitted,
+    this helper reads the live log so ``gm diaglog`` / ``gm tick`` still
+    get the P11 deploy/autosave correlation line.
+    """
     ring = list(getattr(game, "_tick_stats", ()) or ())
     meta = getattr(game, "_cadence_budget_meta", None) or {}
     lines = [
@@ -484,13 +634,55 @@ def build_tick_summary(game):
             if autosave.get(slice_key) is not None:
                 short = slice_key.replace("_ms", "")
                 parts.append(f"{short}={autosave.get(slice_key)}")
+        if autosave.get("wal_checkpoint_ms") is not None:
+            parts.append(f"wal_ckpt={autosave.get('wal_checkpoint_ms')}")
+            parts.append(
+                f"wal_bytes={autosave.get('wal_file_bytes_before')}"
+                f"->{autosave.get('wal_file_bytes_after')}"
+            )
         lines.append("autosave last=" + " ".join(str(p) for p in parts))
         running = bool(getattr(game, "_autosave_running", False))
         if running:
             lines.append("autosave running=1")
     else:
         lines.append("autosave last=(none yet)")
+    overlap = tick_save_overlap_hint(game)
+    if overlap:
+        lines.append(overlap)
+    if log_text is None:
+        try:
+            log_text, _path, found = read_log_text()
+            if not found:
+                log_text = ""
+        except Exception:
+            log_text = ""
+    lines.append(
+        format_deploy_autosave_summary(correlate_deploy_autosave(log_text))
+    )
     return "\n".join(lines)
+
+
+def tick_save_overlap_hint(game, slow_handlers=None):
+    """Hint when cadence handler wall time likely includes save loop blocking."""
+    from engine import tick_registry as tick_reg
+
+    slow = slow_handlers
+    if slow is None:
+        ring = list(getattr(game, "_tick_stats", ()) or ())
+        if ring:
+            slow = ring[-1].get("slow") or []
+    cadence_slow = any(
+        name == "cadence" and float(ms or 0) >= tick_reg.HANDLER_WARN_MS
+        for name, ms in (slow or [])
+    )
+    if not cadence_slow:
+        return None
+    running = bool(getattr(game, "_autosave_running", False))
+    autosave = getattr(game, "_last_autosave_stats", None) or {}
+    save_ms = float(autosave.get("save_ms") or 0)
+    if running or save_ms >= 500.0:
+        return "cadence_wall_includes_save_overlap=1"
+    return None
 
 
 def push_sync(game=None, *, reporter="?"):
@@ -512,7 +704,12 @@ def push_sync(game=None, *, reporter="?"):
         }
 
     log_text, path, found = read_log_text()
-    tick_summary = build_tick_summary(game) if game is not None else "(no game)"
+    if game is not None:
+        tick_summary = build_tick_summary(game, log_text=log_text)
+    else:
+        tick_summary = "(no game)\n" + format_deploy_autosave_summary(
+            correlate_deploy_autosave(log_text)
+        )
     stamp = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
     filename = f"riftforge-diag-{int(time.time())}.ndjson"
     if not found or not log_text.strip():
@@ -613,21 +810,28 @@ def _log_task_exception(task):
 
 async def _push_async(game, reporter, session):
     """Run push_sync off-loop; tell the GM the result."""
+    from engine import gm_notify
+
     try:
         result = await asyncio.to_thread(push_sync, game, reporter=reporter)
         msg = result.get("message") or "(no message)"
-        prefix = "[GM] diaglog: "
-        if session is not None and getattr(session, "send", None):
-            session.send(prefix + msg)
+        if session is not None:
+            gm_notify.send_gm_session(session, f"diaglog: {msg}")
             if result.get("gist_url"):
-                session.send(prefix + f"gist {result['gist_url']}")
+                gm_notify.send_gm_session(
+                    session, f"diaglog: gist {result['gist_url']}",
+                )
             if result.get("issue_url"):
-                session.send(prefix + f"issue {result['issue_url']}")
+                gm_notify.send_gm_session(
+                    session, f"diaglog: issue {result['issue_url']}",
+                )
         print(f"[diag_export] {msg}", flush=True)
     except Exception as exc:
         print(f"[diag_export] unexpected error: {exc}", flush=True)
-        if session is not None and getattr(session, "send", None):
-            session.send(f"[GM] diaglog: unexpected error: {exc}")
+        if session is not None:
+            gm_notify.send_gm_session(
+                session, f"diaglog: unexpected error: {exc}",
+            )
 
 
 def schedule_push(game, *, reporter="?", session=None):
@@ -637,8 +841,13 @@ def schedule_push(game, *, reporter="?", session=None):
     except RuntimeError:
         # Sync smoke / no loop: run blocking so tests can assert.
         result = push_sync(game, reporter=reporter)
-        if session is not None and getattr(session, "send", None):
-            session.send("[GM] diaglog: " + (result.get("message") or ""))
+        if session is not None:
+            from engine import gm_notify
+
+            gm_notify.send_gm_session(
+                session,
+                "diaglog: " + (result.get("message") or ""),
+            )
         return result.get("ok", False)
 
     task = loop.create_task(_push_async(game, reporter, session))
@@ -743,6 +952,8 @@ def summarize_ndjson(text):
                 if name:
                     handler_ms[name].append(float(h.get("ms") or 0))
 
+    deploy_corr = correlate_deploy_autosave(text)
+
     def _stat(xs):
         if not xs:
             return None
@@ -770,13 +981,19 @@ def summarize_ndjson(text):
         "fuel_loop_ms": _stat(fuel_loop_ms),
         "slow_tick_total_ms": _stat(slow_total),
         "top_handlers_by_avg": top_handlers,
+        "deploy_autosave": deploy_corr,
+        "deploy_autosave_line": format_deploy_autosave_summary(deploy_corr),
     }
 
 
 def build_analyze_payload(push_result, game=None, *, reporter="?"):
     """JSON body for the Cursor lag-diag automation."""
     log_text, path, _found = read_log_text()
-    tick_summary = build_tick_summary(game) if game is not None else "(no game)"
+    tick_summary = (
+        build_tick_summary(game, log_text=log_text)
+        if game is not None
+        else "(no game)"
+    )
     return {
         "kind": WEBHOOK_KIND,
         "reporter": reporter,
@@ -796,8 +1013,10 @@ def build_analyze_payload(push_result, game=None, *, reporter="?"):
         ),
         "instructions_hint": (
             "Diagnose live tick lag from this dump. Prefer reading the "
-            "gist_url NDJSON + stats. Open a PR only if you have a clear "
-            "fix; otherwise comment findings on hub_issue / the PR body."
+            "gist_url NDJSON + stats. Check stats.deploy_autosave for "
+            "autosave pulses within 120s of auto_deploy_reset. Open a PR "
+            "only if you have a clear fix; otherwise comment findings on "
+            "hub_issue / the PR body."
         ),
     }
 
@@ -919,29 +1138,37 @@ def _announce_lag_queued_if_ready(game, result, reporter):
 
 async def _analyze_async(game, reporter, session):
     """Run analyze_sync off-loop; tell the GM the result."""
+    from engine import gm_notify
+
     try:
         result = await asyncio.to_thread(
             analyze_sync, game, reporter=reporter
         )
         msg = result.get("message") or "(no message)"
-        prefix = "[GM] diaglog: "
-        if session is not None and getattr(session, "send", None):
-            session.send(prefix + msg)
+        if session is not None:
+            gm_notify.send_gm_session(session, f"diaglog: {msg}")
             if result.get("gist_url"):
-                session.send(prefix + f"gist {result['gist_url']}")
+                gm_notify.send_gm_session(
+                    session, f"diaglog: gist {result['gist_url']}",
+                )
             if result.get("issue_url"):
-                session.send(prefix + f"issue {result['issue_url']}")
+                gm_notify.send_gm_session(
+                    session, f"diaglog: issue {result['issue_url']}",
+                )
             if result.get("writers_off"):
-                session.send(
-                    prefix + "NDJSON writers are OFF "
-                    "(re-enable with `gm diaglog on` to capture again)."
+                gm_notify.send_gm_session(
+                    session,
+                    "diaglog: NDJSON writers are OFF "
+                    "(re-enable with `gm diaglog on` to capture again).",
                 )
         print(f"[diag_export] analyze: {msg}", flush=True)
         _announce_lag_queued_if_ready(game, result, reporter)
     except Exception as exc:
         print(f"[diag_export] analyze unexpected error: {exc}", flush=True)
-        if session is not None and getattr(session, "send", None):
-            session.send(f"[GM] diaglog: analyze error: {exc}")
+        if session is not None:
+            gm_notify.send_gm_session(
+                session, f"diaglog: analyze error: {exc}",
+            )
 
 
 def schedule_analyze(game, *, reporter="?", session=None):
@@ -950,8 +1177,12 @@ def schedule_analyze(game, *, reporter="?", session=None):
         loop = asyncio.get_running_loop()
     except RuntimeError:
         result = analyze_sync(game, reporter=reporter)
-        if session is not None and getattr(session, "send", None):
-            session.send("[GM] diaglog: " + (result.get("message") or ""))
+        if session is not None:
+            from engine import gm_notify
+            gm_notify.send_gm_session(
+                session,
+                "diaglog: " + (result.get("message") or ""),
+            )
         _announce_lag_queued_if_ready(game, result, reporter)
         return result.get("ok", False)
 

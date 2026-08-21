@@ -3,21 +3,11 @@
 **Status:** Phase 6 remotes **done**; Phase 7 framework peels **done**;
 `riftforge_core_expansion.md` Phases 1-8 **done**; two-repo purity H1-H10
 extraction track (`docs/plans/two_repo_purity_extractions_plan.md`)
-**done**. Public remote **`capnknives/riftforge-engine`**. Current SUPERS
-monorepo pin preparing **`v0.5.3`** (strangler collapse FSM + robbery peel +
-fixture_id civic mirror from PR 2394). Shipped **`v0.5.2`** (mine/chargen
-vault + forge hooks from purity P0, `engine/` maps callers on `world_maps` /
-`map_ui`). Shipped
-**`v0.5.1`** adds basegame body-parts demo, clinic strangler hooks,
-optional gateway `wss://`, MSSP catalog fields, justice adapter spike,
-instance-room teardown migration for purgatory/rowena. **`v0.5.0`** adds
-map-authoring OLC helpers plus generic phone,
-appearance-builder, persona-trait, and relationship-tag frameworks, and
-abstract item/NPC/creature/map generic kind grandparents, on top of
-`v0.4.0`'s elemental planes + rotating gates, dual-root content-kind
-profiles, needs-meter registry, spawn bestiary + nest-AI dispatch,
-instance-room teardown, Area Studio reload bridge, and the anatomy/body-
-parts region state machine).
+**done**. Public remote **`capnknives/riftforge-engine`**. Current public tag
+**`v0.6.0`** (103 monorepo engine commits since **`v0.5.3`**: dispatch/door/
+copyover hooks, universal closable doors, channel speech block + MSSP +
+Discord ops hook peels, lag/cooperative-save hardening). Prior **`v0.5.3`**
+strangler collapse FSM + robbery peel + fixture_id civic mirror.
 
 ## Cut a release
 
@@ -29,8 +19,8 @@ parts region state machine).
    `python tools/classic_smoke.py`.
 3. Tag `vX.Y.Z` (semver; breaking hook API = major)::
 
-       git tag -a v0.5.3 -m "riftforge-engine v0.5.3 — collapse FSM + theft peel + fixture_id"
-       git push origin v0.5.3
+       git tag -a v0.6.0 -m "riftforge-engine v0.6.0 — hook peels + doors + lag hardening"
+       git push origin v0.6.0
 
    Prefer the **latest** tag for new consumers.
    Re-exports via `tools/export_public_engine.py` ignore `__pycache__` /
@@ -57,7 +47,7 @@ parts region state machine).
   ``register_sheet_field`` / ``register_sheet_contributor``.
 - Optional env: ``RIFTFORGE_DB`` (SQLite path), ``RIFTFORGE_PORT`` (telnet)
 - Optional WebSocket TLS: ``RIFTFORGE_WSS_CERT`` + ``RIFTFORGE_WSS_KEY`` (pair)
-- Monorepo engine version / next public tag: **v0.5.3**. Export via
+- Monorepo engine version / current public tag: **v0.6.0**. Export via
   ``tools/export_public_engine.py``, then tag ``riftforge-engine`` remote.
 - `tools/engine_smoke.py` / `tools/basegame_smoke.py` /
   `tools/classic_smoke.py` pass

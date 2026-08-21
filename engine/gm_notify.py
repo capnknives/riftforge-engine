@@ -113,6 +113,53 @@ def paint_gm_line(message):
     return style.paint("absinthe_green", f"[GM] {message}")
 
 
+def _gm_message_body(message):
+    """Strip a leading ``[GM]`` prefix so paint helpers do not double-tag."""
+    text = (message or "").strip()
+    if not text:
+        return ""
+    if text.startswith("[GM]"):
+        return text[5:].lstrip()
+    return text
+
+
+def send_gm_player_line(character, message):
+    """Send one absinthe ``[GM]`` line to a staff character's session.
+
+    Use for in-game GM verb feedback (diaglog, auto-diag, …) so it matches
+    ops pings from ``ping_gms`` / ``paint_gm_line``. Accepts messages that
+    already start with ``[GM]`` and normalizes them.
+    """
+    session = getattr(character, "session", None)
+    if session is None:
+        return False
+    send = getattr(session, "send", None)
+    if send is None:
+        return False
+    body = _gm_message_body(message)
+    if not body:
+        return False
+    send(paint_gm_line(body))
+    return True
+
+
+def send_gm_session(session, message):
+    """Like ``send_gm_player_line`` when only the session is handy."""
+    if session is None:
+        return False
+    character = getattr(session, "character", None)
+    if character is not None:
+        return send_gm_player_line(character, message)
+    send = getattr(session, "send", None)
+    if send is None:
+        return False
+    body = _gm_message_body(message)
+    if not body:
+        return False
+    send(paint_gm_line(body))
+    return True
+
+
 def ping_gms(game, message, *, exclude=None, peer_session=None):
     """Send one dark-green staff line to every opted-in online staff GM.
 

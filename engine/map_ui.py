@@ -529,6 +529,15 @@ PLANE_AREA_COLORS = {
         "forest": "\x1b[92m",
         "plains": "\x1b[95m",
     },
+    "coalescence": {
+        "ruins": "\x1b[37m",
+        "city": "\x1b[37m",
+        "mountains": "\x1b[90m",
+        "ocean": "\x1b[90m",
+        "lake": "\x1b[37m",
+        "forest": "\x1b[90m",
+        "plains": "\x1b[37m",
+    },
 }
 
 # Suggestion #26: generic per-area_type room descriptions for grid cells
@@ -723,6 +732,16 @@ PLANE_AREA_DESCRIPTIONS = {
             "marker reads ({x}, {y})."
         ),
     },
+    "coalescence": {
+        "ruins": (
+            "Stone feels remembered rather than built -- belief pinning "
+            "shape before geography. A pale marker reads ({x}, {y})."
+        ),
+        "plains": (
+            "Open gravel under sky that does not belong to any map. A "
+            "pale marker reads ({x}, {y})."
+        ),
+    },
 }
 
 # Player-facing terrain badge on ``look`` (right-hand ``[ … ]`` tag).
@@ -758,6 +777,8 @@ PLANE_AREA_LABELS = {
     ("dream", "plains"): "Dreamscape",
     ("dream", "forest"): "Shifting Wood",
     ("dream", "ruins"): "Impossible Ruins",
+    ("coalescence", "ruins"): "Belief Glimpse",
+    ("coalescence", "plains"): "Witness Gravel",
     ("empty", "void"): "The Empty",
 }
 

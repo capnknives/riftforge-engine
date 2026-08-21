@@ -168,6 +168,16 @@ KNOWN_RESOURCE_TAGS = frozenset({
     "storm_shelter",
     # Wild herb pick patches (Earth tagged cells; plane maps auto-seed).
     "herb_node",
+    # Homestead backyard + co-op south field crop plots (farming.py).
+    "garden_plot",
+    # Lifestyle professions pillar — fishing site tags (fishing.py FISH_RESOURCES).
+    "fish_shore", "fish_pier", "fish_river", "fish_pond", "fish_offshore",
+    # Hunting blinds and tagged wilderness hunt cells (hunting.py).
+    "hunt_blind", "hunt_wilds",
+    # Homestead hearth / trail cooking and occult kitchen benches (cooking.py).
+    "hearth", "fireplace", "still", "apothecary",
+    # Cellar fermenter and smoke preservation yard builds (brewing / lifestyle_smoke).
+    "fermenter", "cellar", "smoke_rack", "smokehouse",
     # Magi reagent site harvest (Earth herbalism Phase 2; pick yields catalog ids).
     "magi_forage",
     # Cross-room ranged combat (line_of_fire.py): nest/overlook extend reach;
@@ -181,6 +191,7 @@ KNOWN_RESOURCE_TAGS = frozenset({
 PLANES = frozenset({
     "earth", "fire", "water", "air", "stone",
     "heaven", "hell", "purgatory", "dream",
+    "coalescence",
     "stellar", "umbral", "empty",
 })
 
@@ -198,6 +209,7 @@ REALM_FOR_PLANE = {
     "hell": "spirit",
     "purgatory": "spirit",
     "dream": "spirit",
+    "coalescence": "spirit",
     "stellar": "void",
     "umbral": "void",
     "empty": "void",
@@ -1800,6 +1812,15 @@ def load_all_maps(*, include_deferred=False):
     """
     global LAST_MAP_REGISTRY, _LANDMARKS_BY_PREFIX, LAST_ROOM_ALIASES
     map_files = _load_map_files(include_deferred=include_deferred)
+
+    # Pre-pass: remap duplicate hand-room keys/vnums before Pass 1 _add_room
+    # (fail-loud on key collision). Later file in stable filename order loses
+    # and gets the next free vnum under its ROOM NAME prefix.
+    from engine import room_vnum as room_vnum_mod
+    for _heal_line in room_vnum_mod.normalize_hand_room_identities_in_map_docs(
+        map_files,
+    ):
+        print(f"[boot heal] {_heal_line}", flush=True)
 
     # Fresh registry each load so copyover / re-import never duplicates.
     _LANDMARKS_BY_PREFIX = {}

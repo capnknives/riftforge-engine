@@ -6,6 +6,8 @@ color-depth helpers. Pure presentation + input rewrite -- no networking,
 no game rules. See docs/plans/mud_formatting_preferences.md.
 """
 
+import re
+
 # Dense gothic prompt built from *optional segment* tokens (%Hp, %Fu, …).
 # Segments that do not apply (no fuel, no mana, solo) expand to "" so the
 # field never leaves an empty bracket. Color via style.render.
@@ -59,6 +61,10 @@ _GENERIC_PROMPT_TEMPLATES = frozenset({
     _OLD_BRACKET_PROMPT,
     _OLD_EXITS_PROMPT,
 })
+
+# Brackets/quotes in chat *bodies* still trip VoiceOver/Mudrammer when channel
+# chrome is already plain — strip them for plaincomms viewers only.
+_PLAIN_COMM_BODY_SYMBOLS = re.compile(r"\(\(|\)\)|[()\[\]{}<>\"`]")
 
 
 def preference_character(character, game=None):
@@ -193,6 +199,9 @@ def ensure_display_defaults(character):
     if not hasattr(character, "suppress_surname_alert"):
         # Mortal mononyms: silence the login no-surname reminder (config).
         character.suppress_surname_alert = False
+    if not hasattr(character, "plaincomms"):
+        # Plain say/tell/OOC sentences without channel symbols (config plaincomms).
+        character.plaincomms = False
 
 
 def drive_map_render_args(character):
@@ -215,7 +224,9 @@ def drive_map_render_args(character):
 def wants_combat_tags(character):
     """True when this viewer should see [DMG]/[HIT]/… on combat lines.
 
-    Default on; ``config combattags off`` hides them (screenreader too).
+    Default on. ``config combattags off`` hides tag prefixes for any viewer.
+    Screenreader combat still uses short SVO lines that name hit/miss/limb in
+    plain words when tags are off.
     """
     ensure_display_defaults(character)
     return bool(getattr(character, "show_combat_tags", True))
@@ -235,6 +246,151 @@ def wants_compact_floor_items(character):
     """True when floor loot on look should collapse to one paragraph."""
     ensure_display_defaults(character)
     return bool(getattr(character, "compact_floor_items", False))
+
+
+def wants_plain_comms(character):
+    """True when say/tell/OOC should drop channel symbols for TTS."""
+    ensure_display_defaults(character)
+    return bool(getattr(character, "plaincomms", False))
+
+
+def plain_comm_face(face: str) -> str:
+    """Rewrite a chat speaker label without bracket chrome."""
+    text = str(face or "").strip()
+    if not text:
+        return "someone"
+    if text.endswith("(GM)"):
+        base = text[:-4].rstrip()
+        return f"GM {base}" if base else "GM"
+    return text
+
+
+def plain_comm_message(message: str) -> str:
+    """Strip bracket/quote symbols from chat body text for TTS readers."""
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    cleaned = _PLAIN_COMM_BODY_SYMBOLS.sub(" ", text)
+    return " ".join(cleaned.split())
+
+
+def apply_plain_comms_mode(character, enabled):
+    """Toggle plain comms and return a short confirmation string."""
+    ensure_display_defaults(character)
+    if enabled:
+        character.plaincomms = True
+        return (
+            "Plain comms on. Example: OOC. GM CapnKnives says. hello. "
+            "Turn off with config plaincomms off."
+        )
+    character.plaincomms = False
+    return "Plain comms off."
+
+
+def _plain_say_verb(you, you_verb, they_verb, tone):
+    """Pick a plain speech verb (no curly quotes)."""
+    if tone == "whisper":
+        return "whisper" if you else "whispers"
+    if tone == "shout":
+        return "shout" if you else "shouts"
+    if tone == "drawl":
+        return "drawl" if you else "drawls"
+    return you_verb if you else they_verb
+
+
+def format_ooc_chat(viewer, face, message, *, kind="normal"):
+    """OOC line for one viewer (plain or default ``((OOC))`` chrome)."""
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    if wants_plain_comms(viewer):
+        text = plain_comm_message(text)
+        if not text:
+            return ""
+        label = plain_comm_face(face)
+        from engine import ooc_channel
+        if kind == ooc_channel.OOC_KIND_AUTHOR_NUDGE:
+            return f"OOC. Author {label} says. {text}."
+        return f"OOC. {label} says. {text}."
+    from engine import ooc_channel
+    return ooc_channel.format_ooc_line(face, text, kind=kind)
+
+
+def format_say_chat(
+    viewer,
+    face,
+    message,
+    *,
+    you=False,
+    you_verb="say",
+    they_verb="says",
+    tone=None,
+):
+    """Room say line for one viewer (plain or quoted default)."""
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    if wants_plain_comms(viewer):
+        text = plain_comm_message(text)
+        if not text:
+            return ""
+        verb = _plain_say_verb(you, you_verb, they_verb, tone)
+        who = "You" if you else plain_comm_face(face)
+        return f"{who} {verb}. {text}."
+    if tone:
+        if tone == "whisper":
+            if you:
+                return f'You whisper, "{text}"'
+            return f'{face} whispers, "{text}"'
+        if tone == "shout":
+            if you:
+                return f'You shout, "{text}"'
+            return f'{face} shouts, "{text}"'
+        if tone == "drawl":
+            if you:
+                return f'You drawl, "{text}"'
+            return f'{face} drawls, "{text}"'
+    if you:
+        return f'You {you_verb}, "{text}"'
+    return f'{face} {they_verb}, "{text}"'
+
+
+def format_tell_chat(viewer, *, outgoing, peer_face, message):
+    """Private tell line for one viewer."""
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    peer = str(peer_face or "?").strip() or "?"
+    if wants_plain_comms(viewer):
+        text = plain_comm_message(text)
+        if not text:
+            return ""
+        label = plain_comm_face(peer)
+        if outgoing:
+            return f"You tell {label}. {text}."
+        return f"Tell from {label}. {text}."
+    if outgoing:
+        return f'You tell {peer}, "{text}"'
+    return f'{peer} tells you, "{text}"'
+
+
+def format_custom_chat(viewer, channel_title, prefix, face, message):
+    """Staff/custom global channel line for one viewer."""
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    if wants_plain_comms(viewer):
+        text = plain_comm_message(text)
+        if not text:
+            return ""
+        title = str(channel_title or "Channel").strip() or "Channel"
+        label = plain_comm_face(face)
+        return f"{title}. {label} says. {text}."
+    label = str(face or "?").strip() or "?"
+    prefix_text = str(prefix or "").strip()
+    if prefix_text:
+        return f"{prefix_text} [{label}]: {text}"
+    return f"[{label}]: {text}"
 
 
 def apply_screenreader_mode(character, enabled):
@@ -811,3 +967,163 @@ def paint_channel_line(character, channel, text, *, default="muted"):
         return text
     role = channel_role(character, channel, default=default)
     return style.paint_for(character, role, text)
+
+
+def format_tag_line(
+    character,
+    tag,
+    body,
+    *,
+    tag_role="gold",
+    body_role="prose",
+):
+    """Plain ``[TAG]`` plus body, with optional split role paint for sighted play.
+
+    System notifications ([TIP], [RIFT], …) pair a bracket label with prose
+    so meaning never depends on color alone (SYSTEMS_DESIGN.md section 8).
+    Sighted players with color on get ``tag_role`` on the label and
+    ``body_role`` on the remainder (60-30-10 — prefs #8 / #29 partial).
+
+    Returns flat text when ``character`` is None, ``screenreader`` is on, or
+    ``use_color`` is off. Uses ``paint_layered_for`` so the tag span can
+    accent without painting the whole line one role.
+
+    Agent guide: docs/plans/sighted_color_guide.md section 6 pairing rule.
+    """
+    from engine import style
+
+    marker = f"[{str(tag or '').strip()}]"
+    body_text = str(body or "").strip()
+    if not body_text:
+        plain = marker
+    else:
+        plain = f"{marker} {body_text}"
+    if character is None:
+        return plain
+    ensure_display_defaults(character)
+    if getattr(character, "screenreader", False) or not getattr(
+        character, "use_color", True,
+    ):
+        return plain
+    if not body_text:
+        return style.paint_for(character, tag_role, marker)
+    template = f"<{tag_role}>{marker}<{body_role}> {body_text}"
+    return style.paint_layered_for(character, body_role, template)
+
+
+# Known system tags for ``format_tagged_text`` — tag chrome only; body stays
+# prose so meaning never depends on color (prefs #8 / rule 7).
+_TAG_ROLES = {
+    "ALERT": "alert",
+    "HEAL": "ok",
+    "TIP": "gold",
+    "RIFT": "alert",
+    "WARD": "alert",
+    "DMG": "error",
+    "TRAP": "warn",
+    "GAIN": "ok",
+    "TIER": "alert",
+    "JOURNAL": "accent",
+}
+
+
+def format_tagged_text(character, text, *, body_role="prose"):
+    """Paint a line that already starts with ``[TAG] body``.
+
+    Unknown tags, empty text, or tags that are not a single token stay
+    unchanged. Flat when screenreader / color off (via ``format_tag_line``).
+    """
+    raw = str(text or "")
+    if not raw.startswith("["):
+        return raw
+    close = raw.find("]")
+    if close < 2:
+        return raw
+    tag = raw[1:close]
+    if not tag.isalpha():
+        return raw
+    role = _TAG_ROLES.get(tag.upper())
+    if role is None:
+        return raw
+    body = raw[close + 1 :].lstrip()
+    return format_tag_line(
+        character, tag, body, tag_role=role, body_role=body_role,
+    )
+
+
+def send_tagged(character, text, *, body_role="prose"):
+    """Send one tagged system line, painted for this viewer."""
+    session = getattr(character, "session", None)
+    if session is None or not text:
+        return False
+    session.send(format_tagged_text(character, text, body_role=body_role))
+    return True
+
+
+def broadcast_tagged(room, text, exclude=None, *, body_role="prose"):
+    """Room-broadcast a tagged line, painted per watcher."""
+    if room is None or not text:
+        return
+    def _line(watcher):
+        return format_tagged_text(watcher, text, body_role=body_role)
+
+    room.broadcast(_line, exclude=exclude)
+
+
+def paint_feedback_line(character, text, *, role="prose"):
+    """Paint a one-shot player feedback line (shop, quest, lifestyle).
+
+    Flat when screenreader on or color off. ``character`` None returns plain
+    text (offline helpers / sims).
+    """
+    plain = str(text or "")
+    if not plain or character is None:
+        return plain
+    ensure_display_defaults(character)
+    if getattr(character, "screenreader", False) or not getattr(
+        character, "use_color", True,
+    ):
+        return plain
+    from engine import style
+    return style.paint_for(character, role, plain)
+
+
+def paint_shop_result(character, ok, message):
+    """Paint economy buy/sell feedback (ok / warn / error roles)."""
+    role = "ok" if ok else "warn"
+    if not ok:
+        low = (message or "").lower()
+        if any(
+            bit in low
+            for bit in (
+                "can't afford",
+                "payment failed",
+                "not carrying",
+                "doesn't sell",
+                "doesn't have",
+            )
+        ):
+            role = "error"
+    return paint_feedback_line(character, message, role=role)
+
+
+def send_status_sheet(character, title, lines, *, width=48):
+    """Send a Blood & Velvet framed status dump as one session string.
+
+    Used for Origin fuel hubs (blood, mana, grace, …) and wallet. Flat
+    borders when screenreader on (``format_sheet`` SR path). ``Session.send``
+    strips ANSI when color is off.
+    """
+    session = getattr(character, "session", None)
+    if session is None:
+        return False
+    body = [str(row) for row in (lines or [])]
+    from engine import style
+    framed = style.format_sheet(
+        str(title or "Status"),
+        body,
+        width=width,
+        screenreader=bool(getattr(character, "screenreader", False)),
+    )
+    session.send("\r\n".join(framed))
+    return True

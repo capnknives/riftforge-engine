@@ -417,6 +417,28 @@ async def _prompt_character_password(session, *, create=False):
         return password
 
 
+def _purge_stale_vault_for_create(game, storage_key) -> None:
+    """Drop a leftover vault row before reusing a storage key at create.
+
+    After ``delete`` or a mid-create disconnect the key may be free in
+    ``game.characters`` while ``character_vault`` still holds a partial
+    blob -- ``allocate_storage_key`` would reuse the name and login/gateway
+    restore paths could skip ``run_chargen`` (bug report 618).
+    """
+    key = (storage_key or "").strip()
+    if not key:
+        return
+    db = getattr(game, "db", None)
+    if db is None:
+        return
+    try:
+        from engine import persistence as persistence_mod
+
+        persistence_mod.vault_delete(db, key)
+    except Exception:
+        pass
+
+
 def _find_unlinked_body(game, given_name, surname):
     """Resolve a live or vaulted unlinked body for the link-existing flow."""
     from engine import char_identity as identity_mod
@@ -449,6 +471,8 @@ async def _finish_new_character_after_chargen(session, game, account, char):
         start_room = lookup_room(game, start_key)
         if start_room is None and start_key in game.rooms:
             start_room = game.rooms[start_key]
+    if start_room is None:
+        start_room = hooks.chargen_fallback_start_room(char, game)
     if start_room is None:
         start_room = game.start_room
     char.chargen_start_room_key = None
@@ -515,6 +539,7 @@ async def _flow_create_character(session, game, account):
         return None
 
     storage_key = identity_mod.allocate_storage_key(game, given, surname)
+    _purge_stale_vault_for_create(game, storage_key)
     char = Character(storage_key)
     identity_mod.stamp_new_identity(char, game, given, surname)
     char.password_hash = auth.hash_password(password)

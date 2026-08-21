@@ -35,6 +35,16 @@ already matches); catch-up is only the re-enable path.
 
 State lives in .auto_deploy_state.json (gitignored) so a container restart
 does not re-deploy old commits.
+
+Lag P11: successful tree reset / overlay also appends one always-on
+``auto_deploy_reset`` NDJSON row to the diag log (``engine.diag_export``)
+so ``gm diaglog analyze`` can correlate deploy I/O with autosave stalls.
+
+Lag P13: when ``RIFTFORGE_AUTO_DEPLOY_BATCH_QUIET_S`` and/or
+``RIFTFORGE_AUTO_DEPLOY_BATCH_MAX_S`` are set (docker-compose defaults
+120 / 600), merges debounce across watcher polls into one deploy instead
+of one Veil pause per PR. Legacy ``RIFTFORGE_AUTO_DEPLOY_COALESCE_S`` still
+works when batch is off.
 """
 
 from __future__ import annotations
@@ -48,6 +58,42 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+
+# Lag P11 -- last watcher poll / deploy event (monotonic). Used to stamp
+# poll_gap_s and since_prev_deploy_s on diag NDJSON rows. Reset on reload.
+_last_poll_monotonic = None
+_current_poll_gap_s = None
+_last_deploy_event_monotonic = None
+_last_fetch_skip_log = (0.0, "")
+_FETCH_SKIP_LOG_INTERVAL_S = 300.0
+
+
+def _log_git_fetch_skipped(detail, *, root):
+    """Rate-limit identical git fetch failure spam in Docker logs."""
+    global _last_fetch_skip_log
+    now = time.time()
+    prev_at, prev_detail = _last_fetch_skip_log
+    if detail == prev_detail and (now - prev_at) < _FETCH_SKIP_LOG_INTERVAL_S:
+        return
+    _last_fetch_skip_log = (now, detail)
+    print(f"[auto_deploy] git fetch skipped: {detail}", flush=True)
+    detail_l = detail.lower()
+    if _is_permanent_fetch_auth_failure(detail):
+        _clear_catchup_on_permanent_fetch_failure(root, detail)
+    if "empty" in detail_l or "bad object" in detail_l:
+        print(
+            "[auto_deploy] hint: live .git may have empty loose objects -- "
+            "see docs/LIVE_DEPLOY.md (Repair corrupted .git)",
+            flush=True,
+        )
+    if "cannot fork" in detail_l or "resource temporarily unavailable" in detail_l:
+        print(
+            "[auto_deploy] hint: container PID limit / git zombies -- "
+            "docker compose restart; see docs/LIVE_DEPLOY.md "
+            "(cannot fork / high PIDS)",
+            flush=True,
+        )
 
 
 STATE_NAME = ".auto_deploy_state.json"
@@ -66,6 +112,19 @@ ANNOUNCED_COPYOVER_NAME = ".deploy_announced_copyover"
 TREE_SYNCING_NAME = ".deploy_tree_syncing"
 # Watcher touches this briefly before killing gateway (safety net if countdown missed).
 DISCONNECT_IMMINENT_NAME = ".deploy_disconnect_imminent"
+# Same moment, but read by the gateway hold loop when the game child is already down.
+GATEWAY_DISCONNECT_IMMINENT_NAME = ".gateway_disconnect_imminent"
+# Wall-clock stamp after a successful tree sync reset (lag P12: autosave skip).
+DEPLOY_RESET_AT_NAME = ".auto_deploy_reset_at"
+
+# Lag P12: legacy fixed sleep after first advance (0 = off; ignored when batch on).
+DEPLOY_COALESCE_ENV = "RIFTFORGE_AUTO_DEPLOY_COALESCE_S"
+# Lag P13: debounced batch — wait until merges go quiet, with a max cap (0 = off).
+BATCH_QUIET_ENV = "RIFTFORGE_AUTO_DEPLOY_BATCH_QUIET_S"
+BATCH_MAX_ENV = "RIFTFORGE_AUTO_DEPLOY_BATCH_MAX_S"
+BATCH_PENDING_NAME = ".auto_deploy_batch_pending.json"
+# Lag P12: skip scheduled autosaves for N seconds after deploy reset (0 = off).
+AUTOSAVE_SKIP_AFTER_DEPLOY_ENV = "RIFTFORGE_AUTOSAVE_SKIP_AFTER_DEPLOY_S"
 
 # Defaults; override via environment (see docker-compose.yml / .env.example).
 DEFAULT_POLL_EVERY = 30
@@ -274,6 +333,286 @@ def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _env_seconds(name):
+    """Parse a non-negative integer seconds knob from the environment."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def coalesce_seconds():
+    """Extra seconds to wait after detecting origin/main advance (0 = off)."""
+    return _env_seconds(DEPLOY_COALESCE_ENV)
+
+
+def batch_quiet_seconds():
+    """Seconds of quiet origin/main after the last merge before deploy (0 = off)."""
+    return _env_seconds(BATCH_QUIET_ENV)
+
+
+def batch_max_seconds():
+    """Max seconds from the first queued merge before deploy is forced (0 = no cap)."""
+    return _env_seconds(BATCH_MAX_ENV)
+
+
+def batch_debounce_enabled():
+    """True when debounced batching replaces immediate deploy / legacy coalesce."""
+    return batch_quiet_seconds() > 0 or batch_max_seconds() > 0
+
+
+def autosave_skip_after_deploy_seconds():
+    """Skip scheduled autosaves for this many seconds after a tree sync reset."""
+    raw = os.environ.get(AUTOSAVE_SKIP_AFTER_DEPLOY_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _deploy_reset_at_path(root):
+    return os.path.join(root, DEPLOY_RESET_AT_NAME)
+
+
+def record_deploy_reset_wall(root=None):
+    """Stamp wall time when a deploy reset finishes (game reads for autosave skip)."""
+    root = root or _repo_root()
+    try:
+        with open(_deploy_reset_at_path(root), "w", encoding="utf-8") as fh:
+            json.dump({"wall": time.time()}, fh)
+    except OSError as exc:
+        print(f"[auto_deploy] deploy reset stamp skipped: {exc!r}", flush=True)
+
+
+def seconds_since_deploy_reset(root=None):
+    """Seconds since the last tree sync reset stamp, or None if unknown."""
+    root = root or _repo_root()
+    try:
+        with open(_deploy_reset_at_path(root), encoding="utf-8") as fh:
+            payload = json.load(fh)
+        wall = float(payload.get("wall") or 0)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if wall <= 0:
+        return None
+    return time.time() - wall
+
+
+def deploy_save_defer_status(root=None):
+    """Return (blocked, since_s, window_s) for post-deploy save deferral.
+
+    ``since_s`` is seconds since the last deploy stamp when known, else None.
+    """
+    root = root or _repo_root()
+    window = autosave_skip_after_deploy_seconds()
+    if window <= 0:
+        return False, None, window
+    since = seconds_since_deploy_reset(root)
+    if since is None:
+        return False, since, window
+    return since < window, since, window
+
+
+def autosave_blocked_by_recent_deploy(root=None):
+    """True when a scheduled autosave should defer until deploy window passes."""
+    blocked, _since, _window = deploy_save_defer_status(root)
+    return blocked
+
+
+def _coalesce_remote_sha(root, remote_sha):
+    """Wait for a merge burst, then return the latest origin/main tip."""
+    delay = coalesce_seconds()
+    if delay <= 0 or not remote_sha:
+        return remote_sha
+    initial = remote_sha
+    print(
+        f"[auto_deploy] coalesce waiting {delay}s before sync "
+        f"(tip {initial[:12]})",
+        flush=True,
+    )
+    time.sleep(delay)
+    if not _fetch_origin(root):
+        print(
+            "[auto_deploy] coalesce fetch failed; using pre-wait tip",
+            flush=True,
+        )
+        return initial
+    try:
+        tip = _origin_main_sha(root)
+    except subprocess.CalledProcessError:
+        return initial
+    if tip != initial:
+        print(
+            f"[auto_deploy] coalesce caught advance "
+            f"{initial[:12]} -> {tip[:12]}",
+            flush=True,
+        )
+    return tip
+
+
+def _batch_pending_path(root):
+    return os.path.join(root, BATCH_PENDING_NAME)
+
+
+def _load_batch_pending(root):
+    path = _batch_pending_path(root)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not data.get("synced_sha") or not data.get("tip_sha"):
+        return None
+    return data
+
+
+def _save_batch_pending(root, data):
+    path = _batch_pending_path(root)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+
+
+def clear_batch_pending(root=None):
+    """Drop debounce state after deploy or explicit catch-up."""
+    path = _batch_pending_path(root or _repo_root())
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def batch_status_lines(root=None):
+    """Human-readable debounce queue for GM ``autodeploy`` / ``deploy status``."""
+    root = root or _repo_root()
+    if not batch_debounce_enabled():
+        return [f"Deploy batch: off (set {BATCH_QUIET_ENV} / {BATCH_MAX_ENV})"]
+    pending = _load_batch_pending(root)
+    quiet = batch_quiet_seconds()
+    max_wait = batch_max_seconds()
+    if not pending:
+        return [
+            "Deploy batch: idle",
+            f"  quiet={quiet}s max={max_wait}s",
+        ]
+    now = time.time()
+    quiet_left = max(0.0, quiet - (now - pending.get("last_seen_wall", now)))
+    max_left = (
+        max(0.0, max_wait - (now - pending.get("first_seen_wall", now)))
+        if max_wait > 0
+        else None
+    )
+    tip = (pending.get("tip_sha") or "")[:12]
+    lines = [
+        "Deploy batch: queued",
+        f"  tip: {tip}",
+        f"  quiet={quiet}s (≈{int(quiet_left)}s left)",
+    ]
+    if max_left is not None:
+        lines.append(f"  max={max_wait}s (≈{int(max_left)}s left)")
+    return lines
+
+
+def _maybe_log_batch_waiting(root, pending, *, reason=""):
+    """Throttle waiting logs to once per poll interval."""
+    now = time.time()
+    last_log = float(pending.get("last_log_wall") or 0.0)
+    if now - last_log < max(10, poll_interval_seconds() - 1):
+        return
+    pending["last_log_wall"] = now
+    _save_batch_pending(root, pending)
+    quiet = batch_quiet_seconds()
+    max_wait = batch_max_seconds()
+    quiet_elapsed = now - float(pending.get("last_seen_wall") or now)
+    age = now - float(pending.get("first_seen_wall") or now)
+    suffix = f" ({reason})" if reason else ""
+    print(
+        f"[auto_deploy] batch waiting{suffix} tip "
+        f"{(pending.get('tip_sha') or '')[:12]} "
+        f"quiet {quiet_elapsed:.0f}/{quiet}s age {age:.0f}/"
+        f"{max_wait or '∞'}s",
+        flush=True,
+    )
+
+
+def _batch_deploy_gate(root, synced_sha, remote_sha):
+    """Debounce merges across polls; return ``(tip_sha, ready_to_deploy)``."""
+    now = time.time()
+    quiet = batch_quiet_seconds()
+    max_wait = batch_max_seconds()
+    pending = _load_batch_pending(root)
+
+    if pending and pending.get("synced_sha") != synced_sha:
+        clear_batch_pending(root)
+        pending = None
+
+    if pending and pending.get("tip_sha") != remote_sha:
+        pending["tip_sha"] = remote_sha
+        pending["last_seen_wall"] = now
+        _save_batch_pending(root, pending)
+        _maybe_log_batch_waiting(root, pending, reason="tip advanced")
+    elif not pending:
+        try:
+            subject = _commit_subject(remote_sha, root)
+        except subprocess.CalledProcessError:
+            subject = "(unknown)"
+        pending = {
+            "synced_sha": synced_sha,
+            "tip_sha": remote_sha,
+            "first_seen_wall": now,
+            "last_seen_wall": now,
+        }
+        _save_batch_pending(root, pending)
+        print(
+            f"[auto_deploy] batch queued {synced_sha[:12]} -> "
+            f"{remote_sha[:12]} ({subject}) "
+            f"quiet={quiet}s max={max_wait or '∞'}s",
+            flush=True,
+        )
+        return remote_sha, False
+
+    quiet_elapsed = now - float(pending.get("last_seen_wall") or now)
+    age = now - float(pending.get("first_seen_wall") or now)
+    force_max = max_wait > 0 and age >= max_wait
+    quiet_ok = quiet > 0 and quiet_elapsed >= quiet
+
+    if not (force_max or quiet_ok):
+        _maybe_log_batch_waiting(root, pending)
+        return pending["tip_sha"], False
+
+    tip = pending.get("tip_sha") or remote_sha
+    if _fetch_origin(root):
+        try:
+            latest = _origin_main_sha(root)
+            if latest:
+                tip = latest
+        except subprocess.CalledProcessError:
+            pass
+    clear_batch_pending(root)
+    reason = "max elapsed" if force_max else "quiet elapsed"
+    print(
+        f"[auto_deploy] batch ready ({reason}) deploying tip {tip[:12]}",
+        flush=True,
+    )
+    return tip, True
+
+
+def _resolve_deploy_tip(root, synced_sha, remote_sha, *, bypass_batch=False):
+    """Return ``(tip_sha, ready)`` — batch debounce, legacy coalesce, or immediate."""
+    if not bypass_batch and batch_debounce_enabled():
+        return _batch_deploy_gate(root, synced_sha, remote_sha)
+    if coalesce_seconds() > 0:
+        return _coalesce_remote_sha(root, remote_sha), True
+    return remote_sha, True
+
+
 def _announced_copyover_path(root):
     return os.path.join(root, ANNOUNCED_COPYOVER_NAME)
 
@@ -284,6 +623,10 @@ def _tree_syncing_path(root):
 
 def _disconnect_imminent_path(root):
     return os.path.join(root, DISCONNECT_IMMINENT_NAME)
+
+
+def _gateway_disconnect_imminent_path(root):
+    return os.path.join(root, GATEWAY_DISCONNECT_IMMINENT_NAME)
 
 
 def touch_disconnect_imminent(root):
@@ -298,9 +641,28 @@ def touch_disconnect_imminent(root):
         )
 
 
+def touch_gateway_disconnect_imminent(root):
+    """Watcher touched this before killing gateway — hold loop warns held clients."""
+    try:
+        with open(_gateway_disconnect_imminent_path(root), "w", encoding="utf-8") as fh:
+            fh.write("\n")
+    except OSError as exc:
+        print(
+            f"[auto_deploy] could not touch gateway disconnect marker: {exc!r}",
+            flush=True,
+        )
+
+
 def clear_disconnect_imminent(root):
     try:
         os.remove(_disconnect_imminent_path(root))
+    except OSError:
+        pass
+
+
+def clear_gateway_disconnect_imminent(root):
+    try:
+        os.remove(_gateway_disconnect_imminent_path(root))
     except OSError:
         pass
 
@@ -604,6 +966,7 @@ def status_text():
         catchup_line,
     ]
     lines.extend(build_lock.status_lines(root))
+    lines.extend(batch_status_lines(root))
     synced = (_load_state(root).get("origin_main") or "")
     remote = ""
     try:
@@ -1146,6 +1509,54 @@ def _verify_boot_probe_or_rollback(root, previous_head):
     return False
 
 
+def _mark_poll():
+    """Stamp this watcher poll so deploy diag rows can report poll_gap_s."""
+    global _last_poll_monotonic, _current_poll_gap_s
+    now = time.monotonic()
+    if _last_poll_monotonic is None:
+        _current_poll_gap_s = None
+    else:
+        _current_poll_gap_s = round(now - _last_poll_monotonic, 2)
+    _last_poll_monotonic = now
+
+
+def _diff_file_count(root, from_sha, to_sha):
+    """How many paths differ between two commits (best-effort, no raise)."""
+    if not from_sha or not to_sha:
+        return None
+    try:
+        names = _git("diff", "--name-only", from_sha, to_sha, cwd=root)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+    return len([ln for ln in names.splitlines() if ln.strip()])
+
+
+def _emit_deploy_diag(*, kind, from_sha, to_sha, n_files_changed, extra=None):
+    """Append one always-on auto_deploy_reset NDJSON row; never raise."""
+    global _last_deploy_event_monotonic
+    now = time.monotonic()
+    since = None
+    if _last_deploy_event_monotonic is not None:
+        since = round(now - _last_deploy_event_monotonic, 2)
+    try:
+        from engine import diag_export
+        diag_export.append_deploy_event(
+            kind=kind,
+            from_sha=from_sha,
+            to_sha=to_sha,
+            n_files_changed=n_files_changed,
+            poll_gap_s=_current_poll_gap_s,
+            since_prev_deploy_s=since,
+            extra=extra,
+        )
+    except Exception as exc:
+        print(f"[auto_deploy] diag event skipped: {exc}", flush=True)
+    _last_deploy_event_monotonic = now
+    # Overlay + full reset both refresh the save-defer window (lag P12.1).
+    if kind in ("reset", "overlay"):
+        record_deploy_reset_wall(_repo_root())
+
+
 def _reset_hard_to(root, sha):
     """Move the working tree to sha (feature pushes on Azure / any host).
 
@@ -1177,6 +1588,7 @@ def _reset_hard_to(root, sha):
         _ensure_changelog_index_after_sync(root)
         return True
     previous_head = head
+    n_files = _diff_file_count(root, previous_head, sha)
     print(f"[auto_deploy] syncing working tree to {sha[:12]}", flush=True)
     stash = _stash_protected_live_files(root)
     try:
@@ -1210,6 +1622,12 @@ def _reset_hard_to(root, sha):
     _ensure_changelog_index_after_sync(root)
     if not _verify_boot_probe_or_rollback(root, previous_head):
         return False
+    _emit_deploy_diag(
+        kind="reset",
+        from_sha=previous_head,
+        to_sha=sha,
+        n_files_changed=n_files,
+    )
     return True
 
 
@@ -1401,25 +1819,7 @@ def _fetch_origin(root):
         return False
     except subprocess.CalledProcessError as exc:
         detail = getattr(exc, "_riftforge_git_detail", None) or str(exc)
-        print(f"[auto_deploy] git fetch skipped: {detail}", flush=True)
-        detail_l = detail.lower()
-        if _is_permanent_fetch_auth_failure(detail):
-            _clear_catchup_on_permanent_fetch_failure(root, detail)
-        # One-line recovery hint for the empty-object failure we hit on Azure.
-        if "empty" in detail_l or "bad object" in detail_l:
-            print(
-                "[auto_deploy] hint: live .git may have empty loose objects -- "
-                "see docs/LIVE_DEPLOY.md (Repair corrupted .git)",
-                flush=True,
-            )
-        # PID-1 never reaping git helpers fills the cgroup until fork fails.
-        if "cannot fork" in detail_l or "resource temporarily unavailable" in detail_l:
-            print(
-                "[auto_deploy] hint: container PID limit / git zombies -- "
-                "docker compose restart; see docs/LIVE_DEPLOY.md "
-                "(cannot fork / high PIDS)",
-                flush=True,
-            )
+        _log_git_fetch_skipped(detail, root=root)
         return False
     except FileNotFoundError as exc:
         print(f"[auto_deploy] git fetch skipped: {exc}", flush=True)
@@ -1821,13 +2221,14 @@ def should_ship_bug_fix(subject: str, *, parent_count: int, file_count: int):
     )
 
 
-def _advance_origin_only(root, state, remote_sha, subject, reason):
+def _advance_origin_only(root, state, remote_sha, subject, reason, *, from_sha=""):
     """Record the new tip without announcing or overlaying."""
     print(
         f"[auto_deploy] skipping announce for {remote_sha[:12]} "
         f"({reason}): {subject}",
         flush=True,
     )
+    prev = (from_sha or state.get("origin_main") or "").strip()
     state["origin_main"] = remote_sha
     # Do NOT write last_deploy -- that would imply we shipped a fix.
     # Tracking origin_main alone is enough for advance-only gating.
@@ -1835,7 +2236,18 @@ def _advance_origin_only(root, state, remote_sha, subject, reason):
     from engine import deploy_queue
 
     deploy_queue.clear_pending(root)
+    _maybe_schedule_deploy_patch_notes(root, prev, remote_sha)
     return False
+
+
+def _maybe_schedule_deploy_patch_notes(root, from_sha, to_sha):
+    """Fail-soft Discord #patch-notes mirror for CHANGELOG.d in this deploy."""
+    try:
+        from engine import discord_patch_notes
+
+        discord_patch_notes.schedule_for_deploy(root, from_sha, to_sha)
+    except Exception as exc:
+        print(f"[auto_deploy] patch notes skipped: {exc}", flush=True)
 
 
 def _wait_for_ready(root, timeout_seconds):
@@ -1975,6 +2387,12 @@ def _run_deploy_pipeline(
     )
     from engine.deploy_guard import run_post_overlay_checks
     run_post_overlay_checks(root)
+    _emit_deploy_diag(
+        kind="overlay",
+        from_sha=None,
+        to_sha=commit_sha,
+        n_files_changed=len(files or ()),
+    )
     return True
 
 
@@ -2489,6 +2907,14 @@ def _run_reenable_catchup(root, state, remote_sha):
         f"{remote_sha[:12]} ({subject})",
         flush=True,
     )
+    clear_batch_pending(root)
+    remote_sha, _ready = _resolve_deploy_tip(
+        root, from_sha, remote_sha, bypass_batch=True,
+    )
+    try:
+        subject = _commit_subject(remote_sha, root)
+    except subprocess.CalledProcessError:
+        pass
     if tree_sync_blocked(root):
         from engine import deploy_queue
 
@@ -2566,6 +2992,7 @@ def _run_reenable_catchup(root, state, remote_sha):
     from engine import deploy_queue
 
     deploy_queue.clear_pending(root)
+    _maybe_schedule_deploy_patch_notes(root, from_sha, remote_sha)
     print(
         f"[auto_deploy] catch-up complete at {remote_sha[:12]}",
         flush=True,
@@ -2592,6 +3019,8 @@ def try_auto_deploy():
     if skip_reason is not None:
         _maybe_log_poll_skip(skip_reason)
         return False
+
+    _mark_poll()
 
     root = _repo_root()
     if root not in sys.path:
@@ -2636,6 +3065,11 @@ def try_auto_deploy():
                 flush=True,
             )
         return False
+
+    tip, ready = _resolve_deploy_tip(root, prev_sha, remote_sha)
+    if not ready:
+        return False
+    remote_sha = tip
 
     subject = _commit_subject(remote_sha, root)
     message = _commit_message(remote_sha, root)
@@ -2718,7 +3152,9 @@ def try_auto_deploy():
                     f"[auto_deploy] missed-fix catch-up failed: {exc}",
                     flush=True,
                 )
-        return _advance_origin_only(root, state, remote_sha, subject, reason)
+        return _advance_origin_only(
+            root, state, remote_sha, subject, reason, from_sha=prev_sha,
+        )
 
     # Multi-commit gaps: only the tip Fix gets the countdown; earlier Fix
     # subjects in the same batch still need reporter credit + resolved status.
@@ -2760,6 +3196,8 @@ def try_auto_deploy():
         "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     _save_state(root, state)
+    clear_batch_pending(root)
+    _maybe_schedule_deploy_patch_notes(root, prev_sha, remote_sha)
     return True
 
 

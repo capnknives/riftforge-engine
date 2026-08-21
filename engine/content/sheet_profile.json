@@ -29,6 +29,24 @@
       "panes": ["default", "vitals", "full"]
     },
     {
+      "id": "supers_edges",
+      "slot": "body",
+      "source": "hook:supers_edges",
+      "panes": ["default", "full"]
+    },
+    {
+      "id": "supers_god_hunt_intel",
+      "slot": "body",
+      "source": "hook:supers_god_hunt_intel",
+      "panes": ["default", "full"]
+    },
+    {
+      "id": "supers_cult_reach",
+      "slot": "body",
+      "source": "hook:supers_cult_reach",
+      "panes": ["default", "full"]
+    },
+    {
       "id": "hp",
       "slot": "body",
       "source": "hook:hp",

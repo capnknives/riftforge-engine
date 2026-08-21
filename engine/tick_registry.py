@@ -31,6 +31,11 @@ a re-export facade so existing `from supers.tick_registry import X` /
 import collections
 import os
 import time
+import traceback
+
+# Per-handler name: monotonic time of the last stderr traceback we printed.
+# Without this, one handler raising every 3s heartbeat would flood Docker logs.
+_tick_fail_log_at = {}
 
 
 # Log the whole heartbeat when it exceeds this (milliseconds). Idle ticks
@@ -43,7 +48,10 @@ HANDLER_WARN_MS = 20.0
 TICK_STATS_LEN = 20
 # Soft wall: once handlers have spent this many ms, skip remaining
 # skippable ambient handlers for this heartbeat.
-_TICK_SOFT_BUDGET_MS_DEFAULT = 350.0
+_TICK_SOFT_BUDGET_MS_DEFAULT = 300.0
+_TICK_FAIL_LOG_SECONDS_DEFAULT = 60.0
+_TICK_DISABLE_THRESHOLD_DEFAULT = 5
+_TICK_DISABLE_WINDOW_SECONDS_DEFAULT = 300.0
 _tick_finalize_cadence_clear = None
 
 
@@ -64,6 +72,160 @@ def tick_soft_budget_ms():
         return _TICK_SOFT_BUDGET_MS_DEFAULT
 
 
+def tick_fail_log_seconds():
+    """Min seconds between stderr tracebacks for the same handler name."""
+    raw = (os.environ.get("RIFTFORGE_TICK_FAIL_LOG_SECONDS") or "").strip()
+    if not raw:
+        return _TICK_FAIL_LOG_SECONDS_DEFAULT
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return _TICK_FAIL_LOG_SECONDS_DEFAULT
+
+
+def _tick_fail_ops_enabled():
+    raw = (os.environ.get("RIFTFORGE_TICK_FAIL_OPS") or "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def tick_disable_threshold():
+    """Failures in the sliding window before a handler is auto-disabled."""
+    raw = (os.environ.get("RIFTFORGE_TICK_DISABLE_THRESHOLD") or "").strip()
+    if not raw:
+        return _TICK_DISABLE_THRESHOLD_DEFAULT
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _TICK_DISABLE_THRESHOLD_DEFAULT
+
+
+def tick_disable_window_seconds():
+    """Sliding window for tick_fail auto-disable (seconds)."""
+    raw = (os.environ.get("RIFTFORGE_TICK_DISABLE_WINDOW") or "").strip()
+    if not raw:
+        return _TICK_DISABLE_WINDOW_SECONDS_DEFAULT
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return _TICK_DISABLE_WINDOW_SECONDS_DEFAULT
+
+
+def _tick_handlers_disabled(game):
+    """Set of handler names skipped until game child respawn / copyover."""
+    disabled = getattr(game, "_tick_handlers_disabled", None)
+    if not isinstance(disabled, set):
+        disabled = set()
+        game._tick_handlers_disabled = disabled
+    return disabled
+
+
+def is_tick_handler_disabled(game, name):
+    return name in _tick_handlers_disabled(game)
+
+
+def clear_tick_handler_health(game):
+    """Reset failure windows and disabled set (tests; fresh Game starts empty)."""
+    game._tick_handlers_disabled = set()
+    game._tick_handler_fail_times = {}
+
+
+def _maybe_disable_tick_handler(game, name):
+    """After a failure, disable the handler when the window threshold is hit."""
+    from engine import metrics as metrics_mod
+
+    now = time.monotonic()
+    window = tick_disable_window_seconds()
+    store = getattr(game, "_tick_handler_fail_times", None)
+    if not isinstance(store, dict):
+        store = {}
+        game._tick_handler_fail_times = store
+    times = store.get(name)
+    if not isinstance(times, collections.deque):
+        times = collections.deque()
+        store[name] = times
+    times.append(now)
+    cutoff = now - window
+    while times and times[0] < cutoff:
+        times.popleft()
+    threshold = tick_disable_threshold()
+    if len(times) < threshold:
+        return
+    disabled = _tick_handlers_disabled(game)
+    if name in disabled:
+        return
+    disabled.add(name)
+    metrics_mod.bump(game, f"tick_disabled:{name}")
+    if _tick_fail_ops_enabled():
+        from engine import log_util
+
+        log_util.ops(
+            "tick_registry",
+            f"disabled handler={name} after {len(times)} failures in "
+            f"{window:.0f}s window",
+        )
+
+
+def _tick_fail_log_due(name):
+    """True when we may print another traceback for this handler name."""
+    now = time.monotonic()
+    last = _tick_fail_log_at.get(name)
+    if last is None or (now - last) >= tick_fail_log_seconds():
+        _tick_fail_log_at[name] = now
+        return True
+    return False
+
+
+def _note_tick_handler_failure(game, name, exc):
+    """Count + remember one handler failure without aborting the tick pass."""
+    from engine import metrics as metrics_mod
+
+    metrics_mod.bump(game, f"tick_fail:{name}")
+    last_fail = getattr(game, "_tick_handler_last_fail", None)
+    if not isinstance(last_fail, dict):
+        last_fail = {}
+        game._tick_handler_last_fail = last_fail
+    msg = str(exc).strip()
+    last_fail[name] = {
+        "exc_type": type(exc).__name__,
+        "message": msg[:120],
+        "at_mono": time.monotonic(),
+    }
+    if _tick_fail_log_due(name):
+        traceback.print_exc()
+        if _tick_fail_ops_enabled():
+            from engine import log_util
+
+            log_util.ops(
+                "tick_registry",
+                f"handler={name} {type(exc).__name__}: {msg[:200]}",
+                exc=exc,
+            )
+    _maybe_disable_tick_handler(game, name)
+
+
+def _invoke_tick_handler_safe(game, name, fn):
+    """Run one sync tick handler; sibling handlers still run on failure.
+
+    Hangs are not caught here -- only exceptions. A stuck handler still trips
+    the watcher heartbeat (GAME_HANG_TIMEOUT).
+    """
+    try:
+        fn(game)
+    except Exception as exc:
+        _note_tick_handler_failure(game, name, exc)
+
+
+async def _invoke_tick_handler_safe_async(game, name, fn, async_fn):
+    """Run one production tick handler (async_fn when set, else sync fn)."""
+    try:
+        if async_fn is not None:
+            await async_fn(game)
+        else:
+            fn(game)
+    except Exception as exc:
+        _note_tick_handler_failure(game, name, exc)
+
+
 def register_tick(
     game, fn, *, order=100, name=None, async_fn=None,
     every_n=1, skippable=False,
@@ -78,9 +240,11 @@ def register_tick(
     systems do not all fire on the same tick). skippable: may be dropped
     when the soft tick budget is already spent.
 
-    Exceptions are NOT caught here -- Game.tick_loop already wraps the
-    whole heartbeat in try/except so one bad system does not kill the
-    heartbeat.
+    Exceptions in fn/async_fn are caught per handler so one bad system does
+    not skip later handlers in the same heartbeat. After
+    ``RIFTFORGE_TICK_DISABLE_THRESHOLD`` failures in the disable window the
+    handler is skipped until game child respawn. Game.tick_loop still wraps
+    the whole heartbeat for bugs outside this registry.
     """
     if not hasattr(game, "_tick_handlers"):
         game._tick_handlers = []
@@ -105,6 +269,38 @@ def _handler_due(name, every_n, game_time_ticks):
     # Stable stagger: different ambient names land on different residues.
     offset = sum(ord(ch) for ch in (name or "")) % every_n
     return (ticks % every_n) == offset
+
+
+def _cadence_pressure_skip_ambient(game, name, h_ms, spent, budget):
+    """After a heavy Cadence slice, drop remaining skippable ambient work."""
+    if name != "cadence" or budget <= 0:
+        return spent
+    spent = max(spent, h_ms)
+    meta = getattr(game, "_cadence_budget_meta", None) or {}
+    saturated = (
+        meta.get("wall_capped")
+        or meta.get("action_capped")
+        or h_ms >= HANDLER_WARN_MS * 2
+    )
+    if not saturated:
+        # Also saturate when Cadence used most of its action budget.
+        try:
+            used = int(meta.get("used") or 0)
+            limit = int(meta.get("limit") or 0)
+            if limit > 0 and used >= max(1, limit - 4):
+                saturated = True
+        except (TypeError, ValueError):
+            pass
+    if saturated:
+        spent = max(spent, budget)
+    return spent
+
+
+def _async_handler_budget_cost(name, h_ms):
+    """How much of the soft budget an async handler consumes."""
+    if name == "cadence":
+        return h_ms
+    return min(h_ms, 100.0)
 
 
 def _unpack_handler(entry):
@@ -135,7 +331,12 @@ def _finalize_tick_run(
         except Exception:
             pass
     _record_tick_sample(game, total_ms, slow_handlers, skipped=skipped)
-    if total_ms >= TICK_WARN_MS:
+    from engine import boot_stability
+
+    if (
+        total_ms >= TICK_WARN_MS
+        and not boot_stability.tick_stderr_warmup_active(game)
+    ):
         parts = [f"[tick] total={total_ms:.1f}ms"]
         if slow_handlers:
             detail = ", ".join(
@@ -182,6 +383,12 @@ def _finalize_tick_run(
         }
         if skipped:
             payload["skipped_ambient"] = list(skipped)[:20]
+        payload["autosave_running"] = bool(
+            getattr(game, "_autosave_running", False)
+        )
+        last_as = getattr(game, "_last_autosave_stats", None) or {}
+        if last_as.get("save_ms") is not None:
+            payload["last_autosave_save_ms"] = last_as.get("save_ms")
         if diag_export.append_auto_capture_event(
             game, payload, reason=auto_reason,
         ):
@@ -228,6 +435,9 @@ def run_ticks(game):
         _order, name, fn, _async_fn, every_n, skippable = _unpack_handler(entry)
         if not _handler_due(name, every_n, ticks):
             continue
+        if is_tick_handler_disabled(game, name):
+            skipped.append(f"{name}:disabled")
+            continue
         if (
             skippable
             and budget > 0
@@ -236,15 +446,27 @@ def run_ticks(game):
             skipped.append(name)
             continue
         h0 = time.perf_counter()
-        fn(game)
+        _invoke_tick_handler_safe(game, name, fn)
         h_ms = (time.perf_counter() - h0) * 1000.0
-        # Async yield inflation must not zero the soft budget; sync path
-        # has no async_fn so full cost counts.
         spent += h_ms
+        spent = _cadence_pressure_skip_ambient(
+            game, name, h_ms, spent, budget,
+        )
+        try:
+            from engine import game_heartbeat
+
+            game_heartbeat.touch_heartbeat(f"tick:{name}")
+        except Exception:
+            pass
         if all_handlers is not None:
             all_handlers.append((name, h_ms))
         if h_ms >= HANDLER_WARN_MS:
             slow_handlers.append((name, h_ms))
+        try:
+            from engine import lag_watch
+            lag_watch.note_handler_stall(game, name, h_ms)
+        except Exception:
+            pass
     _finalize_tick_run(
         game, t0, slow_handlers, all_handlers, capture, skipped=skipped,
     )
@@ -270,6 +492,9 @@ async def run_ticks_async(game):
         _order, name, fn, async_fn, every_n, skippable = _unpack_handler(entry)
         if not _handler_due(name, every_n, ticks):
             continue
+        if is_tick_handler_disabled(game, name):
+            skipped.append(f"{name}:disabled")
+            continue
         if (
             skippable
             and budget > 0
@@ -278,21 +503,33 @@ async def run_ticks_async(game):
             skipped.append(name)
             continue
         h0 = time.perf_counter()
-        if async_fn is not None:
-            await async_fn(game)
-        else:
-            fn(game)
+        await _invoke_tick_handler_safe_async(game, name, fn, async_fn)
         h_ms = (time.perf_counter() - h0) * 1000.0
-        # Cadence (and other async_fn) wall time includes asyncio yields
-        # that overlap autosave -- do not let that erase ambient work.
         if async_fn is not None:
-            spent += min(h_ms, 100.0)
+            spent += _async_handler_budget_cost(name, h_ms)
+            spent = _cadence_pressure_skip_ambient(
+                game, name, h_ms, spent, budget,
+            )
         else:
             spent += h_ms
+            spent = _cadence_pressure_skip_ambient(
+                game, name, h_ms, spent, budget,
+            )
+        try:
+            from engine import game_heartbeat
+
+            game_heartbeat.touch_heartbeat(f"tick:{name}")
+        except Exception:
+            pass
         if all_handlers is not None:
             all_handlers.append((name, h_ms))
         if h_ms >= HANDLER_WARN_MS:
             slow_handlers.append((name, h_ms))
+        try:
+            from engine import lag_watch
+            lag_watch.note_handler_stall(game, name, h_ms)
+        except Exception:
+            pass
     _finalize_tick_run(
         game, t0, slow_handlers, all_handlers, capture, skipped=skipped,
     )

@@ -21,6 +21,8 @@ the two sides honest.
 
 from __future__ import annotations
 
+from typing import Optional
+
 from engine import auth
 
 # Mirror character login name bounds (engine/connection.LOGIN_NAME_*).
@@ -74,13 +76,16 @@ class Account:
         self.wizinvis = True
         # Playtester diagnostic tools (``playtest`` / ``playtester add``).
         self.playtester = False
-        # Highest changelog ship timestamp this account has read (ISO UTC).
+        # Visit-ceiling for in-game ``changes`` (new since last acknowledgment).
         # Legacy ``last_seen_changelog_id`` is uplifted once on read.
         self.last_seen_changelog_sort_ts = ""
+        self.changelog_visit_migrated = False
         # Legacy numeric watermark (pre Aug 2026 timestamp-only feed).
         self.last_seen_changelog_id = 0
         # Phase 5: storage key of a body mid create-flow chargen (resume draft).
         self.chargen_draft_key = ""
+        # Account names blocked on OOC + player public channels (not IC say/tell).
+        self.ooc_blocked_accounts = []
 
     def to_blob(self):
         """JSON-serializable extras for the accounts.data column."""
@@ -104,8 +109,14 @@ class Account:
             "last_seen_changelog_sort_ts": str(
                 getattr(self, "last_seen_changelog_sort_ts", "") or ""
             ),
+            "changelog_visit_migrated": bool(
+                getattr(self, "changelog_visit_migrated", False)
+            ),
             "chargen_draft_key": str(
                 getattr(self, "chargen_draft_key", "") or ""
+            ),
+            "ooc_blocked_accounts": list(
+                getattr(self, "ooc_blocked_accounts", None) or []
             ),
         }
 
@@ -147,7 +158,21 @@ class Account:
         self.last_seen_changelog_sort_ts = str(
             data.get("last_seen_changelog_sort_ts", "") or ""
         )
+        self.changelog_visit_migrated = bool(
+            data.get("changelog_visit_migrated", False)
+        )
         self.chargen_draft_key = str(data.get("chargen_draft_key", "") or "")
+        blocked = data.get("ooc_blocked_accounts") or []
+        cleaned_blocked = []
+        seen_blocked = set()
+        if isinstance(blocked, (list, tuple)):
+            for raw in blocked:
+                key = account_lookup_key(str(raw or ""))
+                if not key or key in seen_blocked:
+                    continue
+                seen_blocked.add(key)
+                cleaned_blocked.append(key)
+        self.ooc_blocked_accounts = cleaned_blocked
 
 
 def normalize_account_name(raw):
@@ -328,6 +353,149 @@ def account_for_character(game, character):
     if not name:
         return None
     return find_account(game, name)
+
+
+def account_name_for_character_key(game, speaker_key) -> Optional[str]:
+    """Linked account storage name for a character key, or None."""
+    if not speaker_key or game is None:
+        return None
+    finder = getattr(game, "find_character", None)
+    if not callable(finder):
+        return None
+    speaker = finder(speaker_key)
+    if speaker is None:
+        return None
+    linked = (getattr(speaker, "account", None) or "").strip()
+    return linked or None
+
+
+def resolve_block_target_account(game, name):
+    """Resolve ``name`` to an Account for OOC/public-channel blocking.
+
+    Accepts an account name or a character name (online or Echo). Returns
+    ``(account, error_message)``; error is set when lookup fails.
+    """
+    raw = (name or "").strip()
+    if not raw:
+        return None, "Usage: block <account|character>"
+    acct = find_account(game, raw)
+    if acct is not None:
+        return acct, None
+    finder = getattr(game, "find_character", None)
+    if callable(finder):
+        character = finder(raw)
+        if character is not None:
+            acct = account_for_character(game, character)
+            if acct is not None:
+                return acct, None
+            return None, (
+                f"{character.key} is not linked to an account yet — "
+                "use the account name instead."
+            )
+    return None, f"No account or character named '{raw}'."
+
+
+def ooc_is_blocked(listener_account, speaker_account_name) -> bool:
+    """True when *listener_account* blocks *speaker_account_name* on OOC nets."""
+    if listener_account is None or not speaker_account_name:
+        return False
+    key = account_lookup_key(speaker_account_name)
+    if not key:
+        return False
+    blocked = getattr(listener_account, "ooc_blocked_accounts", None) or []
+    return key in {account_lookup_key(x) for x in blocked}
+
+
+def ooc_should_hide_from_viewer(viewer, game, speaker_key) -> bool:
+    """True when *viewer* has blocked the speaker's account on OOC/public nets."""
+    if viewer is None or game is None:
+        return False
+    listener = account_for_character(game, viewer)
+    if listener is None:
+        return False
+    speaker_account = account_name_for_character_key(game, speaker_key)
+    if not speaker_account:
+        return False
+    return ooc_is_blocked(listener, speaker_account)
+
+
+def ooc_block_account(game, listener_account, target_name):
+    """Block an account on OOC/public channels. Returns ``(ok, message)``."""
+    target, err = resolve_block_target_account(game, target_name)
+    if target is None:
+        return False, err or "Could not resolve that name."
+    if listener_account is None:
+        return False, "You need a linked account to block someone."
+    if account_lookup_key(target.name) == account_lookup_key(listener_account.name):
+        return False, "You cannot block yourself."
+    blocked = list(getattr(listener_account, "ooc_blocked_accounts", None) or [])
+    key = account_lookup_key(target.name)
+    if key in {account_lookup_key(x) for x in blocked}:
+        return False, f"You already block {target.display_name or target.name} on OOC channels."
+    blocked.append(target.name)
+    listener_account.ooc_blocked_accounts = blocked
+    try:
+        from engine.persistence import mark_account_dirty
+        mark_account_dirty(game, listener_account)
+    except Exception:
+        pass
+    label = target.display_name or target.name
+    return True, (
+        f"You will no longer hear {label} on OOC or player public channels. "
+        "In-character say, tell, phone, and radio are unchanged."
+    )
+
+
+def ooc_unblock_account(game, listener_account, target_name):
+    """Clear one OOC/public-channel block. Returns ``(ok, message)``."""
+    raw = (target_name or "").strip()
+    if not raw:
+        return False, "Usage: unblock <account|character>"
+    if listener_account is None:
+        return False, "You need a linked account to manage blocks."
+    target_key = account_lookup_key(raw)
+    blocked = list(getattr(listener_account, "ooc_blocked_accounts", None) or [])
+    kept = []
+    removed_label = None
+    for entry in blocked:
+        if account_lookup_key(entry) == target_key:
+            acct = find_account(game, entry)
+            removed_label = (
+                (acct.display_name or acct.name) if acct is not None else entry
+            )
+            continue
+        kept.append(entry)
+    if removed_label is None:
+        target, err = resolve_block_target_account(game, raw)
+        if target is None:
+            return False, err or f"You are not blocking '{raw}'."
+        kept = [
+            x for x in blocked
+            if account_lookup_key(x) != account_lookup_key(target.name)
+        ]
+        removed_label = target.display_name or target.name
+    listener_account.ooc_blocked_accounts = kept
+    try:
+        from engine.persistence import mark_account_dirty
+        mark_account_dirty(game, listener_account)
+    except Exception:
+        pass
+    return True, f"You can hear {removed_label} on OOC and player public channels again."
+
+
+def ooc_list_blocked(game, listener_account):
+    """Return display labels for blocked accounts (may be empty)."""
+    if listener_account is None:
+        return []
+    blocked = getattr(listener_account, "ooc_blocked_accounts", None) or []
+    labels = []
+    for entry in blocked:
+        acct = find_account(game, entry) if game is not None else None
+        if acct is not None:
+            labels.append(acct.display_name or acct.name)
+        else:
+            labels.append(str(entry or "").strip())
+    return labels
 
 
 def effective_gm_rank(game, character):

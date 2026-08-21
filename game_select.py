@@ -182,3 +182,10 @@ def seed_content(game):
     elif name == "classic":
         from classic.seed import seed_content as fn
         fn(game)
+
+
+def run_boot_content_gate():
+    """Validate on-disk catalogs before world load (P3). No-op for lean boot."""
+    from engine.boot_content_gate import run_boot_content_gate as _run
+
+    _run()

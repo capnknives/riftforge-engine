@@ -47,6 +47,7 @@ from engine.persistence import (
     load_rumor_boards,
     load_world,
     mark_seeded,
+    maybe_wal_checkpoint_after_save,
     save_calendar_epoch_day,
     save_cadence_chances,
     save_taxi_mode,

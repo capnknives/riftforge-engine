@@ -226,7 +226,13 @@ def stamp_hand_room(game, room, *, taken: set[str] | None = None) -> str:
 
     old_key = (getattr(room, "key", "") or "").strip()
     raw = getattr(room, "vnum", None)
-    if raw is not None and str(raw).strip():
+    parsed_existing = parse_vnum(old_key)
+    if parsed_existing is not None:
+        # Runtime pockets reload from SQL under an existing VNUM (homestead
+        # remodel, vehicle interior, …). Keep the stable id even when
+        # ``room.vnum`` was not persisted on the row (bug report 655).
+        vnum = old_key.upper()
+    elif raw is not None and str(raw).strip():
         try:
             vnum = validate_vnum(raw)
         except ValueError:
@@ -401,6 +407,11 @@ def staff_room_label(room) -> str:
     return f"{name}[{code}]"
 
 
+def label_is_bare_vnum(text) -> bool:
+    """True when ``text`` is only a hand-room VNUM (``JG00001``), not prose."""
+    return parse_vnum(str(text or "").strip().upper()) is not None
+
+
 def describe_room(room, *, staff: bool = False) -> str:
     """Prose place label: ROOM NAME, or NAME[VNUM] when ``staff``.
 
@@ -408,7 +419,8 @@ def describe_room(room, *, staff: bool = False) -> str:
     Empty / missing room → ``\"?\"``. Prefer this over ``location.key`` in
     any player or GM message. Opaque Cadence dig keys
     (``unowned amenity12``, ``unowned shop4``, …) are never returned --
-    ``look_title`` / flag generics win first.
+    ``look_title`` / flag generics win first. Players never see a bare
+    VNUM string -- staff may use ``NAME[VNUM]`` or the raw code alone.
     """
     if room is None:
         return "?"
@@ -425,11 +437,15 @@ def describe_room(room, *, staff: bool = False) -> str:
     if label and is_opaque_storage_key(label):
         label = generic_title_from_flags(room) or ""
     if label and not is_opaque_storage_key(label):
-        return label
-    # Authored title missing and look_title fell through empty -- last
-    # resort for staff is the raw vnum string (never teach dig keys).
+        if not staff and label_is_bare_vnum(label):
+            if getattr(room, "private_home", False) or getattr(room, "is_home", False):
+                return "Private Home"
+            label = generic_title_from_flags(room) or ""
+        else:
+            return label
+    # Authored title missing -- staff may fall back to the raw vnum string.
     raw = getattr(room, "vnum", None)
-    if raw is not None and str(raw).strip():
+    if staff and raw is not None and str(raw).strip():
         try:
             return validate_vnum(raw)
         except ValueError:
@@ -660,6 +676,111 @@ def merge_map_additive(
     filtered = dict(data)
     filtered["rooms"] = missing
     return filtered, conflicts
+
+
+def _rewrite_hand_room_refs_in_doc(data, old_key, new_key):
+    """Rewrite exit / pocket / portal targets inside one map JSON doc."""
+    if not data or not old_key or old_key == new_key:
+        return
+    for room in data.get("rooms") or []:
+        if room.get("key") == old_key:
+            room["key"] = new_key
+        exits = room.get("exits") or {}
+        for direction, dest in list(exits.items()):
+            if dest == old_key:
+                exits[direction] = new_key
+    for pocket in data.get("pockets") or []:
+        if pocket.get("hub_room") == old_key:
+            pocket["hub_room"] = new_key
+    grid = data.get("grid")
+    if isinstance(grid, dict):
+        for portal in grid.get("portals") or []:
+            if portal.get("to_room") == old_key:
+                portal["to_room"] = new_key
+
+
+def normalize_hand_room_identities_in_map_docs(map_files) -> list[str]:
+    """Pre-pass for ``load_all_maps``: globally unique hand-room storage keys.
+
+    Walks every ``(filename, data)`` pair before Pass 1 creates live
+    ``Room`` objects. When two map files (or two entries in one file)
+    claim the same storage ``key`` for different chambers, the *later*
+    entry in stable ``(filename, key)`` order is remapped to the next
+    free vnum under its ROOM NAME prefix. The colliding room's ``key``
+    becomes that vnum (Phase 3 identity), the former key is preserved as
+    ``legacy_key`` when missing, and exit / pocket / portal strings
+    **inside that file only** are rewritten.
+
+    Duplicate **vnums** with different keys are left to ``assign_room_vnums``
+    / CI (first authored vnum wins; the duplicate field is dropped) and
+    Pass 1.5 fill — this pass does not allocate missing vnums (that
+    would steal a slot before an explicit ``CP00002`` row is registered).
+
+    Mutates ``map_files`` docs in place. Returns human-readable log lines
+    for each remap (caller prints as ``[boot heal]``). Idempotent when
+    content is already clean.
+    """
+    if not map_files:
+        return []
+
+    from engine.world_maps import ensure_hand_room_identity
+
+    records = []
+    for file_ord, (filename, data) in enumerate(map_files):
+        if not isinstance(data, dict):
+            continue
+        for idx, room in enumerate(data.get("rooms") or []):
+            if not isinstance(room, dict):
+                continue
+            records.append((file_ord, filename, data, idx, room))
+
+    taken: set[str] = set()
+    key_owner: dict[str, tuple[int, int]] = {}
+    logs: list[str] = []
+
+    # Pass 1: claim explicit unique vnums (first in load order wins).
+    for file_ord, filename, data, idx, room in records:
+        ensure_hand_room_identity(
+            room, where=f"{filename} rooms[{idx}]",
+        )
+        raw_v = room.get("vnum")
+        if raw_v is None or not str(raw_v).strip():
+            continue
+        try:
+            vnum = validate_vnum(raw_v)
+        except ValueError:
+            room.pop("vnum", None)
+            continue
+        if vnum in taken:
+            room.pop("vnum", None)
+            continue
+        taken.add(vnum)
+
+    # Pass 2: resolve duplicate storage keys (the boot crash surface).
+    for file_ord, filename, data, idx, room in records:
+        key = str(room.get("key") or "").strip()
+        title = room.get("title")
+        owner = (file_ord, idx)
+
+        if key in key_owner and key_owner[key] != owner:
+            old_key = key
+            new_vnum = allocate_vnum_for_name(old_key, title, taken=taken)
+            leg = str(room.get("legacy_key") or "").strip()
+            if not leg or leg == old_key:
+                room["legacy_key"] = old_key
+            room["vnum"] = new_vnum
+            room["key"] = new_vnum
+            _rewrite_hand_room_refs_in_doc(data, old_key, new_vnum)
+            key = new_vnum
+            taken.add(new_vnum)
+            logs.append(
+                f"{filename}: remapped hand room {old_key!r} -> {new_vnum!r} "
+                "(global key collision)"
+            )
+
+        key_owner[key] = owner
+
+    return logs
 
 
 def lookup_room(game, key):

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from typing import Callable, Optional
 
 from engine.gateway_protocol import (
@@ -189,6 +190,71 @@ class GatewayBridge:
         self._send_lock = asyncio.Lock()
         # World heartbeat starts after welcome/reattach (not at process boot).
         self._tick_loop_started = False
+        self._last_gateway_frame_at = 0.0
+
+    def _ipc_ping_interval_seconds(self) -> float:
+        raw = (os.environ.get("GAME_GATEWAY_IPC_PING_SECONDS") or "").strip()
+        try:
+            value = float(raw) if raw else 15.0
+        except ValueError:
+            value = 15.0
+        return max(5.0, value)
+
+    def _ipc_stale_seconds(self) -> float:
+        raw = (os.environ.get("GAME_GATEWAY_IPC_STALE_SECONDS") or "").strip()
+        try:
+            value = float(raw) if raw else 45.0
+        except ValueError:
+            value = 45.0
+        ping = self._ipc_ping_interval_seconds()
+        return max(ping + 5.0, value)
+
+    async def _ipc_watchdog_loop(self) -> None:
+        """Exit the game process when gateway IPC stops responding.
+
+        Split-brain recovery: ticks may continue while the gateway lost the
+        IPC writer — periodic ping + stale detection forces watcher respawn.
+        """
+        interval = self._ipc_ping_interval_seconds()
+        stale_limit = self._ipc_stale_seconds()
+        while True:
+            await asyncio.sleep(interval)
+            writer = self.writer
+            if writer is None or writer.is_closing():
+                return
+            now = time.monotonic()
+            if (
+                self._tick_loop_started
+                and self._last_gateway_frame_at > 0
+                and (now - self._last_gateway_frame_at) > stale_limit
+            ):
+                print(
+                    f"[gateway_client] no gateway IPC frame for "
+                    f"{now - self._last_gateway_frame_at:.0f}s "
+                    "-- exiting for watcher respawn",
+                    flush=True,
+                )
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+                return
+            try:
+                await self.send_frame(encode_ctrl({"op": "ping"}))
+            except (
+                asyncio.IncompleteReadError,
+                ConnectionError,
+                OSError,
+            ):
+                print(
+                    "[gateway_client] IPC ping failed -- exiting",
+                    flush=True,
+                )
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+                return
 
     def _ensure_tick_loop(self) -> None:
         """Start game.tick_loop once, after held clients are rebound.
@@ -316,11 +382,18 @@ class GatewayBridge:
         await self.send_frame(encode_ctrl({"op": "hello"}))
         print(f"[gateway_client] connected to {host}:{port}", flush=True)
 
+        self._last_gateway_frame_at = time.monotonic()
+        watchdog = asyncio.create_task(
+            self._ipc_watchdog_loop(),
+            name="gateway-ipc-watchdog",
+        )
+
         try:
             while True:
                 ftype, sid, payload = await read_frame(self.reader)
                 if ftype is None:
                     break
+                self._last_gateway_frame_at = time.monotonic()
                 if ftype == TYPE_CTRL:
                     await self._on_ctrl(payload or {})
                 elif ftype == TYPE_DATA and sid:
@@ -330,6 +403,11 @@ class GatewayBridge:
         except (asyncio.IncompleteReadError, ConnectionError, OSError) as exc:
             print(f"[gateway_client] IPC ended: {exc}", flush=True)
         finally:
+            watchdog.cancel()
+            try:
+                await watchdog
+            except asyncio.CancelledError:
+                pass
             # Do not disconnect characters — gateway still holds sockets.
             # Cancel play tasks only; leave Echo conversion to real client close.
             for sid, session in list(self._sessions.items()):
@@ -355,8 +433,6 @@ class GatewayBridge:
             ]
             if held:
                 self._begin_gateway_copyover_reattach()
-                from engine import deploy_notify
-                deploy_notify.announce_world_stitching(self.game)
                 await self.notify_boot_warming(True)
             for entry in msg.get("sessions") or []:
                 sid = entry.get("sid")

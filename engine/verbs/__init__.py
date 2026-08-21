@@ -20,6 +20,7 @@ flavor; Phase 2 forbids that outright (see basic.py's module docstring) --
 those flavor sites now go through `engine.hooks` instead, which SUPERS
 wires up at boot without this package ever needing to know SUPERS exists.
 """
+from .channels import cmd_block, cmd_blocks, cmd_chans, cmd_unblock
 from .basic import (
     cmd_account,
     cmd_alias,
@@ -44,6 +45,7 @@ from .basic import (
     cmd_go_out,
     cmd_group,
     cmd_hedit,
+    cmd_hrefresh,
     cmd_help,
     cmd_helpsubmit,
     cmd_idlemode,
@@ -120,6 +122,10 @@ ENGINE_COMMANDS = {
     "reply":     (cmd_reply,     "tell back to whoever last told you (reply hi)"),
     "r":         (cmd_reply,     "short for reply -- tell back to whoever last told you"),
     "ooc":       (cmd_ooc,       "global out-of-character chat; bare ooc shows the last 20 lines"),
+    "block":     (cmd_block,     "block an account on OOC/public channels (not IC say/tell; see help block)"),
+    "unblock":   (cmd_unblock,   "clear an OOC/public-channel block (see help block)"),
+    "blocks":    (cmd_blocks,    "list accounts you block on OOC/public channels"),
+    "chans":     (cmd_chans,     "create or manage player public chat channels (see help chans)"),
     "follow":    (cmd_follow,    "follow <name> when they move; bare follow stops (see 'help follow')"),
     "unfollow":  (cmd_unfollow,  "stop following whoever you are following"),
     "group":     (cmd_group,     "party roster + Group wants + row (see 'help group')"),
@@ -151,9 +157,10 @@ ENGINE_COMMANDS = {
     "typos":     (cmd_typos,     "list your open typo reports (see 'help typo')"),
     "helpsubmit": (cmd_helpsubmit, "propose new help content for staff review (see 'help helpsubmit')"),
     "hedit":     (cmd_hedit,     "GM: hot-edit a help page live, no deploy (see 'help hedit')"),
+    "hrefresh":  (cmd_hrefresh,  "GM: refresh a hedit overlay from static help (see 'help hrefresh')"),
     "reports":   (cmd_reports,   "GM: list bug/idea reports; reports show <kind> <id> for one ticket"),
     "resolve":   (cmd_resolve,   "GM: mark bug/suggestion/help-idea resolved (or open/rejected)"),
-    "changes":   (cmd_changes,   "recent changelog; changes 1 = newest full text; changes all for scrollback; GMs: changes ops (help changes)"),
+    "changes":   (cmd_changes,   "recent changelog (global top 10; * = new); changes new | changes all; GMs: changes ops (help changes)"),
     "commands":  (cmd_commands,  "list every verb with a one-line tip"),
     "help":      (cmd_help,      "topic index, or help <topic|command> for one page"),
     "quit":      (cmd_quit,      "disconnect; your body stays as an Echo (see 'help echo')"),

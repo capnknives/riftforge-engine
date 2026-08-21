@@ -31,14 +31,23 @@ def _breachable_targets(room):
     return out
 
 
+def _rng_uniform(rng):
+    """Return a 0..1 roll from ``random.random``, a ``Random`` instance, or callable."""
+    if rng is None:
+        return random.random()
+    if isinstance(rng, random.Random):
+        return rng.random()
+    if callable(rng):
+        return float(rng())
+    return random.random()
+
+
 def pick_slam_target(room, *, rng=None):
     """Choose a breachable ``slam_targets`` entry, or ``None``."""
     targets = _breachable_targets(room)
     if not targets:
         return None
-    if rng is None:
-        rng = random.random
-    roll = rng()
+    roll = _rng_uniform(rng)
     idx = int(roll * len(targets)) % len(targets)
     return dict(targets[idx])
 

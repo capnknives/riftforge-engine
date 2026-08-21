@@ -9,6 +9,8 @@ Env (optional):
 
 - ``RIFTFORGE_STABLE_TICKS`` -- consecutive post_tick stamps required
   (default ``10``).
+- ``RIFTFORGE_BOOT_TICK_WARMUP`` -- suppress ``[tick]`` / cadence cap
+  stderr for the first N heartbeats after boot (default ``10``; ``0`` = off).
 """
 
 from __future__ import annotations
@@ -170,6 +172,28 @@ def mark_boot_finished():
 def boot_finished():
     """True once this game child finished ``Game.__init__``."""
     return _boot_finished
+
+
+def boot_tick_warmup_ticks():
+    """Heartbeats after boot where slow-tick stderr is expected noise."""
+    raw = (os.environ.get("RIFTFORGE_BOOT_TICK_WARMUP") or "10").strip()
+    if not raw:
+        return 10
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 10
+
+
+def tick_stderr_warmup_active(game):
+    """True while post-boot heartbeats should not spam slow-tick stderr."""
+    warmup = boot_tick_warmup_ticks()
+    if warmup <= 0:
+        return False
+    if not _boot_finished:
+        return True
+    tick = int(getattr(game, "game_time_ticks", 0) or 0)
+    return tick <= warmup
 
 
 def reset_post_tick_counter():

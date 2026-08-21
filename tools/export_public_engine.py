@@ -68,14 +68,14 @@ briefs, body parts, content kinds, travel, economy, …). Game-specific lore,
 catalogs, and prose live in a **separate** consumer repo and pin **tagged
 releases** of this package.
 
-**Current release: [`v0.5.3`](https://github.com/capnknives/riftforge-engine/releases/tag/v0.5.3)** — street-collapse FSM (`engine/systems/collapse.py`), robbery till peel via `attempt_theft` + `justice_on_robbery`, civic `fixture_id` registry mirror. Builds on **`v0.5.2`** (mine/chargen hooks + maps peel) and **`v0.5.1`** (body-parts demo, clinic strangler hooks). Pin `@v0.5.3` until the next semver tag ships from `main`.
+**Current release: [`v0.6.0`](https://github.com/capnknives/riftforge-engine/releases/tag/v0.6.0)** — command-dispatch hook peel, universal closable doors, copyover cache + boot-content gates, channel speech block hook, Discord ops restore hook, lag/cooperative-save hardening since `v0.5.3`. Pin `@v0.6.0` until the next semver tag ships from `main`.
 
 ## Install
 
 ```bash
 pip install -e .
 # or pin from another project:
-#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.5.3
+#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.6.0
 ```
 
 Requires **Python 3.11+**.

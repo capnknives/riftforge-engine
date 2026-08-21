@@ -47,10 +47,20 @@ DEFAULT_DELAY_TICKS = {
     # P2 — kit verbs
     "chemistry_kit": 15,
     "electronics_kit": 15,
+    "emf": 8,
     # Social / lifestyle (migrated from ad-hoc cooldowns)
     "grill": 12,
     "haggle": 8,
     "herb_smoke": 40,
+    "fish": 14,
+    "fish_tie": 8,
+    "fillet": 10,
+    "farm": 16,
+    "hunt": 18,
+    "butcher": 12,
+    "smoke": 20,
+    "apothecary": 24,
+    "ferment": 36,
 }
 
 # Player-facing verb family labels for refusal lines.
@@ -80,9 +90,19 @@ VERB_LABELS = {
     "disguise": "disguise",
     "chemistry_kit": "chemistry kits",
     "electronics_kit": "electronics kits",
+    "emf": "EMF sweeps",
     "grill": "grilling a witness",
     "haggle": "haggling",
     "herb_smoke": "smoking herbs",
+    "fish": "fishing",
+    "fish_tie": "tying a fly",
+    "fillet": "filleting",
+    "farm": "farm work",
+    "hunt": "hunting",
+    "butcher": "butchering",
+    "smoke": "smoking",
+    "apothecary": "apothecary work",
+    "ferment": "fermenting",
 }
 
 

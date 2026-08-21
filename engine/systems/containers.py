@@ -39,6 +39,11 @@ OPEN_FULL = (
     f"({OPEN_INVENTORY_CAPACITY} stacks). Stow something, wear a backpack, "
     "or drop gear."
 )
+LOOT_BAG_HANDS_FULL = (
+    "Your hands are full "
+    f"({OPEN_INVENTORY_CAPACITY} stacks). Stow something or drop gear "
+    "before picking that up."
+)
 LOOT_BAG_FULL = (
     "Your backpack is full. Make room or stash overflow at home "
     "(help stash)."
@@ -715,6 +720,11 @@ def open_stack_keys(character):
     """Distinct stack keys currently in open inventory."""
     keys = OrderedDict()
     for piece in _surface_items(character):
+        # Worn bags are already hidden from surface inventory; loose bags are
+        # containers, not pocket stacks — they must not consume the open cap
+        # (bug report 616: drop kit bag, hands full, cannot get it back).
+        if is_bag_item(piece):
+            continue
         keys.setdefault(stack_key(piece, character), True)
     return keys
 
@@ -745,6 +755,8 @@ def pickup_needs_new_open_stack(character, item):
     separate rows (bug reports 329 / 350). Those pickups still need a free
     stack slot even when ``open_inventory_would_add_stack`` is false.
     """
+    if is_bag_item(item):
+        return False
     if open_inventory_would_add_stack(character, item):
         return True
     return not _item_stack_merge_eligible(item)
@@ -922,6 +934,11 @@ def open_inventory_refusal(character, item):
         return None
     if hooks_mod.containers_is_gear_item(item):
         return hooks_mod.containers_gear_acquire_refusal(character, item)
+    if is_bag_item(item):
+        cap_refusal = weight_volume_refusal(character, item, viewer=character)
+        if cap_refusal:
+            return cap_refusal
+        return None
     cap_refusal = weight_volume_refusal(character, item, viewer=character)
     if cap_refusal:
         return cap_refusal
@@ -932,7 +949,7 @@ def open_inventory_refusal(character, item):
             pickup_needs_new_open_stack(character, item)
             and open_inventory_stack_count(character) >= OPEN_INVENTORY_CAPACITY
         ):
-            return LOOT_BAG_TOO_LARGE
+            return LOOT_BAG_HANDS_FULL
         return None
     if designated_loot_bag(character) is None:
         return NO_LOOT_BAG
@@ -948,6 +965,26 @@ def acquire_refusal(character, item):
     if relic_refusal:
         return relic_refusal
     return open_inventory_refusal(character, item)
+
+
+def resolve_worn_bag_slot(character, bag_item):
+    """Return ``back`` or ``shoulder`` for a worn bag Item.
+
+    Prefer ``container_worn``; fall back to the live containers map when
+    strip/heal cleared the flag but left a stale slot ref (bug report 602).
+    Syncs ``container_worn`` when the map is authoritative.
+    """
+    if character is None or bag_item is None:
+        return None
+    worn = getattr(bag_item, "container_worn", None)
+    if worn in CONTAINER_SLOTS:
+        return worn
+    containers = ensure_containers_map(character)
+    for slot in CONTAINER_SLOTS:
+        if containers.get(slot) is bag_item:
+            bag_item.container_worn = slot
+            return slot
+    return None
 
 
 def designated_gear_bag(character):
@@ -1103,6 +1140,39 @@ def migrate_virtual_gear_bag(character):
     character.gear_bag = []
 
 
+def collapse_duplicate_kit_bags(character):
+    """Keep one kit bag (prefer worn); merge duplicate bag contents in place."""
+    if character is None:
+        return 0
+    inv = getattr(character, "inventory", None)
+    if not inv:
+        return 0
+    extras = [item for item in list(inv) if is_gear_bag_item(item)]
+    if not extras:
+        return 0
+    primary = designated_gear_bag(character)
+    if primary is None:
+        primary = extras[0]
+        wear_bag(character, primary, "back")
+    removed = 0
+    containers = ensure_containers_map(character)
+    for bag in extras:
+        if bag is primary:
+            continue
+        for piece in list(bag_contents(bag)):
+            bag_contents(primary).append(piece)
+        if bag in inv:
+            inv.remove(bag)
+        for slot in CONTAINER_SLOTS:
+            if containers.get(slot) is bag:
+                containers[slot] = None
+        removed += 1
+    if removed:
+        rebind_containers_from_inventory(character)
+        consolidate_gear_bag_stacks(character)
+    return removed
+
+
 def heal_character_kit_bag(character):
     """Idempotent: every character gets a worn starter kit bag + migration."""
     if character is None:
@@ -1113,6 +1183,7 @@ def heal_character_kit_bag(character):
         grant_and_wear_starter_kit_bag(character)
     else:
         migrate_virtual_gear_bag(character)
+    collapse_duplicate_kit_bags(character)
     rebind_containers_from_inventory(character)
     return True
 

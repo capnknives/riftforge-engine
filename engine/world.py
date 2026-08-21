@@ -367,7 +367,19 @@ class Room(GameObject):
                 return generic
         if title:
             return str(title).strip()
-        return self.key
+        key = getattr(self, "key", "") or ""
+        # Phase 3 rekeys use VNUM as storage id -- never show bare codes in
+        # look / walk / who (bug report 652: walk homestead → J00001).
+        from engine.room_vnum import label_is_bare_vnum
+
+        if label_is_bare_vnum(key):
+            if getattr(self, "private_home", False) or getattr(self, "is_home", False):
+                return "Private Home"
+            generic = generic_title_from_flags(self)
+            if generic:
+                return generic
+            return "Somewhere"
+        return key
 
     def add(self, obj):
         # Put an object in this room, but guard against adding it twice.

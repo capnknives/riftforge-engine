@@ -46,6 +46,7 @@ _after_new_character = None
 # Runs for reconnects AND brand-new characters, after the Session is
 # wired and the character is in the world, before play()/first look.
 _after_session_attach = None
+_after_session_attach_deferred = None
 
 # Optional pre-Echo Session-detach side effect (connection log, ...).
 # Runs while the Character still has session-linked fields intact --
@@ -80,6 +81,10 @@ _help_categories = []
 # supers.verbs) -- routing through this hook keeps npc_act.py from ever
 # importing that module directly (Phase 2 purity gate).
 _dispatch = None
+
+# Optional game-owned verb gates (cage hold, vessel passenger, combat KO, …).
+# fn(character, verb, args, game) -> (blocked: bool, message: str|None).
+_command_dispatch_gate = None
 
 # --- Phase 2 game-flavor hooks -------------------------------------------
 # The hooks below are the small, single-purpose extension points that
@@ -149,6 +154,16 @@ _look_exit_visible = None
 # (dual-layer virtual wilderness exits point at self).
 _look_exit_dest_label = None
 
+# Optional look exit door-closed flag. fn(room, direction, dest, game=None,
+# character=None) -> bool. When True, look/exits mark the exit sealed.
+_look_exit_door_closed = None
+
+# Trickster site mask: filter pocket zone_entries per viewer.
+_filter_zone_entries = None
+
+# Per-viewer exit hide (shrine fold). fn(viewer, room, direction, dest, game) -> bool.
+_look_exit_hidden_from_viewer = None
+
 # Cancel any in-progress "awake rest" state -- movement/combat interrupts it.
 # fn(character) -> None (side-effecting only; no return value used).
 _cancel_rest = None
@@ -209,6 +224,16 @@ _can_see_hellhound = None
 # fn(viewer, other) -> bool when other is hidden but swinging at viewer.
 _can_target_hidden_attacker = None
 _can_notice_stealth = None
+# Staff gm-on look pierce for hidden presences (stealth, etc.) -- tagged
+# ``(hidden)`` instead of omitted. fn(viewer, other) -> bool.
+_staff_tags_hidden_presence = None
+
+# Trickster "laying low" withdraw pierce (bug report 632: a trickster
+# folded into their shrine while an archangel wears their face should not
+# stand around in plain sight for casual onlookers). Default (no game
+# installed): True -- bare engine has no trickster kit, so nobody is hidden
+# by this hook. fn(viewer, other) -> bool.
+_can_perceive_trickster_laylow = None
 
 # Veil-layer membership + sight pierce (death spirits, faded Ghosts, veiled
 # Reapers, vessel-free Mantle walks share Prime's XYZ map but not its
@@ -218,6 +243,7 @@ _can_notice_stealth = None
 _in_veil = None
 _veil_visible_to = None
 _veil_look_tag = None
+_veil_soul_label = None
 
 # Dark-room sight gate (D67): can `character` see in a dark room without
 # a carried light? Engine default is False (torch required). SUPERS
@@ -289,6 +315,14 @@ _extra_target_match_needles = None
 # fn(viewer, subject) -> str | None.
 _look_body_for = None
 
+# Registered combat helper that cannot be targeted (owner's pet/minion).
+# fn(character) -> bool. Default False when no game is installed.
+_is_untargetable_helper = None
+
+# Chargen placement when ``chargen_start_room_key`` did not resolve.
+# fn(character, game) -> Room | None. Default None when no game is installed.
+_chargen_fallback_start_room = None
+
 # Room-entry spawn/aggro rolls (wilderness hostiles, procedural dungeons,
 # idle-hostile aggro). fn(game, room) -> None (side-effecting only).
 _encounter_check = None
@@ -306,6 +340,14 @@ _ensure_game_defaults = None
 # protect-restore. fn() -> {name: count}.
 _boot_content_heal = None
 
+# Pre-boot content validation (P3) before ``build_world``. fn() -> None;
+# raises on bad catalogs / JSON syntax.
+_boot_content_gate = None
+
+# Drop in-memory catalog caches before copyover reload (dungeon catalog +
+# bestiary registry). fn() -> None. Default no-op when no game is installed.
+_clear_content_caches_for_copyover = None
+
 # Re-derive a character's max HP (used after un-spiriting a character whose
 # body was lost on load -- see engine/persistence.py's load_world).
 # fn(character) -> None (mutates character.hp in place).
@@ -315,6 +357,11 @@ _recompute_hp = None
 # heal marooned afterlife desk flags / Heaven location (bug #387).
 # fn(character, game) -> None.
 _heal_force_unspirit = None
+
+# When Item corpse relink fails, try living-husk Character relink before
+# force-unspirit (embodiment matrix Phase 3).
+# fn(game, character) -> bool (True when relinked).
+_relink_living_husk_body = None
 
 # Per-character load normalization (home stamps, vehicle board flags) after
 # equipment rebind in ``load_world`` -- boot lifecycle Phase C.
@@ -485,6 +532,37 @@ def boot_content_heal():
     return {}
 
 
+def set_boot_content_gate(fn):
+    """Register fn() -> None that validates on-disk catalogs before world load.
+
+    Pass None to restore the no-op default (lean engine / tests).
+    """
+    global _boot_content_gate
+    _boot_content_gate = fn
+
+
+def boot_content_gate():
+    """Return the registered pre-boot validator, or None."""
+    return _boot_content_gate
+
+
+def set_clear_content_caches_for_copyover(fn):
+    """Register fn() -> None to flush stale in-memory catalog caches.
+
+    Used by engine/copyover.py before reload_world_save_modules so mouth
+    alignment reads fresh dungeon catalog + bestiary after auto-deploy
+    overlays. Pass None to restore the no-op default.
+    """
+    global _clear_content_caches_for_copyover
+    _clear_content_caches_for_copyover = fn
+
+
+def clear_content_caches_for_copyover():
+    """Flush game-owned catalog caches before a copyover snapshot reload."""
+    if _clear_content_caches_for_copyover is not None:
+        _clear_content_caches_for_copyover()
+
+
 def set_recompute_hp(fn):
     """Register fn(character) that mutates character.hp back to its max
     (SUPERS: supers.stats.max_hp). Pass None to restore the no-op default.
@@ -512,6 +590,19 @@ def heal_force_unspirit(character, game=None):
         _heal_force_unspirit(character, game)
 
 
+def set_relink_living_husk_body(fn):
+    """Register fn(game, character) -> bool for living-husk body relink."""
+    global _relink_living_husk_body
+    _relink_living_husk_body = fn
+
+
+def relink_living_husk_body(game, character):
+    """Try living-husk relink when Item corpse lookup failed on load."""
+    if _relink_living_husk_body is not None:
+        return bool(_relink_living_husk_body(game, character))
+    return False
+
+
 def set_normalize_character_after_load(fn):
     """Register fn(character, game) after persistence load + equipment rebind."""
     global _normalize_character_after_load
@@ -525,6 +616,26 @@ def normalize_character_after_load(character, game=None):
 
 
 _gateway_resume_hook = None  # fn(game) -> None, or an awaitable -- see setter.
+_should_skip_map_missing_stub_heal = None  # fn(character) -> bool
+
+
+def set_should_skip_map_missing_stub_heal(fn):
+    """Register fn(character) -> bool for ``heal_map_missing_stub_occupants``.
+
+    When True, boot must not yank the body to home/start -- an ephemeral
+    instance run (Slumber Depths, pit, Drift, …) will rebuild the floor
+    instead. SUPERS registers this in ``bootstrap.register_all_hooks``.
+    Pass None to restore the default (never skip).
+    """
+    global _should_skip_map_missing_stub_heal
+    _should_skip_map_missing_stub_heal = fn
+
+
+def should_skip_map_missing_stub_heal(character):
+    """True when persistence stub-heal must leave the body for resume."""
+    if _should_skip_map_missing_stub_heal is None:
+        return False
+    return bool(_should_skip_map_missing_stub_heal(character))
 
 
 def set_gateway_resume_hook(fn):
@@ -865,6 +976,23 @@ def after_session_attach(character, game):
         _after_session_attach(character, game)
 
 
+def set_after_session_attach_deferred(fn):
+    """Register fn(character, game) for post-look login attach work.
+
+    Heavy hooks (mail, vehicles, quest spawns, …) run from ``play()`` after
+    the first ``look`` so character select does not wedge the asyncio loop.
+    Pass None to restore the no-op default.
+    """
+    global _after_session_attach_deferred
+    _after_session_attach_deferred = fn
+
+
+def after_session_attach_deferred(character, game):
+    """Run deferred Session-attach hooks after the first room look."""
+    if _after_session_attach_deferred is not None:
+        _after_session_attach_deferred(character, game)
+
+
 def set_on_session_disconnect(fn):
     """Register fn(character, game, *, to_echo=True) before Session detach.
 
@@ -1072,6 +1200,109 @@ def set_dispatch(fn):
 def get_dispatch():
     """Return the registered dispatcher, or None if none is set yet."""
     return _dispatch
+
+
+def set_command_dispatch_gate(fn):
+    """Register fn(character, verb, args, game) -> (blocked, message|None).
+
+    Pass None to restore the default (never blocks). SUPERS registers
+    cage / vessel / KO gates from ``supers.dispatch_gates``.
+    """
+    global _command_dispatch_gate
+    _command_dispatch_gate = fn
+
+
+def command_dispatch_gate(character, verb, args, game):
+    """Run the game-owned dispatch gate, if any."""
+    if _command_dispatch_gate is not None:
+        return _command_dispatch_gate(character, verb, args, game)
+    return False, None
+
+
+_dispatch_on_input = None
+_dispatch_idlemode_wake = None
+_resolve_dispatch_actor = None
+_pre_command_handler = None
+_post_command_handler = None
+_verb_disable_bypass = None
+
+
+def set_dispatch_on_input(fn):
+    """Register fn(character, verb, game) for idle stamp + walk interrupt."""
+    global _dispatch_on_input
+    _dispatch_on_input = fn
+
+
+def dispatch_on_input(character, verb, game):
+    """Run game-owned dispatch input side effects, if any."""
+    if _dispatch_on_input is not None:
+        _dispatch_on_input(character, verb, game)
+
+
+def set_dispatch_idlemode_wake(fn):
+    """Register fn(character, verb, game) -> bool (True = stop dispatch)."""
+    global _dispatch_idlemode_wake
+    _dispatch_idlemode_wake = fn
+
+
+def try_idlemode_wake_dispatch(character, verb, game):
+    """Maybe wake idlemode; return True when dispatch should return early."""
+    if _dispatch_idlemode_wake is not None:
+        return _dispatch_idlemode_wake(character, verb, game)
+    return False
+
+
+def set_resolve_dispatch_actor(fn):
+    """Register fn(character, verb, game, force_actor) -> actor Character."""
+    global _resolve_dispatch_actor
+    _resolve_dispatch_actor = fn
+
+
+def resolve_dispatch_actor(character, verb, game, force_actor=None):
+    """Resolve which body runs the verb (login, twin, ghost host, …)."""
+    if _resolve_dispatch_actor is not None:
+        return _resolve_dispatch_actor(
+            character, verb, game, force_actor=force_actor,
+        )
+    return force_actor if force_actor is not None else character
+
+
+def set_pre_command_handler(fn):
+    """Register fn(actor, verb, game) -> twin_owner|None before handler."""
+    global _pre_command_handler
+    _pre_command_handler = fn
+
+
+def pre_command_handler(actor, verb, game):
+    """Game hook before a matched handler runs."""
+    if _pre_command_handler is not None:
+        return _pre_command_handler(actor, verb, game)
+    return None
+
+
+def set_post_command_handler(fn):
+    """Register fn(twin_owner, actor, game) after handler."""
+    global _post_command_handler
+    _post_command_handler = fn
+
+
+def post_command_handler(twin_owner, actor, game):
+    """Game hook after a matched handler runs."""
+    if _post_command_handler is not None:
+        _post_command_handler(twin_owner, actor, game)
+
+
+def set_verb_disable_bypass(fn):
+    """Register fn(game, verb, actor) -> bool for disabled-verb bypass."""
+    global _verb_disable_bypass
+    _verb_disable_bypass = fn
+
+
+def verb_disable_bypass(game, verb, actor):
+    """True when a staff-disabled verb should still run for this actor."""
+    if _verb_disable_bypass is not None:
+        return _verb_disable_bypass(game, verb, actor)
+    return False
 
 
 def set_eclipse_ambient_line(fn):
@@ -1609,6 +1840,44 @@ def look_exit_visible(dest, game):
     return True
 
 
+def set_filter_zone_entries(fn):
+    """Register fn(viewer, room, entries, game) -> filtered entries dict."""
+    global _filter_zone_entries
+    _filter_zone_entries = fn
+
+
+def filter_zone_entries(viewer, room, entries, game):
+    """Return zone_entries visible to viewer (site mask may hide hubs)."""
+    base = dict(entries or {})
+    if _filter_zone_entries is None:
+        return base
+    try:
+        return dict(_filter_zone_entries(viewer, room, base, game) or base)
+    except TypeError:
+        return dict(_filter_zone_entries(viewer, room, base) or base)
+
+
+def set_look_exit_hidden_from_viewer(fn):
+    """Register fn(viewer, room, direction, dest, game) -> bool (True hides)."""
+    global _look_exit_hidden_from_viewer
+    _look_exit_hidden_from_viewer = fn
+
+
+def look_exit_hidden_from_viewer(viewer, room, direction, dest, game):
+    if _look_exit_hidden_from_viewer is None:
+        return False
+    try:
+        return bool(
+            _look_exit_hidden_from_viewer(
+                viewer, room, direction, dest, game,
+            )
+        )
+    except TypeError:
+        return bool(
+            _look_exit_hidden_from_viewer(viewer, room, direction, dest)
+        )
+
+
 def set_look_exit_dest_label(fn):
     """Register optional look exit destination label rewriter.
 
@@ -1635,6 +1904,31 @@ def look_exit_dest_label(room, direction, dest, game=None, character=None):
             return _look_exit_dest_label(room, direction, dest, game)
         except TypeError:
             return _look_exit_dest_label(room, direction, dest)
+
+
+def set_look_exit_door_closed(fn):
+    """Register fn(room, direction, dest, game=None, character=None) -> bool."""
+    global _look_exit_door_closed
+    _look_exit_door_closed = fn
+
+
+def look_exit_door_closed(room, direction, dest, game=None, character=None):
+    """True when look/exits should show this exit as door-closed."""
+    if _look_exit_door_closed is None:
+        return False
+    try:
+        return bool(
+            _look_exit_door_closed(
+                room, direction, dest, game=game, character=character,
+            )
+        )
+    except TypeError:
+        try:
+            return bool(
+                _look_exit_door_closed(room, direction, dest, game)
+            )
+        except TypeError:
+            return bool(_look_exit_door_closed(room, direction, dest))
 
 
 def set_cancel_rest(fn):
@@ -1926,6 +2220,46 @@ def can_target_hidden_attacker(viewer, other):
     return True
 
 
+def set_is_untargetable_helper(fn):
+    """Register fn(character) -> bool for registered combat helpers.
+
+    Pass None to restore the default: helpers are targetable (False).
+    """
+    global _is_untargetable_helper
+    _is_untargetable_helper = fn
+
+
+def is_untargetable_helper(character):
+    """True when ``character`` is a registered combat helper (game-owned).
+
+    Default (no game installed): False. SUPERS registers from
+    ``supers.combat_helpers``.
+    """
+    if _is_untargetable_helper is not None:
+        return bool(_is_untargetable_helper(character))
+    return False
+
+
+def set_chargen_fallback_start_room(fn):
+    """Register fn(character, game) -> Room | None for post-chargen placement.
+
+    Pass None to restore the default: no game-specific fallback room.
+    """
+    global _chargen_fallback_start_room
+    _chargen_fallback_start_room = fn
+
+
+def chargen_fallback_start_room(character, game):
+    """Resolve a start room when chargen room key lookup failed.
+
+    Default (no game installed): None. SUPERS may register tutorial-specific
+    rooms (e.g. vampire nest when Lebanon homezones are still wiring).
+    """
+    if _chargen_fallback_start_room is not None:
+        return _chargen_fallback_start_room(character, game)
+    return None
+
+
 def set_in_veil(fn):
     """Register fn(character) -> bool for the Veil-layer membership check.
 
@@ -1985,6 +2319,19 @@ def veil_look_tag():
     return ""
 
 
+def set_veil_soul_label(fn):
+    """Register fn(viewer, other, base_label) -> str for Veil look lines."""
+    global _veil_soul_label
+    _veil_soul_label = fn
+
+
+def veil_soul_label(viewer, other, base_label: str) -> str:
+    """Face label for a Veil occupant in look / scan (perception axis)."""
+    if _veil_soul_label is not None:
+        return _veil_soul_label(viewer, other, base_label)
+    return f"{veil_look_tag()} {base_label}".strip()
+
+
 def set_can_notice_stealth(fn):
     """Register fn(viewer, other, game=None) -> bool for hide/sneak pierce."""
     global _can_notice_stealth
@@ -1998,6 +2345,39 @@ def can_notice_stealth(viewer, other, game=None):
     if _can_notice_stealth is not None:
         return bool(_can_notice_stealth(viewer, other, game))
     return True
+
+
+def set_can_perceive_trickster_laylow(fn):
+    """Register fn(viewer, other) -> bool for trickster lay-low pierce."""
+    global _can_perceive_trickster_laylow
+    _can_perceive_trickster_laylow = fn
+
+
+def can_perceive_trickster_laylow(viewer, other):
+    """Can `viewer` see `other` while `other` is laying low (withdrawn)?
+
+    Default (no game installed): True -- bare engine has no trickster kit.
+    SUPERS registers ``trickster_laylow.pierce_lay_low`` (staff, research
+    intel, hunter field codex, or a tier-3+ angel's grace-sight).
+    """
+    if viewer is other:
+        return True
+    if _can_perceive_trickster_laylow is not None:
+        return bool(_can_perceive_trickster_laylow(viewer, other))
+    return True
+
+
+def set_staff_tags_hidden_presence(fn):
+    """Register fn(viewer, other) -> bool for gm-on look (hidden) tags."""
+    global _staff_tags_hidden_presence
+    _staff_tags_hidden_presence = fn
+
+
+def staff_tags_hidden_presence(viewer, other):
+    """True when staff in gm on should see a hidden body in look tagged."""
+    if _staff_tags_hidden_presence is not None:
+        return bool(_staff_tags_hidden_presence(viewer, other))
+    return False
 
 
 def set_can_see_in_dark(fn):
@@ -2218,6 +2598,25 @@ def set_account_roster_label_for(fn):
     _account_roster_label_for = fn
 
 
+def _engine_roster_identity_tag(body):
+    """Minimal Origin / Path / Aspect tag when no game hook is registered.
+
+    Uses raw field ids (title-cased) so login still shows *something* after
+    ``importlib.reload(hooks)`` clears bootstrap callbacks mid-process.
+    """
+    if body is None:
+        return ""
+    parts = []
+    for attr in ("origin", "path", "aspect"):
+        val = getattr(body, attr, None)
+        if val:
+            text = str(val).strip().replace("_", " ")
+            parts.append(text.title())
+    if not parts:
+        return "Human"
+    return " / ".join(parts)
+
+
 def account_roster_label_for(game, key, body=None):
     """Roster label for account menu / ``account`` command."""
     if _account_roster_label_for is not None:
@@ -2225,7 +2624,11 @@ def account_roster_label_for(game, key, body=None):
     from engine.command_support import _presence_face
 
     if body is not None:
-        return _presence_face(body)
+        face = _presence_face(body)
+        tag = _engine_roster_identity_tag(body)
+        if tag:
+            return f"{face} ({tag})"
+        return face
     return (key or "").strip() or "(unknown)"
 
 
@@ -2398,6 +2801,24 @@ def is_tutorial_incomplete_vault(game, name):
     if _is_tutorial_incomplete_vault is None:
         return False
     return bool(_is_tutorial_incomplete_vault(game, name))
+
+
+# Account-scoped mid-create resume rows (``account_chargen_draft``).
+# fn(game, name) -> bool
+_is_chargen_draft_vault = None
+
+
+def set_is_chargen_draft_vault(fn):
+    """Register fn(game, name) -> bool for create-flow draft vault rows."""
+    global _is_chargen_draft_vault
+    _is_chargen_draft_vault = fn
+
+
+def is_chargen_draft_vault(game, name):
+    """True when ``name`` is vaulted for incomplete account create flow."""
+    if _is_chargen_draft_vault is None:
+        return False
+    return bool(_is_chargen_draft_vault(game, name))
 
 
 # Chargen-draft vault + generic hard-fold extract (account_chargen_draft).
@@ -2591,6 +3012,7 @@ _try_exit_zone = None
 # After a HELP_TOPICS page is shown (authored quests gate on help topics).
 # fn(character, topic, game)
 _after_help_topic = None
+_refresh_help_overlay = None
 
 
 def set_map_center_room(fn):
@@ -2813,6 +3235,53 @@ def after_help_topic(character, topic, game):
     """Run the registered post-help-topic hook, or do nothing."""
     if _after_help_topic is not None:
         _after_help_topic(character, topic, game)
+
+
+def set_refresh_help_overlay(fn):
+    """Register fn(game, keyword, *, author) -> (ok, message) for GM hrefresh.
+
+    Pass None to restore the lean-engine fallback (static HELP_TOPICS only).
+    """
+    global _refresh_help_overlay
+    _refresh_help_overlay = fn
+
+
+def refresh_help_overlay(game, keyword, *, author="hrefresh"):
+    """Rewrite one help_db overlay from static HELP_TOPICS. Returns (ok, msg)."""
+    if _refresh_help_overlay is not None:
+        return _refresh_help_overlay(game, keyword, author=author)
+    from engine import help_sync as help_sync_mod
+
+    keyword = (keyword or "").strip().lower()
+    if not keyword:
+        return False, "missing keyword"
+    if keyword == "catalog" or keyword in ("paths", "path list", "pathlist"):
+        return (
+            False,
+            "paths catalog refresh needs the full game package.",
+        )
+    db = getattr(game, "db", None)
+    if db is None:
+        return False, "no database connection"
+    topics = get_help_topics()
+    body = topics.get(keyword)
+    if not body:
+        return False, f"no static help page for '{keyword}'"
+    category = ""
+    for category_name, entries in get_help_categories():
+        for topic_keyword, _blurb in entries:
+            if topic_keyword == keyword:
+                category = category_name
+                break
+        if category:
+            break
+    return help_sync_mod.push_static_topic(
+        db,
+        keyword,
+        body,
+        category=category,
+        author=author,
+    )
 
 
 # --- Weather / possession-exile / dungeon-entry (Phase 2 purity) ----------
@@ -4782,6 +5251,67 @@ def channel_audience_ok(viewer, audience_token, game):
     if _channel_audience_ok is not None:
         return bool(_channel_audience_ok(viewer, audience_token, game))
     return False
+
+
+_channel_speech_blocked = None
+
+
+def set_channel_speech_blocked(fn):
+    """Register fn(character, game) -> bool when speech must be blocked.
+
+    Pass None to restore the default (never blocked). SUPERS registers
+    archangel biokinesis mute from ``supers.archangel_powers``.
+    """
+    global _channel_speech_blocked
+    _channel_speech_blocked = fn
+
+
+def channel_speech_blocked(character, game):
+    """Run the game-owned channel speech block hook, if any."""
+    if _channel_speech_blocked is not None:
+        return bool(_channel_speech_blocked(character, game))
+    return False
+
+
+_default_mssp_description = None
+
+
+def set_default_mssp_description(fn):
+    """Register fn() -> str copied onto ``Game.mssp_description`` at boot.
+
+    Pass None to restore the empty default (``engine.mssp`` falls back to
+    ``RIFTFORGE_MSSP_DESCRIPTION`` or the generic engine-demo blurb).
+    """
+    global _default_mssp_description
+    _default_mssp_description = fn
+
+
+def default_mssp_description():
+    """Return the game-owned MSSP DESCRIPTION seed for ``Game.__init__``."""
+    if _default_mssp_description is not None:
+        return str(_default_mssp_description() or "")
+    return ""
+
+
+_discord_staff_op_executor = None
+
+
+def set_discord_staff_op_executor(fn):
+    """Register fn(game, op, args) -> (ok, message) for Discord #ops inbox.
+
+    Pass None to restore the default (unknown op). SUPERS wires GM restore
+    / revive parity from ``supers.discord_staff_ops_hooks``.
+    """
+    global _discord_staff_op_executor
+    _discord_staff_op_executor = fn
+
+
+def discord_staff_op_executor(game, op, args):
+    """Run a Discord staff ops mutation through the game hook, if any."""
+    if _discord_staff_op_executor is not None:
+        return _discord_staff_op_executor(game, op, args)
+    op_s = str(op or "").strip().lower()
+    return False, f"Unknown op {op_s!r}"
 
 
 # --- Mining system hooks (docs/plans/mine_system.md) -----------------------

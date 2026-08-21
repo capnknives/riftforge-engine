@@ -91,7 +91,7 @@ def render_ooc_line(character, face: str, message: str, *, kind: str = OOC_KIND_
     from engine import style
 
     display_prefs.ensure_display_defaults(character)
-    plain = format_ooc_line(face, message, kind=kind)
+    plain = display_prefs.format_ooc_chat(character, face, message, kind=kind)
     if getattr(character, "screenreader", False):
         return plain
     if not getattr(character, "use_color", True):
@@ -148,9 +148,12 @@ def broadcast_ooc(
         game, "ooc", entry, gateway_plain=public_plain,
     )
     delivered = False
+    from engine.accounts import ooc_should_hide_from_viewer
     for session in list(getattr(game, "sessions", None) or []):
         other = getattr(session, "character", None)
         if other is None:
+            continue
+        if ooc_should_hide_from_viewer(other, game, speaker.key):
             continue
         face = speaker_face_for_character(speaker, game, viewer=other)
         line = render_ooc_line(other, face, message, kind=kind)
@@ -195,10 +198,16 @@ def broadcast_ooc_from_discord(game, face: str, message: str) -> bool:
         game, "ooc", entry, gateway_plain=public_plain,
     )
     delivered = False
+    from engine.accounts import find_account, ooc_is_blocked, account_for_character
     for session in list(getattr(game, "sessions", None) or []):
         other = getattr(session, "character", None)
         if other is None:
             continue
+        listener = account_for_character(game, other)
+        if listener is not None:
+            discord_acct = find_account(game, face)
+            if discord_acct is not None and ooc_is_blocked(listener, discord_acct.name):
+                continue
         line = render_ooc_line(other, face, message)
         session.send(line)
         session.send("")

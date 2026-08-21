@@ -604,6 +604,8 @@ def _branch_room_entry(kind, room_key, title, living_key, back_dir,
     }
     if zone:
         entry["zone"] = zone
+    # Forward authoring: branch connects through a closable interior door.
+    entry["doors"] = [back_dir]
 
     if kind == "bedroom":
         entry["description"] = (

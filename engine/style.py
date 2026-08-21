@@ -26,7 +26,8 @@ Palette (#51 + the plan's named tags):
     direction-role base coexist with rare gothic accents inside one line
     (docs/plans/combat_color_gothic.md).
   - Semantic combat/chat roles (prefs #10 / #19 / #23): ``combat_out``,
-    ``combat_in``, ``combat_other``, ``combat_mitigate``, ``ooc``, ``alert``.
+    ``combat_in``, ``combat_other``, ``combat_mitigate``, ``ooc``, ``say``,
+    ``emote``, ``tell``, ``alert``.
     Combat direction VALUES are gothic parchment/blood/ash/steel (retuned
     2026-07-19 -- the old bright-cyan/teal pair read as sci-fi HUD).
 
@@ -94,6 +95,8 @@ COLORS = {
     "combat_mitigate": "\x1b[90m",
     "ooc": "\x1b[90m",
     "say": "\x1b[37m",
+    "emote": "\x1b[35m",
+    "tell": "\x1b[36m",
     "alert": "\x1b[93m",
     "prose": "\x1b[37m",
     "item": "\x1b[36m",
@@ -145,6 +148,8 @@ COLORS_XTERM256 = {
     "combat_mitigate": "\x1b[38;5;242m",
     "ooc": "\x1b[38;5;245m",
     "say": "\x1b[38;5;111m",
+    "emote": "\x1b[38;5;97m",
+    "tell": "\x1b[38;5;110m",
     "alert": "\x1b[38;5;220m",
     "prose": "\x1b[38;5;250m",
     "item": "\x1b[38;5;73m",
@@ -491,12 +496,14 @@ LOGIN_GAME_TITLE = "Mortals and Monsters"
 LOGIN_CREATOR = "CapnKnives"
 LOGIN_ENGINE = "Riftforge"
 LOGIN_STATUS = "Pre-alpha"
+# Community invite shown on the connect splash (staff override via gm gamestate).
+LOGIN_DISCORD_URL = "https://discord.gg/pyxTSc5Td"
 # Spaced title kept for the sighted who-list banner (brand continuity).
 # Login splash uses LOGIN_GAME_TITLE (unspaced) for TTS -- see format_login_banner.
 LOGIN_SPACED_TITLE = "M O R T A L S   &   M O N S T E R S"
 
 
-def format_login_banner(width=WHO_WIDTH, status_text=None):
+def format_login_banner(width=WHO_WIDTH, status_text=None, discord_url=None):
     """Build the connect splash: title, setting blurb, creator + engine.
 
     Returns painted lines (wrought rules / silver title / muted blurb /
@@ -505,6 +512,10 @@ def format_login_banner(width=WHO_WIDTH, status_text=None):
 
     ``status_text`` overrides the default ``LOGIN_STATUS`` line body
     (e.g. ``Alpha #1082.``) when Game meta sets ``login_status_text``.
+
+    ``discord_url`` overrides ``LOGIN_DISCORD_URL`` when Game meta sets
+    ``login_discord_url``. Pass ``None`` to omit the Discord line entirely
+    (staff ``gm gamestate discord clear``).
 
     Pre-login has no ``config screenreader`` yet, so the title stays
     **unspaced** (``Mortals and Monsters``, not letter-spaced) and credits
@@ -521,7 +532,14 @@ def format_login_banner(width=WHO_WIDTH, status_text=None):
         "Hunters work the cases. Monsters wear human faces.",
         "Earth towns sit thin under Heaven, Hell, and older prisons.",
     )
-    lines = ["", rule, title, rule, ""]
+    lines = ["", rule, title]
+    invite = (discord_url or "").strip()
+    if invite:
+        # Label: value. for TTS; teal accent is decoration only.
+        lines.append(
+            paint("teal", pad(f"Discord: {invite}.", w, "center"))
+        )
+    lines.extend([rule, ""])
     for line in blurb:
         lines.append(paint("muted", pad(line, w, "center")))
     lines.append("")
@@ -1076,9 +1094,13 @@ def format_help_index(categories, *, width=TOME_WIDTH, screenreader=False):
             "",
             _tts_period("Help Index"),
             _tts_period(
-                "Full topic catalog. Type help followed by a name for a page"
+                "Warning: long listen -- this is the full topic catalog, "
+                "not the short Start Here list"
             ),
-            _tts_period("Type commands for verbs. Type help for the short Start Here list"),
+            _tts_period(
+                "Type help for Start Here. Type help followed by a name for one page"
+            ),
+            _tts_period("Type commands for verbs"),
             "",
         ]
         for category, topics in categories:
@@ -1594,7 +1616,10 @@ def _exit_columns(exits, width=ROOM_WIDTH, cols=2):
     pair = list(exits)
     for i in range(0, len(pair), cols):
         chunk = pair[i:i + cols]
-        cells = [_cell(d, dest) for d, dest in chunk]
+        cells = [
+            _cell(direction, dest)
+            for direction, dest, _closed in (_unpack_exit(item) for item in chunk)
+        ]
         while len(cells) < cols:
             cells.append(" " * cell_w)
         rows.append(indent + gap.join(cells).rstrip())
@@ -1615,10 +1640,31 @@ _COMPASS_LEGEND_ORDER = (
 )
 
 
+def _unpack_exit(item):
+    """Return ``(direction, dest_title, closed_bool)`` from a 2- or 3-tuple."""
+    if len(item) >= 3:
+        return item[0], item[1], bool(item[2])
+    direction, dest = item[0], item[1]
+    return direction, dest, False
+
+
+def _exit_closed_set(exits):
+    """Lowercased directions that should show as sealed on look/exits."""
+    out = set()
+    for item in exits or []:
+        direction, _dest, closed = _unpack_exit(item)
+        if closed:
+            key = str(direction).strip().lower()
+            if key:
+                out.add(key)
+    return out
+
+
 def _exit_dir_set(exits):
     """Lowercased direction -> destination title from exit pairs."""
     out = {}
-    for direction, dest in exits:
+    for item in exits or []:
+        direction, dest, _closed = _unpack_exit(item)
         key = str(direction).strip().lower()
         if key:
             out[key] = str(dest)
@@ -1669,11 +1715,17 @@ def _compass_lines(exits, width=ROOM_WIDTH):
     if not by_dir:
         return []
 
+    closed_dirs = _exit_closed_set(exits)
+
     def cell(name, size):
         """Fixed-width slot: abbrev centered, or blank spaces."""
         if name in by_dir:
             abbrev = _COMPASS_CARDINALS.get(name, name[:size].upper())
-            return abbrev.center(size)
+            token = abbrev.center(size)
+            if name in closed_dirs:
+                # SMAUG-style bracket when the door is sealed to this viewer.
+                return f"[{token.strip()}]".center(size)
+            return token
         return " " * size
 
     # Compact 3-row rose (much shorter than the classic 5-row layout).
@@ -1695,7 +1747,8 @@ def _compass_lines(exits, width=ROOM_WIDTH):
 
     # Non-compass exits: in/out, apartment doors, street numbers, …
     also = []
-    for direction, dest in exits:
+    for item in exits:
+        direction, dest, _closed = _unpack_exit(item)
         key = str(direction).strip().lower()
         if key in _COMPASS_CARDINALS:
             continue
@@ -1721,7 +1774,8 @@ def _exit_legend_lines(exits, width=ROOM_WIDTH):
         abbrev = _COMPASS_CARDINALS[name]
         parts.append(f"{abbrev} {by_dir[name]}")
         seen.add(name)
-    for direction, dest in exits:
+    for item in exits:
+        direction, dest, _closed = _unpack_exit(item)
         key = str(direction).strip().lower()
         if key in seen or key in _COMPASS_CARDINALS:
             continue
@@ -1747,12 +1801,18 @@ def _exit_legend_lines(exits, width=ROOM_WIDTH):
     return out
 
 
-def _exit_abbrev(direction):
-    """Short token for an exit direction (n, ne, in, …)."""
+def _exit_abbrev(direction, *, closed=False):
+    """Short token for an exit direction (n, ne, in, …).
+
+    Closed exits use SMAUG-style brackets (``[n]``) so compact look/exits
+    still signal a sealed door without color alone.
+    """
     key = str(direction).strip().lower()
     if key in _COMPASS_CARDINALS:
-        return _COMPASS_CARDINALS[key].lower()
-    return key
+        abb = _COMPASS_CARDINALS[key].lower()
+    else:
+        abb = key
+    return f"[{abb}]" if closed else abb
 
 
 # Compact Exits: line order (cardinals, vertical, diagonals).
@@ -1786,7 +1846,8 @@ def _sparse_exits_line(exits, *, verbose=True):
             if name in by_dir:
                 ordered.append((name, by_dir[name]))
                 seen.add(name)
-        for direction, dest in exits:
+        for item in exits:
+            direction, dest, _closed = _unpack_exit(item)
             key = str(direction).strip().lower()
             if key in seen:
                 continue
@@ -1800,18 +1861,20 @@ def _sparse_exits_line(exits, *, verbose=True):
             )
         return lines
 
+    closed_dirs = _exit_closed_set(exits)
     tokens = []
     seen = set()
     by_dir = _exit_dir_set(exits)
     for name in _EXIT_LINE_ORDER:
         if name in by_dir:
-            tokens.append(_exit_abbrev(name))
+            tokens.append(_exit_abbrev(name, closed=name in closed_dirs))
             seen.add(name)
-    for direction, _dest in exits:
+    for item in exits:
+        direction, _dest, closed = _unpack_exit(item)
         key = str(direction).strip().lower()
         if key in seen:
             continue
-        tokens.append(_exit_abbrev(direction))
+        tokens.append(_exit_abbrev(direction, closed=closed))
         seen.add(key)
     if not tokens:
         return []
@@ -1877,22 +1940,27 @@ def format_room(title, description, *, area_tag="Indoors", exits=None,
         if exits:
             if exits_verbose:
                 lines.append("Paths:")
-                for direction, dest in exits:
+                for item in exits:
+                    direction, dest, _closed = _unpack_exit(item)
                     lines.append(f"  {direction}: {dest}.")
             else:
                 # Compact SR: one abbrev line (matches config exits compact).
                 tokens = []
                 seen = set()
+                closed_dirs = _exit_closed_set(exits)
                 by_dir = _exit_dir_set(exits)
                 for name in _EXIT_LINE_ORDER:
                     if name in by_dir:
-                        tokens.append(_exit_abbrev(name))
+                        tokens.append(
+                            _exit_abbrev(name, closed=name in closed_dirs),
+                        )
                         seen.add(name)
-                for direction, _dest in exits:
+                for item in exits:
+                    direction, _dest, closed = _unpack_exit(item)
                     key = str(direction).strip().lower()
                     if key in seen:
                         continue
-                    tokens.append(_exit_abbrev(direction))
+                    tokens.append(_exit_abbrev(direction, closed=closed))
                     seen.add(key)
                 if tokens:
                     lines.append(f"Paths: {', '.join(tokens)}.")

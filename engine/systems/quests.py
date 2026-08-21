@@ -67,6 +67,16 @@ _quest_no_offers_hint = None
 _quest_predicates: dict = {}
 
 
+def _quest_ops(game, key, message, *, exc=None):
+    """Tagged stderr for quest hook / grant failures."""
+    from engine import log_util
+
+    if game is not None and key:
+        log_util.ops_once_per_tick(game, key, "quest", message, exc=exc)
+    else:
+        log_util.ops("quest", message, exc=exc)
+
+
 def set_quest_grant_handler(fn):
     """Register fn(character, grant, game) for per-step ``grant`` blobs."""
     global _quest_grant_handler
@@ -167,17 +177,27 @@ def _game_from_character(character, payload=None):
     return getattr(loc, "game", None) if loc is not None else None
 
 
-def _send(character, lines):
+def _send(character, lines, *, role="accent"):
     """Send one string or a list of strings to the character's session."""
     session = getattr(character, "session", None)
     if session is None:
         return
+    from engine import display_prefs as dp_mod
+
+    def emit(raw):
+        if not raw:
+            return
+        text = str(raw)
+        if text.startswith("[") and text.find("]") > 1:
+            session.send(dp_mod.format_tagged_text(character, text))
+            return
+        session.send(dp_mod.paint_feedback_line(character, text, role=role))
+
     if isinstance(lines, str):
-        session.send(lines)
+        emit(lines)
         return
     for line in lines or []:
-        if line:
-            session.send(line)
+        emit(line)
 
 
 def has_active_quest(character, quest_id=None):
@@ -231,7 +251,12 @@ def _complete_quest(character, quest_id, game=None, *, announce=True):
             _send(character, data.get("complete") or ["Case closed."])
         paid = _apply_rewards(character, data, game=game)
         if announce and paid and character.session:
-            character.session.send(f"Paid: {', '.join(paid)}.")
+            from engine import display_prefs as dp_mod
+            character.session.send(
+                dp_mod.paint_feedback_line(
+                    character, f"Paid: {', '.join(paid)}.", role="ok",
+                )
+            )
     elif announce:
         _send(character, data.get("complete") or ["Case closed."])
     return True
@@ -338,30 +363,79 @@ def current_step(character, quest_id=None):
     return steps[idx]
 
 
+def _giver_present(room, giver_key):
+    """True when an NPC whose key matches ``giver_key`` is in ``room``.
+
+    Matches either way as a substring so ``Bobby`` still finds
+    ``Bobby Singer`` and a short key still matches a longer giver id.
+    """
+    want = (giver_key or "").lower()
+    if not want or room is None:
+        return False
+    for obj in getattr(room, "contents", None) or []:
+        key = (getattr(obj, "key", None) or "").lower()
+        if want in key or key in want:
+            return True
+    return False
+
+
+def _offer_room_matches(room, offer_rooms, game=None):
+    """True when ``room`` is one of the quest's listed offer rooms.
+
+    Uses identity key, legacy_key, and ``room_keys_match`` so builders
+    can author ``Bunker Library Stacks`` or a VNUM interchangeably.
+    """
+    if room is None or not offer_rooms:
+        return False
+    room_key = getattr(room, "key", None) or ""
+    legacy = getattr(room, "legacy_key", None) or ""
+    for offered in offer_rooms:
+        if not offered:
+            continue
+        if room_key == offered or legacy == offered:
+            return True
+        if game is not None:
+            if room_key and room_keys_match(game, offered, room_key):
+                return True
+            if legacy and room_keys_match(game, offered, legacy):
+                return True
+    return False
+
+
 def list_offers_in_room(character, room):
-    """Quests offered here that the character has not finished."""
+    """Takeable authored cases offered here that the character has not finished.
+
+    Chargen openers (``auto_start``) never appear -- they start with the
+    character, not from a folder. Empty ``offer_rooms`` is not "everywhere";
+    those rows stay off the list unless a giver is in the room *and* the
+    quest is not an opener.
+
+    When ``offer_rooms`` is set, listing is **room-scoped only** -- the
+    giver standing beside you does not surface every errand they could give.
+    Talk still uses the first matching offer line from this same list.
+    """
     if room is None:
         return []
-    room_key = getattr(room, "key", None) or ""
+    game = _game_from_character(character)
     prog = _progress(character)
     offers = []
     for qid, data in loader_mod.load_quests().items():
+        # Starter tutorials (Family Business, Phone Tree, Plane Temper, …).
+        if data.get("auto_start"):
+            continue
         entry = prog.get(qid) or {}
         if entry.get("status") in ("active", "done"):
             continue
         offer_rooms = data.get("offer_rooms") or []
-        if offer_rooms and room_key not in offer_rooms:
-            # Also allow offer when the giver NPC shares the room.
-            giver = (data.get("giver_npc") or "").lower()
-            present = False
-            if giver:
-                for obj in getattr(room, "contents", None) or []:
-                    key = (getattr(obj, "key", None) or "").lower()
-                    if giver in key or key in giver:
-                        present = True
-                        break
-            if not present:
+        giver = data.get("giver_npc") or ""
+        in_offer_room = _offer_room_matches(room, offer_rooms, game=game)
+        giver_here = _giver_present(room, giver)
+        if offer_rooms:
+            if not in_offer_room:
                 continue
+        elif not giver_here:
+            # No rooms and no giver in sight -- do not list globally.
+            continue
         offers.append(data)
     return offers
 
@@ -413,8 +487,8 @@ def format_log_lines(character):
             return [_quest_empty_log_hint(character, screenreader=sr)]
         if sr:
             return [
-                "Quest log empty. Look for authored quests around town, "
-                "or type takequest after quests.",
+                "Quest log empty. Look for authored cases around town, "
+                "or type quests near a giver.",
             ]
         return [
             "Quest log empty. Look for folders around town "
@@ -507,30 +581,43 @@ def _apply_grant(character, grant, game=None):
     """Apply optional step/quest grant: dollars, favor, items, flags."""
     if not grant or not isinstance(grant, dict):
         return
-    if _quest_grant_handler is not None:
-        _quest_grant_handler(character, grant, game)
-        return
-    cash = None
-    if "dollars" in grant or "cents" in grant:
-        cash = {
-            "dollars": grant.get("dollars", 0),
-            "cents": grant.get("cents", 0),
-        }
-    elif "coins" in grant:
-        cash = grant.get("coins")
-    if cash is not None:
-        economy_wallet.apply_cash_reward(character, cash)
-        if character.session and economy_wallet.money_to_cents(cash):
-            character.session.send(
-                f"You receive {economy_wallet.format_money(cash)}."
-            )
-    if "flag" in grant:
-        qid = getattr(character, "_quest_grant_target", None)
-        if qid:
-            entry = _entry(character, qid)
-            if entry is not None:
-                flags = entry.setdefault("flags", {})
-                flags[grant["flag"]] = True
+    qid = getattr(character, "_quest_grant_target", None) or "?"
+    try:
+        if _quest_grant_handler is not None:
+            _quest_grant_handler(character, grant, game)
+            return
+        cash = None
+        if "dollars" in grant or "cents" in grant:
+            cash = {
+                "dollars": grant.get("dollars", 0),
+                "cents": grant.get("cents", 0),
+            }
+        elif "coins" in grant:
+            cash = grant.get("coins")
+        if cash is not None:
+            economy_wallet.apply_cash_reward(character, cash)
+            if character.session and economy_wallet.money_to_cents(cash):
+                from engine import display_prefs as dp_mod
+                character.session.send(
+                    dp_mod.paint_feedback_line(
+                        character,
+                        f"You receive {economy_wallet.format_money(cash)}.",
+                        role="ok",
+                    )
+                )
+        if "flag" in grant:
+            if qid:
+                entry = _entry(character, qid)
+                if entry is not None:
+                    flags = entry.setdefault("flags", {})
+                    flags[grant["flag"]] = True
+    except Exception as exc:
+        _quest_ops(
+            game,
+            f"grant_{qid}",
+            f"grant failed quest={qid} char={character.key}",
+            exc=exc,
+        )
 
 
 def _apply_rewards(character, data, game=None):
@@ -719,14 +806,19 @@ def _announce_current_step(character, quest_id, game=None, *, include_seek=False
     _send(character, step.get("narrate") or [])
     hint = step.get("hint")
     if hint:
-        _send(character, _hint_line(character, hint))
+        _send(character, _hint_line(character, hint), role="prose")
     try:
         if _quest_seek_tip_handler is not None:
             tip = _quest_seek_tip_handler(character, game)
             if tip:
                 _send(character, tip)
-    except Exception:
-        pass
+    except Exception as exc:
+        _quest_ops(
+            game,
+            f"seek_tip_{character.key}",
+            f"seek tip failed on step announce char={character.key}",
+            exc=exc,
+        )
     _maybe_auto_complete_enter_room(character, quest_id, game=game)
 
 
@@ -856,8 +948,10 @@ def begin(character, quest_id, game=None, *, force=False, defer_step=False):
 
     ``defer_step=True`` (chargen auto_start): send ``intro`` only, then
     hold first-step narrate/hint until ``flush_pending_step_announce``
-    (after the login room look). ``takequest`` / GM grant keep
-    ``defer_step=False`` so the player gets the next beat immediately.
+    (after the login room look). Player ``takequest`` keeps
+    ``defer_step=False`` so the next beat prints immediately. GM grant
+    and ``restartquest`` pass ``force=True``. Chargen openers refuse a
+    plain ``takequest`` -- they are not case folders.
     """
     data = loader_mod.get_quest(quest_id)
     if data is None:
@@ -868,6 +962,26 @@ def begin(character, quest_id, game=None, *, force=False, defer_step=False):
         return False, "You already have that case open. See 'questlog'."
     if entry and entry.get("status") == "done" and not force:
         return False, "You already closed that case."
+    # Starter tutorials start at chargen (defer_step) or GM/restart (force).
+    if data.get("auto_start") and not force and not defer_step:
+        title = data.get("title") or quest_id
+        return False, (
+            f"'{title}' is a starting tutorial, not a takeable case. "
+            "It begins when you create a matching character. If you "
+            f"dropped it, type 'restartquest {quest_id} confirm'."
+        )
+    giver = (data.get("giver_npc") or "").strip()
+    if giver and not force:
+        for other_id in active_quest_ids(character):
+            if other_id == quest_id:
+                continue
+            other = loader_mod.get_quest(other_id) or {}
+            other_giver = (other.get("giver_npc") or "").strip()
+            if other_giver and other_giver.lower() == giver.lower():
+                return False, (
+                    f"You already have an open case from {other_giver}. "
+                    "Finish or abandon it first -- see 'questlog'."
+                )
     _set_status(character, quest_id, "active", step=0)
     pin_map = data.get("pin_npcs") or {}
     if pin_map and game is not None:
@@ -897,8 +1011,13 @@ def begin(character, quest_id, game=None, *, force=False, defer_step=False):
         try:
             if _quest_step_stamp_handler is not None:
                 _quest_step_stamp_handler(character, game)
-        except Exception:
-            pass
+        except Exception as exc:
+            _quest_ops(
+                game,
+                f"step_stamp_{character.key}",
+                f"step stamp failed char={character.key} quest={quest_id}",
+                exc=exc,
+            )
     else:
         _announce_current_step(
             character, quest_id, game=game, include_seek=False
@@ -1144,6 +1263,32 @@ def allows_talk(character, npc):
     return False
 
 
+def _giver_direct_offers(character, npc):
+    """Not-active/done authored quests whose giver matches ``npc`` directly.
+
+    Unlike ``list_offers_in_room``, this ignores ``offer_rooms`` -- talking
+    straight to the giver should surface what they have regardless of which
+    of their several errand rooms you happen to be standing in. The passive
+    ``quests`` room listing stays room-scoped (a11y: no unprompted dumps).
+    """
+    if npc is None:
+        return []
+    prog = _progress(character)
+    out = []
+    for qid, data in loader_mod.load_quests().items():
+        if data.get("auto_start"):
+            continue
+        giver = data.get("giver_npc") or ""
+        if not giver or not _npc_matches_giver(npc, giver):
+            continue
+        entry = prog.get(qid) or {}
+        if entry.get("status") in ("active", "done"):
+            continue
+        out.append(data)
+    out.sort(key=lambda d: d.get("id") or "")
+    return out
+
+
 def npc_talk_line(character, npc):
     """Return a quest-gated talk line for npc, or None to fall through.
 
@@ -1183,13 +1328,31 @@ def npc_talk_line(character, npc):
             return lines[f"step:{step_id}"]
         if lines.get("active"):
             return lines["active"]
-    # Offer line when standing in an offer room / with giver.
-    for data in list_offers_in_room(character, room):
-        lines = (data.get("npc_lines") or {}).get(npc_key) or {}
-        if not lines and data.get("giver_npc"):
-            if (data.get("giver_npc") or "").lower() in npc_key.lower():
-                lines = (data.get("npc_lines") or {}).get(
-                    data.get("giver_npc")
+    # Offer line -- talking directly to the giver ignores offer_rooms so a
+    # player does not have to blind-walk every one of their errand rooms to
+    # learn something is available (Wave 1: Garth's cases sit at the pawn
+    # counter, vault, street, and park). Prefer the offer whose own room
+    # matches where you are standing (correct flavor); otherwise fall back
+    # to the first one (stable id order) so talk always surfaces *something*.
+    # Deliberately single-line -- SR dialogue quotes one sentence at a time
+    # (engine.style.format_dialogue), so this never stacks multiple offers
+    # into one reply. The giver-open-case cap (see begin()) means only one
+    # case can be active at a time regardless; talk again after finishing
+    # one to learn about the next.
+    direct_offers = _giver_direct_offers(character, npc)
+    if direct_offers:
+        chosen = None
+        for data in direct_offers:
+            if _offer_room_matches(room, data.get("offer_rooms") or [], game=game):
+                chosen = data
+                break
+        if chosen is None:
+            chosen = direct_offers[0]
+        lines = (chosen.get("npc_lines") or {}).get(npc_key) or {}
+        if not lines and chosen.get("giver_npc"):
+            if (chosen.get("giver_npc") or "").lower() in npc_key.lower():
+                lines = (chosen.get("npc_lines") or {}).get(
+                    chosen.get("giver_npc")
                 ) or {}
         if lines.get("offer"):
             return lines["offer"]
@@ -1268,8 +1431,13 @@ def show_hint(character):
                     if sr and not tip.endswith((".", "!", "?")):
                         tip = tip + "."
                     _send(character, tip)
-        except Exception:
-            pass
+        except Exception as exc:
+            _quest_ops(
+                None,
+                f"seek_tip_hint_{character.key}",
+                f"seek tip failed on hint char={character.key}",
+                exc=exc,
+            )
     return True
 
 
@@ -1343,14 +1511,23 @@ def _pin_mentors(game, pin_map):
     if not game or not pin_map:
         return
     for npc_key, room_key in pin_map.items():
-        npc = None
-        find = getattr(game, "find_character", None)
-        if callable(find):
-            npc = find(npc_key)
-        if npc is None:
-            continue
         room = lookup_room(game, room_key)
         if room is None:
+            continue
+        want = (npc_key or "").strip().lower()
+        npc = None
+        # Prefer a copy already standing in the pin room (Emberwake has one
+        # per Reach hub). Global find_character would steal Cinder's copy.
+        for obj in room.characters():
+            key = (getattr(obj, "key", None) or "").strip().lower()
+            if key == want:
+                npc = obj
+                break
+        if npc is None:
+            find = getattr(game, "find_character", None)
+            if callable(find):
+                npc = find(npc_key)
+        if npc is None:
             continue
         # Remember prior park so abandon/complete can restore.
         if not getattr(npc, "_quest_pin_restore", None):
@@ -1518,7 +1695,13 @@ def tick_idle_nudge(game):
                     extra = _quest_idle_nudge_extra_handler(char, game)
                     if extra:
                         seek_bit = extra
-            except Exception:
+            except Exception as exc:
+                _quest_ops(
+                    game,
+                    f"nudge_extra_{char.key}",
+                    f"idle nudge extra failed char={char.key} quest={qid}",
+                    exc=exc,
+                )
                 seek_bit = ""
             stuck = (step or {}).get("stuck_hint")
             if stuck:

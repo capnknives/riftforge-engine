@@ -38,8 +38,16 @@ DB_HOLD_FILENAME = ".db_corruption_hold"
 BOOT_HOLD_FILENAME = ".boot_failure_hold"
 PLANNED_RESTART_FILENAME = ".planned_restart"
 GATEWAY_OUTAGE_FILENAME = ".gateway_outage.json"
+# Written as soon as gateway IPC drops; watcher uses this for fast desync
+# recovery (game ticking but IPC dead) — separate from the 300s revert file.
+GATEWAY_IPC_DOWN_FILENAME = ".gateway_ipc_down.json"
+# Watcher counts desync kills; after N in a window, bounce gateway+game.
+IPC_DESYNC_STREAK_FILENAME = ".ipc_desync_streak.json"
 
 DEFAULT_CRASH_WINDOW = 300.0
+DEFAULT_IPC_DESYNC_KILL = 30.0
+DEFAULT_IPC_DESYNC_GATEWAY_RESTART = 3
+DEFAULT_IPC_DESYNC_STREAK_WINDOW = 180.0
 DEFAULT_MAX_EXITS = 5
 DEFAULT_BACKOFF_BASE = 30.0
 DEFAULT_DB_CORRUPT_MAX_EXITS = 3
@@ -72,6 +80,14 @@ def _planned_restart_path(root=None):
 
 def _gateway_outage_path(root=None):
     return os.path.join(root or _repo_root(), GATEWAY_OUTAGE_FILENAME)
+
+
+def _gateway_ipc_down_path(root=None):
+    return os.path.join(root or _repo_root(), GATEWAY_IPC_DOWN_FILENAME)
+
+
+def _ipc_desync_streak_path(root=None):
+    return os.path.join(root or _repo_root(), IPC_DESYNC_STREAK_FILENAME)
 
 
 def _db_hold_path(root=None):
@@ -304,6 +320,200 @@ def clear_gateway_outage(*, root=None):
         os.remove(_gateway_outage_path(root))
     except OSError:
         pass
+
+
+def ipc_desync_kill_seconds():
+    """Watcher kills a ticking game child when IPC is down longer than this."""
+    raw = (os.environ.get("RIFTFORGE_GATEWAY_IPC_DESYNC_KILL") or "").strip()
+    if not raw:
+        return DEFAULT_IPC_DESYNC_KILL
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_IPC_DESYNC_KILL
+    # Must exceed routine game-only reload + hold grace (default 5s).
+    return max(10.0, value)
+
+
+def clear_gateway_ipc_down(*, root=None):
+    try:
+        os.remove(_gateway_ipc_down_path(root))
+    except OSError:
+        pass
+    clear_ipc_desync_streak(root=root)
+
+
+def read_gateway_ipc_down(*, root=None):
+    path = _gateway_ipc_down_path(root)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def write_gateway_ipc_down(
+    *, down_since_wall, planned_restart=False, root=None
+):
+    """Gateway writes immediately when game IPC drops (watcher fast path)."""
+    payload = {
+        "down_since_wall": float(down_since_wall),
+        "planned_restart": bool(planned_restart),
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    path = _gateway_ipc_down_path(root)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def should_kill_for_ipc_desync(
+    *, game_spawn_wall, now_wall=None, root=None
+):
+    """True when gateway IPC is down but the game child heartbeat is fresh.
+
+    Covers split-brain: ``server.py`` still ticks while the gateway lost the
+    IPC writer — clients connect to :4000 but get a blank telnet socket.
+    """
+    data = read_gateway_ipc_down(root=root)
+    if not data or not isinstance(data, dict):
+        return False, "no_ipc_down_file"
+    if data.get("planned_restart"):
+        return False, "planned_restart"
+    started = float(data.get("down_since_wall") or 0)
+    if started <= 0:
+        return False, "invalid_down_since"
+    now = time.time() if now_wall is None else now_wall
+    age = now - started
+    threshold = ipc_desync_kill_seconds()
+    if age < threshold:
+        return False, f"ipc_down_age_{age:.0f}s"
+    from engine import game_heartbeat
+
+    mtime = game_heartbeat.heartbeat_mtime()
+    stamp_from_this_child = (
+        mtime is not None and mtime >= (game_spawn_wall - 1.0)
+    )
+    if not stamp_from_this_child:
+        return False, "heartbeat_not_from_this_child"
+    heartbeat_age = now - mtime
+    if heartbeat_age >= game_heartbeat.hang_timeout_seconds():
+        return False, "heartbeat_stale_use_hang_check"
+    return True, (
+        f"ipc_down_{age:.0f}s>{threshold:.0f}s heartbeat_fresh_{heartbeat_age:.0f}s"
+    )
+
+
+def ipc_desync_gateway_restart_kills():
+    """Desync game-kills in ``ipc_desync_streak_window`` before gateway bounce."""
+    raw = (
+        os.environ.get("RIFTFORGE_GATEWAY_IPC_DESYNC_GATEWAY_RESTART") or ""
+    ).strip()
+    if not raw:
+        return int(DEFAULT_IPC_DESYNC_GATEWAY_RESTART)
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return int(DEFAULT_IPC_DESYNC_GATEWAY_RESTART)
+
+
+def ipc_desync_streak_window_seconds():
+    """Rolling window for ``record_ipc_desync_kill`` streak counting."""
+    raw = (
+        os.environ.get("RIFTFORGE_GATEWAY_IPC_DESYNC_STREAK_WINDOW") or ""
+    ).strip()
+    if not raw:
+        return float(DEFAULT_IPC_DESYNC_STREAK_WINDOW)
+    try:
+        return max(30.0, float(raw))
+    except ValueError:
+        return float(DEFAULT_IPC_DESYNC_STREAK_WINDOW)
+
+
+def read_ipc_desync_streak(*, root=None):
+    path = _ipc_desync_streak_path(root)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return {"kills": [], "gateway_restarts": 0}
+    if not isinstance(data, dict):
+        return {"kills": [], "gateway_restarts": 0}
+    kills = data.get("kills")
+    if not isinstance(kills, list):
+        kills = []
+    return {
+        "kills": [float(x) for x in kills if x is not None],
+        "gateway_restarts": int(data.get("gateway_restarts", 0) or 0),
+    }
+
+
+def _write_ipc_desync_streak(data, *, root=None):
+    path = _ipc_desync_streak_path(root)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
+
+def record_ipc_desync_kill(*, root=None, now_wall=None):
+    """Append one watcher desync-kill timestamp (rolling window)."""
+    now = time.time() if now_wall is None else float(now_wall)
+    window = ipc_desync_streak_window_seconds()
+    data = read_ipc_desync_streak(root=root)
+    kills = [t for t in data.get("kills", []) if now - t <= window]
+    kills.append(now)
+    data["kills"] = kills
+    _write_ipc_desync_streak(data, root=root)
+    return len(kills)
+
+
+def record_ipc_desync_gateway_restart(*, root=None):
+    """Bump gateway-bounce counter after desync escalation."""
+    data = read_ipc_desync_streak(root=root)
+    data["gateway_restarts"] = int(data.get("gateway_restarts", 0) or 0) + 1
+    data["kills"] = []
+    _write_ipc_desync_streak(data, root=root)
+
+
+def clear_ipc_desync_streak(*, root=None):
+    """Clear desync kill streak when game IPC is healthy again."""
+    try:
+        os.remove(_ipc_desync_streak_path(root))
+    except OSError:
+        pass
+
+
+def should_restart_gateway_for_desync(*, root=None, now_wall=None):
+    """True when repeated desync kills did not restore IPC — bounce gateway."""
+    now = time.time() if now_wall is None else float(now_wall)
+    window = ipc_desync_streak_window_seconds()
+    need = ipc_desync_gateway_restart_kills()
+    data = read_ipc_desync_streak(root=root)
+    recent = [
+        t for t in data.get("kills", [])
+        if now - float(t) <= window
+    ]
+    if len(recent) < need:
+        return False, f"desync_kills_{len(recent)}_of_{need}"
+    return True, (
+        f"desync_kills_{len(recent)}>={need} in {window:.0f}s "
+        "-- gateway restart"
+    )
 
 
 def read_gateway_outage(*, root=None):

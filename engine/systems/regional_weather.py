@@ -1525,7 +1525,8 @@ def _tell(character, text):
     Characters have no ``.message`` — use ``snoop.tell`` like other verbs.
     ``session.send`` already appends ``\\r\\n``, so do not double it here.
     """
-    snoop.tell(character, text)
+    from engine import display_prefs as dp_mod
+    snoop.tell(character, dp_mod.format_tagged_text(character, text))
 
 
 def _maybe_flee_indoors(game, track):

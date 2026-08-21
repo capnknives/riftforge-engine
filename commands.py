@@ -39,9 +39,7 @@ from command_support import (
     resolve_walk_direction,
     _can_see_spirit,
     _display_name,
-    _presence_face,
     _pull_followers,
-    is_staff_stealth_presence,
 )
 from engine.verbs import ENGINE_COMMANDS
 from engine.verbs.basic import _report_history, cmd_move
@@ -208,18 +206,14 @@ def _verb_disabled_for_actor(game, verb, actor):
     ``dothepit`` disable so pit autopilot stays available on cast logins.
     """
     from engine import command_disable as _cmd_disable
+    from engine import hooks
 
     if not _cmd_disable.is_disabled(game, verb):
         return False
-    if game_select.game_name() == "supers" and verb == "dothepit":
-        try:
-            from supers.purgatory_dungeon.leaderboard import (
-                is_cast_immersion_body,
-            )
-            if is_cast_immersion_body(actor):
-                return False
-        except ImportError:
-            pass
+    if game_select.game_name() == "supers" and hooks.verb_disable_bypass(
+        game, verb, actor,
+    ):
+        return False
     return True
 
 
@@ -280,9 +274,19 @@ def dispatch(character, raw, game, *, force_actor=None):
         character=character,
     )
     actor = force_actor or character
+    import time as _time
+    from engine import lag_watch
+    _cmd_t0 = _time.perf_counter()
     try:
         return _dispatch_body(character, raw, game, verb, args, force_actor=force_actor)
     finally:
+        lag_watch.note_command_stall(
+            game,
+            character,
+            verb,
+            (_time.perf_counter() - _cmd_t0) * 1000.0,
+            raw_preview=raw or "",
+        )
         log_context.clear_command_context()
         from engine.persistence import (
             command_marks_character_dirty,
@@ -301,19 +305,20 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
         verb = "consumetithe"
         args = ""
 
+    # Burkitsville Vanir anchor (two-word player phrase).
+    if verb == "burn" and (args or "").strip().lower() == "tree":
+        verb = "burntree"
+        args = ""
+
     # Stamp player activity for auto-idle (skip Cadence SilentSession).
     from engine.npc_act import SilentSession
+    from engine import hooks
     if (
         getattr(character, "session", None) is not None
         and not isinstance(character.session, SilentSession)
     ):
-        import game_select
         if _active_game == "supers":
-            try:
-                from supers.verbs import engine_flavor as _idle_flavor
-                _idle_flavor.stamp_input_activity(character, game)
-            except ImportError:
-                pass
+            hooks.dispatch_on_input(character, verb, game)
         else:
             # Lean engine / basegame: never import supers here -- that
             # package's __init__ re-registers hooks and clobbers the
@@ -330,8 +335,12 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
     )
     _asleep_ok = verb in ASLEEP_SPECTATOR
     if not _asleep_ok and verb == "cast":
-        rite = (args or "").strip().split(None, 1)[0].lower()
-        _asleep_ok = rite in _ASLEEP_DREAM_CAST_RITES
+        # Bare ``cast`` has no rite token -- let cmd_cast print usage instead
+        # of IndexError on split()[0] (bug report 544).
+        cast_args = (args or "").strip()
+        if cast_args:
+            rite = cast_args.split(None, 1)[0].lower()
+            _asleep_ok = rite in _ASLEEP_DREAM_CAST_RITES
     if asleep_blocks_world(character) and not _asleep_ok:
         if resolve_walk_direction(verb, getattr(character, "location", None)):
             character.session.send(
@@ -341,11 +350,13 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
         character.session.send(ASLEEP_WORLD_CLOSED_MSG)
         return
 
-    # GM freeze: staff paralyzed the player -- only help / quit / bug path.
-    # Mirror asleep so a frozen player can still file a report or disconnect.
+    # GM freeze: staff paralyzed the body -- movement, room speech, and
+    # verbs stay closed. OOC and private tells stay open so they can still
+    # talk to staff / other players. gm mute is what closes those channels.
     _FROZEN_ALLOWED = frozenset({
         "help", "commands", "quit", "logout", "bug", "suggest",
         "score", "sc", "ooc",
+        "tell", "whisper", "reply", "r",
     })
     if getattr(character, "frozen", False) and verb not in _FROZEN_ALLOWED:
         if resolve_walk_direction(verb, getattr(character, "location", None)):
@@ -355,41 +366,16 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
             return
         character.session.send(
             "You're frozen by staff. You can still use help, bug, "
-            "suggest, or quit."
+            "suggest, quit, ooc, and tell."
         )
         return
 
-    # Lucifer's Cage hold: sit and wait. Exit via cageproject swap or a
-    # Primordial (T4+) God Mantle walking out -- see supers.magic.
-    _CAGE_ALLOWED = frozenset({
-        "look", "l", "examine", "ex", "score", "sc", "help", "commands",
-        "inventory", "i", "time", "who", "quit", "logout", "bug", "suggest",
-        "say", "'", "gm", "ooc",
-    })
-    _cage_held = False
-    if _active_game == "supers":
-        try:
-            from supers import magic as _magic_cage
-            _cage_held = _magic_cage.cage_holds_actor(character)
-        except Exception as exc:
-            from engine import log_util
-            log_util.ops(
-                "commands",
-                "cage gate error -- treating as not caged",
-                exc=exc,
-            )
-            _cage_held = False
-    if _cage_held and verb not in _CAGE_ALLOWED:
-        if resolve_walk_direction(verb, getattr(character, "location", None)):
-            character.session.send(
-                "The Cage holds you. Sit. Wait. Only another "
-                "cageproject -- or a Primordial God's will -- frees you."
-            )
-            return
-        character.session.send(
-            "The Cage smothers action. You can look, speak, check score, "
-            "or wait. Freedom is a projection swap or a Primordial God."
-        )
+    # Game-owned dispatch gates (cage / vessel passenger / combat KO).
+    blocked, gate_msg = hooks.command_dispatch_gate(
+        character, verb, args, game,
+    )
+    if blocked:
+        character.session.send(gate_msg)
         return
 
     # GM mute: block global / room speech channels only (not movement).
@@ -401,131 +387,27 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
             "You're muted by staff -- you can't use that channel."
         )
         return
-
-    # Vessel shared-wheel passenger gate (movement/combat vs mind/wheel).
-    if _active_game == "supers":
-        try:
-            from supers import vessel_passenger as _vp_gate
-            blocked, gate_msg = _vp_gate.dispatch_gate(character, verb, game)
-            if blocked:
-                character.session.send(gate_msg)
-                return
-        except ImportError:
-            pass
-
-    # Combat KO / immortal incap / headless containment -- full freeze except
-    # look and sheet panes (bug #322: west/east while [KO] must not work).
-    if _active_game == "supers":
-        try:
-            from supers import combat_ko as _ko_gate
-            blocked, gate_msg = _ko_gate.dispatch_gate(character, verb, game)
-            if blocked:
-                if resolve_walk_direction(
-                    verb, getattr(character, "location", None),
-                ):
-                    character.session.send(_ko_gate.COMBAT_KO_MOVE_BLOCKED_MSG)
-                else:
-                    character.session.send(gate_msg)
-                return
-        except ImportError:
-            pass
+    try:
+        from supers import archangel_powers as arch_powers_mod
+        if arch_powers_mod.is_biokinesis_muted(character, game) and verb in _MUTED_VERBS:
+            character.session.send(
+                "Your voice is gone -- you can't use that channel. [MUTED]"
+            )
+            return
+    except ImportError:
+        pass
 
     # Manual cardinals / aggression cancel a paced walk (say/emote keep it).
-    # ``walk`` itself manages focus inside cmd_walk.
-    if verb != "walk" and (
-        verb in IDLE_WAKE_MOVE
-        or verb in IDLE_WAKE_AGGRESSIVE
-        or resolve_walk_direction(verb, getattr(character, "location", None))
-        is not None
-    ):
-        if _active_game == "supers":
-            try:
-                from supers import walk as walk_mod
-                if walk_mod.has_walk_focus(character):
-                    from engine.npc_act import SilentSession
-                    if not isinstance(
-                        getattr(character, "session", None), SilentSession
-                    ):
-                        walk_mod.clear_walk_focus(character)
-            except ImportError:
-                pass
+    # ``walk`` itself manages focus inside cmd_walk. SUPERS registers the
+    # interrupt via hooks.dispatch_on_input during idle stamp above.
 
     # Idlemode: only walking / aggressive verbs reclaim presence (then run).
-    # Say, get, train, sheet panes, OOC, etc. keep watching Cadence.
-    # Cadence drives idlemode bodies through npc_do + SilentSession -- that
-    # must NOT wake them, or the first AI verb silently drops idle_mode and
-    # the body freezes (wake text went to the silent sink, not the player).
-    if getattr(character, "idle_mode", False):
-        if _idlemode_should_wake(verb, character):
-            # Local import: npc_act imports commands inside npc_do only.
-            from engine.npc_act import SilentSession
-            if isinstance(character.session, SilentSession):
-                # Cadence AI verb -- keep watching; do not clear idle_mode.
-                pass
-            else:
-                # Pack mission-defer: walk/fight must confirm via idle off.
-                try:
-                    from supers import pack as pack_mod
-                    if getattr(character, "pack_mission_defer", False):
-                        pack_mod.try_wake_from_pack_defer(
-                            character, game, confirm=False,
-                        )
-                        return
-                except ImportError:
-                    pass
-                character.idle_mode = False
-                # Waking cancels a locked seek focus (same as idle off).
-                try:
-                    from supers import seek as seek_mod
-                    if seek_mod.has_seek_focus(character):
-                        seek_mod.clear_seek_focus(character)
-                except ImportError:
-                    pass
-                character.session.send(
-                    "You snap back -- your Echo stirs and you are present again."
-                )
-                from supers import training as training_mod
-                training_mod.send_pending_offline_break(character)
-                if (
-                    character.location
-                    and not is_staff_stealth_presence(character)
-                ):
-                    face = _presence_face(character)
-                    character.location.broadcast(
-                        f"{face}'s echo stirs and comes back to life.",
-                        exclude=character,
-                    )
+    if hooks.try_idlemode_wake_dispatch(character, verb, game):
+        return
 
-    # God omnipresence: sustained act focus redirects bare verbs to the twin
-    # body (session is bound in god_omnipresence.sync_focus_session).
-    actor = character
-    if force_actor is not None:
-        actor = force_actor
-    else:
-        if _active_game == "supers":
-            try:
-                from supers import god_omnipresence as go
-                if go.should_redirect_to_twin(character, verb):
-                    twin = go.resolve_twin(character, game)
-                    if (
-                        twin is not None
-                        and getattr(twin, "location", None) is not None
-                    ):
-                        actor = twin
-            except ImportError:
-                pass
-            if actor is character:
-                try:
-                    from supers import ghost as _ghost_inhabit
-                    if (
-                        _ghost_inhabit.is_inhabiting(character)
-                        and verb not in _ghost_inhabit.GHOST_INHABIT_SELF_VERBS
-                    ):
-                        host = _ghost_inhabit.inhabited_host(character, game)
-                        if host is not None:
-                            actor = host
-                except ImportError:
-                    pass
+    actor = hooks.resolve_dispatch_actor(
+        character, verb, game, force_actor=force_actor,
+    )
 
     def _loan_session_to_actor(fn):
         """Run *fn* with the login Session on *actor* when steering a host."""
@@ -556,12 +438,7 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
                 verb, getattr(actor, "location", None),
             ) is None
         ):
-            try:
-                from supers import lodging
-                lodging.cancel_rest_if_any(character)
-            except ImportError:
-                from engine import hooks
-                hooks.cancel_rest(character)
+            hooks.cancel_rest(character)
 
     # Soft-but-strict authored quest gate (Family Business foyer, …).
     # Same layer as asleep/frozen -- not a pre-parser black hole.
@@ -631,28 +508,30 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
             display_prefs.send_prompt(character, game)
             return
         handler, _help_text = entry
-        _twin_owner = None
-        if _active_game == "supers":
-            try:
-                from supers import god_omnipresence as _go_kit
-                if _go_kit.is_god_twin(actor):
-                    _twin_owner = _go_kit.resolve_owner(actor, game)
-                    if _twin_owner is not None:
-                        _go_kit.sync_twin_kit(_twin_owner, actor)
-            except ImportError:
-                pass
+        _twin_owner = hooks.pre_command_handler(actor, verb, game)
         def _run_handler():
             from engine import metrics as metrics_mod
             metrics_mod.bump(game, "commands_total")
             metrics_mod.bump(game, f"command.{verb}")
             handler(actor, args, game)  # call whichever function we found
+            if _active_game == "supers":
+                from supers import life_log as life_log_mod
+                from engine.npc_act import SilentSession
+                if (
+                    verb in life_log_mod.PLAYER_CMD_LOG_VERBS
+                    and getattr(character, "session", None) is not None
+                    and not isinstance(character.session, SilentSession)
+                    and not verb.startswith("gm")
+                ):
+                    preview = (args or "")[:80]
+                    life_log_mod.record(
+                        game,
+                        actor,
+                        "player_cmd",
+                        {"verb": verb, "args_preview": preview},
+                    )
         _loan_session_to_actor(_run_handler)
-        if _twin_owner is not None and _active_game == "supers":
-            try:
-                from supers import god_omnipresence as _go_kit
-                _go_kit.pull_twin_kit_to_owner(_twin_owner, actor)
-            except ImportError:
-                pass
+        hooks.post_command_handler(_twin_owner, actor, game)
         # Authored quests: simple verb steps (look / gear / track / …).
         # Dedicated events (takehunt, rent, …) fire from success paths.
         if _quest_gate is not None:

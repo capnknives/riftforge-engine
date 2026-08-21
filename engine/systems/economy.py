@@ -46,11 +46,25 @@ def money_to_cents(value):
         text = value.strip().lstrip("$").replace(",", "")
         if not text or text.lower() == "all":
             return 0
+        lower = text.lower()
+        for suffix in (" dollars", " dollar", " bucks", " buck"):
+            if lower.endswith(suffix):
+                text = text[: len(text) - len(suffix)].strip()
+                lower = text.lower()
+                break
+        # ``wallet pull 1 dollar`` / ``5 bucks`` -- first token is the amount.
+        if " " in text:
+            head = text.split(None, 1)[0]
+            if head.replace(".", "", 1).isdigit():
+                text = head
         if "." in text:
             whole, frac = text.split(".", 1)
             frac = (frac + "00")[:2]
             return int(whole or 0) * 100 + int(frac or 0)
-        return int(text) * 100
+        try:
+            return int(text) * 100
+        except ValueError:
+            return 0
     if isinstance(value, float):
         return int(round(value * 100))
     if isinstance(value, int):
@@ -260,6 +274,34 @@ def migrate_wallet_fields(character):
     character.bank_cents = bc
 
 
+def heal_legacy_wallet_fields(game):
+    """Boot sweep: normalize wallet attrs; count legacy blob loads.
+
+    ``migrate_wallet_fields`` drops in-memory ``coins`` / ``bank_coins``.
+    ``apply_character_blob`` stamps ``_wallet_legacy_coins_blob`` when a
+    save still used the old JSON keys -- next autosave writes ``dollars``.
+    """
+    if game is None:
+        return {"legacy_blob": 0, "legacy_attr": 0}
+    from engine.char_index import iter_characters
+
+    legacy_blob = 0
+    legacy_attr = 0
+    for char in iter_characters(game):
+        if getattr(char, "_wallet_legacy_coins_blob", False):
+            legacy_blob += 1
+            try:
+                del char._wallet_legacy_coins_blob
+            except AttributeError:
+                pass
+        if getattr(char, "coins", None) is not None:
+            legacy_attr += 1
+        if getattr(char, "bank_coins", None) is not None:
+            legacy_attr += 1
+        migrate_wallet_fields(char)
+    return {"legacy_blob": legacy_blob, "legacy_attr": legacy_attr}
+
+
 def _pocket_wallet_item(character):
     """Worn pocket wallet Item when present (cash lives on the Item)."""
     try:
@@ -431,6 +473,13 @@ def credit_wallet(character, dollars=0, cents=0, *, reason=None, tick=None):
                 open_stack_keys,
             )
             if len(open_stack_keys(character)) >= OPEN_INVENTORY_CAPACITY:
+                from engine import log_util
+
+                log_util.ops(
+                    "wallet",
+                    f"credit failed pocket full actor={getattr(character, 'key', '?')} "
+                    f"delta_cents={delta} reason={reason or ''}",
+                )
                 return False
     total = wallet_total_cents(character) + delta
     d, c = divmod(max(0, total), 100)
@@ -458,6 +507,14 @@ def debit_wallet(character, dollars=0, cents=0, *, reason=None, tick=None):
     else:
         need = money_to_cents(dollars)
     if carry_cash_total_cents(character) < need:
+        if need > 0 and reason:
+            from engine import log_util
+
+            log_util.ops(
+                "wallet",
+                f"debit insufficient actor={getattr(character, 'key', '?')} "
+                f"need_cents={need} reason={reason}",
+            )
         return False
     remaining = need
     loose_d, loose_c = inventory_loose_cash_parts(character)

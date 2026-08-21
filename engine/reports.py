@@ -72,6 +72,44 @@ KIND_ALIASES = {
 }
 
 
+class ReportsIOError(OSError):
+    """Report log append/update failed (permissions, read-only bind-mount, …)."""
+
+
+def ensure_report_logs(directory="."):
+    """Create JSONL report files with best-effort writable permissions.
+
+    Docker bind-mounts on Windows can leave ``bug_reports.log`` /
+    ``suggestions.log`` read-only on the host; without a writable file the
+    tick credit reconcile and player ``bug`` / ``suggest`` verbs crash the
+    game child. Call once from ``Game.__init__`` (and after manual restores).
+    """
+    directory = directory or "."
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        pass
+    for kind in _FILENAMES:
+        path = _path(kind, directory)
+        try:
+            if not os.path.isfile(path):
+                with open(path, "a", encoding="utf-8"):
+                    pass
+            try:
+                os.chmod(path, 0o666)
+            except OSError:
+                # Windows bind-mounts may ignore chmod; append probe below.
+                pass
+            with open(path, "a", encoding="utf-8"):
+                pass
+        except OSError as exc:
+            print(
+                f"[reports] ensure_report_logs {os.path.basename(path)}: "
+                f"{exc!r} (bug/suggest logging may fail until perms fixed)",
+                flush=True,
+            )
+
+
 def parse_kind_word(kind_word):
     """Map a staff-facing kind token to BUG / SUGGEST / HELP / TYPO, or None."""
     return KIND_ALIASES.get((kind_word or "").lower())
@@ -139,14 +177,23 @@ def record(kind, reporter, description, history, directory=".", context=None,
     if subject:
         payload["subject"] = subject
     path = _path(kind, directory)
-    # "a" appends; if the file doesn't exist yet, open creates it.
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(payload) + "\n")
-    # Id = physical line count after the append (matches recent()'s
-    # enumerate(..., start=1) over the same file). Count every line,
-    # including any blank ones, so ids stay stable with mark().
-    with open(path, encoding="utf-8") as f:
-        payload["id"] = sum(1 for _ in f)
+    try:
+        # "a" appends; if the file doesn't exist yet, open creates it.
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+        # Id = physical line count after the append (matches recent()'s
+        # enumerate(..., start=1) over the same file). Count every line,
+        # including any blank ones, so ids stay stable with mark().
+        with open(path, encoding="utf-8") as f:
+            payload["id"] = sum(1 for _ in f)
+    except OSError as exc:
+        print(
+            f"[reports] record failed ({_FILENAMES.get(kind, kind)}): {exc!r}",
+            flush=True,
+        )
+        raise ReportsIOError(
+            f"cannot write report log {path!r}: {exc}"
+        ) from exc
     for hook in _after_record_hooks:
         hook(kind, payload)
     return payload
@@ -175,19 +222,27 @@ def recent(kind, n, directory="."):
         return []
 
     entries = []
-    with open(path, encoding="utf-8") as f:
-        for line_no, raw in enumerate(f, start=1):
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                entry = json.loads(raw)
-            except json.JSONDecodeError:
-                # Skip a bad line rather than failing the whole listing.
-                continue
-            entry["id"] = line_no
-            entry.setdefault("status", "open")
-            entries.append(entry)
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line_no, raw in enumerate(f, start=1):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except json.JSONDecodeError:
+                    # Skip a bad line rather than failing the whole listing.
+                    continue
+                entry["id"] = line_no
+                entry.setdefault("status", "open")
+                entries.append(entry)
+    except OSError as exc:
+        print(
+            f"[reports] recent read failed ({_FILENAMES.get(kind, kind)}): "
+            f"{exc!r}",
+            flush=True,
+        )
+        return []
     if n is None:
         return entries
     # Slice the tail: entries[-n:] is the last n; if fewer exist, all of them.
@@ -295,8 +350,13 @@ def mark(kind, entry_id, status, directory=".", game=None):
     if not os.path.isfile(path):
         raise IndexError(f"no {kind} reports logged yet")
 
-    with open(path, encoding="utf-8") as f:
-        lines = f.readlines()
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError as exc:
+        raise ReportsIOError(
+            f"cannot read report log {path!r}: {exc}"
+        ) from exc
     if entry_id < 1 or entry_id > len(lines):
         raise IndexError(f"no {kind} report #{entry_id}")
 
@@ -305,8 +365,13 @@ def mark(kind, entry_id, status, directory=".", game=None):
     payload["status"] = status
     payload["id"] = entry_id
     lines[entry_id - 1] = json.dumps(payload) + "\n"
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(lines)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except OSError as exc:
+        raise ReportsIOError(
+            f"cannot update report log {path!r}: {exc}"
+        ) from exc
     for hook in _after_mark_hooks:
         hook(kind, payload, old_status=old_status, directory=directory, game=game)
     return payload

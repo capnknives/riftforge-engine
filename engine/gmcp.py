@@ -365,15 +365,18 @@ def room_info_payload(character):
     look_name = room.look_title() if hasattr(room, "look_title") else (
         getattr(room, "key", "") or ""
     )
-    zone = getattr(room, "zone", None)
-    map_id = getattr(room, "map_id", None)
+    from engine.systems import vehicles as vehicles_mod
+
+    area_room = vehicles_mod.look_area_source_room(game, room)
+    zone = getattr(area_room, "zone", None)
+    map_id = getattr(area_room, "map_id", None)
     if zone:
         area = str(zone)
     elif map_id:
         area = str(map_id)
     else:
         area = "world"
-    environment = getattr(room, "area_type", "plains") or "plains"
+    environment = getattr(area_room, "area_type", "plains") or "plains"
 
     vnum = getattr(room, "vnum", None)
     if vnum:
@@ -413,6 +416,15 @@ def push_comm(session, chan: str, msg: str, player: str):
     """Send Comm.Channel to one session (parallel to prose, never instead)."""
     if session is None or not client_supports(session, "Comm.Channel"):
         return
+    character = getattr(session, "character", None) or getattr(session, "owner", None)
+    if character is not None:
+        from engine import display_prefs
+
+        display_prefs.ensure_display_defaults(character)
+        if display_prefs.wants_plain_comms(character):
+            # Mudlet/Mudrammer render Comm.Channel with bracket chrome from
+            # raw player/msg fields — skip when plain telnet is authoritative.
+            return
     session.send_gmcp(
         "Comm.Channel",
         {"chan": chan, "msg": msg, "player": player},

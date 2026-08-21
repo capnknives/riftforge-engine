@@ -604,6 +604,55 @@ def is_vehicle_interior_room(room, game=None):
     return False
 
 
+def vehicle_host_room(game, interior_room):
+    """World room where a vehicle interior is parked or cruising.
+
+    Vehicle cabins stamp ``area_type = "city"`` at creation so look/GMCP
+    must resolve the live curb or America atlas cell instead of the cabin
+    stub (bug report 646).
+    """
+    if interior_room is None or game is None:
+        return None
+    if not is_vehicle_interior_room(interior_room, game):
+        return None
+    veh = vehicle_for_interior_room(game, interior_room)
+    if veh is None:
+        return None
+    rooms = getattr(game, "rooms", None) or {}
+    from engine.systems import overland as overland_mod
+
+    macro = overland_mod._parse_pos_pair(veh.get("macro_pos"))
+    if macro is not None:
+        key = overland_mod.america_cell_key(macro[0], macro[1])
+        host = rooms.get(key)
+        if host is not None:
+            return host
+    park_key = veh.get("parked_room")
+    interior_key = veh.get("interior_key")
+    if park_key and interior_key and park_key == interior_key:
+        return None
+    if not park_key:
+        return None
+    from engine.room_vnum import lookup_room
+
+    canon = canonical_park_key(game, park_key)
+    for candidate in (canon, park_key):
+        if not candidate:
+            continue
+        host = lookup_room(game, candidate) or rooms.get(candidate)
+        if host is not None and not is_vehicle_interior_room(host, game):
+            return host
+    return None
+
+
+def look_area_source_room(game, room):
+    """Room whose plane/area_type/zone should drive look badges."""
+    if room is None:
+        return room
+    host = vehicle_host_room(game, room)
+    return host if host is not None else room
+
+
 def room_is_valid_park_spot(room, game=None, *, character=None):
     """True when a vehicle may list ``room`` as its curb (``parked_room``)."""
     if room is None:
@@ -834,14 +883,9 @@ def heal_character_vehicle_board_state(character, game):
             touched = True
         role = getattr(character, "vehicle_role", None)
         if role not in ("driver", "passenger"):
-            driver = veh_here.get("driver")
-            driver_ok = (
-                driver is not None
-                and driver is not character
-                and getattr(driver, "in_vehicle", None) == want_id
-                and getattr(driver, "vehicle_role", None) == "driver"
-            )
-            if driver_ok:
+            clear_stale_driver_slot(game, veh_here)
+            live_driver = effective_driver(game, veh_here)
+            if live_driver is not None and live_driver is not character:
                 character.vehicle_role = "passenger"
             else:
                 character.vehicle_role = "driver"
@@ -880,14 +924,9 @@ def heal_character_vehicle_board_state(character, game):
         if on_curb or on_road:
             role = getattr(character, "vehicle_role", None)
             if role not in ("driver", "passenger"):
-                driver = veh.get("driver")
-                driver_ok = (
-                    driver is not None
-                    and driver is not character
-                    and getattr(driver, "in_vehicle", None) == vid
-                    and getattr(driver, "vehicle_role", None) == "driver"
-                )
-                if driver_ok:
+                clear_stale_driver_slot(game, veh)
+                live_driver = effective_driver(game, veh)
+                if live_driver is not None and live_driver is not character:
                     character.vehicle_role = "passenger"
                 else:
                     character.vehicle_role = "driver"
@@ -925,6 +964,42 @@ def heal_vehicle_board_state(game):
             flush=True,
         )
     return healed
+
+
+def effective_driver(game, veh):
+    """Return the live driver aboard ``veh``, or None when the slot is empty/stale.
+
+    ``veh["driver"]`` alone is not enough: logout/fold cycles can leave a
+    dangling pointer whose ``in_vehicle`` flag still matches even though the
+    body is not in the cabin or no longer holds the driver role (bug report
+    620 — owner re-boarded as passenger behind a ghost driver slot).
+    """
+    if game is None or veh is None:
+        return None
+    driver = veh.get("driver")
+    if driver is None:
+        return None
+    vid = veh.get("id")
+    if not vid or getattr(driver, "in_vehicle", None) != vid:
+        return None
+    if getattr(driver, "vehicle_role", None) != "driver":
+        return None
+    occupants = vehicle_occupants(game, veh)
+    if driver not in occupants:
+        return None
+    return driver
+
+
+def clear_stale_driver_slot(game, veh):
+    """Drop ``veh["driver"]`` when ``effective_driver`` says the slot is empty."""
+    if veh is None:
+        return False
+    if effective_driver(game, veh) is not None:
+        return False
+    if veh.get("driver") is None:
+        return False
+    veh["driver"] = None
+    return True
 
 
 def vehicle_occupants(game, veh):
@@ -1073,12 +1148,9 @@ def try_board(character, args, game):
     if len(occupants) >= int(veh.get("seats", 4)):
         _send(character, f"The {veh['key']} is full.")
         return True
-    role = "driver" if veh.get("driver") is None else "passenger"
-    if role == "passenger":
-        driver = veh.get("driver")
-        if driver is None or getattr(driver, "in_vehicle", None) != veh["id"]:
-            role = "driver"
-            veh["driver"] = None
+    clear_stale_driver_slot(game, veh)
+    live_driver = effective_driver(game, veh)
+    role = "driver" if live_driver is None else "passenger"
     _board_one(character, veh, role, game)
     board_followers(character, veh, game)
     return True
