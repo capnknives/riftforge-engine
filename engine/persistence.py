@@ -3671,6 +3671,11 @@ async def _collect_world_save_snapshot_async(
     slow_chars = []
     char_build_total_ms = 0.0
     char_build_count = 0
+    # Incremental removed_chars is prev_hashes - alive_names. That is only
+    # safe after a complete roster walk. Breaking mid-loop leaves unvisited
+    # live bodies out of alive_names; treating them as deleted then wipes
+    # their SQLite rows. A later crash / game-only restart loads the hole.
+    scan_incomplete = False
     for obj in iter_characters(game):
         if wall_start is not None and _persist_save_over_wall_budget(
             wall_start, wall_budget_ms,
@@ -3684,9 +3689,11 @@ async def _collect_world_save_snapshot_async(
                     "force_full": force_full,
                     "deferred_chars": sorted(dirty_chars | deferred_chars),
                     "deferred_rooms": sorted(dirty_rooms | deferred_rooms),
+                    "scan_incomplete": True,
                 }
                 return [], [], meta
             deferred_chars.update(dirty_chars - set(changed_chars))
+            scan_incomplete = True
             break
         name = (getattr(obj, "key", None) or getattr(obj, "name", None) or "")
         name = str(name)
@@ -3729,7 +3736,7 @@ async def _collect_world_save_snapshot_async(
             last_yield = time.perf_counter()
     slow_chars.sort(key=lambda pair: pair[1], reverse=True)
     removed_chars = []
-    if not force_full and prev_char:
+    if not force_full and prev_char and not scan_incomplete:
         removed_chars = sorted(set(prev_char.keys()) - alive_names)
 
     if (
@@ -3761,6 +3768,7 @@ async def _collect_world_save_snapshot_async(
         "deferred_chars": deferred_chars,
         "deferred_rooms": deferred_rooms,
         "wall_budget_hit": wall_budget_hit,
+        "scan_incomplete": scan_incomplete,
         "n_dirty_chars_queued": len(
             getattr(game, "_persist_dirty_characters", None) or ()
         ),
@@ -3794,7 +3802,12 @@ def _apply_world_save_snapshot(conn, char_rows, item_rows, meta=None):
                     conn.execute("DELETE FROM characters")
                     conn.execute("DELETE FROM items")
                 else:
-                    for name in meta.get("removed_chars", ()):
+                    # Incomplete incremental walks must never DELETE
+                    # unvisited bodies (see scan_incomplete in collect).
+                    removed = () if meta.get("scan_incomplete") else meta.get(
+                        "removed_chars", (),
+                    )
+                    for name in removed:
                         conn.execute(
                             "DELETE FROM characters WHERE name=?", (name,),
                         )
@@ -3939,7 +3952,10 @@ async def _apply_world_save_snapshot_async(
     pending_commit = False
 
     try:
-        for name in meta.get("removed_chars", ()):
+        removed = () if meta.get("scan_incomplete") else meta.get(
+            "removed_chars", (),
+        )
+        for name in removed:
             conn.execute("DELETE FROM characters WHERE name=?", (name,))
             conn.execute(
                 "DELETE FROM items WHERE holder_key=? "
