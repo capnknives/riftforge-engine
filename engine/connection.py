@@ -76,6 +76,26 @@ def history_line_for_storage(line):
     return text
 
 
+def expand_bang_repeat(line, last_command):
+    """Expand a lone ``!`` to *last_command* (suggestion report 263).
+
+    Returns ``(expanded_line, error_message)``. When *error_message* is
+    set, *expanded_line* is ``None`` and the caller should print the error
+    without dispatching.
+    """
+    text = line if isinstance(line, str) else str(line or "")
+    if text.strip() != "!":
+        return text, None
+    if not last_command:
+        return None, "No previous command."
+    return last_command, None
+
+
+def tracks_last_command(line):
+    """True when *line* should become the session's repeatable last command."""
+    return history_line_for_storage(line) != "[redacted setpass]"
+
+
 def _activity_logger_call(character, method, *args):
     """Duck-typed activity_logger side channel; never abort play or logout.
 
@@ -139,6 +159,43 @@ def normalize_input_line(line: str) -> str:
     if not line:
         return line
     return unicodedata.normalize("NFKC", line)
+
+
+# Async menus (makecar, phone Carvana, rechargen) call session.read_line()
+# from a create_task. play() also calls read_line() for commands. Without
+# this gate the command loop steals numbered picks and names (bug report 837).
+_MODAL_PROMPT_FLAGS = (
+    "_rechargen_running",
+    "_makecar_running",
+    "_carvana_running",
+)
+
+
+def session_modal_prompt_running(session):
+    """True when a verb's async menu owns this session's read_line."""
+    if session is None:
+        return False
+    return any(getattr(session, attr, False) for attr in _MODAL_PROMPT_FLAGS)
+
+
+def spawn_modal_prompt(session, coro, flag_attr):
+    """Schedule ``coro`` and mark ``flag_attr`` before play() can race it.
+
+    The flag is set *synchronously* so the next play() iteration sleeps
+    instead of consuming the first menu answer as a command. ``coro`` is
+    an already-created coroutine (pass ``_flow(session, ...)``).
+    """
+    if flag_attr not in _MODAL_PROMPT_FLAGS:
+        raise ValueError(f"unknown modal prompt flag {flag_attr!r}")
+    setattr(session, flag_attr, True)
+
+    async def _runner():
+        try:
+            await coro
+        finally:
+            setattr(session, flag_attr, False)
+
+    asyncio.get_running_loop().create_task(_runner())
 
 
 def strip_client_session_tags(raw: str) -> str:
@@ -260,7 +317,12 @@ class Session:
         self.character = None     # set once they pick a name and log in
         # Staff account name while this Session rides GM form / cast / alts.
         self.staff_account = None
+        # RPC cast grant ride: account name + PC key to return to on playcast off.
+        self.cast_grant_account = None
+        self.cast_grant_return_key = None
         self.alive = True         # flips to False on quit/disconnect; ends the loop
+        # Coalesce duplicate blank lines (see Session.send).
+        self._last_output_empty = False
         # Gateway IPC: fixed session id + optional bridge for bound/kick CTRL.
         # None when speaking telnet directly (RIFTFORGE_GATEWAY=0).
         self.gateway_session_id = gateway_session_id
@@ -279,6 +341,8 @@ class Session:
         # except block below can fill in a traceback after a failed dispatch.
         # collections.deque(maxlen=N) auto-drops the oldest entry when full.
         self.history = collections.deque(maxlen=RECENT_HISTORY_SIZE)
+        # Last dispatched play-loop line for bare ``!`` repeat (suggestion 263).
+        self.last_command = None
         # Multi-line bug/suggest capture (a live report: pasting a multi-
         # line message into 'suggest' split across several 'Unknown
         # command' lines instead of landing as one report -- a raw telnet
@@ -287,7 +351,10 @@ class Session:
         # got treated as the whole report). None when not capturing;
         # otherwise {"kind": reports.BUG|SUGGEST, "lines": [...]} -- see
         # commands.cmd_bug/cmd_suggest (which starts it) and
-        # play()/_finish_report_capture below (which ends it).
+        # play()/_handle_report_capture_line below (which ends it).
+        # Optional ``on_finish`` / ``on_cancel`` callables let other paste
+        # UIs (GM MOTD editor) reuse this gate without going through
+        # bug_filing -- engine stays generic; the game sets the callbacks.
         self.report_capture = None
         # Modal helpfile line editor (GM `hedit` command; docs/plans/
         # helpfile_editing_system.md). Same shape of gate as report_capture
@@ -305,6 +372,12 @@ class Session:
         self._pending_lines = collections.deque()
         self.gmcp_enabled = False
         self.gmcp_supports = {}
+        self._web_map_grid_ids = set()
+        self._web_map_atlas_id = None
+        # Browser HUD: skip OOC/tell/custom-channel prose in the main log
+        # while the communication pane is showing them (GMCP Comm.Channel).
+        # Telnet never sets this; default False so full prose still prints.
+        self.gag_captured_comms = False
         # Per-session wire counters for GM `host` (bytes on the socket,
         # including telnet/GMCP framing). Stdlib-only ops pulse -- not
         # host-wide NIC stats.
@@ -355,6 +428,11 @@ class Session:
         self.login_stage = "creating"
         # Ensure the bucket still holds us (password path already registered).
         self._register_connecting("creating")
+        # Gateway reattach after a Veil rewrite keys off this bind name.
+        char = getattr(self, "character", None)
+        key = getattr(char, "key", None) if char is not None else None
+        if key:
+            self._notify_gateway_bound(key)
 
     def _leave_connecting(self):
         """Drop from connecting_sessions (play promote or disconnect)."""
@@ -366,6 +444,16 @@ class Session:
         """Leave connecting bucket and join game.sessions for who/play."""
         self._leave_connecting()
         self.login_stage = None
+        char = getattr(self, "character", None)
+        if char is not None:
+            from engine.session_attach import detach_stale_sessions
+
+            dropped = detach_stale_sessions(char, self.game, self)
+            if dropped:
+                _log_connection(
+                    f"detached {dropped} stale session(s) "
+                    f"char={getattr(char, 'key', '?')}"
+                )
         if self not in self.game.sessions:
             self.game.sessions.append(self)
 
@@ -492,11 +580,26 @@ class Session:
             ):
                 from engine import style
                 message = style.strip_ansi(message)
+            is_empty = not str(message).strip()
+            # Coalesce duplicate blanks -- callers (Room.broadcast's
+            # blank_after, look's trailing "", send_prompt's leading "")
+            # sometimes stack two intentional blanks back to back; only
+            # the first reaches the wire. This is a pure safety net -- it
+            # never removes a blank a caller actually wanted to be visible
+            # (a single blank always survives), and it does NOT add any
+            # spacing on its own (see engine.world.Room.broadcast and
+            # cmd_tell for where airy paragraph spacing is actually
+            # decided -- never here, so an internal loop of many
+            # session.send() calls for one logical block, e.g. a herb
+            # list or tutorial page, never gets split apart).
+            if is_empty and self._last_output_empty:
+                return
             self._write(message)
             # Fan out to GM snoopers after the real client has the line.
             if self.character is not None:
                 from engine import snoop
                 snoop.mirror_output(self.character, message)
+            self._last_output_empty = is_empty
 
     def send_gmcp(self, package, payload, force=False):
         """Send one GMCP package as a telnet subnegotiation frame.
@@ -520,6 +623,9 @@ class Session:
         """Clear negotiation state (copyover resume re-offers WILL GMCP)."""
         self.gmcp_enabled = False
         self.gmcp_supports = {}
+        self._web_map_grid_ids = set()
+        self._web_map_atlas_id = None
+        self.gag_captured_comms = False
         self._recv_buf = bytearray()
         self._text_buf = bytearray()
         self._pending_lines.clear()
@@ -638,7 +744,12 @@ class Session:
             self._leave_connecting()
 
     async def _wait_veil_world_ready(self):
-        """Gateway copyover: block play() until deferred boot finishes."""
+        """Gateway copyover: block play() until the veil playable gate opens.
+
+        Copyover reattach opens this as soon as sessions are rebound
+        (Circle/Diku copyover_recover). Gap-fill heals continue in the
+        background and must not hold the gate.
+        """
         game = getattr(self, "game", None)
         if game is None:
             return
@@ -664,6 +775,35 @@ class Session:
         # Fresh password login still clears idle_mode below -- intentional.
         reattach = getattr(self, "_gateway_reattach_name", None)
         if reattach:
+            from engine import account_chargen_draft as draft_mod
+
+            chargen_char = draft_mod.resolve_copyover_chargen_body(
+                self.game, reattach,
+            )
+            if chargen_char is not None:
+                # Mid-create: keep the socket, re-enter chargen at the
+                # saved step -- never promote to who/play (bug report 618).
+                self._gateway_reattach_name = None
+                chargen_char.session = self
+                self.character = chargen_char
+                self._set_creating()
+                self.reset_gmcp()
+                from engine import gmcp
+                from engine import mssp
+                from engine import telnet
+                gmcp.offer_gmcp(self)
+                mssp.offer_mssp(self)
+                telnet.offer_naws(self)
+                telnet.set_client_echo(self, True)
+                from engine.copyover import MSG_AFTER
+                from engine.account_login import resume_chargen_after_hold
+                self.send(MSG_AFTER)
+                await self._wait_veil_world_ready()
+                result = await resume_chargen_after_hold(self)
+                if result is None:
+                    return
+                await self.play()
+                return
             # Prefer exact login body (never husk: / gmspirit:).
             finder = getattr(self.game, "find_login_character", None)
             if callable(finder):
@@ -707,6 +847,8 @@ class Session:
                 from engine.copyover import MSG_AFTER
                 from engine import char_identity as identity_mod
                 self.send(MSG_AFTER)
+                # Skip reprinting the login MOTD board on gateway reattach.
+                self._copyover_resume = True
                 self._notify_gateway_bound(char.key)
                 hooks.after_session_attach(char, self.game)
                 notice = identity_mod.legacy_surname_login_notice(char)
@@ -750,7 +892,7 @@ class Session:
 
         from engine import account_login as account_login_mod
         result = await account_login_mod.run_account_login_flow(
-            self, known_account=prefer_acct,
+            self, known_account=prefer_acct, skip_password=bool(prefer_acct),
         )
         if result is None:
             return
@@ -809,8 +951,9 @@ class Session:
         # ---- PLAYING STATE ----
         # Loop forever reading commands until the session stops being 'alive'.
         while self.alive:
-            if getattr(self, "_rechargen_running", False):
-                import asyncio
+            # rechargen / makecar / Carvana own read_line while their
+            # numbered menu is up -- yield so those tasks get the answers.
+            if session_modal_prompt_running(self):
                 await asyncio.sleep(0.05)
                 continue
             line = await self.read_line()
@@ -843,6 +986,10 @@ class Session:
                         "Your connection was replaced from another login."
                     )
                 break
+            line, bang_err = expand_bang_repeat(line, self.last_command)
+            if bang_err:
+                self.send(bang_err)
+                continue
             # Record BEFORE dispatch so a crash still lands in history;
             # redact setpass so plaintext never hits bug reports (H2).
             entry = [history_line_for_storage(line), None]
@@ -865,6 +1012,8 @@ class Session:
                 entry[1] = traceback.format_exc()
                 traceback.print_exc()
                 self.send("Something went wrong with that command.")
+            if tracks_last_command(line):
+                self.last_command = line
             # drain() waits if the outgoing buffer is backed up (slow client),
             # applying "backpressure" so we don't pile up unlimited data.
             await self.writer.drain()
@@ -888,17 +1037,22 @@ class Session:
             from engine import reports
             from engine import bug_filing
             from commands import _report_history
-            description = "\n".join(self.report_capture["lines"]).strip()
-            kind = self.report_capture["kind"]
+            capture = self.report_capture or {}
+            description = "\n".join(capture.get("lines") or []).strip()
+            kind = capture.get("kind")
             # Optional generic prefix (e.g. cmd_helpsubmit stamps the
             # proposed keyword ahead of the pasted body) -- not report-kind
             # specific, any future paste-capture caller can use it.
-            prefix = self.report_capture.get("prefix")
+            prefix = capture.get("prefix")
             # Read optional fields before clearing capture -- a live crash
             # (bug report 209) hit .get on None when subject_key was read
             # after ``self.report_capture = None`` below.
-            subject_key = self.report_capture.get("subject_key")
+            subject_key = capture.get("subject_key")
+            on_finish = capture.get("on_finish")
             self.report_capture = None
+            if callable(on_finish):
+                on_finish(self.character, self.game, description)
+                return
             if not description:
                 self.send("Empty report -- nothing logged.")
                 return
@@ -922,7 +1076,12 @@ class Session:
             )
             return
         if line.strip().lower() == "cancel":
+            capture = self.report_capture or {}
+            on_cancel = capture.get("on_cancel")
             self.report_capture = None
+            if callable(on_cancel):
+                on_cancel(self.character, self.game)
+                return
             self.send("Cancelled -- nothing logged.")
             return
         self.report_capture["lines"].append(line)
@@ -1143,6 +1302,9 @@ class Session:
         self._deferred_attach_done = True
         import asyncio
         await asyncio.sleep(0)
+        from engine import login_briefing as login_briefing_mod
+
+        login_briefing_mod.begin(self, self.character)
         try:
             hooks.after_session_attach_deferred(self.character, self.game)
         except Exception as exc:
@@ -1153,6 +1315,8 @@ class Session:
             )
             import traceback
             traceback.print_exc()
+        finally:
+            login_briefing_mod.end(self)
 
     async def _attach_returning_character(self, char, *, takeover=False):
         """Wire a returning body after account menu pick."""
@@ -1227,33 +1391,30 @@ class Session:
         an Echo leave or double-save.
         """
         old = getattr(character, "session", None)
-        if old is None or old is self:
-            return
-        _log_connection(
-            f"session takeover char={getattr(character, 'key', '?')}"
-        )
-        try:
-            old.send(
-                "Your connection has been taken over from another login."
+        if old is not None and old is not self:
+            _log_connection(
+                f"session takeover char={getattr(character, 'key', '?')}"
             )
-        except Exception:
-            pass
-        # Stop the old play loop; clear the Character link before close so
-        # a later old.disconnect() is a no-op for Echo broadcast.
-        from engine import hooks
-        hooks.on_session_disconnect(character, self.game, to_echo=False)
-        old.alive = False
-        old.character = None
-        character.session = None
-        sessions = getattr(self.game, "sessions", None)
-        if sessions is not None and old in sessions:
-            sessions.remove(old)
-        writer = getattr(old, "writer", None)
-        if writer is not None:
             try:
-                writer.close()
+                old.send(
+                    "Your connection has been taken over from another login."
+                )
             except Exception:
                 pass
+            # Stop the old play loop; clear the Character link before close so
+            # a later old.disconnect() is a no-op for Echo broadcast.
+            from engine import hooks
+            hooks.on_session_disconnect(character, self.game, to_echo=False)
+        from engine.session_attach import detach_stale_sessions
+
+        detach_stale_sessions(character, self.game, self)
+        if old is not None and old is not self:
+            writer = getattr(old, "writer", None)
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
 
     def disconnect(self, *, keep_connection=False, reason=None):
         # Tidy up when a player leaves. THE INVARIANT (systems doc section 4-E):
@@ -1406,9 +1567,13 @@ class Session:
         try:
             schedule = getattr(self.game, "schedule_save_async", None)
             if callable(schedule):
-                schedule()
+                schedule(reason="disconnect")
             else:
-                self.game.save()
+                from engine import persistence
+
+                persistence.save_world_before_process_exit(
+                    self.game.db, self.game, reason="disconnect",
+                )
         except Exception as exc:
             print(
                 f"[connection] disconnect save failed ({exc!r}) -- "
@@ -1419,6 +1584,7 @@ class Session:
             # Soft logout: clear gateway bind, stay on TCP, re-enter login.
             self._notify_gateway_unbound()
             self.history.clear()
+            self.last_command = None
             self.report_capture = None
             self.help_edit = None
             self.staff_account = None

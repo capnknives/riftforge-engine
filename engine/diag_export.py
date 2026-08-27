@@ -79,6 +79,38 @@ _API_VERSION = "2022-11-28"
 # Cap how many NDJSON lines we parse for the inline stats summary.
 _SUMMARY_MAX_LINES = 5000
 
+# Cadence phase keys surfaced in ``summarize_ndjson`` (lag diag analyze).
+_CADENCE_PHASE_STAT_KEYS = (
+    "echo_ms",
+    "echo_other_ms",
+    "echo_path_ms",
+    "echo_npc_ms",
+    "echo_origin_ms",
+    "echo_prep_ms",
+    "echo_decay_ms",
+    "echo_priority_ms",
+    "echo_lifestyle_ms",
+    "town_ms",
+    "town_prep_ms",
+    "town_lite_ms",
+    "town_offload_ms",
+    "town_off_schedule_ms",
+    "town_act_preamble_ms",
+    "town_act_ms",
+    "town_path_ms",
+    "town_npc_ms",
+    "town_masquerade_ms",
+    "town_other_ms",
+    "lifestyle_save_busy_ms",
+    "motel_hunters_ms",
+    "plane_soldiers_ms",
+    "hunters_ms",
+    "hostiles_misc_ms",
+    "vampires_ms",
+    "maint_ms",
+    "zone_snaps_ms",
+)
+
 # Always-on tick overrun burst capture (bug diagnosis kit slice C).
 # Independent of ``diag_enabled()`` -- rate-limited so lag storms do not
 # fill the disk when staff forgot ``gm diaglog on``.
@@ -659,6 +691,24 @@ def build_tick_summary(game, *, log_text=None):
     lines.append(
         format_deploy_autosave_summary(correlate_deploy_autosave(log_text))
     )
+    last_pass = getattr(game, "_cadence_last_pass", None) or {}
+    if last_pass:
+        lines.append(
+            "cadence last_pass "
+            f"cpu={last_pass.get('cpu_ms')}ms "
+            f"wall={last_pass.get('wall_ms')}ms "
+            f"paused={last_pass.get('paused_ms')}ms "
+            f"budget={last_pass.get('budget_used')}/"
+            f"{last_pass.get('budget_limit')}"
+        )
+    try:
+        stats = summarize_ndjson(log_text)
+        summary = stats.get("analyze_summary")
+        if summary:
+            lines.append("analyze_summary:")
+            lines.extend(summary.splitlines())
+    except Exception:
+        pass
     return "\n".join(lines)
 
 
@@ -903,7 +953,9 @@ def _maybe_warn_missing_webhook_auth():
 def summarize_ndjson(text):
     """Cheap stats from NDJSON for the webhook body (no Gist fetch needed).
 
-    Returns a dict with counts and ms averages for cadence / slow ticks.
+    Returns a dict with counts and ms averages for cadence / slow ticks,
+    echo sub-phases (``cadence_echo_diag``), autosave pulses, and deploy
+    correlation (lag P11).
     """
     from collections import defaultdict
 
@@ -913,8 +965,15 @@ def summarize_ndjson(text):
     fuel_total = []
     fuel_loop_ms = []
     cadence_total = []
+    cadence_cpu = []
+    cadence_paused = []
+    phase_ms = {key: [] for key in _CADENCE_PHASE_STAT_KEYS}
     slow_total = []
+    autosave_ms = []
+    autosave_lock_wait = []
     handler_ms = defaultdict(list)
+    worst_slow = None
+    save_busy_ticks = 0
     lines_seen = 0
     for line in (text or "").splitlines():
         if lines_seen >= _SUMMARY_MAX_LINES:
@@ -931,12 +990,32 @@ def summarize_ndjson(text):
         messages[msg] += 1
         data = row.get("data") or {}
         if msg == "cadence_phase_breakdown":
-            cadence_total.append(float(data.get("total_ms") or 0))
+            cadence_total.append(float(data.get("total_ms") or data.get("wall_ms") or 0))
+            cadence_cpu.append(float(data.get("cpu_ms") or 0))
+            cadence_paused.append(float(data.get("paused_ms") or 0))
             phases = data.get("phases") or {}
             echo_ms.append(float(phases.get("echo_ms") or 0))
             town_ms.append(float(phases.get("town_ms") or 0))
-        elif msg == "slow_or_spike_tick":
-            slow_total.append(float(data.get("total_ms") or 0))
+            for key in _CADENCE_PHASE_STAT_KEYS:
+                val = phases.get(key)
+                if val:
+                    phase_ms[key].append(float(val))
+        elif msg in ("slow_or_spike_tick", AUTO_CAPTURE_MESSAGE) or data.get("auto"):
+            total = float(data.get("total_ms") or 0)
+            slow_total.append(total)
+            if worst_slow is None or total > float(worst_slow.get("total_ms") or 0):
+                worst_slow = {
+                    "total_ms": round(total, 1),
+                    "game_time_ticks": data.get("game_time_ticks"),
+                    "top_handlers": (data.get("top_handlers") or [])[:6],
+                    "autosave_running": bool(data.get("autosave_running")),
+                    "cadence_budget": data.get("cadence_budget"),
+                }
+            if total >= 2000.0 and (
+                data.get("autosave_running")
+                or float(data.get("last_autosave_save_ms") or 0) >= 500.0
+            ):
+                save_busy_ticks += 1
             for h in data.get("top_handlers") or []:
                 name = h.get("name")
                 if name:
@@ -945,12 +1024,12 @@ def summarize_ndjson(text):
             fuel_total.append(float(data.get("total_ms") or 0))
             phases = data.get("phases") or {}
             fuel_loop_ms.append(float(phases.get("fuel_loop_ms") or 0))
-        elif msg == AUTO_CAPTURE_MESSAGE or data.get("auto"):
-            slow_total.append(float(data.get("total_ms") or 0))
-            for h in data.get("top_handlers") or []:
-                name = h.get("name")
-                if name:
-                    handler_ms[name].append(float(h.get("ms") or 0))
+        elif msg == "autosave_ms":
+            save = float(data.get("save_ms") or 0)
+            autosave_ms.append(save)
+            lock = data.get("lock_wait_ms")
+            if lock is not None:
+                autosave_lock_wait.append(float(lock))
 
     deploy_corr = correlate_deploy_autosave(text)
 
@@ -964,26 +1043,120 @@ def summarize_ndjson(text):
             "max": round(max(xs), 1),
         }
 
+    phase_stats = {
+        key: _stat(xs) for key, xs in phase_ms.items() if xs
+    }
+    top_phases = sorted(
+        (
+            {"phase": key, **_stat(xs)}
+            for key, xs in phase_ms.items()
+            if xs and statistics.mean(xs) >= 5.0
+        ),
+        key=lambda row: -row["avg"],
+    )[:10]
+
     top_handlers = sorted(
         (
             {"name": n, "avg_ms": round(statistics.mean(xs), 1), "n": len(xs)}
             for n, xs in handler_ms.items()
         ),
         key=lambda row: -row["avg_ms"],
-    )[:8]
-    return {
+    )[:12]
+    stats = {
         "ndjson_lines_parsed": lines_seen,
         "messages": dict(messages),
         "cadence_total_ms": _stat(cadence_total),
+        "cadence_cpu_ms": _stat(cadence_cpu),
+        "cadence_paused_ms": _stat(cadence_paused),
         "echo_ms": _stat(echo_ms),
         "town_ms": _stat(town_ms),
+        "cadence_phases": phase_stats,
+        "top_cadence_phases_by_avg": top_phases,
         "fuel_total_ms": _stat(fuel_total),
         "fuel_loop_ms": _stat(fuel_loop_ms),
         "slow_tick_total_ms": _stat(slow_total),
+        "autosave_ms": _stat(autosave_ms),
+        "autosave_lock_wait_ms": _stat(autosave_lock_wait),
+        "save_busy_cadence_spikes": save_busy_ticks,
+        "worst_slow_tick": worst_slow,
         "top_handlers_by_avg": top_handlers,
         "deploy_autosave": deploy_corr,
         "deploy_autosave_line": format_deploy_autosave_summary(deploy_corr),
     }
+    stats["analyze_summary"] = format_analyze_summary(stats)
+    return stats
+
+
+def format_analyze_summary(stats):
+    """Plain-text hotspot block for Gist ``tick_summary`` + webhook skimmers."""
+    if not stats:
+        return "(no stats)"
+    lines = []
+    worst = stats.get("worst_slow_tick") or {}
+    if worst.get("total_ms"):
+        tops = ", ".join(
+            f"{h.get('name')}={h.get('ms')}ms"
+            for h in (worst.get("top_handlers") or [])[:5]
+        )
+        lines.append(
+            f"worst_tick={worst.get('total_ms')}ms "
+            f"game_ticks={worst.get('game_time_ticks')} "
+            f"autosave_running={worst.get('autosave_running')} "
+            f"[{tops}]"
+        )
+    cadence_cpu = stats.get("cadence_cpu_ms") or {}
+    cadence_wall = stats.get("cadence_total_ms") or {}
+    cadence_pause = stats.get("cadence_paused_ms") or {}
+    if cadence_wall.get("avg") is not None:
+        lines.append(
+            "cadence wall_avg={wall}ms cpu_avg={cpu}ms paused_avg={pause}ms".format(
+                wall=cadence_wall.get("avg"),
+                cpu=cadence_cpu.get("avg"),
+                pause=cadence_pause.get("avg"),
+            )
+        )
+    for row in (stats.get("top_cadence_phases_by_avg") or [])[:5]:
+        lines.append(
+            f"phase {row.get('phase')} avg={row.get('avg')}ms max={row.get('max')}ms"
+        )
+    town_wall = stats.get("town_ms") or {}
+    town_phases = stats.get("cadence_phases") or {}
+    if town_wall.get("avg") is not None and float(town_wall.get("avg") or 0) >= 100.0:
+        act_avg = (town_phases.get("town_act_ms") or {}).get("avg")
+        preamble_avg = (town_phases.get("town_act_preamble_ms") or {}).get("avg")
+        path_avg = (town_phases.get("town_path_ms") or {}).get("avg")
+        save_busy_avg = (town_phases.get("lifestyle_save_busy_ms") or {}).get("avg")
+        cadence_cpu = stats.get("cadence_cpu_ms") or {}
+        lines.append(
+            "town wall_avg={wall}ms cadence_cpu_avg={cpu}ms "
+            "act_avg={act}ms preamble_avg={pre}ms path_avg={path}ms "
+            "save_busy_yield_avg={busy}ms".format(
+                wall=town_wall.get("avg"),
+                cpu=cadence_cpu.get("avg"),
+                act=act_avg if act_avg is not None else "-",
+                pre=preamble_avg if preamble_avg is not None else "-",
+                path=path_avg if path_avg is not None else "-",
+                busy=save_busy_avg if save_busy_avg is not None else "-",
+            )
+        )
+    for row in (stats.get("top_handlers_by_avg") or [])[:6]:
+        lines.append(
+            f"handler {row.get('name')} avg={row.get('avg_ms')}ms n={row.get('n')}"
+        )
+    autosave = stats.get("autosave_ms") or {}
+    if autosave.get("avg") is not None:
+        lines.append(
+            f"autosave avg={autosave.get('avg')}ms max={autosave.get('max')}ms"
+        )
+    if stats.get("save_busy_cadence_spikes"):
+        lines.append(
+            f"save_busy_cadence_spikes={stats.get('save_busy_cadence_spikes')} "
+            "(slow tick >=2s during autosave -- overlap, not Cadence CPU)"
+        )
+    deploy_line = stats.get("deploy_autosave_line")
+    if deploy_line:
+        lines.append(deploy_line)
+    return "\n".join(lines) if lines else "(no hotspots in sample)"
 
 
 def build_analyze_payload(push_result, game=None, *, reporter="?"):
@@ -1012,11 +1185,12 @@ def build_analyze_payload(push_result, game=None, *, reporter="?"):
             else None
         ),
         "instructions_hint": (
-            "Diagnose live tick lag from this dump. Prefer reading the "
-            "gist_url NDJSON + stats. Check stats.deploy_autosave for "
-            "autosave pulses within 120s of auto_deploy_reset. Open a PR "
-            "only if you have a clear fix; otherwise comment findings on "
-            "hub_issue / the PR body."
+            "Diagnose live tick lag from this dump. Read stats.analyze_summary "
+            "and gist NDJSON. Echo sub-phases: echo_other_ms / echo_path_ms / "
+            "echo_npc_ms (cadence_echo_diag). Compare cadence_cpu_ms vs "
+            "cadence_total_ms + cadence_paused_ms -- multi-second total tick "
+            "with autosave_running is usually overlap, not Cadence CPU. "
+            "Check stats.deploy_autosave and save_busy_cadence_spikes."
         ),
     }
 

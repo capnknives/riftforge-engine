@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import textwrap
 
 from engine.world import Room
 from engine.world_maps import get_zones_dir
@@ -375,7 +376,7 @@ ATLAS_AREA_GLYPH = {
     "highway": "=",
     "desert": ",",
     "wetland": "'",
-    "void": ".",
+    "void": " ",
 }
 
 # Layer colors for atlas maps -- letter/glyph is still the primary signal;
@@ -413,6 +414,8 @@ ATLAS_BG = {                        # background fill per terrain
     "furnace": "41",
     "desert": "43",                 # yellow-tan scrub
     "wetland": "42",                # green bayou (glyph distinguishes)
+    "highway": "43",                # yellow-tan asphalt (browser HUD + filled atlas)
+    "road": "43",
 }
 ATLAS_TOPO_FG = {                   # glyph color when the cell is bare topo
     "ocean": "96",                  # bright-cyan ripples on blue
@@ -573,6 +576,21 @@ AREA_TYPE_DESCRIPTIONS = {
     "plains": (
         "Open grassland rolls under a wide sky. A simple stake marker "
         "reads ({x}, {y})."
+    ),
+    "highway": (
+        "Asphalt ribbon cuts the continent. A faded mile marker reads "
+        "({x}, {y}). Drive the cardinals; cities wait at the hubs."
+    ),
+    "desert": (
+        "Sun-blasted scrub and hardpan. Heat shimmers off the road "
+        "shoulder. A marker reads ({x}, {y})."
+    ),
+    "wetland": (
+        "Black water and cypress knees. The air smells of mud and rot. "
+        "A marker reads ({x}, {y})."
+    ),
+    "void": (
+        "Nothing mapped here -- off the drivable atlas at ({x}, {y})."
     ),
 }
 
@@ -1048,11 +1066,20 @@ def _map_legend_for(rooms_sample):
     if uses_atlas:
         return (
             "@=you *=city .=plains ^=mtn ~=ocean o=lake "
-            "==EW-hwy |=NS-hwy +=junction T=forest ,=desert '=wetland "
-            "H=homestead (bright=highway/city; muted=topo)"
+            "==hwy T=woods ,=desert H=home"
         )
     return " ".join(
         f"{AREA_TYPE_GLYPH[t]}={t}" for t in sorted(AREA_TYPE_GLYPH)
+    )
+
+
+def _fit_legend(legend, width):
+    """Wrap a legend so 80-col telnet never splits a glyph mid-line."""
+    width = max(12, int(width or 80))
+    if len(legend) <= width:
+        return legend
+    return "\n".join(
+        textwrap.wrap(legend, width=width, break_long_words=False)
     )
 
 
@@ -1540,6 +1567,166 @@ def render_full_grid(
     return append_mapzone_overlay(
         rendered, center_room, game, character=character,
     )
+
+
+# Standard telnet when NAWS is silent. Maps must not use the 67-col
+# sheet budget -- that clips a 78-wide America silhouette.
+TELNET_COLS = 80
+TELNET_ROWS = 24
+# Header + legend + one travel hint + prompt, so the glyph window plus
+# chrome still fits a 24-row screen.
+VIEWPORT_CHROME_ROWS = 6
+
+
+def viewport_dims(character, atlas_w, atlas_h):
+    """Columns x rows for the telnet atlas *camera* (not the full country).
+
+    NAWS may **shrink** the window for narrow/short clients so map lines
+    never wrap. Wide Mudlet/browser terminals must not expand the telnet
+    dump to the full 96-wide grid -- those clients paint the whole atlas
+    out of band via ``RiftForge.Map.Atlas`` / the browser HUD.
+
+    Defaults when NAWS is silent: 80 cols, 24 rows minus chrome (not the
+    67-col sheet budget). Caps at those same telnet defaults even when
+    NAWS reports a larger window. Never larger than the atlas itself.
+    """
+    max_view_w = TELNET_COLS
+    max_view_h = TELNET_ROWS - VIEWPORT_CHROME_ROWS
+    session = getattr(character, "session", None) if character else None
+    cols = None
+    if session is not None:
+        tw = getattr(session, "term_width", None)
+        if tw:
+            try:
+                cols = int(tw)
+            except (TypeError, ValueError):
+                cols = None
+    if not cols:
+        cols = max_view_w
+    cols = max(7, min(int(cols), max_view_w, int(atlas_w)))
+    rows = None
+    if session is not None:
+        th = getattr(session, "term_height", None)
+        if th:
+            try:
+                rows = int(th) - VIEWPORT_CHROME_ROWS
+            except (TypeError, ValueError):
+                rows = None
+    if not rows:
+        rows = max_view_h
+    rows = max(8, min(int(rows), max_view_h, int(atlas_h)))
+    return cols, rows
+
+
+def viewport_origin(cx, cy, atlas_w, atlas_h, view_w, view_h):
+    """Southwest-inclusive origin so (cx, cy) sits near the window center."""
+    atlas_w = int(atlas_w)
+    atlas_h = int(atlas_h)
+    view_w = max(1, min(int(view_w), atlas_w))
+    view_h = max(1, min(int(view_h), atlas_h))
+    x0 = int(cx) - view_w // 2
+    y0 = int(cy) - view_h // 2
+    x0 = max(0, min(x0, atlas_w - view_w))
+    y0 = max(0, min(y0, atlas_h - view_h))
+    return x0, y0, view_w, view_h
+
+
+def render_viewport_grid(
+    rooms,
+    center_room,
+    *,
+    width,
+    height,
+    view_w,
+    view_h,
+    use_color=True,
+    mark_you=True,
+    character=None,
+    game=None,
+):
+    """ASCII camera window -- never wider/taller than view_w x view_h cells.
+
+    Each terrain row is exactly ``view_w`` glyphs so an 80-col client cannot
+    wrap the silhouette. Off-atlas cells are spaces (not ocean, not wrap).
+    Returns (text, payload) where payload is the GMCP-friendly dict, or
+    (None, None) if the center is not a stamped grid cell.
+    """
+    prefix = getattr(center_room, "grid_prefix", None)
+    cx = getattr(center_room, "grid_x", None)
+    cy = getattr(center_room, "grid_y", None)
+    if prefix is None or cx is None or cy is None:
+        parsed = parse_grid_key(center_room.key)
+        if parsed is None:
+            return None, None
+        prefix, cx, cy = parsed
+    try:
+        width = int(width)
+        height = int(height)
+        view_w = int(view_w)
+        view_h = int(view_h)
+        cx = int(cx)
+        cy = int(cy)
+    except (TypeError, ValueError):
+        return None, None
+    if width < 1 or height < 1:
+        return None, None
+    x0, y0, view_w, view_h = viewport_origin(
+        cx, cy, width, height, view_w, view_h,
+    )
+
+    glyph_rows = []
+    color_rows = []
+    seen_rooms = []
+    # North (high y) first -- same as the full dump.
+    for y in range(y0 + view_h - 1, y0 - 1, -1):
+        raw_cells = []
+        paint_cells = []
+        for x in range(x0, x0 + view_w):
+            if mark_you and x == cx and y == cy:
+                raw_cells.append("@")
+                paint_cells.append("@")
+                continue
+            if not (0 <= x < width and 0 <= y < height):
+                raw_cells.append(" ")
+                paint_cells.append(" ")
+                continue
+            neighbor = rooms.get(f"{prefix} ({x}, {y})")
+            if neighbor is None:
+                raw_cells.append(" ")
+                paint_cells.append(" ")
+                continue
+            seen_rooms.append(neighbor)
+            glyph = _room_display_glyph(neighbor)
+            raw_cells.append(glyph)
+            if use_color:
+                color = _room_display_color(neighbor)
+                if color:
+                    glyph = f"{color}{glyph}{ANSI_RESET}"
+            paint_cells.append(glyph)
+        glyph_rows.append("".join(raw_cells))
+        color_rows.append("".join(paint_cells))
+
+    header = (
+        f"{prefix} you=({cx},{cy}) "
+        f"{view_w}x{view_h}/{width}x{height} @=you"
+    )
+    legend = _fit_legend(_map_legend_for(seen_rooms or [center_room]), view_w)
+    text = "\n".join([header, *color_rows, legend])
+    text = append_mapzone_overlay(
+        text, center_room, game, character=character,
+    )
+    payload = {
+        "atlas": prefix,
+        "full_width": width,
+        "full_height": height,
+        "you": [cx, cy],
+        "origin": [x0, y0],
+        "view_width": view_w,
+        "view_height": view_h,
+        "rows": glyph_rows,
+    }
+    return text, payload
+
 
 
 

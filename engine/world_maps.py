@@ -192,6 +192,7 @@ PLANES = frozenset({
     "earth", "fire", "water", "air", "stone",
     "heaven", "hell", "purgatory", "dream",
     "coalescence",
+    "riftcrash",
     "stellar", "umbral", "empty",
 })
 
@@ -210,6 +211,7 @@ REALM_FOR_PLANE = {
     "purgatory": "spirit",
     "dream": "spirit",
     "coalescence": "spirit",
+    "riftcrash": "pocket",
     "stellar": "void",
     "umbral": "void",
     "empty": "void",
@@ -360,14 +362,20 @@ def _autoload_enabled(data):
     return data.get("autoload", True) is not False
 
 
-def document_hand_exit_graph_errors(filename, data):
-    """Return errors when hand-room exits point at missing room keys in one doc.
+def document_hand_exit_graph_errors(filename, data, *, known_keys=None):
+    """Return errors when hand-room exits point at missing room keys.
 
-    Used by map heal before writing merged JSON. Cross-map exits that resolve
-    during ``load_all_maps`` pass 2 are intentionally not checked here.
+    Used by map heal before writing merged JSON. Destinations that exist in
+    *this* document (hand rooms + grid cells) are always valid. Pass
+    ``known_keys`` for rooms defined in *other* map/zone files — cross-map
+    exits resolve during ``load_all_maps`` pass 2 (Lebanon spur ``SP00001``
+    north to bunker ``BE00007``). Without that set, heal skipped writing
+    Lebanon because the bunker key lives in ``men_of_letters.json``.
     """
     rooms = data.get("rooms") or []
-    keys = {room.get("key") for room in rooms if room.get("key")}
+    keys = _room_keys_for_map_document(data)
+    if known_keys:
+        keys = keys | set(known_keys)
     errors = []
     for room in rooms:
         key = room.get("key")
@@ -437,6 +445,26 @@ def iter_map_json_paths():
             )
         seen.add(base)
         yield path
+
+
+def collect_map_room_keys(exclude_path=None):
+    """Room keys from every map/zone JSON except *exclude_path*.
+
+    Map heal uses this so cross-file exits (Lebanon spur → bunker gatehouse)
+    do not look like a broken graph in a single document.
+    """
+    keys = set()
+    exclude = os.path.normpath(exclude_path) if exclude_path else None
+    for path in iter_map_json_paths():
+        if exclude and os.path.normpath(path) == exclude:
+            continue
+        try:
+            with open(path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            continue
+        keys |= _room_keys_for_map_document(data)
+    return keys
 
 
 def resolve_map_file(name):
@@ -1013,6 +1041,17 @@ def validate_grid_block(grid, *, where):
         raise ValueError(f"{where}: grid.width must be a positive int")
     if not isinstance(height, int) or isinstance(height, bool) or height <= 0:
         raise ValueError(f"{where}: grid.height must be a positive int")
+    from engine.atlas_layers import ROAD_GLYPHS, TERRAIN_GLYPH_TO_AREA, validate_layer_rows
+    validate_layer_rows(
+        grid.get("terrain_rows"), width, height,
+        name="terrain_rows", where=where,
+        allowed=set(TERRAIN_GLYPH_TO_AREA),
+    )
+    validate_layer_rows(
+        grid.get("road_rows"), width, height,
+        name="road_rows", where=where,
+        allowed=set(ROAD_GLYPHS) | {" "},
+    )
 
 
 def validate_pocket_link(pocket, *, where):
@@ -1091,7 +1130,7 @@ def _build_grid(rooms, filename, grid, plane=None, realm=None, map_id=None):
     # categories.
     bestiary_categories = grid.get("bestiary_categories")
     default_description = grid["default_description"]
-    overrides = grid.get("cell_overrides", {})
+    from engine.atlas_layers import expand_grid_cell
     # Optional atlas glyph set for this whole grid (earth_america, …).
     grid_glyph_set = grid.get("glyph_set")
     # Cadence confinement for whole grids (Elemental Reaches, …). Cell
@@ -1102,7 +1141,8 @@ def _build_grid(rooms, filename, grid, plane=None, realm=None, map_id=None):
     for x in range(width):
         for y in range(height):
             key = f"{prefix} ({x}, {y})"
-            override = overrides.get(f"{x},{y}", {})
+            # Layers + sparse overrides (America) or overrides-only (Wastes).
+            override = expand_grid_cell(grid, x, y)
             # A cell override can also punch through the grid's
             # area_type/bestiary_categories for just this one cell -- e.g.
             # a settlement gateway sitting in an otherwise-uniform

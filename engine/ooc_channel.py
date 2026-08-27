@@ -86,7 +86,14 @@ def _highlight_author_nudge_verbs(message: str) -> str:
 
 
 def render_ooc_line(character, face: str, message: str, *, kind: str = OOC_KIND_NORMAL) -> str:
-    """Paint one OOC line for *character* (or plain when SR / color off)."""
+    """Paint one OOC line for *character* (or plain when SR / color off).
+
+    Default sighted chrome is layered: crimson ``((`` ``))``, gold ``OOC``
+    letters, parchment/white body -- so the line does not blend into room
+    prose grey. Player text is never run through ``paint_layered`` (no
+    ``<tag>`` injection). ``config channel ooc <role>`` still paints the
+    whole line one color. Author nudges stay gold with silver verb pops.
+    """
     from engine import display_prefs
     from engine import style
 
@@ -100,8 +107,16 @@ def render_ooc_line(character, face: str, message: str, *, kind: str = OOC_KIND_
         body = _highlight_author_nudge_verbs(message)
         template = format_ooc_line(face, body, kind=kind)
         return style.paint_layered_for(character, "gold", template)
-    role = display_prefs.channel_role(character, "ooc", default="ooc")
-    return style.paint_for(character, role, plain)
+    if display_prefs.wants_plain_comms(character):
+        return display_prefs.paint_plaincomms_channel_lead(
+            character, plain, "OOC.", body_role="ooc",
+        )
+    prefix = "((OOC))"
+    if not plain.startswith(prefix):
+        return style.paint_for(character, "ooc", plain)
+    return display_prefs.paint_double_bracket_channel_line(
+        character, "OOC", plain[len(prefix):], channel="ooc",
+    )
 
 
 def make_ooc_history_entry(
@@ -109,12 +124,33 @@ def make_ooc_history_entry(
     message: str,
     *,
     kind: str = OOC_KIND_NORMAL,
+    face: str | None = None,
+    plain: str | None = None,
 ) -> dict:
-    """Structured OOC ring entry (speaker key + message for per-viewer replay)."""
+    """Structured OOC ring entry (speaker key + message for per-viewer replay).
+
+    *face* and *plain* cache the public label at send time so bare ``ooc``
+    replay still shows ``Accountname(GM)`` after a folded ``gmspirit:`` row
+    is no longer on the live roster.
+    """
     entry = {"speaker": speaker_key, "message": message}
     if kind != OOC_KIND_NORMAL:
         entry["kind"] = kind
+    cached_face = (face or "").strip()
+    if cached_face:
+        entry["face"] = cached_face
+    cached_plain = (plain or "").strip()
+    if cached_plain:
+        entry["plain"] = cached_plain
     return entry
+
+
+def _ooc_fallback_face(entry: dict) -> str | None:
+    """Public OOC label stored at send time (when speaker lookup may fail later)."""
+    face = entry.get("face")
+    if isinstance(face, str) and face.strip():
+        return face.strip()
+    return None
 
 
 def broadcast_ooc(
@@ -143,7 +179,13 @@ def broadcast_ooc(
 
     public_face = speaker_face_for_character(speaker, game)
     public_plain = format_ooc_line(public_face, message, kind=kind)
-    entry = make_ooc_history_entry(speaker.key, message, kind=kind)
+    entry = make_ooc_history_entry(
+        speaker.key,
+        message,
+        kind=kind,
+        face=public_face,
+        plain=public_plain,
+    )
     channel_history.append(
         game, "ooc", entry, gateway_plain=public_plain,
     )
@@ -157,17 +199,72 @@ def broadcast_ooc(
             continue
         face = speaker_face_for_character(speaker, game, viewer=other)
         line = render_ooc_line(other, face, message, kind=kind)
-        session.send(line)
-        session.send("")
-        gmcp.push_comm(session, "ooc", message, face)
+        # Blank line after OOC is part of the same captured burst -- skip
+        # both when the browser HUD gags captured comms from the main log.
+        gmcp.deliver_comm(session, "ooc", message, face, line, "")
         delivered = True
     if not delivered and speaker_session is not None:
         other = speaker
         face = speaker_face_for_character(speaker, game, viewer=other)
         line = render_ooc_line(other, face, message, kind=kind)
-        speaker_session.send(line)
-        speaker_session.send("")
-        gmcp.push_comm(speaker_session, "ooc", message, face)
+        gmcp.deliver_comm(speaker_session, "ooc", message, face, line, "")
+        delivered = True
+    if not skip_discord_mirror:
+        try:
+            from engine import discord_bridge
+
+            discord_bridge.schedule_ooc(public_plain)
+        except Exception as exc:
+            print(f"[discord_bridge] ooc schedule skipped: {exc}", flush=True)
+    return delivered
+
+
+def broadcast_ooc_from_face(
+    game,
+    face: str,
+    message: str,
+    *,
+    skip_discord_mirror: bool = False,
+    from_discord: bool = False,
+    respect_mutes: bool = True,
+) -> bool:
+    """Send OOC as a named face without a Character speaker.
+
+    Used for Discord relay and system staff lines (deploy heads-up from
+    ``Ash(GM)``). ``from_discord`` marks the history entry so it is not
+    mirrored back out; ``respect_mutes`` applies account OOC ignore when
+    the face matches a known account name.
+    """
+    from engine import gmcp
+
+    public_plain = format_ooc_line(face, message)
+    entry = {
+        "speaker": None,
+        "message": message,
+        "plain": public_plain,
+    }
+    if from_discord:
+        entry["from_discord"] = True
+    channel_history.append(
+        game, "ooc", entry, gateway_plain=public_plain,
+    )
+    delivered = False
+    from engine.accounts import find_account, ooc_is_blocked, account_for_character
+    for session in list(getattr(game, "sessions", None) or []):
+        other = getattr(session, "character", None)
+        if other is None:
+            continue
+        if respect_mutes:
+            listener = account_for_character(game, other)
+            if listener is not None:
+                discord_acct = find_account(game, face)
+                if (
+                    discord_acct is not None
+                    and ooc_is_blocked(listener, discord_acct.name)
+                ):
+                    continue
+        line = render_ooc_line(other, face, message)
+        gmcp.deliver_comm(session, "ooc", message, face, line, "")
         delivered = True
     if not skip_discord_mirror:
         try:
@@ -185,35 +282,14 @@ def broadcast_ooc_from_discord(game, face: str, message: str) -> bool:
     Uses a synthetic history entry (no Character speaker) and never
     mirrors back out to Discord.
     """
-    from engine import gmcp
-
-    public_plain = format_ooc_line(face, message)
-    entry = {
-        "speaker": None,
-        "message": message,
-        "plain": public_plain,
-        "from_discord": True,
-    }
-    channel_history.append(
-        game, "ooc", entry, gateway_plain=public_plain,
+    return broadcast_ooc_from_face(
+        game,
+        face,
+        message,
+        skip_discord_mirror=True,
+        from_discord=True,
+        respect_mutes=True,
     )
-    delivered = False
-    from engine.accounts import find_account, ooc_is_blocked, account_for_character
-    for session in list(getattr(game, "sessions", None) or []):
-        other = getattr(session, "character", None)
-        if other is None:
-            continue
-        listener = account_for_character(game, other)
-        if listener is not None:
-            discord_acct = find_account(game, face)
-            if discord_acct is not None and ooc_is_blocked(listener, discord_acct.name):
-                continue
-        line = render_ooc_line(other, face, message)
-        session.send(line)
-        session.send("")
-        gmcp.push_comm(session, "ooc", message, face)
-        delivered = True
-    return delivered
 
 
 def format_ooc_history_entry(entry, viewer, game) -> str:
@@ -235,6 +311,13 @@ def format_ooc_history_entry(entry, viewer, game) -> str:
     finder = getattr(game, "find_character", None)
     speaker = finder(speaker_key) if callable(finder) else None
     if speaker is None:
+        fallback_face = _ooc_fallback_face(entry)
+        if fallback_face:
+            if viewer is not None:
+                return render_ooc_line(
+                    viewer, fallback_face, message, kind=kind,
+                )
+            return format_ooc_line(fallback_face, message, kind=kind)
         plain = entry.get("plain")
         if isinstance(plain, str) and plain:
             return plain

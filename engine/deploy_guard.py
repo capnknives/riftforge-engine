@@ -6,6 +6,7 @@ squashbugs). These checks print warnings to docker logs; they never block a
 deploy that already squash-merged on GitHub.
 """
 
+import importlib
 import os
 
 
@@ -133,6 +134,11 @@ def check_integrations():
     except Exception as exc:
         warnings.append(f"could not load cursor_automations catalog: {exc}")
 
+    # persist_blob calls cuff blob_fragment / load_fragment; overlay drift
+    # without copyover cuff reload broke gm on + autosave (bug 739).
+    from engine import hooks
+    warnings.extend(hooks.post_overlay_game_checks())
+
     return warnings
 
 
@@ -141,9 +147,12 @@ def run_post_overlay_checks(root=None):
     if root is None:
         root = os.getcwd()
     try:
-        from engine import changelog_index as changelog_index_mod
+        import engine.changelog_ids as changelog_ids
+        import engine.changelog_index as changelog_index_mod
 
-        changelog_index_mod.ensure_compiled_index(
+        importlib.reload(changelog_ids)
+        changelog_index_mod = importlib.reload(changelog_index_mod)
+        changelog_index_mod.stamp_pending_and_ensure_index(
             root, log_prefix="[auto_deploy]",
         )
     except Exception as exc:

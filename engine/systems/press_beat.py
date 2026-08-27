@@ -340,8 +340,8 @@ def board_lines(game, character=None):
     for i, tmpl in enumerate(_STORY_TEMPLATES, start=1):
         lines.append(f"  {i}. {tmpl['title']} -- {tmpl['blurb']}")
     lines.append(
-        "Commands: takestory | interview <name> | photograph | reportstory | "
-        "abandonstory | sellphoto"
+        "Commands: storyboard take | interview <name> | photograph | storyboard report | "
+        "storyboard abandon | sellphoto (also: takestory, reportstory, abandonstory)"
     )
     if character is not None and has_story(character):
         brief = getattr(character, "press_story_brief", None) or {}
@@ -365,7 +365,7 @@ def takestory(character, game, pick=None):
     if not can_use_press_kit(character, game):
         return False, refuse_press(character, game), None
     if has_story(character):
-        return False, "You already have an open story. reportstory or abandonstory.", None
+        return False, "You already have an open story. storyboard report or storyboard abandon.", None
 
     ticks = int(getattr(game, "game_time_ticks", 0) or 0)
     if pick is not None:
@@ -392,7 +392,7 @@ def takestory(character, game, pick=None):
     msg = (
         f"[STORY] Accepted: {brief['title']}.\r\n"
         f"{brief['blurb']}\r\n"
-        "interview locals, photograph if needed, reportstory here."
+        "interview locals, photograph if needed, storyboard report here."
     )
     room_line = f"{character.key} tears a story card off the board."
     return True, msg, room_line
@@ -415,7 +415,7 @@ def interview(character, target, game):
     if not can_use_press_kit(character, game):
         return False, refuse_press(character, game), None
     if not has_story(character):
-        return False, "takestory at the Gazette first.", None
+        return False, "storyboard take at the Gazette first.", None
     if target is None or target is character:
         return False, "Interview whom?", None
     room = getattr(character, "location", None)
@@ -435,7 +435,7 @@ def interview(character, target, game):
     if len(done) >= need:
         return (
             False,
-            "Enough interviews for this brief. reportstory at the Gazette.",
+            "Enough interviews for this brief. storyboard report at the Gazette.",
             None,
         )
 
@@ -473,7 +473,7 @@ def _story_ready(character):
 def reportstory(character, game):
     """File a completed story at the desk."""
     if not has_story(character):
-        return False, "No open story. takestory at the Gazette.", None
+        return False, "No open story. storyboard take at the Gazette.", None
     room = getattr(character, "location", None)
     if not is_news_desk_room(room):
         return False, "File stories at the Gazette news desk.", None

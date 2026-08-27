@@ -16,6 +16,8 @@ import os
 import re
 from datetime import datetime
 
+from engine import thread_log
+
 
 # Kind strings used by callers and as the JSON "kind" field when useful.
 BUG = "bug"
@@ -49,6 +51,16 @@ _FILENAMES = {
 # tell triaged entries apart from new ones.
 STATUSES = ("open", "resolved", "rejected")
 
+# Threaded comments (suggestion 258 remainder). Same messages[] shape as
+# the player board / helper queries -- separate files, shared kit.
+MAX_COMMENTS_PER_TICKET = 40
+MAX_COMMENT_CHARS = 400
+
+_READ_DEFAULTS = {
+    "status": "open",
+    "messages": [],
+}
+
 # Labels shown in GM ``reports`` / ``reports show`` output.
 DISPLAY_LABELS = {
     BUG: "BUG",
@@ -71,8 +83,17 @@ KIND_ALIASES = {
     "typos": TYPO,
 }
 
+# Sections for the GM ``reports`` list (all-kinds view, oldest-first within
+# each block). Order matches the combined ``gm reports`` sheet.
+REPORT_LIST_SECTIONS = (
+    (BUG, "Bugs:", "BUG"),
+    (SUGGEST, "Ideas:", "IDEA"),
+    (TYPO, "Typos:", "TYPO"),
+    (HELP, "Help ideas:", "HELP"),
+)
 
-class ReportsIOError(OSError):
+
+class ReportsIOError(thread_log.ThreadLogIOError):
     """Report log append/update failed (permissions, read-only bind-mount, …)."""
 
 
@@ -90,24 +111,7 @@ def ensure_report_logs(directory="."):
     except OSError:
         pass
     for kind in _FILENAMES:
-        path = _path(kind, directory)
-        try:
-            if not os.path.isfile(path):
-                with open(path, "a", encoding="utf-8"):
-                    pass
-            try:
-                os.chmod(path, 0o666)
-            except OSError:
-                # Windows bind-mounts may ignore chmod; append probe below.
-                pass
-            with open(path, "a", encoding="utf-8"):
-                pass
-        except OSError as exc:
-            print(
-                f"[reports] ensure_report_logs {os.path.basename(path)}: "
-                f"{exc!r} (bug/suggest logging may fail until perms fixed)",
-                flush=True,
-            )
+        thread_log.ensure_file(_path(kind, directory), log_label="reports")
 
 
 def parse_kind_word(kind_word):
@@ -144,7 +148,8 @@ def record(kind, reporter, description, history, directory=".", context=None,
                  {"line": ..., "traceback": ...}
 
     context is an optional dict of diagnostic facts (room, vitals, mission,
-    …) from engine.report_context.build().
+    …) from engine.report_context.build(). Suggestions / typos / help ideas
+    attach a slim identity/location snapshot instead of the full dump.
 
     Returns the payload dict that was written, including a 1-based ``id``
     (the physical line number in the JSONL file -- same numbering
@@ -171,6 +176,7 @@ def record(kind, reporter, description, history, directory=".", context=None,
         "history": lines,
         "errors": errors,
         "status": "open",
+        "messages": [],
     }
     if context:
         payload["context"] = context
@@ -178,15 +184,8 @@ def record(kind, reporter, description, history, directory=".", context=None,
         payload["subject"] = subject
     path = _path(kind, directory)
     try:
-        # "a" appends; if the file doesn't exist yet, open creates it.
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload) + "\n")
-        # Id = physical line count after the append (matches recent()'s
-        # enumerate(..., start=1) over the same file). Count every line,
-        # including any blank ones, so ids stay stable with mark().
-        with open(path, encoding="utf-8") as f:
-            payload["id"] = sum(1 for _ in f)
-    except OSError as exc:
+        payload = thread_log.append_line(path, payload)
+    except thread_log.ThreadLogIOError as exc:
         print(
             f"[reports] record failed ({_FILENAMES.get(kind, kind)}): {exc!r}",
             flush=True,
@@ -218,25 +217,9 @@ def recent(kind, n, directory="."):
     if n is not None and n <= 0:
         return []
     path = _path(kind, directory)
-    if not os.path.isfile(path):
-        return []
-
-    entries = []
     try:
-        with open(path, encoding="utf-8") as f:
-            for line_no, raw in enumerate(f, start=1):
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    entry = json.loads(raw)
-                except json.JSONDecodeError:
-                    # Skip a bad line rather than failing the whole listing.
-                    continue
-                entry["id"] = line_no
-                entry.setdefault("status", "open")
-                entries.append(entry)
-    except OSError as exc:
+        entries = thread_log.read_all(path, defaults=_READ_DEFAULTS)
+    except thread_log.ThreadLogIOError as exc:
         print(
             f"[reports] recent read failed ({_FILENAMES.get(kind, kind)}): "
             f"{exc!r}",
@@ -329,7 +312,117 @@ def format_entry_lines(kind, entry, *, game=None):
         lines.append("")
         lines.append("context:")
         lines.append(json.dumps(context, indent=2, sort_keys=True))
+    lines.extend(_comment_lines(entry, game=game))
     return lines
+
+
+def _comment_lines(entry, *, game=None):
+    """Shared comment block for GM show and player bugs read."""
+    messages = entry.get("messages") or []
+    if not messages:
+        return []
+    from engine.char_identity import reporter_display_name
+
+    lines = ["", "comments:"]
+    for msg in messages:
+        who_raw = msg.get("from") or msg.get("author") or "?"
+        who = reporter_display_name(game, who_raw) if game is not None else who_raw
+        staff_bit = " [staff]" if msg.get("staff") else ""
+        stamp = msg.get("time") or msg.get("tick") or "?"
+        text = (msg.get("text") or "").strip()
+        lines.append(f"  [{stamp}] {who}{staff_bit}: {text}")
+    return lines
+
+
+def comment_count(entry):
+    """How many threaded comments sit on this ticket (0 if none)."""
+    return len(entry.get("messages") or [])
+
+
+def format_player_thread_lines(kind, entry, *, game=None):
+    """Lean player dump: description + comments, no history/context."""
+    label = DISPLAY_LABELS.get(kind, (kind or "?").upper())
+    entry_id = entry.get("id", "?")
+    status = entry.get("status", "open")
+    lines = [
+        f"{label} #{entry_id} ({status})",
+        f"filed: {entry.get('time', '?')}",
+        "",
+        (entry.get("description") or "").strip() or "(no description)",
+    ]
+    comments = _comment_lines(entry, game=game)
+    if comments:
+        lines.extend(comments)
+    else:
+        lines.extend(["", "(no comments yet)"])
+    cmd = {
+        BUG: "bugs",
+        SUGGEST: "ideas",
+        TYPO: "typos",
+        HELP: "helpsubmit",
+    }.get(kind, "bugs")
+    if entry.get("status") == "open":
+        lines.extend([
+            "",
+            f"Add a note: {cmd} comment {entry_id} <text>",
+        ])
+    return lines
+
+
+def can_player_comment(entry, character_key):
+    """Reporter may comment only while the ticket is still open."""
+    if entry is None:
+        return False
+    if (entry.get("status") or "open") != "open":
+        return False
+    needle = (character_key or "").strip()
+    return bool(needle) and entry.get("reporter") == needle
+
+
+def can_player_read(entry, character_key):
+    """Reporter may read their own ticket (any status)."""
+    if entry is None:
+        return False
+    needle = (character_key or "").strip()
+    return bool(needle) and entry.get("reporter") == needle
+
+
+def append_comment(
+    kind, entry_id, author_key, text, directory=".", *,
+    staff=False, tick=0,
+):
+    """Append one messages[] row. Does not flip status (staff still resolve)."""
+    body = (text or "").strip()
+    if not body:
+        raise ValueError("comment text required")
+    if len(body) > MAX_COMMENT_CHARS:
+        raise ValueError(
+            f"Keep comments under {MAX_COMMENT_CHARS} characters "
+            f"(yours is {len(body)})."
+        )
+    entry = get_by_id(kind, entry_id, directory=directory)
+    if entry is None:
+        raise IndexError(f"no {kind} report #{entry_id}")
+    messages = list(entry.get("messages") or [])
+    if len(messages) >= MAX_COMMENTS_PER_TICKET:
+        raise ValueError(
+            f"Ticket #{entry_id} hit the {MAX_COMMENTS_PER_TICKET}-comment cap."
+        )
+    messages.append({
+        "from": author_key or "?",
+        "text": body,
+        "tick": int(tick or 0),
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "staff": bool(staff),
+    })
+    entry["messages"] = messages
+    path = _path(kind, directory)
+    try:
+        return thread_log.rewrite_line(
+            path, entry_id, entry, missing=f"no {kind} report",
+        )
+    except thread_log.ThreadLogIOError as exc:
+        raise ReportsIOError(str(exc)) from exc
 
 
 def mark(kind, entry_id, status, directory=".", game=None):
@@ -347,28 +440,19 @@ def mark(kind, entry_id, status, directory=".", game=None):
     if status not in STATUSES:
         raise ValueError(f"status must be one of {STATUSES}, got {status!r}")
     path = _path(kind, directory)
-    if not os.path.isfile(path):
-        raise IndexError(f"no {kind} reports logged yet")
-
-    try:
-        with open(path, encoding="utf-8") as f:
-            lines = f.readlines()
-    except OSError as exc:
-        raise ReportsIOError(
-            f"cannot read report log {path!r}: {exc}"
-        ) from exc
-    if entry_id < 1 or entry_id > len(lines):
+    payload = get_by_id(kind, entry_id, directory=directory)
+    if payload is None:
+        if not os.path.isfile(path):
+            raise IndexError(f"no {kind} reports logged yet")
         raise IndexError(f"no {kind} report #{entry_id}")
 
-    payload = json.loads(lines[entry_id - 1])
     old_status = payload.get("status", "open")
     payload["status"] = status
-    payload["id"] = entry_id
-    lines[entry_id - 1] = json.dumps(payload) + "\n"
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-    except OSError as exc:
+        payload = thread_log.rewrite_line(
+            path, entry_id, payload, missing=f"no {kind} report",
+        )
+    except thread_log.ThreadLogIOError as exc:
         raise ReportsIOError(
             f"cannot update report log {path!r}: {exc}"
         ) from exc

@@ -19,6 +19,12 @@ POSTs to a Cursor webhook:
 3. **PR ready** -- when an open ``Fix lag: …`` PR appears, Kokid wiznet
    the PR link and clear the watch.
 
+Unmatched watches expire after ``DEFAULT_WATCH_TTL_SECONDS`` (24h) so a
+squashbug that never grew a Fix/Ship PR does not poll GitHub forever.
+Staff can drop the list immediately with ``gm kokid clear`` (also
+``gm reports kokid clear``). Quiet poll logs are the default; set
+``RIFTFORGE_KOKID_POLL_LOG=1`` for the old every-cycle trace.
+
 No separate GM-chat channel -- wiznet already is staff chat.
 """
 
@@ -50,6 +56,9 @@ DEFAULT_BURST_POLL_SECONDS = 15
 DEFAULT_BURST_WINDOW_SECONDS = 15 * 60
 # Fixer PRs often squash-merge in under a minute; scan recently merged too.
 DEFAULT_CLOSED_LOOKBACK_SECONDS = 6 * 3600
+# Unmatched squashbug / sendsuggest watches die after this so leftover ids
+# do not keep GitHub polling (and container logs) alive forever. 0 = never.
+DEFAULT_WATCH_TTL_SECONDS = 24 * 3600
 REPO_API_PULLS = (
     "https://api.github.com/repos/capnknives/RiftForge/pulls"
     "?state=open&per_page=30&sort=updated&direction=desc"
@@ -59,7 +68,8 @@ REPO_API_CLOSED_PULLS = (
     "?state=closed&per_page=30&sort=updated&direction=desc"
 )
 
-# Staff / container logs: one poll summary line per cycle while ids are watched.
+# Staff / container logs. The verbose every-cycle line is opt-in
+# (RIFTFORGE_KOKID_POLL_LOG=1); announce / expire / pickup still print.
 _POLL_LOG_PREFIX = "[kokid]"
 
 _FIX_IN_TITLE_RE = re.compile(
@@ -142,7 +152,8 @@ def _watch_ids(bucket, ids, *, root=None):
             print(
                 f"{_POLL_LOG_PREFIX} watching {label} report(s) {listed} "
                 f"(poll every {_poll_interval_seconds():.0f}s; "
-                f"gm reports kokid probe for live GitHub scan)",
+                f"gm kokid probe for a live GitHub scan; "
+                f"gm kokid clear to drop)",
                 flush=True,
             )
     return changed
@@ -205,6 +216,66 @@ def _watched_ids(bucket, *, root=None):
         except ValueError:
             continue
     return out
+
+
+def _entry_since(meta):
+    """Epoch seconds from a watch-file meta dict; 0 if missing or junk."""
+    if not isinstance(meta, dict):
+        return 0.0
+    try:
+        return float(meta.get("since") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _format_age(seconds):
+    """Short staff age label (45s, 12m, 5h, 3d)."""
+    try:
+        age = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        return "?"
+    if age < 90:
+        return f"{age:.0f}s"
+    if age < 3600:
+        return f"{age / 60.0:.0f}m"
+    if age < 86400:
+        return f"{age / 3600.0:.0f}h"
+    return f"{age / 86400.0:.0f}d"
+
+
+def _oldest_watch_age_seconds(*, root=None, now=None):
+    """Age in seconds of the oldest remaining unmatched watch, or None."""
+    root = root or _repo_root()
+    now = time.time() if now is None else float(now)
+    state = _load_json(_watch_path(root), {"bugs": {}, "suggestions": {}})
+    oldest = None
+    for bucket in ("bugs", "suggestions"):
+        for meta in (state.get(bucket) or {}).values():
+            since = _entry_since(meta)
+            if since <= 0:
+                continue
+            age = now - since
+            if oldest is None or age > oldest:
+                oldest = age
+    pending = lag_diag_pending(root=root)
+    if pending:
+        since = _entry_since(pending)
+        if since > 0:
+            age = now - since
+            if oldest is None or age > oldest:
+                oldest = age
+    return oldest
+
+
+def _format_ttl_label(seconds):
+    """Staff TTL label for diagnostic sheets."""
+    try:
+        ttl = float(seconds)
+    except (TypeError, ValueError):
+        return "?"
+    if ttl <= 0:
+        return "off (never expire)"
+    return _format_age(ttl)
 
 
 def _load_announced(*, root=None):
@@ -356,6 +427,216 @@ def clear_lag_diag_pending(*, root=None):
     except OSError:
         _save_json(path, {})
     return True
+
+
+def expire_stale_watches(*, root=None, now=None):
+    """Drop unmatched watches older than the TTL. TTL 0 means never expire.
+
+    Missing or zero ``since`` counts as already stale so leftover junk from
+    older watch files does not poll forever. Returns a dict of what dropped
+    (empty lists / False when nothing expired).
+    """
+    root = root or _repo_root()
+    now = time.time() if now is None else float(now)
+    ttl = _watch_ttl_seconds()
+    dropped = {"bugs": [], "suggestions": [], "lag": False}
+    if ttl <= 0:
+        return dropped
+
+    path = _watch_path(root)
+    state = _load_json(path, {"bugs": {}, "suggestions": {}})
+    changed = False
+    for bucket in ("bugs", "suggestions"):
+        bucket_map = dict(state.get(bucket) or {})
+        keep = {}
+        for key, meta in bucket_map.items():
+            since = _entry_since(meta)
+            age = (now - since) if since > 0 else (ttl + 1.0)
+            if age >= ttl:
+                try:
+                    dropped[bucket].append(int(key))
+                except (TypeError, ValueError):
+                    continue
+                changed = True
+            else:
+                keep[key] = meta
+        state[bucket] = keep
+    if changed:
+        if state.get("bugs") or state.get("suggestions"):
+            _save_json(path, state)
+        else:
+            try:
+                os.remove(path)
+            except OSError:
+                _save_json(path, {"bugs": {}, "suggestions": {}})
+
+    pending = lag_diag_pending(root=root)
+    if pending:
+        since = _entry_since(pending)
+        age = (now - since) if since > 0 else (ttl + 1.0)
+        if age >= ttl:
+            clear_lag_diag_pending(root=root)
+            dropped["lag"] = True
+    return dropped
+
+
+def log_expired_watches(dropped):
+    """One container line when TTL drops leftover squashbug watches."""
+    if not dropped:
+        return
+    bits = []
+    bugs = dropped.get("bugs") or []
+    sugs = dropped.get("suggestions") or []
+    if bugs:
+        bits.append(f"bugs {format_id_list(bugs)}")
+    if sugs:
+        bits.append(f"suggestions {format_id_list(sugs)}")
+    if dropped.get("lag"):
+        bits.append("lag-diag")
+    if not bits:
+        return
+    print(
+        f"{_POLL_LOG_PREFIX} dropped stale watches ({', '.join(bits)}) "
+        f"after {_format_ttl_label(_watch_ttl_seconds())} with no matching PR "
+        f"(gm kokid clear to drop sooner)",
+        flush=True,
+    )
+
+
+def _empty_dropped():
+    return {"bugs": [], "suggestions": [], "lag": False}
+
+
+def watches_dropped_any(dropped):
+    """True when expire/clear actually removed something."""
+    if not dropped:
+        return False
+    return bool(
+        dropped.get("bugs")
+        or dropped.get("suggestions")
+        or dropped.get("lag")
+    )
+
+
+def format_cleared_message(dropped):
+    """One GM line after ``gm kokid clear``."""
+    if not watches_dropped_any(dropped):
+        return "Kokid watch list was already empty."
+    bits = []
+    bugs = dropped.get("bugs") or []
+    sugs = dropped.get("suggestions") or []
+    if bugs:
+        bits.append(f"bug {format_id_list(bugs)}")
+    if sugs:
+        bits.append(f"suggestion {format_id_list(sugs)}")
+    if dropped.get("lag"):
+        bits.append("lag-diag")
+    return (
+        "Cleared Kokid watches: "
+        + "; ".join(bits)
+        + ". GitHub polling stops until the next squashbug or sendsuggest."
+    )
+
+
+def clear_watches(
+    *,
+    root=None,
+    ids=None,
+    bugs=True,
+    suggestions=True,
+    lag=False,
+):
+    """Staff/TTL helper: drop watches. ``ids`` None = every id in the buckets."""
+    root = root or _repo_root()
+    dropped = _empty_dropped()
+    want_ids = None
+    if ids:
+        want_ids = set()
+        for raw in ids:
+            try:
+                sid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if sid > 0:
+                want_ids.add(sid)
+        if not want_ids:
+            want_ids = None
+
+    if bugs:
+        have = watched_bug_ids(root=root)
+        hit = sorted(have if want_ids is None else (have & want_ids))
+        if hit:
+            clear_watched_bug_ids(hit, root=root)
+            dropped["bugs"] = hit
+    if suggestions:
+        have = watched_suggestion_ids(root=root)
+        hit = sorted(have if want_ids is None else (have & want_ids))
+        if hit:
+            clear_watched_suggestion_ids(hit, root=root)
+            dropped["suggestions"] = hit
+    if lag and want_ids is None:
+        if lag_diag_pending(root=root):
+            clear_lag_diag_pending(root=root)
+            dropped["lag"] = True
+    return dropped
+
+
+def clear_watches_from_args(tokens, *, root=None):
+    """Parse ``gm kokid clear …`` tokens. Returns (dropped, error_or_none)."""
+    buckets = set()
+    ids = []
+    unknown = []
+    for tok in tokens or ():
+        low = str(tok).strip().lower().lstrip("#")
+        if not low or low == "all":
+            continue
+        if low in ("bugs", "bug"):
+            buckets.add("bugs")
+        elif low in ("suggestions", "suggestion", "ideas", "idea", "sugs"):
+            buckets.add("suggestions")
+        elif low in ("lag", "diag", "lag-diag"):
+            buckets.add("lag")
+        else:
+            try:
+                ids.append(int(low))
+            except ValueError:
+                unknown.append(str(tok))
+    if unknown:
+        return None, (
+            "Unknown kokid clear token(s): "
+            + ", ".join(unknown)
+            + ". Type gm kokid help"
+        )
+    if not tokens or (not buckets and not ids):
+        dropped = clear_watches(
+            root=root, bugs=True, suggestions=True, lag=True,
+        )
+        return dropped, None
+    if not buckets:
+        buckets = {"bugs", "suggestions"}
+    dropped = clear_watches(
+        root=root,
+        bugs="bugs" in buckets,
+        suggestions="suggestions" in buckets,
+        lag="lag" in buckets,
+        ids=ids or None,
+    )
+    return dropped, None
+
+
+def usage_lines():
+    """How-to lines for ``gm kokid help`` / unknown args."""
+    return [
+        "gm kokid                 watcher status (also gm reports kokid)",
+        "gm kokid probe           live GitHub scan",
+        "gm kokid clear           drop every unmatched watch (stop polling)",
+        "gm kokid clear 199 220   drop those bug/suggestion ids",
+        "gm kokid clear bugs      drop bug watches only",
+        "gm kokid clear suggestions",
+        "gm kokid clear lag       drop pending lag-diag watch",
+        "Unmatched watches also expire on their own "
+        f"(TTL {_format_ttl_label(_watch_ttl_seconds())}).",
+    ]
 
 
 def lag_reporter_wiznet_label(game, reporter):
@@ -521,6 +802,24 @@ def _poll_interval_seconds():
         return float(DEFAULT_POLL_SECONDS)
 
 
+def _watch_ttl_seconds():
+    """How long unmatched watches stay before expire (0 = never)."""
+    raw = (os.environ.get("RIFTFORGE_KOKID_WATCH_TTL_SECONDS") or "").strip()
+    if not raw:
+        return float(DEFAULT_WATCH_TTL_SECONDS)
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return float(DEFAULT_WATCH_TTL_SECONDS)
+
+
+def _poll_log_verbose():
+    """True when staff opted into the every-cycle GitHub poll trace."""
+    return (os.environ.get("RIFTFORGE_KOKID_POLL_LOG") or "").strip().lower() in (
+        "1", "yes", "true", "on",
+    )
+
+
 def _burst_poll_seconds():
     """Faster interval while a watch is still in the post-pickup window."""
     try:
@@ -645,7 +944,13 @@ def _log_poll_summary(
     announced_prs,
     found_pr_numbers,
 ):
-    """One container-log line per poll so staff can trace missed wiznet announces."""
+    """One container-log line per poll so staff can trace missed wiznet announces.
+
+    Quiet by default (announce / expire / pickup still print). Set
+    ``RIFTFORGE_KOKID_POLL_LOG=1`` for the full every-cycle dump.
+    """
+    if not found_pr_numbers and not _poll_log_verbose():
+        return
     open_nums = [p.get("number") for p in (pulls or ()) if p.get("number") is not None]
     fix_rows, ship_rows = _fix_ship_titles_from_pulls(pulls)
     parts = [
@@ -695,6 +1000,9 @@ def diagnostic_lines(*, game=None, root=None, probe_github=False):
     PR titles would match the current watch list.
     """
     root = root or _repo_root()
+    dropped = expire_stale_watches(root=root)
+    if watches_dropped_any(dropped):
+        log_expired_watches(dropped)
     bugs = sorted(watched_bug_ids(root=root))
     sugs = sorted(watched_suggestion_ids(root=root))
     lines = [
@@ -706,6 +1014,13 @@ def diagnostic_lines(*, game=None, root=None, probe_github=False):
         lines.append(f"  Watching suggestions: {format_id_list(sugs)}")
     if not bugs and not sugs:
         lines.append("  Watching: (nothing — squashbug/squashsuggest to queue)")
+    oldest = _oldest_watch_age_seconds(root=root)
+    if oldest is not None:
+        lines.append(f"  Oldest unmatched watch: {_format_age(oldest)} ago")
+    lines.append(
+        f"  Watch TTL: {_format_ttl_label(_watch_ttl_seconds())} "
+        "(gm kokid clear drops now)",
+    )
     lines.append(
         f"  GitHub token: {'set' if _github_token_present() else 'MISSING (401)'}",
     )
@@ -714,6 +1029,11 @@ def diagnostic_lines(*, game=None, root=None, probe_github=False):
         f"(steady {_poll_interval_seconds():.0f}s; "
         f"burst {_burst_poll_seconds():.0f}s for {_burst_window_seconds():.0f}s "
         "after squashbug; drafts count; immediate poll after pickup)",
+    )
+    lines.append(
+        "  Poll log: quiet"
+        if not _poll_log_verbose()
+        else "  Poll log: verbose (every cycle)",
     )
     if game is not None:
         last = float(getattr(game, "_kokid_pr_poll_at", 0) or 0)
@@ -1029,6 +1349,9 @@ def poll_watched_prs(game, *, root=None, force=False, pulls=None):
     GitHub round-trip when the tick also checks lag-diag PRs).
     """
     root = root or _repo_root()
+    dropped = expire_stale_watches(root=root)
+    if watches_dropped_any(dropped):
+        log_expired_watches(dropped)
     watched_bugs = watched_bug_ids(root=root)
     watched_suggestions = watched_suggestion_ids(root=root)
     if not watched_bugs and not watched_suggestions:
@@ -1050,6 +1373,9 @@ def poll_lag_diag_pr(game, *, root=None, force=False, pulls=None):
     watches) instead of a second blocking urllib call.
     """
     root = root or _repo_root()
+    dropped = expire_stale_watches(root=root)
+    if watches_dropped_any(dropped):
+        log_expired_watches(dropped)
     if not lag_diag_pending(root=root):
         return None
 
@@ -1092,6 +1418,9 @@ def maybe_poll_on_tick(game):
     (see ``maybe_poll_on_tick_async``) so sync urllib never blocks the
     ~3s tick. Smoke / no-loop callers still poll inline.
     """
+    dropped = expire_stale_watches()
+    if watches_dropped_any(dropped):
+        log_expired_watches(dropped)
     if not _watch_active():
         return []
     if not _poll_interval_elapsed(game, force=False):

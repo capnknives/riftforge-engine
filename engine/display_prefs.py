@@ -8,6 +8,19 @@ no game rules. See docs/plans/mud_formatting_preferences.md.
 
 import re
 
+# Paragraph spacing for *asynchronous* arrivals -- a room event (say,
+# emote, another player's action) or an incoming tell that lands on your
+# screen between your own commands. Airy adds one blank line after each
+# such event so a busy room does not read as a wall of text; packed keeps
+# the old tight layout. This never touches your own command's reply text
+# (see cmd_get's "You pick up X." + "You tuck it into your bag." staying
+# glued together) or anything that already manages its own spacing
+# (combat, pager pages, list/table dumps that loop session.send for one
+# logical block) -- see engine.world.Room.broadcast and cmd_tell for the
+# only two call sites that apply it.
+OUTPUT_SPACING_AIRY = "airy"
+OUTPUT_SPACING_PACKED = "packed"
+
 # Dense gothic prompt built from *optional segment* tokens (%Hp, %Fu, …).
 # Segments that do not apply (no fuel, no mana, solo) expand to "" so the
 # field never leaves an empty bracket. Color via style.render.
@@ -48,6 +61,16 @@ WIDTH_MIN = 40
 WIDTH_MAX = 120
 WIDTH_DEFAULT = 67
 
+# NPC foot-traffic verbosity (bug report 782 / screenreader peace).
+TRAFFIC_QUIET = "quiet"
+TRAFFIC_NORMAL = "normal"
+TRAFFIC_VERBOSE = "verbose"
+TRAFFIC_MODES = frozenset({
+    TRAFFIC_QUIET,
+    TRAFFIC_NORMAL,
+    TRAFFIC_VERBOSE,
+})
+
 # Two-character optional-field tokens (checked before single-letter codes).
 _SEGMENT_TOKENS = frozenset({
     "Hp", "En", "St", "Mn", "Fu", "Mo", "Tg", "Ex", "Gr", "Nd",
@@ -65,6 +88,24 @@ _GENERIC_PROMPT_TEMPLATES = frozenset({
 # Brackets/quotes in chat *bodies* still trip VoiceOver/Mudrammer when channel
 # chrome is already plain — strip them for plaincomms viewers only.
 _PLAIN_COMM_BODY_SYMBOLS = re.compile(r"\(\(|\)\)|[()\[\]{}<>\"`]")
+
+
+def normalize_output_spacing(value):
+    """Return ``airy`` or ``packed`` for persist / config."""
+    raw = str(value or "").strip().lower()
+    if raw in (OUTPUT_SPACING_PACKED, "packed", "dense", "compact"):
+        return OUTPUT_SPACING_PACKED
+    return OUTPUT_SPACING_AIRY
+
+
+def wants_airy_spacing(character):
+    """True when the player wants a blank line after async room/tell events."""
+    ensure_display_defaults(character)
+    if getattr(character, "screenreader", False):
+        return False
+    return normalize_output_spacing(
+        getattr(character, "output_spacing", OUTPUT_SPACING_AIRY),
+    ) == OUTPUT_SPACING_AIRY
 
 
 def preference_character(character, game=None):
@@ -131,6 +172,12 @@ def ensure_display_defaults(character):
         character.display_width = WIDTH_DEFAULT
     if not hasattr(character, "screenreader"):
         character.screenreader = False
+    if not hasattr(character, "output_spacing"):
+        character.output_spacing = OUTPUT_SPACING_AIRY
+    else:
+        character.output_spacing = normalize_output_spacing(
+            character.output_spacing,
+        )
     if not hasattr(character, "show_minimap"):
         character.show_minimap = True
     if not hasattr(character, "map_on_move"):
@@ -181,6 +228,12 @@ def ensure_display_defaults(character):
     if not hasattr(character, "compact_floor_items"):
         # config items compact on|off -- one paragraph for floor loot on look.
         character.compact_floor_items = False
+    if not hasattr(character, "compact_vehicles"):
+        # config vehicles compact on|off -- summarize 3+ parked rides on look.
+        character.compact_vehicles = False
+    if not hasattr(character, "compact_houses"):
+        # config houses compact on|off -- summarize 3+ for-sale homes on look.
+        character.compact_houses = False
     if not hasattr(character, "autokill"):
         # Dungeon fodder only -- pit / portal / stronghold trash (help autokill).
         character.autokill = False
@@ -202,6 +255,46 @@ def ensure_display_defaults(character):
     if not hasattr(character, "plaincomms"):
         # Plain say/tell/OOC sentences without channel symbols (config plaincomms).
         character.plaincomms = False
+    if not hasattr(character, "traffic_mode") or character.traffic_mode is None:
+        # quiet | normal | verbose -- NPC leave/arrive crowd sampling.
+        character.traffic_mode = TRAFFIC_NORMAL
+
+
+def normalize_traffic_mode(raw):
+    """Return a valid traffic mode id, or None."""
+    if raw is None:
+        return None
+    key = str(raw).strip().lower()
+    if key in TRAFFIC_MODES:
+        return key
+    return None
+
+
+def traffic_mode(character):
+    """Resolved traffic verbosity for NPC movement lines."""
+    ensure_display_defaults(character)
+    return normalize_traffic_mode(getattr(character, "traffic_mode", None)) or (
+        TRAFFIC_NORMAL
+    )
+
+
+def traffic_wants_quiet(character, game=None):
+    """True when this viewer wants sampled NPC foot traffic in busy hubs."""
+    ensure_display_defaults(character)
+    if character is None:
+        return False
+    try:
+        from engine.hooks import is_watching_room
+        if is_watching_room(character, game=game):
+            return False
+    except Exception:
+        pass
+    mode = traffic_mode(character)
+    if mode == TRAFFIC_VERBOSE:
+        return False
+    if mode == TRAFFIC_QUIET:
+        return True
+    return bool(getattr(character, "screenreader", False))
 
 
 def drive_map_render_args(character):
@@ -246,6 +339,18 @@ def wants_compact_floor_items(character):
     """True when floor loot on look should collapse to one paragraph."""
     ensure_display_defaults(character)
     return bool(getattr(character, "compact_floor_items", False))
+
+
+def wants_compact_vehicles(character):
+    """True when 3+ parked vehicles should summarize on ordinary look."""
+    ensure_display_defaults(character)
+    return bool(getattr(character, "compact_vehicles", False))
+
+
+def wants_compact_houses(character):
+    """True when 3+ for-sale street homes should summarize on look / homes here."""
+    ensure_display_defaults(character)
+    return bool(getattr(character, "compact_houses", False))
 
 
 def wants_plain_comms(character):
@@ -316,6 +421,21 @@ def format_ooc_chat(viewer, face, message, *, kind="normal"):
     return ooc_channel.format_ooc_line(face, text, kind=kind)
 
 
+def format_questions_chat(viewer, face, message):
+    """Questions channel line for one viewer (plain or ``((QUESTIONS))`` chrome)."""
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    if wants_plain_comms(viewer):
+        text = plain_comm_message(text)
+        if not text:
+            return ""
+        label = plain_comm_face(face)
+        return f"Questions. {label} asks. {text}."
+    from engine import questions_channel
+    return questions_channel.format_questions_line(face, text)
+
+
 def format_say_chat(
     viewer,
     face,
@@ -325,33 +445,47 @@ def format_say_chat(
     you_verb="say",
     they_verb="says",
     tone=None,
+    voice_phrase=None,
 ):
     """Room say line for one viewer (plain or quoted default)."""
     text = str(message or "").strip()
     if not text:
         return ""
+    vp = ""
+    if not you:
+        vp = str(voice_phrase or "").strip()
     if wants_plain_comms(viewer):
         text = plain_comm_message(text)
         if not text:
             return ""
         verb = _plain_say_verb(you, you_verb, they_verb, tone)
         who = "You" if you else plain_comm_face(face)
+        if vp:
+            return f"{who} {verb} {vp}. {text}."
         return f"{who} {verb}. {text}."
     if tone:
         if tone == "whisper":
             if you:
                 return f'You whisper, "{text}"'
+            if vp:
+                return f'{face} whispers {vp}, "{text}"'
             return f'{face} whispers, "{text}"'
         if tone == "shout":
             if you:
                 return f'You shout, "{text}"'
+            if vp:
+                return f'{face} shouts {vp}, "{text}"'
             return f'{face} shouts, "{text}"'
         if tone == "drawl":
             if you:
                 return f'You drawl, "{text}"'
+            if vp:
+                return f'{face} drawls {vp}, "{text}"'
             return f'{face} drawls, "{text}"'
     if you:
         return f'You {you_verb}, "{text}"'
+    if vp:
+        return f'{face} {they_verb} {vp}, "{text}"'
     return f'{face} {they_verb}, "{text}"'
 
 
@@ -410,16 +544,28 @@ def apply_screenreader_mode(character, enabled):
         character.show_minimap = False
         character.map_on_move = False
         character.map_on_look = False
+        if traffic_mode(character) == TRAFFIC_NORMAL:
+            character.traffic_mode = TRAFFIC_QUIET
         # Default fightlog on for screenreader (cinematic replay after fights).
         character.fightlog_enabled = True
+        _push_screenreader_status(character)
         return (
             "Screenreader mode on -- ASCII frames and minimaps "
             "flatten to lists; combat stays tagged and brief. "
+            "NPC foot traffic is quiet (config traffic normal to restore). "
             "Fightlog on -- cinematic lines buffer for 'fightlog read' "
             "after a fight (config fightlog off to stop)."
         )
     character.screenreader = False
+    _push_screenreader_status(character)
     return "Screenreader mode off."
+
+
+def _push_screenreader_status(character):
+    """Tell GMCP clients (browser HUD) the atlas should hide or return."""
+    from engine import gmcp
+
+    gmcp.push_char_status(character)
 
 
 def sheet_width(character):
@@ -969,6 +1115,68 @@ def paint_channel_line(character, channel, text, *, default="muted"):
     return style.paint_for(character, role, text)
 
 
+def _explicit_channel_color(character, channel):
+    """Return a player-chosen channel role, or None for default layered chrome.
+
+    ``config channel ooc gold`` (and the same for questions) paints the
+    whole line one color. The catalog default ``ooc`` still means the
+    layered crimson-parens / gold-letters treatment.
+    """
+    ensure_display_defaults(character)
+    custom = (character.channel_colors or {}).get(channel)
+    if not custom or custom == "ooc":
+        return None
+    from engine import style
+    if custom in style.COLORS or custom in style.COLORS_XTERM256:
+        return custom
+    return None
+
+
+def paint_double_bracket_channel_line(
+    character, mark, rest, *, channel="ooc", body_role="ooc",
+):
+    """Sighted ``((MARK))`` chrome: crimson parens, gold letters, body on rest.
+
+    *rest* is never parsed as ``paint_layered`` markup -- player text can
+    contain ``<gold>`` or URLs without eating the line. An explicit
+    ``config channel <channel> <role>`` other than ``ooc`` paints the
+    reconstructed whole line in that one role instead.
+    """
+    from engine import style
+
+    ensure_display_defaults(character)
+    whole = f"(({mark})){rest}"
+    custom = _explicit_channel_color(character, channel)
+    depth = color_depth(character)
+    if custom:
+        return style.paint_preserving_urls(custom, whole, depth=depth)
+    # Layered prefix only -- mark is a fixed catalog word (OOC / QUESTIONS).
+    prefix = style.paint_layered_for(
+        character,
+        "dark_red",
+        f"<dark_red>((<gold>{mark}<dark_red>))",
+    )
+    if not rest:
+        return prefix
+    return prefix + style.paint_preserving_urls(body_role, rest, depth=depth)
+
+
+def paint_plaincomms_channel_lead(character, plain, lead, *, body_role="ooc"):
+    """Gold the leading ``OOC.`` / ``Questions.`` word; body stays parchment."""
+    from engine import style
+
+    ensure_display_defaults(character)
+    text = str(plain or "")
+    if not text.startswith(lead):
+        return style.paint_for(character, body_role, text)
+    rest = text[len(lead):]
+    depth = color_depth(character)
+    return (
+        style.paint_for(character, "gold", lead)
+        + style.paint_preserving_urls(body_role, rest, depth=depth)
+    )
+
+
 def format_tag_line(
     character,
     tag,
@@ -1024,6 +1232,8 @@ _TAG_ROLES = {
     "GAIN": "ok",
     "TIER": "alert",
     "JOURNAL": "accent",
+    "INTEL": "alert",
+    "OOCMAIL": "gold",
 }
 
 

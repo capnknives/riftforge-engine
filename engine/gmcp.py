@@ -12,6 +12,7 @@ engine.hooks so two-repo purity stays intact.
 
 import json
 import logging
+import os
 
 from engine import telnet
 
@@ -20,6 +21,98 @@ log = logging.getLogger(__name__)
 # Advertised in Core.Hello -- bump when the GMCP surface changes meaningfully.
 GMCP_SERVER_NAME = "Riftforge"
 GMCP_SERVER_VERSION = "1.0"
+
+# ---------------------------------------------------------------------------
+# Mudlet auto-install / auto-update (GMCP Client.GUI).
+#
+# Mudlet natively downloads + installs the package at ``url`` and upgrades it
+# whenever ``version`` changes (docs: Manual:GMCP_Extensions). We host the
+# .mpackage on the live player site ``play.riftforge.me`` -- nginx serves it
+# straight from ``/var/www/mm`` (a copy of the repo ``www/`` dir) with the
+# valid play.riftforge.me TLS cert. (The apex ``riftforge.me`` mixes GitHub
+# Pages + droplet A records, so its HTTPS cert does not match the host -- do
+# not use it.) ``tools/mudlet/pack_mortals.py`` writes both the www copy and
+# the version sidecar this module reads, so the announced version always
+# matches the hosted bytes.
+# ---------------------------------------------------------------------------
+MUDLET_GUI_URL = "https://play.riftforge.me/MortalsAndMonsters.mpackage"
+# Human-friendly package name for player-facing verbs (help/mpkg).
+MUDLET_PACKAGE_LABEL = "Mortals and Monsters"
+# tools/mudlet/MortalsAndMonsters.version (content hash written by pack).
+_MUDLET_VERSION_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "tools",
+    "mudlet",
+    "MortalsAndMonsters.version",
+)
+# Cache the file read: (mtime, version) so an edit on disk is still picked up
+# without hitting the filesystem on every login.
+_mudlet_version_cache = (None, None)
+
+
+def _mudlet_package_version():
+    """Return the current package version string, or None if unavailable.
+
+    Read from the sidecar file pack_mortals.py writes; cached by mtime so a
+    rebuild on the live tree is noticed without a per-login stat storm.
+    """
+    global _mudlet_version_cache
+    try:
+        mtime = os.path.getmtime(_MUDLET_VERSION_FILE)
+    except OSError:
+        return None
+    cached_mtime, cached_version = _mudlet_version_cache
+    if cached_mtime == mtime and cached_version:
+        return cached_version
+    try:
+        with open(_MUDLET_VERSION_FILE, encoding="utf-8") as handle:
+            version = handle.read().strip()
+    except OSError:
+        return None
+    if not version:
+        return None
+    _mudlet_version_cache = (mtime, version)
+    return version
+
+
+def maybe_push_client_gui(session):
+    """Offer the Mudlet auto-install package to a Mudlet client, once.
+
+    Only Mudlet (identified by its Core.Hello ``client`` field) understands
+    Client.GUI, so we gate on it -- the browser / telnet never see it. Sending
+    is idempotent per session; Mudlet itself no-ops when already up to date.
+    """
+    if session is None or not getattr(session, "gmcp_enabled", False):
+        return
+    if getattr(session, "_client_gui_sent", False):
+        return
+    if str(getattr(session, "gmcp_client", "") or "").lower() != "mudlet":
+        return
+    version = _mudlet_package_version()
+    if not version:
+        return
+    session._client_gui_sent = True
+    session.send_gmcp("Client.GUI", {"version": version, "url": MUDLET_GUI_URL})
+
+
+def force_push_client_gui(session) -> bool:
+    """Manually (re)send Client.GUI to a Mudlet client. Returns True if sent.
+
+    Backs the in-game ``mpkg download`` verb: unlike maybe_push_client_gui this
+    ignores the once-per-session guard, so a player can pull or re-pull the
+    package on demand (fresh install, or force an upgrade). Non-Mudlet clients
+    get nothing -- the verb prints copy-paste instructions instead.
+    """
+    if session is None or not getattr(session, "gmcp_enabled", False):
+        return False
+    if str(getattr(session, "gmcp_client", "") or "").lower() != "mudlet":
+        return False
+    version = _mudlet_package_version()
+    if not version:
+        return False
+    session._client_gui_sent = True
+    session.send_gmcp("Client.GUI", {"version": version, "url": MUDLET_GUI_URL})
+    return True
 
 # Packages this server can emit (Mudlet Core.Supports.Set style: "Name Ver").
 SERVER_SUPPORTS = (
@@ -34,6 +127,10 @@ SERVER_SUPPORTS = (
     # Live combat-pit / Mudlet spectator channel (supers/combat_viz.py).
     "RiftForge.Combat 1",
     "RiftForge.Char 1",
+    # America overland camera + Mudlet mapper dock + browser HUD (engine/map_ui.py).
+    "RiftForge.Map 1",
+    # Interior zone mapper (engine/zone_hud.py) -- streets + visited rooms.
+    "RiftForge.Zone 1",
 )
 
 
@@ -144,6 +241,22 @@ def _parse_supports_list(payload) -> dict:
     return out
 
 
+def _refresh_after_supports(session):
+    """Re-push identity / room / America atlas after the client changes Supports.
+
+    Stock Mudlet sends Core.Supports.Set without RiftForge.Map. The mapper
+    package then sends Core.Supports.Add once its script loads -- often
+    *after* login -- so Atlas would never go out if we only handled Set.
+    """
+    if session.character is None:
+        return
+    push_char_identity(session.character)
+    push_vitals(session.character)
+    push_room(session.character)
+    push_map(session.character, force_grid=True)
+    push_map_atlas(session.character)
+
+
 def handle_inbound(session, package: str, payload):
     """Dispatch one inbound GMCP package from the client.
 
@@ -156,23 +269,30 @@ def handle_inbound(session, package: str, payload):
         if isinstance(payload, dict):
             cid = payload.get("client") or payload.get("name")
             cver = payload.get("version")
+            session.gmcp_client = str(cid or "")
             log.debug("GMCP Core.Hello from client=%s version=%s", cid, cver)
+        # Mudlet identifies itself here; offer the auto-install package.
+        maybe_push_client_gui(session)
         return
     if package == "Core.Supports.Set":
         session.gmcp_supports = _parse_supports_list(payload)
         # Client just told us what it wants -- push identity packages if
         # a character is already attached (copyover / late Supports).
-        if session.character is not None:
-            push_char_identity(session.character)
-            push_vitals(session.character)
-            push_room(session.character)
+        _refresh_after_supports(session)
         return
     if package == "Core.Supports.Add":
         session.gmcp_supports.update(_parse_supports_list(payload))
+        _refresh_after_supports(session)
         return
     if package == "Core.Supports.Remove":
         for name in _parse_supports_list(payload):
             session.gmcp_supports.pop(name, None)
+        return
+    if package == "RiftForge.Client":
+        # Browser HUD prefs (gag captured comms from the main transcript).
+        # Telnet clients never send this package, so they keep full prose.
+        if isinstance(payload, dict) and "gag_comms" in payload:
+            session.gag_captured_comms = _gag_comms_flag(payload.get("gag_comms"))
         return
     # Everything else: ignore.
 
@@ -209,13 +329,12 @@ def handle_telnet_event(session, event):
                 # Chargen / account-link can take many read_line turns after
                 # the client already sent Core.Supports.Set with no character
                 # attached -- re-push once GMCP is live when a body exists.
-                if session.character is not None:
-                    push_char_identity(session.character)
-                    push_vitals(session.character)
+                _refresh_after_supports(session)
             return
         if _cmd == telnet.DONT:
             session.gmcp_enabled = False
             session.gmcp_supports = {}
+            session.gag_captured_comms = False
             return
         if _cmd == telnet.WILL:
             # Client offers GMCP -- ask them to enable it.
@@ -224,6 +343,7 @@ def handle_telnet_event(session, event):
         if _cmd == telnet.WONT:
             session.gmcp_enabled = False
             session.gmcp_supports = {}
+            session.gag_captured_comms = False
             return
         return
 
@@ -269,6 +389,10 @@ def push_char_status(character):
         "name": _display_name(character) if character is not None else "",
         "idle": "1" if getattr(character, "idle_mode", False) else "0",
         "gm": "1" if getattr(character, "gm_mode", False) else "0",
+        # Browser HUD hides the atlas when this is "1" (help browser).
+        "screenreader": (
+            "1" if getattr(character, "screenreader", False) else "0"
+        ),
     }
     extras = hooks.gmcp_char_status(character)
     if isinstance(extras, dict):
@@ -402,14 +526,90 @@ def room_info_payload(character):
     return payload
 
 
+def _gag_comms_flag(value) -> bool:
+    """Parse inbound gag_comms (true/false, 1/0, \"1\"/\"0\")."""
+    if value is True or value == 1:
+        return True
+    if value is False or value == 0 or value is None:
+        return False
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    return False
+
+
 def push_room(character):
     """Send Room.Info for the character's current room."""
     session = getattr(character, "session", None)
-    if session is None or not client_supports(session, "Room.Info"):
+    if session is None:
         return
-    payload = room_info_payload(character)
-    if payload:
-        session.send_gmcp("Room.Info", payload)
+    if client_supports(session, "Room.Info"):
+        payload = room_info_payload(character)
+        if payload:
+            session.send_gmcp("Room.Info", payload)
+        push_map(character)
+    # Fog + interior graph only for HUD/Mudlet clients that asked for them.
+    # Telnet does not grow visited_room_keys on every look.
+    if (
+        client_supports(session, "RiftForge.Zone")
+        or client_supports(session, "RiftForge.Map")
+    ):
+        from engine import zone_hud
+
+        zone_hud.record_visit(character)
+        push_zone(character)
+
+
+def push_zone(character):
+    """Send RiftForge.Zone (interior streets + visited rooms).
+
+    Advertised as its own package; the browser also lists RiftForge.Map,
+    so a Map-only client still gets the interior graph.
+    """
+    session = getattr(character, "session", None)
+    if session is None:
+        return
+    if not (
+        client_supports(session, "RiftForge.Zone")
+        or client_supports(session, "RiftForge.Map")
+    ):
+        return
+    from engine import zone_hud
+
+    game = getattr(session, "game", None)
+    payload = zone_hud.build_zone_payload(character, game)
+    if not payload:
+        return
+    session.send_gmcp("RiftForge.Zone", payload)
+
+
+def push_map(character, *, force_grid=False):
+    """Send RiftForge.Map you-are-here + landmarks (no 96x60 grid).
+
+    The full-country silhouette is ``RiftForge.Map.Atlas`` (compact rows)
+    so a 64 KB WebSocket frame is not truncated. The HUD keeps that
+    country map until the plane / atlas id changes. ``atlas`` in the
+    transcript is the screen-sized camera (``RiftForge.Map.View``) --
+    the HUD does not swap to it.
+    """
+    session = getattr(character, "session", None)
+    if session is None or not client_supports(session, "RiftForge.Map"):
+        return
+    game = getattr(session, "game", None)
+    from engine import map_hud
+
+    atlas = getattr(game, "overland_atlas", None) if game is not None else None
+    map_id = str(getattr(atlas, "map_id", "") or "") if atlas is not None else ""
+    last_atlas = getattr(session, "_web_map_atlas_id", None)
+    if map_id and (force_grid or map_id != last_atlas):
+        session._web_map_atlas_id = map_id
+        push_map_atlas(character, game=game)
+    payload = map_hud.build_map_payload(
+        character, game, include_grid=False
+    )
+    if not payload:
+        return
+    session.send_gmcp("RiftForge.Map", payload)
 
 
 def push_comm(session, chan: str, msg: str, player: str):
@@ -431,7 +631,131 @@ def push_comm(session, chan: str, msg: str, player: str):
     )
 
 
+def deliver_comm(session, chan: str, msg: str, player: str, *prose_lines):
+    """Always push Comm.Channel; skip transcript prose when the HUD gags.
+
+    Gateway batches leftover telnet into one op:text frame, so the browser
+    cannot reliably strip OOC/tells itself. When session.gag_captured_comms
+    is True the pane still gets GMCP; the main log does not. Telnet never
+    sets the flag, so it keeps every line. Room say/emote must not use this
+    helper -- those stay in the transcript even if a later slice captures
+    them on Comm.Channel.
+    """
+    push_comm(session, chan, msg, player)
+    if session is None:
+        return
+    gagged = bool(getattr(session, "gag_captured_comms", False))
+    # Only skip prose when this client actually receives Comm.Channel;
+    # otherwise gag would mute with no pane to show the line.
+    if gagged and client_supports(session, "Comm.Channel"):
+        character = getattr(session, "character", None) or getattr(
+            session, "owner", None
+        )
+        if character is not None:
+            from engine import display_prefs
+
+            display_prefs.ensure_display_defaults(character)
+            if display_prefs.wants_plain_comms(character):
+                gagged = False
+    if gagged and client_supports(session, "Comm.Channel"):
+        return
+    for line in prose_lines:
+        if line is None:
+            continue
+        session.send(line)
+
+
+def push_map_view(character, payload):
+    """Send RiftForge.Map.View (viewport glyphs + you-are-here)."""
+    session = getattr(character, "session", None)
+    if session is None or not payload:
+        return
+    if not (
+        client_supports(session, "RiftForge.Map")
+        or client_supports(session, "RiftForge.Map.View")
+    ):
+        return
+    session.send_gmcp("RiftForge.Map.View", payload)
+    # Compact here-packet so a mapper can skip redrawing the whole window.
+    session.send_gmcp(
+        "RiftForge.Map.Here",
+        {
+            "you": payload.get("you"),
+            "atlas": payload.get("atlas"),
+            "origin": payload.get("origin"),
+        },
+    )
+
+
+def push_map_atlas(character, game=None):
+    """Send RiftForge.Map.Atlas once so Mudlet can draw the full country.
+
+    Compact north-first glyph rows, no ANSI. Safe to call often -- skipped
+    when the client does not advertise RiftForge.Map.
+    """
+    session = getattr(character, "session", None)
+    if session is None:
+        return
+    if not (
+        client_supports(session, "RiftForge.Map")
+        or client_supports(session, "RiftForge.Map.Atlas")
+    ):
+        return
+    if game is None:
+        game = getattr(session, "game", None)
+    atlas = getattr(game, "overland_atlas", None) if game is not None else None
+    if atlas is None:
+        return
+    from engine import atlas_geo
+
+    width = int(atlas.width)
+    height = int(atlas.height)
+    prefix = getattr(atlas, "prefix", None) or "America Overland"
+    rows = []
+    for y in range(height - 1, -1, -1):
+        cells = []
+        for x in range(width):
+            cell = atlas.terrain.get((x, y)) or {}
+            authored = str(cell.get("map_glyph") or "").strip()
+            if authored:
+                cells.append(authored[0])
+                continue
+            area = atlas.terrain_at(x, y)
+            # Tiny alphabet so a mapper theme can color by letter.
+            glyph = {
+                "ocean": "~",
+                "lake": "o",
+                "plains": ".",
+                "forest": "T",
+                "mountains": "^",
+                "hills": "n",
+                "desert": ",",
+                "swamp": ",",
+                "wetland": "'",
+                "city": "*",
+                "highway": "=",
+                "road": "=",
+                "void": " ",
+            }.get(area or "", ".")
+            cells.append(glyph)
+        rows.append("".join(cells))
+    session.send_gmcp(
+        "RiftForge.Map.Atlas",
+        {
+            "id": getattr(atlas, "map_id", None) or "earth_america",
+            "prefix": prefix,
+            "width": width,
+            "height": height,
+            "projection": atlas_geo.projection_for_size(width, height),
+            "rows": rows,
+        },
+    )
+
+
 def on_session_attach(character, game=None):
     """Push identity + vitals after login/reconnect (Room comes from look)."""
     push_char_identity(character)
     push_vitals(character)
+    push_room(character)
+    push_map(character, force_grid=True)
+    push_map_atlas(character, game=game)

@@ -244,6 +244,21 @@ def _extended_phrase(slot, appearance, *, kit=None):
     return shown.lower()
 
 
+def say_voice_phrase(appearance, *, kit=None):
+    """Third-person ``say`` flavor from the voice appearance slot (not mechanical).
+
+    Returns a phrase like ``in a gravelly voice`` for room listeners, or ``None``
+    when the slot is unset, ``none``, or the kit catalog has no voice row.
+    """
+    value = (appearance or {}).get("voice")
+    if not value or value in ("none",):
+        return None
+    shown = display("voice", value, kit=kit)
+    if not shown:
+        return None
+    return f"in a {shown.lower()} voice"
+
+
 def is_complete(appearance):
     """True when every core appearance slot has a non-None value."""
     if not appearance:

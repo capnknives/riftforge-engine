@@ -11,6 +11,7 @@ stdlib only; zero ``supers`` imports.
 from __future__ import annotations
 
 META_KEY = "door_lock_state"
+META_KEY_OPEN = "door_open_state"
 LOOK_DOOR_CLOSED_SUFFIX = " (door closed)"
 
 _CARDINAL_DIRS = frozenset({
@@ -47,9 +48,20 @@ def export_meta(game):
     return normalize_loaded(state)
 
 
+def export_open_meta(game):
+    """Return the persistable door-open blob (``True`` = open)."""
+    state = getattr(game, "door_open_state", None)
+    return normalize_loaded(state)
+
+
 def load_into_game(game, blob):
     """Hydrate ``game.door_lock_state`` from SQLite meta."""
     game.door_lock_state = normalize_loaded(blob)
+
+
+def load_open_into_game(game, blob):
+    """Hydrate ``game.door_open_state`` from SQLite meta."""
+    game.door_open_state = normalize_loaded(blob)
 
 
 def ensure_game_state(game):
@@ -57,6 +69,13 @@ def ensure_game_state(game):
     if not isinstance(getattr(game, "door_lock_state", None), dict):
         game.door_lock_state = {}
     return game.door_lock_state
+
+
+def ensure_open_state(game):
+    """Idempotent init for open/closed door bits."""
+    if not isinstance(getattr(game, "door_open_state", None), dict):
+        game.door_open_state = {}
+    return game.door_open_state
 
 
 def direction_between(from_room, dest):
@@ -69,6 +88,35 @@ def direction_between(from_room, dest):
             return direction
         if dest_key and getattr(neighbor, "key", None) == dest_key:
             return direction
+    return None
+
+
+def _cell_door_border(from_room, dest):
+    """True when one side is a jail/prison cell and the other is not."""
+    if from_room is None or dest is None:
+        return False
+    from_cell = bool(
+        getattr(from_room, "is_cell", False)
+        or getattr(from_room, "is_prison_cell", False)
+    )
+    to_cell = bool(
+        getattr(dest, "is_cell", False)
+        or getattr(dest, "is_prison_cell", False)
+    )
+    return from_cell != to_cell
+
+
+def _authored_door_key_id(room, direction):
+    """Catalog id for the key that unlocks this exit, if authored."""
+    if room is None:
+        return None
+    d = str(direction or "").strip().lower()
+    raw = getattr(room, "door_keys", None)
+    if isinstance(raw, dict):
+        for key, val in raw.items():
+            if str(key).strip().lower() == d:
+                text = str(val or "").strip()
+                return text or None
     return None
 
 
@@ -112,6 +160,28 @@ def _same_home_compound(a, b):
     return bool(pa) and pa == pb
 
 
+def _exit_defaults_closed(from_room, direction, dest):
+    """True when absent persisted open state means closed (not open).
+
+    Public shop / civic mouths default open so reboot and copyover do not
+    seal Lebanon; cells, private homes, and interior house chambers default
+    closed.
+    """
+    if from_room is None or dest is None:
+        return True
+    if _cell_door_border(from_room, dest):
+        return True
+    if getattr(dest, "private_home", False) or getattr(from_room, "private_home", False):
+        return True
+    if (
+        getattr(from_room, "is_house", False)
+        and getattr(dest, "is_house", False)
+        and _same_home_compound(from_room, dest)
+    ):
+        return True
+    return False
+
+
 def exit_is_door(from_room, direction, dest):
     """True when this step crosses a closable door (not zone travel)."""
     if from_room is None or dest is None:
@@ -137,7 +207,93 @@ def exit_is_door(from_room, direction, dest):
     # Hotel / apartment guest units use private_home on the unit itself.
     if getattr(dest, "private_home", False) or getattr(from_room, "private_home", False):
         return True
+    # Sheriff / prison holding cells: lobby <-> cell is always a door.
+    if _cell_door_border(from_room, dest):
+        return True
     return False
+
+
+def door_key_catalog_id(from_room, direction):
+    """Return the item catalog id for this exit's key, if any."""
+    return _authored_door_key_id(from_room, direction)
+
+
+def _resolved_exit_open(game, from_room, direction, dest):
+    """Open bit for one directed hop (default + persisted override)."""
+    if game is None or from_room is None or dest is None:
+        return False
+    if not exit_is_door(from_room, direction, dest):
+        return False
+    default_open = not _exit_defaults_closed(from_room, direction, dest)
+    state = ensure_open_state(game)
+    key = _pair_key(getattr(from_room, "key", None), direction)
+    if key in state:
+        return bool(state[key])
+    return default_open
+
+
+def is_exit_open(game, from_room, direction, dest):
+    """True when a structure door is open."""
+    if game is None or from_room is None or dest is None:
+        return False
+    if _resolved_exit_open(game, from_room, direction, dest):
+        return True
+    from engine.map_store import opposite_direction
+
+    rev = opposite_direction(direction)
+    if rev:
+        return _resolved_exit_open(game, dest, rev, from_room)
+    return False
+
+
+def set_exit_open(game, from_room, direction, open_):
+    """Persist open (True) or closed (False) for one directed exit."""
+    if game is None or from_room is None:
+        return False
+    room_key = getattr(from_room, "key", None)
+    if not room_key:
+        return False
+    d = str(direction or "").strip().lower()
+    if d not in _CARDINAL_DIRS:
+        return False
+    dest = (from_room.exits or {}).get(d)
+    if dest is None:
+        dest = (from_room.exits or {}).get(direction)
+    if dest is None:
+        return False
+    if not exit_is_door(from_room, d, dest):
+        return False
+    changed = _write_open_state(
+        game, room_key, d, bool(open_), from_room, dest,
+    )
+    from engine.map_store import opposite_direction
+
+    rev = opposite_direction(d)
+    if rev:
+        dest_key = getattr(dest, "key", None)
+        if dest_key and exit_is_door(dest, rev, from_room):
+            changed = _write_open_state(
+                game, dest_key, rev, bool(open_), dest, from_room,
+            ) or changed
+    return changed
+
+
+def _write_open_state(game, room_key, direction, want, from_room, dest):
+    """Set one open bit; return True when the value changed."""
+    default_open = not _exit_defaults_closed(from_room, direction, dest)
+    state = ensure_open_state(game)
+    key = _pair_key(room_key, direction)
+    if want == default_open:
+        if key in state:
+            state.pop(key, None)
+            game._door_open_dirty = True
+            return True
+        return False
+    if state.get(key, default_open) == want:
+        return False
+    state[key] = want
+    game._door_open_dirty = True
+    return True
 
 
 def is_exit_locked(game, from_room, direction, dest):
@@ -152,15 +308,18 @@ def is_exit_locked(game, from_room, direction, dest):
         return False
     state = ensure_game_state(game)
     key = _pair_key(getattr(from_room, "key", None), direction)
-    if key and state.get(key, False):
-        return True
+    if key in state:
+        return bool(state[key])
     from engine.map_store import opposite_direction
 
     rev = opposite_direction(direction)
     if rev:
         rev_key = _pair_key(getattr(dest, "key", None), rev)
-        if rev_key and state.get(rev_key, False):
-            return True
+        if rev_key in state:
+            return bool(state[rev_key])
+    # Holding-cell doors default locked until staff unlock them.
+    if _cell_door_border(from_room, dest):
+        return True
     return False
 
 
@@ -182,16 +341,68 @@ def set_exit_locked(game, from_room, direction, locked):
     if not exit_is_door(from_room, d, dest):
         return False
     state = ensure_game_state(game)
-    key = _pair_key(room_key, d)
     want = bool(locked)
-    if state.get(key, False) == want:
-        return False
-    if want:
-        state[key] = True
-    else:
-        state.pop(key, None)
-    game._door_lock_dirty = True
-    return True
+    from engine.map_store import opposite_direction
+
+    keys = {_pair_key(room_key, d)}
+    rev = opposite_direction(d)
+    dest_key = getattr(dest, "key", None)
+    if rev and dest_key:
+        rev_key = _pair_key(dest_key, rev)
+        if rev_key and exit_is_door(dest, rev, from_room):
+            keys.add(rev_key)
+    changed = False
+    for key in keys:
+        prior = state.get(key)
+        if prior is not None and bool(prior) == want:
+            continue
+        if want:
+            state[key] = True
+            changed = True
+        elif _cell_door_border(from_room, dest):
+            # Explicit unlock on cell doors must persist (default is locked).
+            state[key] = False
+            changed = True
+        elif key in state:
+            state.pop(key, None)
+            changed = True
+    if changed:
+        game._door_lock_dirty = True
+    return changed
+
+
+def heal_orphan_open_state(game):
+    """Drop open rows for missing exits; clear rows that match defaults."""
+    if game is None:
+        return 0
+    state = ensure_open_state(game)
+    if not state:
+        return 0
+    rooms = getattr(game, "rooms", None) or {}
+    removed = 0
+    for key in list(state.keys()):
+        if "|" not in key:
+            state.pop(key, None)
+            removed += 1
+            continue
+        room_key, direction = key.rsplit("|", 1)
+        room = rooms.get(room_key)
+        if room is None:
+            state.pop(key, None)
+            removed += 1
+            continue
+        dest = (room.exits or {}).get(direction)
+        if dest is None or not exit_is_door(room, direction, dest):
+            state.pop(key, None)
+            removed += 1
+            continue
+        default_open = not _exit_defaults_closed(room, direction, dest)
+        if bool(state[key]) == default_open:
+            state.pop(key, None)
+            removed += 1
+    if removed:
+        game._door_open_dirty = True
+    return removed
 
 
 def heal_orphan_lock_state(game):

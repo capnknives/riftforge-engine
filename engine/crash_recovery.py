@@ -382,6 +382,15 @@ def should_kill_for_ipc_desync(
     Covers split-brain: ``server.py`` still ticks while the gateway lost the
     IPC writer — clients connect to :4000 but get a blank telnet socket.
     """
+    now = time.time() if now_wall is None else now_wall
+    from engine import game_heartbeat
+
+    if game_spawn_wall is not None:
+        spawn_age = now - float(game_spawn_wall)
+        # After copyover / deploy sync the child may tick locally for minutes
+        # before gateway IPC reconnects — do not desync-kill during boot grace.
+        if spawn_age < game_heartbeat.boot_grace_seconds():
+            return False, f"spawn_boot_grace_{spawn_age:.0f}s"
     data = read_gateway_ipc_down(root=root)
     if not data or not isinstance(data, dict):
         return False, "no_ipc_down_file"
@@ -390,12 +399,10 @@ def should_kill_for_ipc_desync(
     started = float(data.get("down_since_wall") or 0)
     if started <= 0:
         return False, "invalid_down_since"
-    now = time.time() if now_wall is None else now_wall
     age = now - started
     threshold = ipc_desync_kill_seconds()
     if age < threshold:
         return False, f"ipc_down_age_{age:.0f}s"
-    from engine import game_heartbeat
 
     mtime = game_heartbeat.heartbeat_mtime()
     stamp_from_this_child = (
@@ -598,12 +605,20 @@ def read_hold_sha(*, root=None):
     return ""
 
 
-def set_revert_hold(*, reason="", root=None):
+def _reload_storm_reason(reason):
+    """True when a revert was triggered by copyover/reload churn, not a crash."""
+    text = (reason or "").lower()
+    return "reload storm" in text or "reload/copyover storm" in text
+
+
+def set_revert_hold(*, reason="", root=None, hold_baseline_sha=None):
     """Pause auto-deploy after an automatic code revert.
 
-    Also stamps the current HEAD SHA into ``.crash_revert_hold_meta.json``
-    so ``maybe_auto_resume_hold`` can later tell whether a real fix has
-    landed on ``origin/main`` since this hold began.
+    Also stamps a SHA into ``.crash_revert_hold_meta.json`` so
+    ``maybe_auto_resume_hold`` can later tell whether a real fix has
+    landed on ``origin/main`` since this hold began. Default baseline is
+    post-revert HEAD; reload-storm reverts pass the failed tip so auto-
+    resume does not immediately re-sync the same broken advance.
     """
     from engine import auto_deploy
 
@@ -618,7 +633,7 @@ def set_revert_hold(*, reason="", root=None):
         pass
     auto_deploy.set_override("off", root=root, queue_catchup=False)
 
-    sha = boot_stability.current_head_sha(root)
+    sha = (hold_baseline_sha or "").strip() or boot_stability.current_head_sha(root)
     if sha:
         meta_path = _hold_meta_path(root)
         tmp = meta_path + ".tmp"
@@ -1054,6 +1069,7 @@ def should_revert_reload_storm(
 def revert_to_last_stable(*, root=None, reason=""):
     """Reset working tree to last stable SHA; pause auto-deploy."""
     root = root or _repo_root()
+    failed_head = boot_stability.current_head_sha(root)
     stable = boot_stability.load_stable(root)
     if not stable:
         return False, "no stable boot stamp"
@@ -1153,7 +1169,12 @@ def revert_to_last_stable(*, root=None, reason=""):
         clear_planned_restart(root=root)
         return False, f"reset failed: {detail}"
 
-    set_revert_hold(reason=reason or "crash budget exceeded", root=root)
+    hold_baseline = failed_head if _reload_storm_reason(reason) else None
+    set_revert_hold(
+        reason=reason or "crash budget exceeded",
+        root=root,
+        hold_baseline_sha=hold_baseline,
+    )
 
     state = load_state(root)
     # Remember what we were trying to fix (if the boot failures carried a

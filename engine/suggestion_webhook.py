@@ -70,9 +70,20 @@ def _maybe_warn_missing_auth():
 
 
 def payload_from_record(record_payload):
-    """Build the JSON body the suggestion automation expects."""
+    """Build the JSON body the suggestion automation expects.
+
+    Strip fat diagnostic context (combat/Cadence/loadout) down to
+    identity/location so the implementer is not buried in bug-report
+    dumps. Older ``suggestions.log`` rows still get trimmed here even
+    if they were filed before the slim snapshot landed.
+    """
     body = dict(record_payload)
     body["kind"] = "suggest"
+    ctx = body.get("context")
+    if ctx:
+        from engine import report_context as report_context_mod
+
+        body["context"] = report_context_mod.slim_suggestion_context(ctx)
     return body
 
 

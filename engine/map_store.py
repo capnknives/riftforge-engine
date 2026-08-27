@@ -289,6 +289,20 @@ def save_doc_validated(path, doc):
     }
 
 
+def occupied_hand_room_keys(game):
+    """Identity keys plus legacy dig aliases already claimed in this world.
+
+    Phase 3 stores VNUMs in ``game.rooms`` but keeps builder dig ids in
+    ``game.room_aliases``. ``RoomMap.__contains__`` resolves both, so
+    qualify / collision checks must too or digs like ``Neighborhood Hub``
+    resurrect a taken legacy name.
+    """
+    keys = set((getattr(game, "rooms", None) or {}).keys())
+    aliases = getattr(game, "room_aliases", None) or {}
+    keys.update(aliases.keys())
+    return keys
+
+
 def find_room_entry(doc, key):
     """Return the rooms[] dict for key, VNUM, or matching legacy key."""
     if not key:
@@ -298,6 +312,9 @@ def find_room_entry(doc, key):
         if room.get("key") == text:
             return room
         if str(room.get("vnum") or "").strip().upper() == text.upper():
+            return room
+        leg = str(room.get("legacy_key") or "").strip()
+        if leg and leg == text:
             return room
     return None
 
@@ -356,10 +373,42 @@ def _stamp_live_room_from_source(new_room, source_room, map_id):
         new_room.zone = source_room.zone
 
 
+def _resolve_live_room_slot(game, identity):
+    """Return ``(room, canonical_key)`` for a VNUM, legacy alias, or graph key.
+
+    Phase 3 stores exits and ``internal_room_key`` as VNUM strings while
+  populate / persistence rows may still register the same ``Room`` under a
+    legacy dig key until boot rekey runs. ``dig_room`` / ``link_rooms`` must
+    tolerate that drift so remodel garage does not orphan JSON mid-save.
+    """
+    if not identity:
+        return None, identity
+    text = str(identity).strip()
+    rooms = getattr(game, "rooms", None) or {}
+    if text in rooms:
+        room = rooms[text]
+        return room, getattr(room, "key", None) or text
+    aliases = getattr(game, "room_aliases", None) or {}
+    alias_target = aliases.get(text)
+    if alias_target and alias_target in rooms:
+        room = rooms[alias_target]
+        return room, getattr(room, "key", None) or alias_target
+    for key, room in rooms.items():
+        if room is None:
+            continue
+        vnum = getattr(room, "vnum", None)
+        if vnum is not None and str(vnum).strip().upper() == text.upper():
+            return room, getattr(room, "key", None) or key
+        leg = getattr(room, "legacy_key", None)
+        if leg and str(leg).strip() == text:
+            return room, getattr(room, "key", None) or key
+    return None, text
+
+
 def _live_set_exit(game, from_key, direction, to_key):
     """Wire live Room.exits[direction] = Room for to_key."""
-    src = game.rooms.get(from_key)
-    dest = game.rooms.get(to_key)
+    src, from_key = _resolve_live_room_slot(game, from_key)
+    dest, to_key = _resolve_live_room_slot(game, to_key)
     if src is None:
         raise ValueError(f"Live room {from_key!r} missing.")
     if dest is None:
@@ -369,7 +418,7 @@ def _live_set_exit(game, from_key, direction, to_key):
 
 def _live_clear_exit(game, from_key, direction):
     """Remove a live exit if present."""
-    src = game.rooms.get(from_key)
+    src, _from_key = _resolve_live_room_slot(game, from_key)
     if src is None:
         return
     src.exits.pop(direction, None)
@@ -533,7 +582,7 @@ def dig_room(game, from_room, direction, new_key, *,
     # collide with Wastes Ash Court. Explicit title= still wins for look.
     local_name = new_key
     new_key, auto_title = maps.qualify_hand_room_key(
-        map_id, local_name, taken=game.rooms.keys(),
+        map_id, local_name, taken=occupied_hand_room_keys(game),
     )
     if title is None:
         title = auto_title
@@ -691,7 +740,6 @@ def dig_room(game, from_room, direction, new_key, *,
         src_entry.setdefault("exits", {})[direction] = vnum
         if back:
             new_entry["exits"][back] = from_id
-    save_doc_validated(path, doc)
 
     live = Room(vnum, desc)
     live.title = room_name_face
@@ -715,9 +763,25 @@ def dig_room(game, from_room, direction, new_key, *,
         game.room_aliases = {}
         aliases = game.room_aliases
     aliases[legacy_dig_key] = vnum
-    _live_set_exit(game, from_id, direction, vnum)
-    if back:
-        _live_set_exit(game, vnum, back, from_id)
+    try:
+        _live_set_exit(game, from_id, direction, vnum)
+        if back:
+            _live_set_exit(game, vnum, back, from_id)
+    except ValueError:
+        game.rooms.pop(vnum, None)
+        aliases.pop(legacy_dig_key, None)
+        # Roll back the in-memory doc append so a failed live wire does not
+        # leave orphan garage JSON that lags every later remodel save.
+        rooms_list = doc.get("rooms") or []
+        if new_entry in rooms_list:
+            rooms_list.remove(new_entry)
+        if not is_grid_room(from_room):
+            src_entry = _ensure_hand_room_entry(doc, from_room)
+            src_exits = src_entry.get("exits") or {}
+            if src_exits.get(direction) == vnum:
+                src_exits.pop(direction, None)
+        raise
+    save_doc_validated(path, doc)
 
     msg = (
         f"Dug {room_vnum_mod.staff_room_label(live) or vnum} "
@@ -745,7 +809,7 @@ def create_room(game, here, new_key, *, description=None, title=None):
     path, _kind, _filename, map_id = resolve_map_path(game, here)
     local_name = new_key
     new_key, auto_title = maps.qualify_hand_room_key(
-        map_id, local_name, taken=game.rooms.keys(),
+        map_id, local_name, taken=occupied_hand_room_keys(game),
     )
     if title is None:
         title = auto_title

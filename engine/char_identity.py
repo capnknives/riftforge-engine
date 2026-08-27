@@ -211,9 +211,21 @@ def legal_public_name(char, *, force_surname=False) -> str:
     Respects ``surname_visible`` unless ``force_surname`` (GM tooling).
     When visible and ``public_name_order`` is surname-first, formats
     ``Surname, Given`` (Bond / Crowley desk style).
+
+    Civic ``title`` (Sheriff, Deputy, Agent, Doctor, …) replaces the
+    given name in ordinary prose so players see ``Sheriff Calder`` while
+    the file still stores a real first name. ``public_mononym`` keeps
+    famous one-word faces (Ash) as given-only in player text.
     """
     given = character_given_name(char) or "?"
     sur = character_surname(char)
+    title = (getattr(char, "title", None) or "").strip()
+    if title and sur:
+        return f"{title} {sur}"
+    if title:
+        return f"{title} {given}"
+    if bool(getattr(char, "public_mononym", False)) and not force_surname:
+        return given
     if not sur:
         return given
     visible = bool(getattr(char, "surname_visible", True))
@@ -222,6 +234,73 @@ def legal_public_name(char, *, force_surname=False) -> str:
     if public_name_order(char) == PUBLIC_NAME_ORDER_SURNAME_FIRST:
         return f"{sur}, {given}"
     return f"{given} {sur}"
+
+
+_CAMEL_HUMP_RE = re.compile(r"(?<=[a-z])(?=[A-Z])")
+
+
+def storage_key_has_camel_mash(key_face: str) -> bool:
+    """True when ``key_face`` has a lower→upper boundary (``CapnKnives``)."""
+    peeled = (key_face or "").strip()
+    if not peeled:
+        return False
+    base = re.sub(r"\d+$", "", peeled) or peeled
+    return bool(_CAMEL_HUMP_RE.search(base))
+
+
+def storage_key_matches_account_handle(game, char, key_face: str) -> bool:
+    """True when the storage key is the linked account login/display handle.
+
+    Account brands like ``CapnKnives`` are intentional mononyms -- they must
+    not be CamelCase-split into fake given+surname pairs (``Capn`` + ``Knives``).
+    """
+    if not key_face or char is None:
+        return False
+    needle = key_face.strip().lower()
+    linked = (getattr(char, "account", None) or "").strip().lower()
+    if linked and linked == needle:
+        return True
+    if game is None:
+        return False
+    try:
+        from engine.accounts import account_for_character
+
+        acct = account_for_character(game, char)
+        if acct is None:
+            return False
+        for candidate in (acct.name, acct.display_name):
+            if candidate and str(candidate).strip().lower() == needle:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def heal_account_mononym_identity(char, game=None) -> bool:
+    """Undo a mistaken CamelCase split on an account-handle mononym.
+
+    Bug 748 mash heal treated ``CapnKnives`` like ``ZackMarkson``. When the
+    storage key matches the linked account name, peel the invented surname
+    and restore the whole handle as ``given_name``.
+    """
+    if char is None:
+        return False
+    key_face = _strip_prefix(getattr(char, "key", None) or "")
+    if not key_face or not storage_key_has_camel_mash(key_face):
+        return False
+    if not storage_key_matches_account_handle(game, char, key_face):
+        return False
+    given = character_given_name(char)
+    sur = character_surname(char)
+    mash_parts = split_mashed_key_identity(key_face)
+    if mash_parts is not None and sur and (given, sur) == mash_parts:
+        char.given_name = key_face
+        char.surname = ""
+        return True
+    if not sur and given.lower() != key_face.lower():
+        char.given_name = key_face
+        return True
+    return False
 
 
 def humanize_storage_key(raw_key) -> str:
@@ -633,24 +712,64 @@ def stamp_new_identity(char, game, given_name: str, surname: str) -> None:
     char.cnum = allocate_cnum(given, taken=taken)
 
 
-def heal_mashed_given_surname(char) -> bool:
+def heal_mashed_given_surname(char, game=None) -> bool:
     """Split legacy ``GivenSurname`` mash out of ``given_name``.
 
     Covers:
+      0. Mononym storage key (``Pierre``) + CamelCase or spaced mash in
+         ``given_name`` while ``surname`` is already on file (login roster
+         vs in-game face desync -- bug report 748).
       1. ``given_name=ZackMarkson`` + ``surname=Markson`` (desk / heal peel)
       2. ``given_name=ZackMarkson`` (or empty) + empty surname when the
          storage key is a one-hump mash -- invent surname from the key so
          saves never keep a SingleWord legal name for duplicate-first-name
          bodies.
 
+    Account-handle mononyms (``CapnKnives`` on the ``CapnKnives`` account)
+    are never split -- the whole key is the public brand.
+
     Idempotent boot / desk / pre-save repair. Does not rename ``Character.key``.
     """
     if char is None:
         return False
+    if heal_account_mononym_identity(char, game=game):
+        return True
     key_face = _strip_prefix(getattr(char, "key", None) or "")
     given = character_given_name(char)
     sur = character_surname(char)
     changed = False
+
+    # Case 0: bare storage key + mashed/spaced given while surname exists.
+    if key_face and given:
+        parts = split_mashed_key_identity(given)
+        if parts is not None and sur:
+            peeled_given, peeled_sur = parts
+            if (
+                peeled_given.lower() == key_face.lower()
+                and sur.lower() == peeled_sur.lower()
+            ):
+                char.given_name = peeled_given
+                return True
+        if " " in given.strip():
+            bits = given.strip().split(None, 1)
+            if len(bits) == 2:
+                g_part, s_raw = bits[0], bits[1]
+                cleaned, err = normalize_surname(s_raw)
+                if (
+                    err is None
+                    and cleaned
+                    and g_part.lower() == key_face.lower()
+                ):
+                    char.given_name = (
+                        g_part[0].upper() + g_part[1:]
+                        if len(g_part) > 1
+                        else g_part.upper()
+                    )
+                    if not sur:
+                        char.surname = cleaned
+                    elif sur.lower() != cleaned.lower():
+                        return False
+                    return True
 
     # Case 2 first when surname is missing: split the key (or mashed given).
     if not sur:
@@ -664,7 +783,9 @@ def heal_mashed_given_surname(char) -> bool:
         ):
             # given itself is a CamelCase mash with no surname on file.
             split_src = given
-        if split_src:
+        if split_src and not storage_key_matches_account_handle(
+            game, char, split_src
+        ):
             parts = split_mashed_key_identity(split_src)
             if parts is not None:
                 char.given_name, char.surname = parts
@@ -705,7 +826,9 @@ def ensure_character_identity(char, game=None) -> bool:
     if not isinstance(given, str) or not given.strip():
         face = _strip_prefix(getattr(char, "key", None) or "")
         parts = split_mashed_key_identity(face) if face and face != "?" else None
-        if parts is not None:
+        if parts is not None and not storage_key_matches_account_handle(
+            game, char, face
+        ):
             char.given_name, char.surname = parts
         else:
             char.given_name = face if face and face != "?" else "Unknown"
@@ -728,7 +851,7 @@ def ensure_character_identity(char, game=None) -> bool:
     ):
         char.public_name_order = PUBLIC_NAME_ORDER_GIVEN_FIRST
         changed = True
-    if heal_mashed_given_surname(char):
+    if heal_mashed_given_surname(char, game=game):
         changed = True
     cnum = getattr(char, "cnum", None)
     if not isinstance(cnum, str) or not str(cnum).strip():

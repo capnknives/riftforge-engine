@@ -18,7 +18,9 @@ each CONNECTED client's socket, so those specific ones survive the
 replacement. The new process then re-wraps each surviving socket into a
 fresh Session and resumes it directly, skipping login -- it already knows
 which character was on which connection, because we wrote that mapping to
-a small state file right before calling execv.
+a small state file right before calling execv. Mid-create seats (chargen)
+are snapshotted into the account draft vault and resume at the same prompt
+instead of being dropped back to the name screen.
 
 Two distinct signals, two distinct meanings (see server.py):
   SIGINT  -- a real shutdown (Ctrl-C, `docker stop`): save and exit for good.
@@ -47,13 +49,102 @@ import os
 import signal
 import socket
 import sys
+import time
 
 STATE_PATH = ".copyover_state.json"
+# Planned copyover wrote a full SQLite snapshot. The new Game() must not
+# re-ensure town NPCs / lodging / civic housing (live stitch 3–7 min).
+# Game-only reloads also skip via RIFTFORGE_BOOT_KIND=reload.
+SKIP_DEFERRED_NAME = ".copyover_skip_deferred"
+# Watcher must not SIGUSR1 until the new child can handle it (handler
+# installed + veil open). Cleared on spawn so a previous process cannot
+# look "ready".
+READY_NAME = ".copyover_ready"
+
+
+def _stamp_root(root=None):
+    """Repo cwd, or ``RIFTFORGE_COPYOVER_STAMP_DIR`` for smokes."""
+    if root:
+        return root
+    override = (os.environ.get("RIFTFORGE_COPYOVER_STAMP_DIR") or "").strip()
+    if override:
+        return override
+    return os.getcwd()
+
+
+def _skip_deferred_path(root=None):
+    return os.path.join(_stamp_root(root), SKIP_DEFERRED_NAME)
+
+
+def _ready_path(root=None):
+    return os.path.join(_stamp_root(root), READY_NAME)
+
+
+def mark_skip_deferred_boot(*, root=None):
+    """New process should skip deferred town re-seed (world already saved)."""
+    path = _skip_deferred_path(root)
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(f"{time.time():.3f}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        pass
+
+
+def consume_skip_deferred_boot(*, root=None):
+    """True once per planned copyover; removes the stamp."""
+    path = _skip_deferred_path(root)
+    if not os.path.isfile(path):
+        return False
+    try:
+        os.remove(path)
+    except OSError:
+        return False
+    return True
+
+
+def skip_deferred_boot_pending(*, root=None):
+    """True when a planned copyover asked the next boot to skip deferred."""
+    return os.path.isfile(_skip_deferred_path(root))
+
+
+def clear_copyover_ready(*, root=None):
+    """Drop the playable stamp (watcher calls this on every game spawn)."""
+    try:
+        os.remove(_ready_path(root))
+    except OSError:
+        pass
+
+
+def mark_copyover_ready(*, root=None):
+    """Veil is open / SIGUSR1 is safe. Watcher may queue the next reload."""
+    path = _ready_path(root)
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(f"{time.time():.3f}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        pass
+
+
+def copyover_ready_since(spawn_wall, *, root=None):
+    """True when ``.copyover_ready`` mtime is at or after this spawn."""
+    path = _ready_path(root)
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return False
+    if spawn_wall is None:
+        return True
+    return mtime >= (float(spawn_wall) - 1.0)
 
 # Player-facing lines (plain tags -- never color alone). Shared by classic
 # execv copyover, gateway graceful restart, and gateway reattach.
 # Player-facing arc (keep in sync with deploy_notify / gateway hold music):
-#   warn+countdown → pause-coming → MSG_BEFORE → [WAIT] while IPC down →
+#   warn+countdown → countdown-end (still playable) → MSG_BEFORE →
+#   [WAIT] while IPC down →
 #   MSG_AFTER ([WAIT] reattached, still frozen) → soft stitch (optional) →
 #   "Rewrite complete" after deferred boot. Reserve "thread holds" for
 #   gateway hold music only — not reattach (players type verbs here).
@@ -89,20 +180,34 @@ def trigger(game):
     asyncio.create_task(_perform(game))
 
 
+def _iter_copyover_sessions(game):
+    """Playing sessions plus mid-chargen connecting seats (unique)."""
+    seen = []
+    for bucket in (
+        getattr(game, "sessions", None) or [],
+        getattr(game, "connecting_sessions", None) or [],
+    ):
+        for session in list(bucket):
+            if session not in seen:
+                seen.append(session)
+    return seen
+
+
 async def _announce_before(game):
-    """Send MSG_BEFORE to every logged-in session and drain (best-effort)."""
-    for session in list(game.sessions):
+    """Send MSG_BEFORE to every logged-in or mid-create session and drain."""
+    for session in _iter_copyover_sessions(game):
         if not session.character:
             continue
         session.send(MSG_BEFORE)
         try:
             await session.writer.drain()
         except (ConnectionResetError, BrokenPipeError, TimeoutError,
-                ConnectionError, OSError) as exc:
+                ConnectionError, OSError, AttributeError) as exc:
             # Dead / half-open sockets must not abort the whole reload.
+            key = getattr(session.character, "key", "?")
             print(
                 f"[copyover] skipping dead session "
-                f"({session.character.key}): {exc!r}",
+                f"({key}): {exc!r}",
                 flush=True,
             )
 
@@ -259,6 +364,21 @@ async def _perform(game):
             )
         return
     try:
+        from engine import account_chargen_draft as draft_mod
+
+        n_drafts = draft_mod.persist_creating_sessions(game)
+        if n_drafts:
+            print(
+                f"[copyover] snapshotted {n_drafts} mid-chargen session(s)",
+                flush=True,
+            )
+        await draft_mod.flush_creating_session_binds(game)
+    except Exception as exc:
+        print(
+            f"[copyover] mid-chargen snapshot failed (continuing): {exc!r}",
+            flush=True,
+        )
+    try:
         game.save(copyover=True)
     except Exception as exc:
         import traceback
@@ -285,6 +405,8 @@ async def _perform(game):
                 flush=True,
             )
         return
+    # New Game() must skip town re-seed; SQLite already has this snapshot.
+    mark_skip_deferred_boot()
 
     if gateway_enabled():
         # Watcher holds :4000; exiting is the reload. Players already got
@@ -303,7 +425,7 @@ async def _perform(game):
         return  # unreachable after _exit; kept for tests that stub _exit
 
     entries = []
-    for session in list(game.sessions):
+    for session in _iter_copyover_sessions(game):
         if not session.character:
             # Still on the name/password prompt -- nothing to reattach to.
             continue
@@ -319,7 +441,10 @@ async def _perform(game):
         actor = session.character
         bind_name = getattr(actor, "gm_body_key", None) or actor.key
         bind_name = strip_ephemeral_storage_prefix(bind_name)
-        entries.append({"fd": fd, "name": bind_name})
+        creating = getattr(session, "login_stage", None) == "creating"
+        # Playing bodies with a leftover chargen_draft flag stay in play
+        # (bug report 837). Mid-create seats use login_stage == "creating".
+        entries.append({"fd": fd, "name": bind_name, "chargen": bool(creating)})
 
     with open(STATE_PATH, "w") as f:
         json.dump(entries, f)
@@ -378,20 +503,43 @@ async def resume(game):
     # Imported here (not at module level) to avoid a circular import:
     # connection.py doesn't import copyover.py, so this is one-directional.
     from engine.connection import Session
+    from engine import account_chargen_draft as draft_mod
+    from engine import hooks
 
     for entry in entries:
+        name = entry["name"]
+        want_chargen = bool(entry.get("chargen"))
+        chargen_char = None
+        if want_chargen or hooks.is_chargen_draft_vault(game, name):
+            chargen_char = draft_mod.resolve_copyover_chargen_body(game, name)
+        if chargen_char is not None:
+            try:
+                sock = socket.socket(fileno=entry["fd"])
+                reader, writer = await asyncio.open_connection(sock=sock)
+            except OSError:
+                continue
+            session = Session(reader, writer, game)
+            session.character = chargen_char
+            chargen_char.session = session
+            session._set_creating()
+            session.reset_gmcp()
+            from engine import gmcp
+            from engine import mssp
+            gmcp.offer_gmcp(session)
+            mssp.offer_mssp(session)
+            session.send(MSG_AFTER)
+            asyncio.create_task(_resume_chargen(session))
+            continue
         # Prefer exact login body (never husk: / gmspirit: leftovers).
         finder = getattr(game, "find_login_character", None)
         if callable(finder):
-            char = finder(entry["name"])
+            char = finder(name)
         else:
-            char = game.find_character(entry["name"])
+            char = game.find_character(name)
         if not char:
             # Unfinished homezone lesson: boot heal vaulted the body; do not
             # drop the socket -- send them through login instead.
-            from engine import hooks
-
-            if hooks.is_tutorial_incomplete_vault(game, entry["name"]):
+            if hooks.is_tutorial_incomplete_vault(game, name) or want_chargen:
                 try:
                     sock = socket.socket(fileno=entry["fd"])
                     reader, writer = await asyncio.open_connection(sock=sock)
@@ -411,12 +559,15 @@ async def resume(game):
         session = Session(reader, writer, game)
         session.character = char
         char.session = session
-        game.sessions.append(session)
+        from engine.session_attach import detach_stale_sessions
+
+        detach_stale_sessions(char, game, session)
+        if session not in game.sessions:
+            game.sessions.append(session)
         # Sockets survive copyover; GMCP/MSSP negotiation does not -- re-offer.
         session.reset_gmcp()
         from engine import gmcp
         from engine import mssp
-        from engine import hooks
         gmcp.offer_gmcp(session)
         mssp.offer_mssp(session)
         # Same post-attach hook as a normal login (pending Tier break, mail
@@ -425,6 +576,8 @@ async def resume(game):
         # `gm on` when the body has gm_staff_form.
         hooks.after_session_attach(char, game)
         session.send(MSG_AFTER)
+        # Skip reprinting the login MOTD board on copyover resume.
+        session._copyover_resume = True
         asyncio.create_task(_resume_client(session))
 
     # If a bug-fix deploy was in flight, announce it is live and mark resolved.
@@ -436,6 +589,19 @@ async def _resume_login(session):
     """Run login prompts after copyover when the body was tutorial-folded."""
     try:
         await session.run()
+    except (ConnectionResetError, BrokenPipeError):
+        session.disconnect()
+
+
+async def _resume_chargen(session):
+    """Re-enter create-flow after classic copyover kept the socket."""
+    try:
+        from engine.account_login import resume_chargen_after_hold
+
+        result = await resume_chargen_after_hold(session)
+        if result is None:
+            return
+        await session.play()
     except (ConnectionResetError, BrokenPipeError):
         session.disconnect()
 

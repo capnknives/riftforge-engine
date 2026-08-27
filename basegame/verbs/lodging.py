@@ -35,6 +35,7 @@ def cmd_rent_bed(character, args, game):
         character, cents=INN_NIGHT_CENTS, reason="Inn rent",
     )
     character.home_room_key = room.key
+    lodging_mod.bump_claimants_index(game)
     lodging_mod.stamp_home_basics(room)
     bed, err = lodging_mod.pick_bed(room, character)
     if bed is not None:

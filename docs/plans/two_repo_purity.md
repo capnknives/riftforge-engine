@@ -9,15 +9,16 @@ hook API details grow in [`../ENGINE_CONSUMER.md`](../ENGINE_CONSUMER.md).
 (engine framework extraction + `basegame/` + Stage G root glue) is
 **complete** — Stages **1–10**, A1/A2, Plan B, Stage G, and public tags
 `v0.2.0`–`v0.5.0`. Public
-[`riftforge-engine`](https://github.com/capnknives/riftforge-engine) at
-**`v0.5.0`**; private `capnknives/RiftForge` (SUPERS) pins **`@v0.5.3`**
-(collapse FSM, robbery theft peel, civic `fixture_id` mirror).
+[`riftforge-engine`](https://github.com/capnknives/riftforge-engine) Latest
+**`v0.6.1`** (2026-08-27, purity restore + monorepo engine since **`v0.6.0`**
+2026-08-21); private `capnknives/RiftForge` (SUPERS) pins **`@v0.6.1`**.
 **Post–`v0.4.0` hygiene track (H1–H10)** **complete** (2026-08-05) —
 execution SoT: [`two_repo_purity_extractions_plan.md`](two_repo_purity_extractions_plan.md);
 closeout inventory: [`two_repo_purity_audit_2026-08-05.md`](two_repo_purity_audit_2026-08-05.md).
 **P0** engine purity regression (mine/chargen hooks) **merged** (PR 2386,
 2026-08-16). **P1/P2 shipped:** **`v0.5.2`** maps peel (#2388) then **`v0.5.3`**
-strangler E/D/D (#2394/#2396). Ongoing: export discipline when engine
+strangler E/D/D (#2394/#2396). **Phase 2 gate** was red on 2026-08-26
+(15 `engine/` → `supers` imports); **PR 3266** restored it. Ongoing: export discipline when engine
 APIs change; dual-mount hack when editing both trees. Gateway:
 [`connection_gateway.md`](connection_gateway.md) (shipped).
 T3 hygiene peels (`persistence-api` / `lean-demo` / dirty-saves **bench**)
@@ -76,7 +77,7 @@ plans.
 | **2** | Engine purity | ✅ `rg "from supers\|import supers" engine/` empty; `engine_hooks_purity_tests` + `engine-only-smoke` enforced (restored 2026-08-03) |
 | **2b** | `command_support.py` purity | ✅ shared move/spirit-sight helpers hookified; zero supers imports in `engine/command_support.py` |
 | **3** | Lean world + game bootstrap | ✅ MVP: lean `engine/world.py`/`engine/persistence.py`; dual installable packages declared; game entry alias added |
-| **4** | Engine-only smoke | ✅ CI job `engine-only-smoke` green with SUPERS absent (`tools/engine_smoke.py`) |
+| **4** | Engine-only smoke | ✅ Job exists (`tools/engine_smoke.py`). **2026-08-27:** private-repo GitHub workflow `CI` (`.github/workflows/ci.yml`) is **`disabled_manually`**, so `engine-only-smoke` is **not running on GitHub**. Local `engine_smoke.py` + public `riftforge-engine` CI (active) still gate. Re-enable is a billing/maintainer decision. |
 | **5** | Remote split | ✅ public `riftforge-engine` + private SUPERS; pin `v0.2.0` |
 | **6** | Living docs | ✅ RELEASING / UPGRADING / LIVE_DEPLOY + CI + gateway/auto-deploy verify |
 

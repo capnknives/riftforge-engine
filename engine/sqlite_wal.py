@@ -190,6 +190,18 @@ def maybe_checkpoint_after_save(conn, db_path, *, reason="save", force=False):
         row = conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
         if row:
             busy, log_pages, checkpointed = row[0], row[1], row[2]
+        # TRUNCATE waits for every reader. If SQLite reports busy, do not
+        # retry TRUNCATE every autosave while -wal stays large -- PASSIVE
+        # still moves the WAL forward without pinning the writer.
+        if (
+            not err
+            and str(mode).upper() == "TRUNCATE"
+            and busy
+        ):
+            row = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+            if row:
+                busy, log_pages, checkpointed = row[0], row[1], row[2]
+            mode = "PASSIVE"
     except sqlite3.Error as exc:
         err = repr(exc)
 

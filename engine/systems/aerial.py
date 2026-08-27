@@ -163,7 +163,7 @@ def cmd_fly(character, args, game):
     if tier == "macro":
         macro = overland_mod._parse_pos_pair(character.stellar_flight_macro)
         if macro is None:
-            macro = (35, 10)
+            macro = (44, 32)
         lat, lon = globe_flight_mod.macro_to_lonlat(macro[0], macro[1])
         character.stellar_globe_lat = lat
         character.stellar_globe_lon = lon
@@ -175,7 +175,7 @@ def cmd_fly(character, args, game):
         )
         return
     room = getattr(character, "location", None)
-    macro = overland_mod.america_macro_from_room(room, game) or (35, 10)
+    macro = overland_mod.america_macro_from_room(room, game) or (44, 32)
     if not getattr(room, "outdoor", False):
         character.session.send("You need open sky to take off.")
         return
@@ -215,13 +215,13 @@ def cmd_descend(character, args, game):
         return
     if tier == "globe":
         globe_flight_mod.leave_globe_tier(character, game)
-        macro = overland_mod._parse_pos_pair(character.stellar_flight_macro) or (35, 10)
+        macro = overland_mod._parse_pos_pair(character.stellar_flight_macro) or (44, 32)
         overland_mod.place_aerial_overland(character, game, macro)
         set_flight_tier(character, "macro")
         character.session.send("You sink back to macro altitude.")
         return
     if tier == "macro":
-        macro = overland_mod._parse_pos_pair(character.stellar_flight_macro) or (35, 10)
+        macro = overland_mod._parse_pos_pair(character.stellar_flight_macro) or (44, 32)
         overland_mod.place_on_overland(character, game, macro, overland_mod.LANDMARK_MICRO)
         clear_hover(character)
         character.session.send("You settle back to the ground.")

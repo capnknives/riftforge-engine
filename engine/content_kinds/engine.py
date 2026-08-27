@@ -16,13 +16,9 @@ import os
 import re
 
 from engine import hooks
+from engine.room_naming import split_structured_title
 
 _PROFILES: dict[str, dict] | None = None
-
-# Policy: ROOM NAME should be City - Main - Sub (authoring; not boot-hard).
-_ROOM_TITLE_RE = re.compile(
-    r"^[^-]+ - [^-]+ - .+$",
-)
 
 
 class KindValidationError(ValueError):
@@ -201,7 +197,8 @@ def _coerce_value(raw, spec, *, field_name):
         if isinstance(raw, int):
             return raw
         return int(str(raw).strip())
-    if ftype == "float":
+    # ``number`` is an alias used by older kind profiles (item.ore / item.ingot).
+    if ftype in ("float", "number"):
         if isinstance(raw, bool):
             raise ValueError(f"{field_name}: expected number, got bool")
         if isinstance(raw, (int, float)):
@@ -372,12 +369,15 @@ def lint_kind(kind_id, obj, *, warn_unknown=False):
         pid = pol.get("id", "policy")
         if pid == "room_title_shape":
             title = obj.get("title") or obj.get("key") or ""
-            if title and not _ROOM_TITLE_RE.match(str(title).strip()):
-                warnings.append(LintWarning(
-                    pid,
-                    "ROOM NAME should be City - Main - Sub "
-                    f"(got {title!r}; see help build-maps).",
-                ))
+            text = str(title).strip()
+            if text:
+                city, main, _sub = split_structured_title(text)
+                if not (city and main):
+                    warnings.append(LintWarning(
+                        pid,
+                        "ROOM NAME should be City - Main - Sub "
+                        f"(got {title!r}; see help build-maps).",
+                    ))
         if pid == "description_length":
             desc = obj.get("description") or ""
             min_sent = pol.get("min_sentences", 2)

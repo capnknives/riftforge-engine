@@ -42,13 +42,36 @@ def pathfind_budget_ms():
         return _DEFAULT_BFS_BUDGET_MS
 
 
-def _bfs_budget_exceeded(budget_ms, budget_t0, nodes_seen):
+def _cadence_lifestyle_probe_over_cap(start):
+    """True when Cadence published an expired per-actor wall on this graph.
+
+    Engine must not import supers. Cadence stamps
+    ``game._cadence_lifestyle_actor_probe = (t0, cap_ms)`` for the actor
+    currently in ``_act``. Even with ``PATHFIND_BUDGET_MS=0`` (wall off),
+    a runaway BFS must still abort so one townsfolk cannot freeze look.
+    """
+    if start is None:
+        return False
+    game = getattr(start, "game", None)
+    probe = getattr(game, "_cadence_lifestyle_actor_probe", None)
+    if not probe:
+        return False
+    t0, cap_ms = probe
+    if cap_ms <= 0:
+        return False
+    return (_time.perf_counter() - t0) * 1000.0 >= cap_ms
+
+
+def _bfs_budget_exceeded(budget_ms, budget_t0, nodes_seen, start=None):
     """True when a timed BFS should fail soft and retry next heartbeat."""
+    if _cadence_lifestyle_probe_over_cap(start):
+        return True
     if budget_ms is None or budget_ms <= 0 or budget_t0 is None:
         return False
-    if nodes_seen % 32 != 0:
-        return False
-    return (_time.perf_counter() - budget_t0) * 1000.0 >= budget_ms
+    # Check wall time every expansion — SUPERS passable() can cost ms per
+    # edge on town graphs; sampling every 32 nodes let single calls hit 5s+.
+    elapsed = (_time.perf_counter() - budget_t0) * 1000.0
+    return elapsed >= budget_ms
 
 
 def path_directions_to(
@@ -90,7 +113,7 @@ def path_directions_to(
     while queue:
         if limit is not None and len(seen) >= limit:
             break
-        if _bfs_budget_exceeded(budget_ms, budget_t0, len(seen)):
+        if _bfs_budget_exceeded(budget_ms, budget_t0, len(seen), start):
             return []
         room = queue.popleft()
         if predicate(room):
@@ -104,7 +127,7 @@ def path_directions_to(
             seen.add(neighbor)
             came_from[neighbor] = (room, direction)
             queue.append(neighbor)
-            if _bfs_budget_exceeded(budget_ms, budget_t0, len(seen)):
+            if _bfs_budget_exceeded(budget_ms, budget_t0, len(seen), start):
                 return []
     if goal is None:
         return []
@@ -152,7 +175,7 @@ async def path_directions_to_async(
     while queue:
         if limit is not None and len(seen) >= limit:
             break
-        if _bfs_budget_exceeded(budget_ms, budget_t0, len(seen)):
+        if _bfs_budget_exceeded(budget_ms, budget_t0, len(seen), start):
             return []
         if len(seen) % _BFS_YIELD_EVERY == 0:
             await asyncio.sleep(0)
@@ -168,7 +191,7 @@ async def path_directions_to_async(
             seen.add(neighbor)
             came_from[neighbor] = (room, direction)
             queue.append(neighbor)
-            if _bfs_budget_exceeded(budget_ms, budget_t0, len(seen)):
+            if _bfs_budget_exceeded(budget_ms, budget_t0, len(seen), start):
                 return []
     if goal is None:
         return []

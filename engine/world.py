@@ -500,6 +500,21 @@ class Room(GameObject):
                 char.session.send(text)
                 if blank_after:
                     char.session.send("")
+                else:
+                    # Paragraph spacing (prefs #36, config spacing): an
+                    # unrelated room event (say, emote, another player's
+                    # action) landing between a watcher's own commands
+                    # gets a trailing blank so a busy room does not read
+                    # as a run-on wall of text. Screenreader users and
+                    # anyone on ``config spacing packed`` skip this --
+                    # wants_airy_spacing() already checks both. Only
+                    # fires for callers that did NOT already ask for
+                    # blank_after, so intentional dense sequences (a
+                    # caller looping broadcast() for one cinematic beat)
+                    # are unaffected either way.
+                    from engine import display_prefs
+                    if display_prefs.wants_airy_spacing(char):
+                        char.session.send("")
             elif getattr(char, "snoopers", None):
                 # Sessionless NPC / offline Echo: still feed GM snoopers the
                 # room line they would have heard if they had a Session.
@@ -812,12 +827,30 @@ class Character(GameObject):
 
         Pinned fixtures (``immovable=True``, e.g. gym training dummies) stay
         put unless a heal sets ``_force_move`` for that single placement.
+
+        Returns True when the character entered ``room``; False when blocked
+        (placement gate, immovable fixture, or ``room`` is None).
         """
+        if room is None:
+            return False
         if (
             getattr(self, "immovable", False)
             and not getattr(self, "_force_move", False)
         ):
-            return
+            return False
+        from engine import hooks as hooks_mod
+
+        game = None
+        session = getattr(self, "session", None)
+        if session is not None:
+            game = getattr(session, "game", None)
+        if game is None:
+            game = getattr(room, "game", None)
+        block = hooks_mod.character_placement_block(self, room, game)
+        if block:
+            if session is not None and hasattr(session, "send"):
+                session.send(block)
+            return False
         old_key = getattr(self.location, "key", None) if self.location else None
         if self.location:
             # Bypass Room.remove so we do NOT drop out of game.characters
@@ -836,6 +869,7 @@ class Character(GameObject):
                     logger.move(old_key, new_key)
                 except Exception:
                     _log_activity_error("logger.move", self)
+        return True
 
 
 def make_body(character):

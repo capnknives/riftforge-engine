@@ -39,14 +39,17 @@ ooc           -- global ``ooc`` channel (Town Square ``#ooc``)
 wknz          -- WKNZ Discord radio: host talk, weather/warnings,
                  rare music-flow line (never lyrics / ads / fluff),
                  gateway outage down/up ([WKNZ] Wits)
-bug_report    -- brief player ``bug`` filing to Discord #staff (no debug)
+bug_report    -- brief player ``bug`` filing to Discord #staff (no debug).
+              Use the **bot** channel map (not a webhook) when you want
+              resolved tickets to get a checkmark reaction on the post.
 suggestion    -- brief player ``suggest`` filing to Discord #staff
-patch_notes   -- short player changelog summaries after auto-deploy (#patch-notes)
+wiznet        -- two-way staff chat with in-game ``wiznet`` (#staff)
+patch_notes   -- short player changelog summaries after auto-deploy (#news)
 
 Add a Discord channel + env mapping when you wire a new tag; keep the
 in-game call site one line: ``schedule_discord(tag, text)``.
 
-Runtime mutes (GM ``discord ooc|weather|crash on|off``)
+Runtime mutes (GM ``discord ooc|weather|crash|wiznet on|off``)
 ------------------------------------------------------
 File ``.discord_bridge_toggles`` (gitignored JSON) can mute subsets
 without tearing down env webhooks. Gateway reloads this module and
@@ -64,8 +67,10 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Callable
 
 API_BASE = "https://discord.com/api/v10"
 
@@ -82,7 +87,7 @@ MUSIC_FLOW_INTERVAL_ENV = "DISCORD_BRIDGE_WKNZ_MUSIC_INTERVAL_SEC"
 # GM mute file (same idea as ``.auto_deploy_override``) -- game + gateway.
 TOGGLES_NAME = ".discord_bridge_toggles"
 # Keys staff can flip with ``discord <key> on|off``.
-TOGGLE_KEYS = ("ooc", "weather", "crash")
+TOGGLE_KEYS = ("ooc", "weather", "crash", "wiznet")
 _DEFAULT_TOGGLES = {key: True for key in TOGGLE_KEYS}
 
 _POST_TIMEOUT_SECONDS = 15
@@ -212,7 +217,7 @@ def status_text(root=None) -> str:
     if not path.is_file():
         lines.append("(no override file yet -- defaults are all on)")
     lines.append(
-        "Usage: discord  |  discord <ooc|weather|crash> <on|off>  |  "
+        "Usage: discord  |  discord <ooc|weather|crash|wiznet> <on|off>  |  "
         "discord status"
     )
     return "\r\n".join(lines)
@@ -223,15 +228,18 @@ def _mirror_allowed(tag: str, kind: str | None) -> bool:
 
     Mapping:
       ooc      -- tag ``ooc``
+      wiznet   -- tag ``wiznet`` (Discord #staff two-way staff chat)
       weather  -- tag ``wknz`` + kind weather|warning
       crash    -- tag ``wknz`` + kind outage (gateway down/up)
     Hunt tips / angel radio / WKNZ talk+music are not covered by these
-    three keys (add a new toggle if staff need those muted too).
+    keys (add a new toggle if staff need those muted too).
     """
     tag_s = str(tag or "").strip().lower()
     kind_s = str(kind or "").strip().lower()
     if tag_s == "ooc":
         return is_toggle_on("ooc")
+    if tag_s == "wiznet":
+        return is_toggle_on("wiznet")
     if tag_s == "wknz":
         if kind_s in ("weather", "warning"):
             return is_toggle_on("weather")
@@ -334,7 +342,7 @@ def _cooldown_ok(tag: str) -> bool:
     30-minute gate in ``schedule_wknz_music_flow`` before calling here.
     """
     now = time.monotonic()
-    if tag in ("ooc", "wknz"):
+    if tag in ("ooc", "wknz", "bug_report", "wiznet"):
         _last_sent_mono[tag] = now
         return True
     interval = min_interval_seconds()
@@ -347,6 +355,16 @@ def _cooldown_ok(tag: str) -> bool:
 
 def post_channel_message_sync(token: str, channel_id: str, content: str) -> int:
     """Blocking bot POST of one channel message. Returns HTTP status."""
+    status, _message_id = post_channel_message_with_id_sync(
+        token, channel_id, content,
+    )
+    return status
+
+
+def post_channel_message_with_id_sync(
+    token: str, channel_id: str, content: str,
+) -> tuple[int, str | None]:
+    """Blocking bot POST; return ``(http_status, message_id_or_none)``."""
     url = f"{API_BASE}/channels/{channel_id}/messages"
     data = json.dumps({"content": content}).encode("utf-8")
     req = urllib.request.Request(
@@ -358,6 +376,37 @@ def post_channel_message_sync(token: str, channel_id: str, content: str) -> int:
             "User-Agent": "RiftforgeDiscordBridge (MortalsAndMonsters; stdlib)",
         },
         method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=_POST_TIMEOUT_SECONDS) as resp:
+        raw = resp.read()
+        status = resp.status
+    message_id = None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        if isinstance(payload, dict) and payload.get("id") is not None:
+            message_id = str(payload["id"])
+    except (UnicodeDecodeError, ValueError, TypeError):
+        message_id = None
+    return status, message_id
+
+
+def add_message_reaction_sync(
+    token: str, channel_id: str, message_id: str, emoji: str = "\u2705",
+) -> int:
+    """Blocking bot PUT to add one reaction (default checkmark)."""
+    encoded = urllib.parse.quote(str(emoji or "\u2705"))
+    url = (
+        f"{API_BASE}/channels/{channel_id}/messages/{message_id}"
+        f"/reactions/{encoded}/@me"
+    )
+    req = urllib.request.Request(
+        url,
+        data=b"",
+        headers={
+            "Authorization": f"Bot {token}",
+            "User-Agent": "RiftforgeDiscordBridge (MortalsAndMonsters; stdlib)",
+        },
+        method="PUT",
     )
     with urllib.request.urlopen(req, timeout=_POST_TIMEOUT_SECONDS) as resp:
         resp.read()
@@ -466,6 +515,144 @@ def schedule_discord(tag: str, body: str, *, kind: str | None = None) -> bool:
     return True
 
 
+async def _bot_post_with_id_async(
+    tag: str,
+    content: str,
+    on_posted: Callable[[str, str], None] | None,
+) -> None:
+    """Worker: bot-only POST that returns a message id for later reactions."""
+    try:
+        token = bot_token()
+        channel_id = channel_id_for_tag(tag)
+        if not token or not channel_id:
+            return
+        status, message_id = await asyncio.to_thread(
+            post_channel_message_with_id_sync, token, channel_id, content,
+        )
+        print(
+            f"[discord_bridge] bot tracked ok tag={tag} channel={channel_id} "
+            f"HTTP {status} message_id={message_id or '(none)'}",
+            flush=True,
+        )
+        if message_id and on_posted is not None:
+            on_posted(channel_id, message_id)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+        # Bot token revoked or #staff overwrite missing — fall back to the
+        # per-tag webhook when configured so bug briefs still reach Discord.
+        hook = webhook_url_for_tag(tag)
+        if hook:
+            try:
+                status = await asyncio.to_thread(post_webhook_sync, hook, content)
+                print(
+                    f"[discord_bridge] webhook fallback ok tag={tag} HTTP {status} "
+                    f"(bot failed: {exc})",
+                    flush=True,
+                )
+                return
+            except (
+                urllib.error.URLError,
+                urllib.error.HTTPError,
+                TimeoutError,
+                OSError,
+            ) as hook_exc:
+                print(
+                    f"[discord_bridge] tracked POST failed tag={tag}: {exc}; "
+                    f"webhook fallback also failed: {hook_exc}",
+                    flush=True,
+                )
+                return
+        print(f"[discord_bridge] tracked POST failed tag={tag}: {exc}", flush=True)
+    except Exception as exc:
+        print(f"[discord_bridge] tracked POST unexpected error tag={tag}: {exc}", flush=True)
+
+
+def schedule_bot_post_with_id(
+    tag: str,
+    content: str,
+    *,
+    on_posted: Callable[[str, str], None] | None = None,
+) -> bool:
+    """Queue a bot-channel post and call ``on_posted(channel_id, message_id)``.
+
+    Ignores per-tag webhooks — reactions need the bot API. Silent no-op when
+    bot token or channel map is missing, or when there is no running loop.
+    """
+    tag_s = str(tag or "").strip().lower()
+    if not tag_s or not str(content or "").strip():
+        return False
+    token = bot_token()
+    channel_id = channel_id_for_tag(tag_s)
+    if not token or not channel_id:
+        return False
+    if not _cooldown_ok(tag_s):
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            status, message_id = post_channel_message_with_id_sync(
+                token, channel_id, content,
+            )
+            if message_id and on_posted is not None:
+                on_posted(channel_id, message_id)
+            return bool(status)
+        except Exception as exc:
+            print(
+                f"[discord_bridge] sync tracked POST failed tag={tag_s}: {exc}",
+                flush=True,
+            )
+            return False
+    task = loop.create_task(_bot_post_with_id_async(tag_s, content, on_posted))
+    task.add_done_callback(_log_task_exception)
+    return True
+
+
+async def _add_reaction_async(channel_id: str, message_id: str, emoji: str) -> None:
+    """Worker: add one reaction via the bot token."""
+    try:
+        token = bot_token()
+        if not token:
+            return
+        status = await asyncio.to_thread(
+            add_message_reaction_sync, token, channel_id, message_id, emoji,
+        )
+        print(
+            f"[discord_bridge] reaction ok channel={channel_id} "
+            f"message={message_id} HTTP {status}",
+            flush=True,
+        )
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
+        print(
+            f"[discord_bridge] reaction failed message={message_id}: {exc}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[discord_bridge] reaction unexpected error: {exc}", flush=True)
+
+
+def schedule_message_reaction(
+    channel_id: str, message_id: str, emoji: str = "\u2705",
+) -> bool:
+    """Queue a checkmark (or other emoji) on an existing bot message."""
+    if not str(channel_id or "").strip() or not str(message_id or "").strip():
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            token = bot_token()
+            if not token:
+                return False
+            add_message_reaction_sync(token, channel_id, message_id, emoji)
+            return True
+        except Exception as exc:
+            print(f"[discord_bridge] sync reaction failed: {exc}", flush=True)
+            return False
+    task = loop.create_task(_add_reaction_async(channel_id, message_id, emoji))
+    task.add_done_callback(_log_task_exception)
+    return True
+
+
 def schedule_hunt_tip(summary: str, *, kind: str | None = None) -> bool:
     """Convenience: tip-line → tag ``hunt_tip`` (Discord #hunter-radio)."""
     return schedule_discord("hunt_tip", summary, kind=kind or None)
@@ -483,6 +670,14 @@ def schedule_ooc(plain_line: str) -> bool:
     so Discord stays in lockstep (no second header layer).
     """
     return schedule_discord("ooc", plain_line, kind=None)
+
+
+def schedule_wiznet(plain_line: str) -> bool:
+    """Convenience: staff wiznet → tag ``wiznet`` (Discord #staff).
+
+    Pass the same plain ``[WIZ] Name(GM): …`` string staff see in-game.
+    """
+    return schedule_discord("wiznet", plain_line, kind=None)
 
 
 def schedule_wknz(body: str, *, kind: str | None = None) -> bool:

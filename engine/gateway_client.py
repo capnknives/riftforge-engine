@@ -78,24 +78,39 @@ class GatewaySessionWriter:
             # callers still get a non-None host string.
             self._peername = ("gateway", 0)
 
+        # Coalesce many Session.write() calls into one IPC DATA frame.
+        # create_task-per-line was a live CPU leak under look/help bursts
+        # (follow-on item 6). drain() awaits the in-flight flush.
+        self._pending = bytearray()
+        self._flush_task = None
+
     def write(self, data: bytes) -> None:
-        """Queue telnet bytes to the gateway (scheduled on the running loop)."""
+        """Queue telnet bytes; schedule one flush task if none is in flight."""
         if self._closing or not data:
             return
-        # Session.write is sync; schedule the async send.
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(self._send(encode_data(self.session_id, data)))
+        self._pending.extend(data)
+        task = self._flush_task
+        if task is None or task.done():
+            self._flush_task = loop.create_task(self._flush())
+
+    async def _flush(self) -> None:
+        """Send coalesced pending bytes; loop if write() raced the send."""
+        while self._pending and not self._closing:
+            payload = bytes(self._pending)
+            del self._pending[:]
+            await self._send(encode_data(self.session_id, payload))
 
     async def drain(self) -> None:
-        """No local buffer — gateway send already awaited in send_fn path.
-
-        write() fire-and-forgets tasks; drain is a no-op best-effort yield
-        so callers keep their await drain() pattern.
-        """
-        await asyncio.sleep(0)
+        """Wait until queued telnet bytes have been handed to IPC send."""
+        task = self._flush_task
+        if task is not None and not task.done():
+            await task
+        if self._pending and not self._closing:
+            await self._flush()
 
     def close(self) -> None:
         """Mark closed; gateway still holds the real socket until client hangs up."""
@@ -191,6 +206,12 @@ class GatewayBridge:
         # World heartbeat starts after welcome/reattach (not at process boot).
         self._tick_loop_started = False
         self._last_gateway_frame_at = 0.0
+        # Background stitch after welcome -- cancelled if IPC dies.
+        self._welcome_boot_task = None
+        # Gateway stitch-intercept off while gap-fill heals run (commands
+        # still flow over IPC; this flag only blocks the "game looks stale"
+        # OOC intercept). Watchdog also skips stale-kill while True.
+        self._boot_warming = False
 
     def _ipc_ping_interval_seconds(self) -> float:
         raw = (os.environ.get("GAME_GATEWAY_IPC_PING_SECONDS") or "").strip()
@@ -225,6 +246,7 @@ class GatewayBridge:
             now = time.monotonic()
             if (
                 self._tick_loop_started
+                and not self._boot_warming
                 and self._last_gateway_frame_at > 0
                 and (now - self._last_gateway_frame_at) > stale_limit
             ):
@@ -315,16 +337,21 @@ class GatewayBridge:
 
     async def notify_boot_warming(self, active: bool) -> None:
         """Tell the gateway deferred boot is running (suppress stitch intercept)."""
+        self._boot_warming = bool(active)
         await self.send_frame(
-            encode_ctrl({"op": "boot_warming", "active": bool(active)})
+            encode_ctrl({"op": "boot_warming", "active": self._boot_warming})
         )
 
     def _begin_gateway_copyover_reattach(self) -> None:
         """Reset veil-playable gate before held sessions reattach."""
         import asyncio
 
+        # Copyover restore, not cold-boot re-seed -- boot_seed uses this
+        # to skip civic housing maintain and open look/who immediately.
+        self.game._gateway_copyover_reattach = True
         self.game._veil_world_ready = False
         self.game._veil_stitch_announced = False
+        self.game._veil_hold_ready_until_announce = True
         self.game._veil_ready_event = asyncio.Event()
 
     async def _wait_gateway_copyover_sessions(self) -> None:
@@ -332,11 +359,64 @@ class GatewayBridge:
         await asyncio.sleep(0)
 
     async def _end_gateway_copyover_reattach(self) -> None:
-        """Open the playable gate after deferred boot + rewrite announce."""
+        """Drop boot_warming after background heals (playable gate already open)."""
+        self.game._veil_hold_ready_until_announce = False
         ev = getattr(self.game, "_veil_ready_event", None)
         if ev is not None and not ev.is_set():
             ev.set()
         await self.notify_boot_warming(False)
+
+    async def _complete_welcome_boot(self, *, reload: bool) -> None:
+        """Catch-up + deferred heals, off the IPC read loop.
+
+        Classic copyover.resume() runs after execv; this is the gateway
+        equivalent. Opening the veil *first* on a game-only reload
+        lets look/who run -- and because this is a task, DATA frames still
+        reach play(). Empty-who reloads still skip the heal catalog.
+        """
+        from engine import deploy_notify
+        from engine import hooks
+        from engine.session_attach import sweep_duplicate_session_attaches
+
+        try:
+            await deploy_notify.on_resume(self.game)
+            if reload:
+                # Diku copyover_recover: players type before zone resets.
+                hooks.open_veil_playable(self.game)
+            await hooks.gateway_resume_hook(self.game)
+            await hooks.run_deferred_boot_seed_async(self.game)
+            deploy_notify.announce_rewrite_ready(self.game)
+            swept = sweep_duplicate_session_attaches(self.game)
+            if swept:
+                print(
+                    f"[gateway_client] swept {swept} duplicate session row(s)",
+                    flush=True,
+                )
+            try:
+                await self.notify_chat_history()
+            except Exception as exc:
+                print(
+                    f"[gateway_client] chat_history sync skipped: {exc!r}",
+                    flush=True,
+                )
+            from engine import copyover as copyover_mod
+
+            copyover_mod.mark_copyover_ready()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            import traceback
+
+            print(
+                f"[gateway_client] welcome boot failed: {exc!r}",
+                flush=True,
+            )
+            traceback.print_exc()
+        finally:
+            if reload:
+                await self._end_gateway_copyover_reattach()
+            else:
+                await self.notify_boot_warming(False)
 
     def _schedule_ctrl(self, msg: dict) -> None:
         """Fire-and-forget one CTRL frame from sync game code."""
@@ -410,6 +490,14 @@ class GatewayBridge:
                 pass
             # Do not disconnect characters — gateway still holds sockets.
             # Cancel play tasks only; leave Echo conversion to real client close.
+            boot_task = getattr(self, "_welcome_boot_task", None)
+            if boot_task is not None and not boot_task.done():
+                boot_task.cancel()
+                try:
+                    await boot_task
+                except asyncio.CancelledError:
+                    pass
+            self._welcome_boot_task = None
             for sid, session in list(self._sessions.items()):
                 task = getattr(session, "_gateway_task", None)
                 if task is not None and not task.done():
@@ -431,9 +519,12 @@ class GatewayBridge:
                 e for e in (msg.get("sessions") or [])
                 if e.get("sid") and e.get("name")
             ]
-            if held:
+            from engine.boot_kind import parse_boot_kind, RELOAD
+
+            welcome_kind = parse_boot_kind(msg.get("kind"), default="cold")
+            if held or welcome_kind == RELOAD:
                 self._begin_gateway_copyover_reattach()
-                await self.notify_boot_warming(True)
+            await self.notify_boot_warming(True)
             for entry in msg.get("sessions") or []:
                 sid = entry.get("sid")
                 if not sid:
@@ -445,38 +536,19 @@ class GatewayBridge:
                 )
             if held:
                 await self._wait_gateway_copyover_sessions()
-            # Classic copyover.resume() calls this after execv; gateway
-            # reattach is the equivalent -- finish any in-flight Fix deploy.
-            from engine import deploy_notify
-            await deploy_notify.on_resume(self.game)
-            # Vault offline unfinished onboarding *after* reattach so held
-            # mid-tutorial PCs (gateway TCP never dropped) keep their body
-            # in-world and skip the vault sweep (session is live now). Routed
-            # through engine.hooks (SUPERS: heal_incomplete_tutorial_offline)
-            # -- engine/ never imports supers directly (two-repo purity).
-            from engine import hooks
-            await hooks.gateway_resume_hook(self.game)
             # Start the heartbeat as soon as held clients are rebound.
-            # Deferred heals used to run first and freeze who/look for tens
-            # of seconds under a false "complete" line (veil copyover UX).
-            # Tick handlers register at the end of deferred seed; early ticks
-            # are empty no-ops until then -- safe after reattach (not Echo).
+            # Do NOT await stitch on this CTRL handler -- that blocked the
+            # IPC read loop, so typed look/who never reached Session.play
+            # until every deferred heal returned (playable-first could not
+            # help: DATA frames sat on the gateway). Circle copyover_recover
+            # returns to nanny/game_loop; zone resets keep running.
             self._ensure_tick_loop()
-            # Heavy boot heals yield between small steps so commands stay live.
-            await hooks.run_deferred_boot_seed_async(self.game)
-            # Only now: "Rewrite complete" (queued in on_resume).
-            deploy_notify.announce_rewrite_ready(self.game)
-            if held:
-                await self._end_gateway_copyover_reattach()
-            # Seed gateway stitch buffers from the authoritative game rings
-            # so bare ooc/wiznet replay during the next IPC gap is not empty.
-            try:
-                await self.notify_chat_history()
-            except Exception as exc:
-                print(
-                    f"[gateway_client] chat_history sync skipped: {exc!r}",
-                    flush=True,
-                )
+            self._welcome_boot_task = asyncio.create_task(
+                self._complete_welcome_boot(
+                    reload=bool(held or welcome_kind == RELOAD),
+                ),
+                name="gateway-welcome-boot",
+            )
         elif op == "open":
             sid = msg.get("sid")
             if sid:

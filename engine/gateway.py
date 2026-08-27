@@ -207,6 +207,8 @@ class ClientSlot:
         self.alive = True
         self.line_buffer = b""  # stitch-mode line assembly
         self.ws_recv_buf = b""  # incomplete WebSocket frames (WS clients only)
+        self.ws_out_buf = b""  # incomplete telnet IAC from game (WS mux)
+        self.gmcp_do_sent = False  # synthesized IAC DO GMCP for browsers
         self._ws_handshake_done = protocol != "websocket"
 
 
@@ -256,6 +258,9 @@ class Gateway:
         self._boot_warming = False
         # One-shot client drop warning (gateway restart / SIGTERM).
         self._client_disconnect_warned = False
+        # First game hello after this gateway process started is a cold
+        # compose-style boot; later hellos are game-only reloads.
+        self._game_hello_count = 0
 
     async def send_to_game(self, frame: bytes) -> None:
         """Write one framed message to the connected game, if any."""
@@ -270,31 +275,62 @@ class Gateway:
                 self._game_writer = None
 
     async def send_to_client(self, session_id: str, data: bytes) -> None:
-        """Forward game bytes to one held client (telnet raw or WS text frame)."""
+        """Forward game bytes to one held client (telnet raw or WS JSON)."""
         slot = self.clients.get(session_id)
         if slot is None or not slot.alive:
             return
         try:
             if slot.protocol == "websocket":
-                from engine import websocket as ws_mod
-
-                # Game speaks telnet line discipline; browsers want WS text frames.
-                # Split on newlines so each game line becomes one frame (MVP).
-                text = data.decode("utf-8", errors="replace")
-                parts = text.split("\n")
-                for idx, chunk in enumerate(parts):
-                    if idx < len(parts) - 1:
-                        payload = chunk + "\n"
-                    else:
-                        payload = chunk
-                    if not payload and idx == len(parts) - 1:
-                        continue
-                    slot.writer.write(ws_mod.encode_text_frame(payload))
+                await self._forward_ws_game_bytes(slot, data)
             else:
                 slot.writer.write(data)
             await slot.writer.drain()
         except (ConnectionError, OSError):
             await self._drop_client(session_id, notify_game=True)
+
+    async def _forward_ws_game_bytes(self, slot: ClientSlot, data: bytes) -> None:
+        """Split telnet IAC/GMCP out of game bytes; send JSON text frames.
+
+        Browser clients cannot speak telnet. Prose becomes op=text; GMCP
+        subnegotiations become op=gmcp. WILL GMCP is answered with DO GMCP
+        toward the game so Mudlet-style packages start flowing.
+        """
+        from engine import gmcp as gmcp_mod
+        from engine import telnet
+        from engine import websocket as ws_mod
+        from engine import ws_json
+
+        slot.ws_out_buf += data or b""
+        text, events, remainder = telnet.parse_stream(slot.ws_out_buf)
+        slot.ws_out_buf = remainder
+        frames = []
+        for event in events:
+            kind = event[0]
+            if kind == telnet.EV_NEGOTIATE:
+                cmd, option = event[1], event[2]
+                if option == telnet.TELOPT_GMCP and cmd == telnet.WILL:
+                    if not slot.gmcp_do_sent:
+                        slot.gmcp_do_sent = True
+                        await self.send_to_game(
+                            encode_data(
+                                slot.session_id,
+                                telnet.do(telnet.TELOPT_GMCP),
+                            )
+                        )
+                continue
+            if kind == telnet.EV_SUBNEG:
+                option, payload = event[1], event[2]
+                if option != telnet.TELOPT_GMCP:
+                    continue
+                package, value = gmcp_mod.decode_subneg(payload)
+                if package:
+                    frames.append(ws_json.encode_gmcp(package, value))
+        if text:
+            decoded = text.decode("utf-8", errors="replace")
+            if decoded:
+                frames.append(ws_json.encode_text(decoded))
+        for frame in frames:
+            slot.writer.write(ws_mod.encode_text_frame(frame))
 
     def _discord_bridge(self):
         """Import + reload ``discord_bridge`` so GM mutes apply in-process.
@@ -920,6 +956,42 @@ class Gateway:
         payload = line + b"\r\n"
         await self.send_to_game(encode_data(session_id, payload))
 
+    async def _process_ws_message(self, slot: ClientSlot, text: str) -> None:
+        """Handle one WebSocket text frame (JSON HUD envelope or raw line)."""
+        from engine import gmcp as gmcp_mod
+        from engine import ws_json
+
+        parsed = ws_json.parse_inbound(text)
+        if parsed is None:
+            return
+        kind = parsed.get("kind")
+        if kind in ("cmd", "line"):
+            line = (parsed.get("line") or "").encode("utf-8")
+            if self._should_intercept_commands():
+                if await self._handle_intercepted_line(slot, line):
+                    return
+            if self._game_writer is not None:
+                await self._forward_client_line(slot.session_id, line)
+            return
+        if kind == "gmcp":
+            package = parsed.get("package")
+            if not package:
+                return
+            raw = gmcp_mod.encode_package(package, parsed.get("payload"))
+            await self.send_to_game(encode_data(slot.session_id, raw))
+            return
+        if kind == "hello":
+            if not slot.gmcp_do_sent:
+                from engine import telnet
+
+                slot.gmcp_do_sent = True
+                await self.send_to_game(
+                    encode_data(
+                        slot.session_id,
+                        telnet.do(telnet.TELOPT_GMCP),
+                    )
+                )
+
     async def _process_client_input(self, slot: ClientSlot, data: bytes) -> None:
         """Assemble telnet lines once, then stitch-handle or forward to game.
 
@@ -966,39 +1038,63 @@ class Gateway:
             print(f"[gateway] client closed sid={session_id[:8]}… "
                   f"({len(self.clients)} held)", flush=True)
 
-    async def _complete_websocket_handshake(
-        self, reader, writer
-    ) -> bool:
-        """Read HTTP headers and reply 101 Switching Protocols. False on fail."""
+    async def _read_http_headers(self, reader) -> bytes | None:
+        """Read one HTTP request header block (through blank line). None on EOF."""
         from engine import websocket as ws_mod
 
         buf = b""
         while b"\r\n\r\n" not in buf and len(buf) < ws_mod.MAX_HANDSHAKE_BYTES:
             chunk = await reader.read(4096)
             if not chunk:
-                return False
+                return None
             buf += chunk
-        key, response = ws_mod.parse_handshake_request(buf)
-        if response is None:
-            return False
-        if key is None:
-            writer.write(response)
-            await writer.drain()
-            return False
-        writer.write(response)
-        await writer.drain()
-        return True
+        return buf
 
-    async def handle_websocket(self, reader, writer) -> None:
-        """Accept one browser WebSocket; bridge line text like telnet."""
+    async def handle_browser_port(self, reader, writer) -> None:
+        """Serve static play page (HTTP) or accept WebSocket on the same port."""
         peer = _peer_host_from_writer(writer)
-        if not await self._complete_websocket_handshake(reader, writer):
+        from engine import websocket as ws_mod
+
+        buf = await self._read_http_headers(reader)
+        if buf is None:
             try:
                 writer.close()
                 await writer.wait_closed()
             except Exception:
                 pass
             return
+
+        # WebSocket upgrade (GET + Sec-WebSocket-Key).
+        if b"sec-websocket-key:" in buf.lower():
+            key, response = ws_mod.parse_handshake_request(buf)
+            if key is None:
+                if response:
+                    writer.write(response)
+                    await writer.drain()
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                return
+            writer.write(response)
+            await writer.drain()
+            await self._run_websocket_session(reader, writer, peer)
+            return
+
+        # Plain HTTP — bundled browser client (engine/web_client/static/).
+        from engine import web_client as wc_mod
+
+        writer.write(wc_mod.serve_http(buf))
+        await writer.drain()
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+    async def _run_websocket_session(self, reader, writer, peer) -> None:
+        """After 101 Switching Protocols, bridge WS text frames like telnet."""
         session_id = uuid.uuid4().hex
         slot = ClientSlot(
             session_id, reader, writer, peer=peer, protocol="websocket",
@@ -1023,7 +1119,7 @@ class Gateway:
                 if not chunk:
                     break
                 slot.ws_recv_buf += chunk
-                app_bytes, remainder, close_req = ws_mod.decode_client_frames(
+                messages, remainder, close_req = ws_mod.decode_client_messages(
                     slot.ws_recv_buf
                 )
                 slot.ws_recv_buf = remainder
@@ -1034,9 +1130,9 @@ class Gateway:
                     except Exception:
                         pass
                     break
-                if not app_bytes:
-                    continue
-                await self._process_client_input(slot, app_bytes)
+                for payload in messages:
+                    text = payload.decode("utf-8", errors="replace")
+                    await self._process_ws_message(slot, text)
         except (ConnectionError, OSError, asyncio.CancelledError):
             pass
         finally:
@@ -1087,6 +1183,10 @@ class Gateway:
                     if op == "hello":
                         # Include peer so reattach after game restart still
                         # knows the real client IP (banlist / head-GM pings).
+                        from engine.boot_kind import COLD, RELOAD
+
+                        self._game_hello_count += 1
+                        kind = RELOAD if self._game_hello_count > 1 else COLD
                         sessions = []
                         for c in self.clients.values():
                             if not c.alive:
@@ -1096,7 +1196,11 @@ class Gateway:
                                 entry["peer"] = c.peer
                             sessions.append(entry)
                         await self.send_to_game(
-                            encode_ctrl({"op": "welcome", "sessions": sessions})
+                            encode_ctrl({
+                                "op": "welcome",
+                                "sessions": sessions,
+                                "kind": kind,
+                            })
                         )
                     elif op == "bound":
                         # Game finished login for this sid.
@@ -1190,14 +1294,14 @@ class Gateway:
         if self.ws_port:
             if self.ws_ssl is not None:
                 ws_server = await asyncio.start_server(
-                    self.handle_websocket,
+                    self.handle_browser_port,
                     "0.0.0.0",
                     self.ws_port,
                     ssl=self.ws_ssl,
                 )
             else:
                 ws_server = await asyncio.start_server(
-                    self.handle_websocket, "0.0.0.0", self.ws_port
+                    self.handle_browser_port, "0.0.0.0", self.ws_port
                 )
         ws_note = ""
         if self.ws_port:

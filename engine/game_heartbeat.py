@@ -18,6 +18,10 @@ Env (all optional):
   before treating boot as hung (default ``300``).
 - ``GAME_HEARTBEAT_PATH`` -- override stamp path (default
   ``<repo>/.game_heartbeat``).
+- ``GAME_HEARTBEAT_FSYNC`` -- ``1`` fsyncs the stamp (default off).
+  Watcher only needs mtime; fsync-per-handler on Windows Docker
+  bind-mounts was extra filesync storm. `tick_loop` still stamps
+  pre_tick / post_tick once per heartbeat.
 """
 
 from __future__ import annotations
@@ -76,12 +80,21 @@ def heartbeat_path():
     return os.path.join(_repo_root(), ".game_heartbeat")
 
 
+def heartbeat_fsync_enabled():
+    """True only when ``GAME_HEARTBEAT_FSYNC=1`` (default off)."""
+    raw = (os.environ.get("GAME_HEARTBEAT_FSYNC") or "0").strip().lower()
+    return raw in ("1", "on", "true", "yes")
+
+
 def touch_heartbeat(note=""):
     """Rewrite the stamp so the watcher sees a fresh mtime.
 
     ``note`` is a short phase label (``boot``, ``tick``, …) written as
     the file body for humans reading the file; the watcher only cares
     about mtime. Best-effort: never raise into the tick loop.
+
+    Default is write + flush + ``os.replace`` without ``fsync``. Hang
+    detection uses mtime, not durability across a host crash.
     """
     path = heartbeat_path()
     try:
@@ -96,7 +109,8 @@ def touch_heartbeat(note=""):
         with open(tmp, "wb") as handle:
             handle.write(body)
             handle.flush()
-            os.fsync(handle.fileno())
+            if heartbeat_fsync_enabled():
+                os.fsync(handle.fileno())
         os.replace(tmp, path)
     except OSError:
         pass

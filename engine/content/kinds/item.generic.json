@@ -126,6 +126,11 @@
       "type": "int",
       "required": false,
       "doc": "Max items held when is_bag."
+    },
+    "weight": {
+      "type": "float",
+      "required": false,
+      "doc": "Carry weight in abstract units. Unset means the item does not count toward character burden (kit crumbs, clothing). Ore/ingot kinds require this; fish and other haul goods set it below ore."
     }
   }
 }

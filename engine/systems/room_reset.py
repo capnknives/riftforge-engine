@@ -9,6 +9,10 @@ restored from the snapshot.
 Pairs conceptually with ``engine/systems/spawn/nest_ai.py`` (tick-driven
 world maintenance) but operates on **room loot**, not NPC spawns.
 
+``tick`` only walks ``game._reset_rooms`` (rooms that declared a positive
+``reset_empty_ticks`` at boot or via ``note_reset_room``), not every room in
+``game.rooms`` — live worlds have ~12k rooms but only a handful reset.
+
 Register ``tick`` from the game's ``tick_bootstrap`` (basegame does this).
 
 stdlib only.
@@ -19,6 +23,64 @@ from __future__ import annotations
 
 def _now_tick(game):
     return int(getattr(game, "game_time_ticks", 0) or 0)
+
+
+def _reset_room_key(room):
+    """Stable index key — ``room.key`` matches ``game.rooms`` dict keys."""
+    key = getattr(room, "key", None)
+    if key is not None:
+        return key
+    return id(room)
+
+
+def _room_qualifies_for_reset(room):
+    """True when ``room`` should stay on the reset index."""
+    if room is None:
+        return False
+    delay = getattr(room, "reset_empty_ticks", None)
+    if delay is None:
+        return False
+    try:
+        return int(delay) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _ensure_reset_index(game):
+    """Return ``game._reset_rooms``, building it once on first use."""
+    idx = getattr(game, "_reset_rooms", None)
+    if idx is None:
+        register_reset_rooms(game)
+        idx = getattr(game, "_reset_rooms", None)
+    return idx if idx is not None else set()
+
+
+def note_reset_room(game, room):
+    """Add ``room`` to the reset tick index when it gains ``reset_empty_ticks``.
+
+    Call from map load / staff ``rset`` writers when they set a positive delay.
+    Boot ``register_reset_rooms`` already covers the common JSON-load path.
+    """
+    if not _room_qualifies_for_reset(room):
+        return False
+    idx = getattr(game, "_reset_rooms", None)
+    if idx is None:
+        idx = set()
+        game._reset_rooms = idx
+    idx.add(_reset_room_key(room))
+    return True
+
+
+def drop_reset_room(game, room):
+    """Remove ``room`` from the reset tick index (flag cleared or room gone)."""
+    idx = getattr(game, "_reset_rooms", None)
+    if not idx:
+        return False
+    key = _reset_room_key(room)
+    if key in idx:
+        idx.discard(key)
+        return True
+    return False
 
 
 def _players_in_room(room):
@@ -77,18 +139,18 @@ def capture_reset_snapshot(room):
 
 
 def register_reset_rooms(game):
-    """Boot pass: snapshot every room that declares ``reset_empty_ticks``."""
+    """Boot pass: snapshot every room that declares ``reset_empty_ticks``.
+
+    Also builds ``game._reset_rooms`` so ``tick`` never scans the full world.
+    """
     rooms = getattr(game, "rooms", None) or {}
+    index = set()
+    game._reset_rooms = index
     count = 0
     for room in rooms.values():
-        ticks = getattr(room, "reset_empty_ticks", None)
-        if ticks is None:
+        if not _room_qualifies_for_reset(room):
             continue
-        try:
-            if int(ticks) <= 0:
-                continue
-        except (TypeError, ValueError):
-            continue
+        index.add(_reset_room_key(room))
         if not _item_specs_for_room(room):
             capture_reset_snapshot(room)
         count += 1
@@ -144,20 +206,33 @@ def reset_room(room, game=None):
     return spawned
 
 
-def tick(game):
-    """Advance empty-room timers and restore defaults when due."""
+def _resolve_indexed_room(game, key):
+    """Map index key back to a live room object, or ``None``."""
     rooms = getattr(game, "rooms", None) or {}
-    now = _now_tick(game)
+    if isinstance(key, str):
+        return rooms.get(key)
     for room in rooms.values():
-        delay = getattr(room, "reset_empty_ticks", None)
-        if delay is None:
+        if _reset_room_key(room) == key:
+            return room
+    return None
+
+
+def tick(game):
+    """Advance empty-room timers and restore defaults when due.
+
+    Only visits ``game._reset_rooms`` — not ``game.rooms.values()``.
+    Drops stale keys when the room vanished or no longer has a reset delay.
+    """
+    index = _ensure_reset_index(game)
+    if not index:
+        return
+    now = _now_tick(game)
+    for key in list(index):
+        room = _resolve_indexed_room(game, key)
+        if room is None or not _room_qualifies_for_reset(room):
+            index.discard(key)
             continue
-        try:
-            need = int(delay)
-        except (TypeError, ValueError):
-            continue
-        if need <= 0:
-            continue
+        delay = int(room.reset_empty_ticks)
         if _players_in_room(room):
             room._reset_empty_since = None
             continue
@@ -170,7 +245,7 @@ def tick(game):
         except (TypeError, ValueError):
             room._reset_empty_since = now
             continue
-        if now - since_i >= need:
+        if now - since_i >= delay:
             reset_room(room, game)
             room._reset_empty_since = now
 

@@ -26,9 +26,15 @@ MSSP_NAME = "Mortals and Monsters"
 # Default telnet port when Game has no listen_port (matches server.py).
 MSSP_DEFAULT_PORT = "4000"
 
-# Fixed metadata crawlers expect. Omit CONTACT / WEBSITE / DISCORD until
-# those URLs exist in-repo (do not invent). PORT is emitted from
-# listen_port(game) at build time -- not duplicated here.
+# Public brochure (HTTPS). Listing crawlers (MudVerse, Grapevine, Mudlet)
+# copy WEBSITE / DISCORD / MINIMUM AGE from MSSP -- keep these in-repo so
+# we do not invent listing URLs at crawl time.
+MSSP_WEBSITE = "https://play.riftforge.me/"
+MSSP_MINIMUM_AGE = "18"
+
+# Fixed metadata crawlers expect. PORT is emitted from listen_port(game)
+# at build time -- not duplicated here. WEBSITE / DISCORD / MINIMUM AGE
+# are appended in build_status (Discord follows the login splash URL).
 _STATIC_FIELDS = (
     ("NAME", MSSP_NAME),
     ("CODEBASE", "Riftforge"),
@@ -67,6 +73,46 @@ def player_count(game) -> int:
         return 0
     sessions = getattr(game, "sessions", None) or []
     return len(sessions)
+
+
+def website_url(game) -> str:
+    """MSSP WEBSITE -- game attr, then env, then the brochure constant."""
+    if game is not None:
+        override = str(getattr(game, "mssp_website", "") or "").strip()
+        if override:
+            return override
+    env = os.environ.get("RIFTFORGE_MSSP_WEBSITE", "").strip()
+    return env or MSSP_WEBSITE
+
+
+def minimum_age(game) -> str:
+    """MSSP MINIMUM AGE (18+ house rule). Empty string omits the field."""
+    if game is not None:
+        override = getattr(game, "mssp_minimum_age", None)
+        if override is not None:
+            text = str(override).strip()
+            return text
+    env = os.environ.get("RIFTFORGE_MSSP_MINIMUM_AGE", "").strip()
+    if env:
+        return env
+    return MSSP_MINIMUM_AGE
+
+
+def discord_url(game):
+    """MSSP DISCORD -- same URL as the login splash, or None when cleared.
+
+    ``game.login_discord_url is None`` means staff hid Discord
+    (``gm gamestate discord clear``). Missing attribute uses the code default.
+    """
+    from engine import style as style_mod
+
+    if game is not None and hasattr(game, "login_discord_url"):
+        invite = getattr(game, "login_discord_url")
+        if invite is None:
+            return None
+        text = str(invite or "").strip()
+        return text or None
+    return (style_mod.LOGIN_DISCORD_URL or "").strip() or None
 
 
 def build_status(game):
@@ -111,6 +157,15 @@ def build_status(game):
             pairs.append((key, str(status_override)))
             continue
         pairs.append((key, value))
+    site = website_url(game)
+    if site:
+        pairs.append(("WEBSITE", site))
+    age = minimum_age(game)
+    if age:
+        pairs.append(("MINIMUM AGE", age))
+    invite = discord_url(game)
+    if invite:
+        pairs.append(("DISCORD", invite))
     return pairs
 
 

@@ -368,6 +368,78 @@ def is_safe_sleep_venue(room, character=None, game=None):
     return hooks_mod.lodging_sleep_policy(room, character, game)
 
 
+# Reverse index: home_room_key / compound hub -> characters. Look used to
+# call claimants_of once per house (look_home_hint / list_free_homes), and
+# each call walked the whole roster then lookup_room (full map scan on a
+# miss). Live command_slow: look 16-22s, phases=look:….
+_CLAIMANTS_INDEX_ATTR = "_claimants_by_home_index"
+_CLAIMANTS_VERSION_ATTR = "_claimants_index_version"
+
+
+def bump_claimants_index(game):
+    """Invalidate the home-claimants reverse index (claim / rent / unclaim).
+
+    Cheap: one counter increment. The next ``claimants_of`` rebuilds from
+    the live roster. Also clears Cadence's per-room memo so it cannot
+    serve a stale list for the rest of the heartbeat.
+    """
+    if game is None:
+        return
+    current = getattr(game, _CLAIMANTS_VERSION_ATTR, 0) or 0
+    setattr(game, _CLAIMANTS_VERSION_ATTR, current + 1)
+    setattr(game, _CLAIMANTS_INDEX_ATTR, None)
+    cache = getattr(game, "_cadence_claimants_cache", None)
+    if isinstance(cache, dict):
+        cache.clear()
+
+
+def _claimants_index(game):
+    """home key / living-hub key -> characters who claim that compound.
+
+    Built with one roster pass per tick (or after ``bump_claimants_index``).
+    Resolves homes through ``game.rooms.get`` (identity + alias) -- never
+    ``lookup_room``'s O(rooms) miss scan, which is what made one look
+    freeze the asyncio loop for tens of seconds on live.
+    """
+    if game is None:
+        return {}
+    tick = int(getattr(game, "game_time_ticks", 0) or 0)
+    version = getattr(game, _CLAIMANTS_VERSION_ATTR, 0) or 0
+    chars = getattr(game, "characters", None)
+    n_chars = len(chars) if isinstance(chars, set) else 0
+    cached = getattr(game, _CLAIMANTS_INDEX_ATTR, None)
+    if cached is not None:
+        cached_tick, cached_version, cached_n, index = cached
+        if (
+            cached_tick == tick
+            and cached_version == version
+            and cached_n == n_chars
+        ):
+            return index
+    from engine.char_index import iter_characters
+
+    rooms = getattr(game, "rooms", None) or {}
+    by_key = {}
+    for obj in iter_characters(game):
+        home_key = getattr(obj, "home_room_key", None)
+        if not home_key:
+            continue
+        dest = rooms.get(home_key) if hasattr(rooms, "get") else None
+        if dest is None:
+            by_key.setdefault(home_key, []).append(obj)
+            continue
+        canon = getattr(dest, "key", None) or home_key
+        by_key.setdefault(canon, []).append(obj)
+        if home_key != canon:
+            by_key.setdefault(home_key, []).append(obj)
+        main = main_homeroom_key(dest)
+        if main and main != canon:
+            by_key.setdefault(main, []).append(obj)
+    index = {key: tuple(group) for key, group in by_key.items()}
+    setattr(game, _CLAIMANTS_INDEX_ATTR, (tick, version, n_chars, index))
+    return index
+
+
 def claimants_of(game, room_key):
     """Characters whose home is this room or its house compound."""
     if not room_key or game is None:
@@ -375,24 +447,20 @@ def claimants_of(game, room_key):
     cache = getattr(game, "_cadence_claimants_cache", None)
     if isinstance(cache, dict) and room_key in cache:
         return cache[room_key]
-    from engine.char_index import iter_characters
-
-    dest = game.rooms.get(room_key)
+    rooms = getattr(game, "rooms", None) or {}
+    dest = rooms.get(room_key) if hasattr(rooms, "get") else None
     main = main_homeroom_key(dest) if dest is not None else room_key
+    index = _claimants_index(game)
+    seen = set()
     found = []
-    for obj in iter_characters(game):
-        home_key = getattr(obj, "home_room_key", None)
-        if not home_key:
+    for key in (room_key, main, getattr(dest, "key", None)):
+        if not key:
             continue
-        if home_key == room_key or (main and home_key == main):
-            found.append(obj)
-            continue
-        if dest is None or not main:
-            continue
-        home_room = game.rooms.get(home_key)
-        if home_room is None:
-            continue
-        if main_homeroom_key(home_room) == main:
+        for obj in index.get(key, ()):
+            ident = id(obj)
+            if ident in seen:
+                continue
+            seen.add(ident)
             found.append(obj)
     if isinstance(cache, dict):
         cache[room_key] = found
@@ -438,14 +506,24 @@ def iter_hotel_guest_rooms(game):
     """Yield every live hotel guest Room (``is_hotel_room`` flag)."""
     if game is None:
         return
-    seen = set()
-    for room in getattr(game, "rooms", {}).values():
-        if not is_hotel_guest_room(room):
-            continue
-        key = getattr(room, "key", None)
-        if not key or key in seen:
-            continue
-        seen.add(key)
+    from engine.char_index import authored_room_index, room_is_virtual_overland
+
+    def _build(rooms):
+        out = []
+        seen = set()
+        for room in rooms.values():
+            if room_is_virtual_overland(room):
+                continue
+            if not is_hotel_guest_room(room):
+                continue
+            key = getattr(room, "key", None)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(room)
+        return out
+
+    for room in authored_room_index(game, "_hotel_guest_rooms_cache", _build):
         yield room
 
 

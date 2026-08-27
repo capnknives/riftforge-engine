@@ -171,6 +171,12 @@
       "slot": "origin_meters",
       "source": "hook:supers_mana",
       "panes": ["default", "vitals", "full"]
+    },
+    {
+      "id": "supers_mark_corruption",
+      "slot": "origin_meters",
+      "source": "hook:supers_mark_corruption",
+      "panes": ["default", "vitals", "full"]
     }
   ],
   "panes": {

@@ -33,6 +33,10 @@ while overlays were paused — not just the tip's Fix-bug file list. Any
 advance-only polls stay strict (no silent re-overlay when the tracked SHA
 already matches); catch-up is only the re-enable path.
 
+GM ``autodeploy now`` is the staff flush: enable polls, skip the Lag P13
+merge-quiet debounce (2–10 min), and catch up on the next watcher tick
+(~1s) with a short Veil (5s) instead of the 30s rewrite countdown.
+
 State lives in .auto_deploy_state.json (gitignored) so a container restart
 does not re-deploy old commits.
 
@@ -43,8 +47,11 @@ so ``gm diaglog analyze`` can correlate deploy I/O with autosave stalls.
 Lag P13: when ``RIFTFORGE_AUTO_DEPLOY_BATCH_QUIET_S`` and/or
 ``RIFTFORGE_AUTO_DEPLOY_BATCH_MAX_S`` are set (docker-compose defaults
 120 / 600), merges debounce across watcher polls into one deploy instead
-of one Veil pause per PR. Legacy ``RIFTFORGE_AUTO_DEPLOY_COALESCE_S`` still
-works when batch is off.
+of one Veil pause per PR. First pickup writes a heads-up file so the
+game can OOC from Ash(GM) a few minutes before the Veil countdown.
+``gm autodeploy abort`` cancels a queued batch / catch-up / in-flight
+countdown (``autodeploy off`` only pauses future polls). Legacy
+``RIFTFORGE_AUTO_DEPLOY_COALESCE_S`` still works when batch is off.
 """
 
 from __future__ import annotations
@@ -104,6 +111,9 @@ OVERRIDE_NAME = ".auto_deploy_override"
 # Written by GM `autodeploy on` so the next poll syncs the full working tree
 # to origin/main (commits missed while the override was off).
 CATCHUP_NAME = ".auto_deploy_catchup"
+# GM ``autodeploy now`` — watcher polls on the next 1s tick instead of waiting
+# for AUTO_DEPLOY_POLL_SECONDS, and catch-up uses the short Veil.
+IMMEDIATE_NAME = ".auto_deploy_immediate"
 # After an in-game Veil countdown, skip COPYOVER_SETTLE_SECONDS — players
 # were already warned; the watcher should SIGUSR1 as soon as the tree sync
 # lands (not another ~30s of playable lag).
@@ -123,6 +133,10 @@ DEPLOY_COALESCE_ENV = "RIFTFORGE_AUTO_DEPLOY_COALESCE_S"
 BATCH_QUIET_ENV = "RIFTFORGE_AUTO_DEPLOY_BATCH_QUIET_S"
 BATCH_MAX_ENV = "RIFTFORGE_AUTO_DEPLOY_BATCH_MAX_S"
 BATCH_PENDING_NAME = ".auto_deploy_batch_pending.json"
+# Game tick OOCs from Ash(GM) when the watcher first queues a debounce batch.
+HEADS_UP_NAME = ".auto_deploy_heads_up.json"
+# GM ``autodeploy abort`` — watcher _wait_for_ready bails; same tip is held.
+ABORT_NAME = ".auto_deploy_abort.json"
 # Lag P12: skip scheduled autosaves for N seconds after deploy reset (0 = off).
 AUTOSAVE_SKIP_AFTER_DEPLOY_ENV = "RIFTFORGE_AUTOSAVE_SKIP_AFTER_DEPLOY_S"
 
@@ -133,6 +147,9 @@ DEFAULT_COUNTDOWN = 20
 # Feature / catch-up tree syncs: warn before mtime copyover (was 60 -- felt
 # like a second full hold after Fix ships; 30s is enough gothic warning).
 DEFAULT_CATCHUP_COUNTDOWN = 30
+# ``gm autodeploy now`` — skip the 2–10 min debounce; keep a brief Veil so
+# players are not silently copyover'd. Matches the catch-up helper floor.
+DEFAULT_IMMEDIATE_COUNTDOWN = 5
 DEFAULT_READY_TIMEOUT = 120
 # Cap hung `git fetch` / git-remote-https so a stuck HTTPS helper cannot
 # freeze watch_and_run's 1s loop (gateway + game keep running, but the
@@ -163,7 +180,7 @@ _FIX_SUBJECT_RE = re.compile(
     r"\b",
     re.IGNORECASE,
 )
-# Agent PR bodies: ``Fixes bug report 398`` (no ``#`` — GitHub autolink trap).
+# Agent squash subjects: ``Fix bug report 398`` (no ``#`` — GitHub autolink trap on commits too).
 _FIX_BUG_REPORT_SUBJECT_RE = re.compile(
     r"^(?:fix(?:es|ed)?)\s+"
     r"bug\s+reports?\s+"
@@ -489,6 +506,190 @@ def clear_batch_pending(root=None):
         pass
 
 
+def heads_up_path(root=None):
+    """Absolute path to the Ash(GM) OOC heads-up hand-off file."""
+    return os.path.join(root or _repo_root(), HEADS_UP_NAME)
+
+
+def _load_heads_up(root=None):
+    """Return the pending/announced heads-up payload, or None."""
+    path = heads_up_path(root)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not data.get("tip_sha"):
+        return None
+    return data
+
+
+def _save_heads_up(root, data):
+    """Persist the heads-up payload for the game tick to OOC."""
+    path = heads_up_path(root)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+
+
+def clear_heads_up(root=None):
+    """Drop a queued or announced heads-up (after abort or deploy)."""
+    path = heads_up_path(root or _repo_root())
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def queue_heads_up(root, tip_sha):
+    """Ask the game to OOC from Ash(GM) that a rewrite is queued.
+
+    Called when the debounce batch is first armed, and again if a later
+    tip in the same batch flips to a gateway restart (follow-up OOC).
+    Returns the payload written, or the existing one when unchanged.
+    """
+    sha = (tip_sha or "").strip()
+    if not sha:
+        return None
+    gateway = False
+    try:
+        gateway = bool(_advance_touches_gateway(root, sha))
+    except Exception:
+        gateway = False
+    existing = _load_heads_up(root)
+    follow_up = False
+    phase = "pending"
+    if existing:
+        same_tip = (existing.get("tip_sha") or "") == sha
+        was_gateway = bool(existing.get("gateway_restart"))
+        if same_tip and was_gateway == gateway:
+            return existing
+        # Same batch, but the new tip now drops clients — second OOC.
+        if was_gateway is False and gateway:
+            follow_up = True
+        else:
+            # Tip advanced within the same debounce batch — refresh tip_sha
+            # without re-arming Ash(GM); players already heard the heads-up.
+            phase = existing.get("phase") or "pending"
+    payload = {
+        "phase": phase,
+        "tip_sha": sha,
+        "gateway_restart": gateway,
+        "follow_up": follow_up,
+        "queued_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "quiet_s": batch_quiet_seconds(),
+        "max_s": batch_max_seconds(),
+    }
+    _save_heads_up(root, payload)
+    print(
+        f"[auto_deploy] heads-up queued for {sha[:12]} "
+        f"gateway_restart={gateway} follow_up={follow_up}",
+        flush=True,
+    )
+    return payload
+
+
+def abort_path(root=None):
+    """Absolute path to the GM abort-hold file."""
+    return os.path.join(root or _repo_root(), ABORT_NAME)
+
+
+def load_abort(root=None):
+    """Return the abort-hold payload, or None."""
+    path = abort_path(root)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def abort_requested(root=None):
+    """True when GM abort is signalling an in-flight countdown to stop."""
+    return load_abort(root) is not None
+
+
+def abort_holds_tip(root, remote_sha):
+    """True when this origin/main tip was aborted and should not re-queue."""
+    data = load_abort(root)
+    if not data:
+        return False
+    held = (data.get("tip_sha") or "").strip()
+    want = (remote_sha or "").strip()
+    return bool(held and want and held == want)
+
+
+def clear_abort(root=None):
+    """Drop the abort hold (new commit, explicit catch-up, or successful ship)."""
+    path = abort_path(root or _repo_root())
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def abort_planned_deploy(root=None, *, actor="unknown"):
+    """Cancel a queued batch, catch-up flag, heads-up, and Veil hand-off.
+
+    Does **not** toggle autodeploy on/off. Writes ``.auto_deploy_abort.json``
+    so ``_wait_for_ready`` bails and the next poll will not immediately
+    re-queue the same tip (until a new commit or ``gm autodeploy on`` /
+    ``gm deploy sync``).
+
+    Returns ``(cancelled_labels, payload)``. Empty labels means nothing
+    was planned.
+    """
+    root = root or _repo_root()
+    cancelled = []
+    pending = _load_batch_pending(root)
+    heads = _load_heads_up(root)
+    from engine import deploy_notify
+
+    signal = deploy_notify._read_signal(root)
+    tip = (
+        (pending or {}).get("tip_sha")
+        or (heads or {}).get("tip_sha")
+        or (signal or {}).get("commit_sha")
+        or (signal or {}).get("deploy_key")
+        or ""
+    )
+    heads_announced = bool(heads and heads.get("phase") == "announced")
+    if pending:
+        clear_batch_pending(root)
+        cancelled.append("batch")
+    if catchup_requested(root):
+        clear_catchup(root)
+        cancelled.append("catch-up flag")
+    if immediate_requested(root):
+        clear_immediate(root)
+        cancelled.append("immediate catch-up")
+    if heads:
+        clear_heads_up(root)
+        cancelled.append("heads-up")
+    if signal or os.path.isfile(deploy_notify.ready_path(root)):
+        cancelled.append("veil countdown")
+    deploy_notify._cleanup(root)
+    if not cancelled:
+        return [], {}
+    payload = {
+        "aborted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "actor": actor,
+        "tip_sha": (tip or "").strip(),
+        "heads_announced": heads_announced,
+    }
+    path = abort_path(root)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+        fh.write("\n")
+    print(
+        f"[auto_deploy] planned deploy aborted by {actor}: "
+        f"{', '.join(cancelled)} tip={(tip or '')[:12]}",
+        flush=True,
+    )
+    return cancelled, payload
+
+
 def batch_status_lines(root=None):
     """Human-readable debounce queue for GM ``autodeploy`` / ``deploy status``."""
     root = root or _repo_root()
@@ -558,6 +759,7 @@ def _batch_deploy_gate(root, synced_sha, remote_sha):
         pending["last_seen_wall"] = now
         _save_batch_pending(root, pending)
         _maybe_log_batch_waiting(root, pending, reason="tip advanced")
+        queue_heads_up(root, remote_sha)
     elif not pending:
         try:
             subject = _commit_subject(remote_sha, root)
@@ -576,6 +778,7 @@ def _batch_deploy_gate(root, synced_sha, remote_sha):
             f"quiet={quiet}s max={max_wait or '∞'}s",
             flush=True,
         )
+        queue_heads_up(root, remote_sha)
         return remote_sha, False
 
     quiet_elapsed = now - float(pending.get("last_seen_wall") or now)
@@ -698,10 +901,30 @@ def clear_announced_copyover(root):
         os.remove(_announced_copyover_path(root))
     except OSError:
         pass
+
+
+def tree_sync_quiesce_active(root=None):
+    """True while a deploy tree sync is absorbing protect-restore mtime churn.
+
+    The watcher skips extra copyover triggers until the game records stable
+    boot at the new HEAD (``boot_stability.write_stable`` clears this).
+    """
+    return os.path.isfile(_tree_syncing_path(root or _repo_root()))
+
+
+def clear_tree_sync_quiesce(root=None):
+    """Drop the post-sync quiesce marker (stable boot or abort)."""
     try:
-        os.remove(_tree_syncing_path(root))
+        os.remove(_tree_syncing_path(root or _repo_root()))
     except OSError:
         pass
+
+
+def abort_announced_tree_sync(root=None):
+    """Drop both deploy-sync markers after a failed sync or boot probe."""
+    root = root or _repo_root()
+    clear_announced_copyover(root)
+    clear_tree_sync_quiesce(root)
 
 
 def _files_between_commits(root, old_sha, new_sha):
@@ -720,7 +943,13 @@ def _files_between_commits(root, old_sha, new_sha):
 
 
 def _advance_touches_gateway(root, target_sha):
-    """True when syncing HEAD → *target_sha* will drop client TCP (gateway or watcher)."""
+    """True when syncing HEAD → *target_sha* will drop client TCP (gateway or watcher).
+
+    Compares the working tree to *target_sha* for gateway-holder paths, not
+    only ``git diff HEAD target``. Overlay drift can already have tip gateway
+    modules on disk while HEAD lags — commit-range diff then lies and the
+    Veil warns disconnect when only a game-child copyover will run.
+    """
     from engine import gateway_watch
 
     try:
@@ -729,9 +958,26 @@ def _advance_touches_gateway(root, target_sha):
         return False
     if head == target_sha:
         return False
-    return gateway_watch.paths_touch_gateway_restart(
-        _files_between_commits(root, head, target_sha),
-    )
+    between = _files_between_commits(root, head, target_sha)
+    gateway_candidates = [
+        path
+        for path in between
+        if gateway_watch.normalize_repo_path(path) in gateway_watch.GATEWAY_RESTART_PATHS
+    ]
+    if not gateway_candidates:
+        return False
+    try:
+        out = _git(
+            "diff", "--name-only", target_sha, "--", *gateway_candidates, cwd=root,
+        )
+    except subprocess.CalledProcessError:
+        # Conservative when git cannot compare — warn disconnect.
+        return True
+    return bool([
+        line.strip()
+        for line in (out or "").splitlines()
+        if line.strip()
+    ])
 
 
 def _state_path(root):
@@ -775,8 +1021,13 @@ def request_catchup(root=None):
     """Queue a full working-tree sync on the next successful deploy poll.
 
     The watcher (not the game child) performs the sync — this only drops a
-    flag file the parent reads inside ``try_auto_deploy``.
+    flag file the parent reads inside ``try_auto_deploy``. Explicit catch-up
+    (``gm autodeploy on`` / ``gm autodeploy now`` / ``gm deploy sync``) also
+    clears an abort hold so the same tip can ship after staff cancelled a
+    prior queue.
     """
+    root = root or _repo_root()
+    clear_abort(root)
     path = catchup_path(root)
     with open(path, "w", encoding="utf-8") as f:
         # Timestamp helps ops logs; presence alone triggers the sync.
@@ -791,6 +1042,45 @@ def clear_catchup(root=None):
         os.remove(path)
     except FileNotFoundError:
         pass
+    return path
+
+
+def immediate_path(root=None):
+    """Absolute path to the ``gm autodeploy now`` flush flag."""
+    return os.path.join(root or _repo_root(), IMMEDIATE_NAME)
+
+
+def immediate_requested(root=None):
+    """True when staff asked to skip debounce and catch up on the next tick."""
+    return os.path.isfile(immediate_path(root))
+
+
+def clear_immediate(root=None):
+    """Remove the immediate-flush flag (after sync, abort, or autodeploy off)."""
+    path = immediate_path(root)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    return path
+
+
+def request_immediate_catchup(root=None):
+    """GM ``autodeploy now``: enable polls, skip debounce, catch up ASAP.
+
+    Writes the usual catch-up flag **and** ``.auto_deploy_immediate`` so
+    ``watch_and_run`` polls on the next 1s loop instead of waiting for
+    ``AUTO_DEPLOY_POLL_SECONDS``. Clears a pending merge-quiet batch so
+    the 2–10 minute debounce cannot hold the tip. The watcher still runs
+    ``reset --hard`` (game child never mutates git).
+    """
+    root = root or _repo_root()
+    set_override("on", root=root, queue_catchup=True)
+    clear_batch_pending(root)
+    clear_heads_up(root)
+    path = immediate_path(root)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(time.strftime("%Y-%m-%dT%H:%M:%S") + "\n")
     return path
 
 
@@ -816,12 +1106,15 @@ def set_override(value, root=None, *, queue_catchup=True):
     path = override_path(root)
     with open(path, "w", encoding="utf-8") as f:
         f.write(normalized + "\n")
-    # Re-enable → full tree catch-up; pause → cancel a pending catch-up.
+    # Re-enable → full tree catch-up; pause → cancel a pending catch-up *flag*.
+    # A debounce batch or Veil countdown already running is **not** stopped
+    # by off — GM ``autodeploy abort`` calls ``abort_planned_deploy``.
     if normalized == _OVERRIDE_ON:
         if queue_catchup:
             request_catchup(root)
     else:
         clear_catchup(root)
+        clear_immediate(root)
     return path
 
 
@@ -888,8 +1181,8 @@ def deploy_gate_summary(root=None):
     build = "on" if build_lock.is_active(root) else "off"
     pending = "yes" if deploy_queue.has_pending(root) else "no"
     return (
-        f"OVERRIDE={ov_label} EFFECTIVE={effective} POLL_SKIP={skip} "
-        f"CATCHUP={catchup} REVERT_HOLD={hold} BUILD_LOCK={build} "
+        f"STATE={deploy_headline(root)} OVERRIDE={ov_label} EFFECTIVE={effective} "
+        f"POLL_SKIP={skip} CATCHUP={catchup} REVERT_HOLD={hold} BUILD_LOCK={build} "
         f"DEPLOY_QUEUE={pending}"
     )
 
@@ -941,6 +1234,52 @@ def is_enabled():
     return _enabled()
 
 
+def deploy_headline(root=None):
+    """One-word-ish state so staff never has to read docker logs to know
+    whether it is safe to touch autodeploy: ``PAUSED (hold)``,
+    ``PAUSED (off)``, ``CATCHING UP``, or ``STABLE``.
+
+    Order matters -- a crash-loop hold or an explicit override off always
+    wins over "looks like it's syncing" so staff never see "CATCHING UP"
+    while auto-deploy is actually paused for a reason.
+    """
+    from engine import build_lock
+    from engine import boot_stability
+    from engine import crash_recovery
+
+    root = root or _repo_root()
+
+    if crash_recovery.hold_active(root=root):
+        reason = crash_recovery.read_hold_reason(root=root)
+        return f"PAUSED (hold: {reason})" if reason else "PAUSED (hold)"
+
+    override = read_override(root)
+    if override is not None and override != _OVERRIDE_ON:
+        return "PAUSED (override off)"
+    if not env_enabled() and override is None:
+        return "PAUSED (env off)"
+
+    if (
+        tree_sync_quiesce_active(root)
+        or announced_copyover_pending(root)
+        or catchup_requested(root)
+        or build_lock.is_active(root)
+    ):
+        return "CATCHING UP"
+
+    # No hold, no override pause, no sync in flight -- confirm the game
+    # actually recorded a stable boot at the current HEAD. A blank/older
+    # stamp here usually just means the child hasn't ticked long enough
+    # yet (fresh spawn), which still reads as "settling in", not broken.
+    stable = boot_stability.load_stable(root)
+    head = boot_stability.current_head_sha(root)
+    if stable and head and stable.get("sha") == head:
+        return "STABLE"
+    if head:
+        return "CATCHING UP (settling in)"
+    return "STABLE"
+
+
 def status_text():
     """One short multi-line status string for the GM autodeploy command."""
     from engine import build_lock
@@ -959,11 +1298,27 @@ def status_text():
         if catchup_requested()
         else "Catch-up queued: no"
     )
+    if immediate_requested():
+        catchup_line += (
+            " — immediate (skip merge-quiet wait; next watcher tick, short Veil)"
+        )
+    abort = load_abort(root)
+    if abort and (abort.get("tip_sha") or "").strip():
+        abort_line = (
+            f"Abort hold: yes — skipping tip {abort['tip_sha'][:12]} "
+            "(new commit, gm autodeploy on, or gm deploy sync clears this)"
+        )
+    elif abort:
+        abort_line = "Abort hold: yes (in-flight rewrite cancelled)"
+    else:
+        abort_line = "Abort hold: no"
     lines = [
+        f"State: {deploy_headline(root)}",
         f"Auto-deploy effective: {effective}",
         override_line,
         f"AUTO_DEPLOY env: {'on' if env_on else 'off'}",
         catchup_line,
+        abort_line,
     ]
     lines.extend(build_lock.status_lines(root))
     lines.extend(batch_status_lines(root))
@@ -1250,6 +1605,7 @@ def _iter_protected_live_files(root):
     # Import here so engine boot stays light when auto_deploy is unused.
     from tools.apply_pr_fix import (
         is_protected_path,
+        ops_sidecar_files,
         protected_paths,
         protected_prefixes,
     )
@@ -1278,6 +1634,10 @@ def _iter_protected_live_files(root):
             abs_path = os.path.join(root, *norm_prefix.split("/"))
             if os.path.isfile(abs_path):
                 found.append(norm_prefix)
+    for name in ops_sidecar_files():
+        abs_path = os.path.join(root, name)
+        if os.path.isfile(abs_path):
+            found.append(name)
     # Stable unique list (walk order can vary).
     return sorted(set(found))
 
@@ -1631,12 +1991,41 @@ def _reset_hard_to(root, sha):
     return True
 
 
-def _ensure_changelog_index_after_sync(root):
-    """Rebuild ``content/changelog_index.json`` when CHANGELOG sources advanced."""
-    try:
-        from engine import changelog_index as changelog_index_mod
+def _fresh_changelog_index():
+    """Reload changelog id modules from disk (watcher is long-lived).
 
-        changelog_index_mod.ensure_compiled_index(
+    ``watch_and_run`` reloads ``auto_deploy`` each poll, but used to keep a
+    stale ``engine.changelog_index`` in ``sys.modules``. Live then logged
+    ``has no attribute 'stamp_pending_and_ensure_index'`` every idle poll
+    and newest ships stayed unnumbered. Same class as ``_fresh_deploy_notify``.
+    """
+    import engine.changelog_ids as changelog_ids
+    import engine.changelog_index as changelog_index_mod
+
+    importlib.reload(changelog_ids)
+    return importlib.reload(changelog_index_mod)
+
+
+def _ensure_changelog_index_after_sync(root):
+    """Stamp pending changelog #N ids, then rebuild the compiled index.
+
+    GitHub Actions is not the writer (billing often never starts that job).
+    Fill-only assignment here is deterministic: already-stamped ids stay
+    put, unstamped **player** bullets get that sequence's ``max+1``
+    oldest-first, and unstamped **staff** bullets get a separate ops
+    ``max+1``. Discord patch notes run after this so the post can include
+    ``changes N`` without skipping for ``[ops]`` ships.
+
+    Also called on idle polls (no origin advance) so a missed first stamp
+    or a later ``reset --hard`` back to timestamp-only git still heals.
+
+    Copyover / ``Game()`` boot is the guaranteed mint (fresh interpreter).
+    This watcher path is the Discord / idle-poll companion — it must reload
+    ``changelog_index`` from disk or it no-ops on a stale module.
+    """
+    try:
+        changelog_index_mod = _fresh_changelog_index()
+        changelog_index_mod.stamp_pending_and_ensure_index(
             root, log_prefix="[auto_deploy]",
         )
     except Exception as exc:
@@ -2242,9 +2631,15 @@ def _advance_origin_only(root, state, remote_sha, subject, reason, *, from_sha="
 
 def _maybe_schedule_deploy_patch_notes(root, from_sha, to_sha):
     """Fail-soft Discord #patch-notes mirror for CHANGELOG.d in this deploy."""
+    # Stamp before posting so Discord never teaches a blank ``changes`` footer
+    # while the in-game list already has #N (GitHub assign job is retired).
+    _ensure_changelog_index_after_sync(root)
     try:
-        from engine import discord_patch_notes
+        import engine.discord_patch_notes as discord_patch_notes
 
+        # Watcher keeps a stale discord_patch_notes the same way it kept a
+        # stale changelog_index — reload so "wait then retry" actually runs.
+        discord_patch_notes = importlib.reload(discord_patch_notes)
         discord_patch_notes.schedule_for_deploy(root, from_sha, to_sha)
     except Exception as exc:
         print(f"[auto_deploy] patch notes skipped: {exc}", flush=True)
@@ -2254,6 +2649,13 @@ def _wait_for_ready(root, timeout_seconds):
     deadline = time.monotonic() + timeout_seconds
     ready = _ready_path(root)
     while time.monotonic() < deadline:
+        if abort_requested(root):
+            print(
+                "[auto_deploy] deploy aborted by GM while waiting for "
+                ".deploy_ready",
+                flush=True,
+            )
+            return False
         if os.path.isfile(ready):
             try:
                 os.remove(ready)
@@ -2303,11 +2705,17 @@ def _run_catchup_countdown(
     )
     timeout = DEFAULT_READY_TIMEOUT + seconds
     if not _wait_for_ready(root, timeout):
-        print(
-            "[auto_deploy] timed out waiting for catch-up .deploy_ready -- "
-            "is deploy_notify wired in server.py?",
-            flush=True,
-        )
+        if abort_requested(root):
+            print(
+                "[auto_deploy] catch-up countdown aborted by GM",
+                flush=True,
+            )
+        else:
+            print(
+                "[auto_deploy] timed out waiting for catch-up .deploy_ready -- "
+                "is deploy_notify wired in server.py?",
+                flush=True,
+            )
         return False
     return True
 
@@ -2361,11 +2769,17 @@ def _run_deploy_pipeline(
     )
     timeout = DEFAULT_READY_TIMEOUT + countdown
     if not _wait_for_ready(root, timeout):
-        print(
-            "[auto_deploy] timed out waiting for .deploy_ready -- "
-            "is deploy_notify wired in server.py?",
-            flush=True,
-        )
+        if abort_requested(root):
+            print(
+                "[auto_deploy] Fix countdown aborted by GM",
+                flush=True,
+            )
+        else:
+            print(
+                "[auto_deploy] timed out waiting for .deploy_ready -- "
+                "is deploy_notify wired in server.py?",
+                flush=True,
+            )
         return False
 
     begin_announced_tree_sync(root)
@@ -2373,7 +2787,7 @@ def _run_deploy_pipeline(
         commit_sha, files, cwd=root,
     )
     if not ok:
-        clear_announced_copyover(root)
+        abort_announced_tree_sync(root)
         print(
             f"[auto_deploy] overlay rolled back (boot probe): {probe_detail}",
             flush=True,
@@ -2885,7 +3299,7 @@ def record_catchup_last_deploy(root, fix, *, subject=None):
     _save_state(root, state)
 
 
-def _run_reenable_catchup(root, state, remote_sha):
+def _run_reenable_catchup(root, state, remote_sha, *, immediate=False):
     """Full working-tree sync after GM ``autodeploy on`` (missed commits).
 
     Uses the same ``reset --hard`` + protect stash path as a feature
@@ -2944,9 +3358,13 @@ def _run_reenable_catchup(root, state, remote_sha):
         )
     else:
         # Warn in-game before rewriting files (mtime → copyover).
+        # ``autodeploy now`` keeps a 5s Veil instead of the 30s rewrite wait
+        # and the 2–10 min merge-quiet debounce.
+        countdown = DEFAULT_IMMEDIATE_COUNTDOWN if immediate else None
         if not _run_catchup_countdown(
             root,
             commit_sha=remote_sha,
+            countdown=countdown,
             summary=(
                 "Catch-up rewrite — the Veil is about to stitch origin/main "
                 "into the live bones of this world."
@@ -2958,14 +3376,14 @@ def _run_reenable_catchup(root, state, remote_sha):
             begin_announced_tree_sync(root)
             _snapshot_db_before_tree_sync(root)
             if not _reset_hard_to(root, remote_sha):
-                clear_announced_copyover(root)
+                abort_announced_tree_sync(root)
                 print(
                     "[auto_deploy] catch-up sync aborted (boot probe failed)",
                     flush=True,
                 )
                 return False
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-            clear_announced_copyover(root)
+            abort_announced_tree_sync(root)
             print(f"[auto_deploy] catch-up sync failed: {exc}", flush=True)
             # Leave the flag so the next poll retries.
             return False
@@ -2989,6 +3407,7 @@ def _run_reenable_catchup(root, state, remote_sha):
     state["origin_main"] = remote_sha
     _save_state(root, state)
     clear_catchup(root)
+    clear_immediate(root)
     from engine import deploy_queue
 
     deploy_queue.clear_pending(root)
@@ -3014,6 +3433,9 @@ def try_auto_deploy():
     next poll does one full ``reset --hard`` to origin/main (commits missed
     while overlays were off). That is intentional and flag-gated — not the
     old "files differ from tracked SHA" auto path.
+
+    Idle polls (no SHA advance) still fill-stamp changelog ``#N`` so
+    timestamp-only ships do not stay unnumbered until the next merge.
     """
     skip_reason = poll_skip_reason()
     if skip_reason is not None:
@@ -3025,6 +3447,11 @@ def try_auto_deploy():
     root = _repo_root()
     if root not in sys.path:
         sys.path.insert(0, root)
+
+    # Stray ``.auto_deploy_immediate`` with no catch-up flag: consume so
+    # the watcher does not poll every second forever.
+    if immediate_requested(root) and not catchup_requested(root):
+        clear_immediate(root)
 
     if not _fetch_origin(root):
         return False
@@ -3038,11 +3465,32 @@ def try_auto_deploy():
     # Re-enable catch-up runs before advance-only gates so a paused host
     # that fell behind by many commits always gets a full tree sync.
     if catchup_requested(root):
-        return _run_reenable_catchup(root, state, remote_sha)
+        immediate = immediate_requested(root)
+        # Consume the 1s watcher poke before the blocking Veil wait so a
+        # deferred/failed catch-up cannot git-fetch every tick.
+        if immediate:
+            clear_immediate(root)
+        return _run_reenable_catchup(
+            root, state, remote_sha, immediate=immediate,
+        )
+
+    if abort_holds_tip(root, remote_sha):
+        _maybe_log_poll_skip("aborted tip held")
+        return False
+    # A newer origin/main SHA (or no hold) — drop a stale abort stamp.
+    if load_abort(root) is not None:
+        clear_abort(root)
 
     # Never re-run the full deploy pipeline for a commit we already shipped.
     last_deploy_sha = (state.get("last_deploy") or {}).get("sha")
     if last_deploy_sha == remote_sha:
+        # Stamp then retry Discord: copyover may have minted #N after the
+        # first pass deferred an unnumbered patch-notes post.
+        _maybe_schedule_deploy_patch_notes(
+            root,
+            state.get("origin_main") or remote_sha,
+            remote_sha,
+        )
         return False
 
     prev_sha = state.get("origin_main") or ""
@@ -3064,6 +3512,12 @@ def try_auto_deploy():
                 "run tools/deploy_bug_fix.py --merged to catch up manually",
                 flush=True,
             )
+        # Feature deploys advance origin_main without last_deploy. Idle
+        # polls used to skip the changelog stamper here, so timestamp-only
+        # ships stayed unnumbered until the next origin SHA. Discord must
+        # retry on the same poll or the footer stays "type changes" with
+        # no lookup number.
+        _maybe_schedule_deploy_patch_notes(root, prev_sha or remote_sha, remote_sha)
         return False
 
     tip, ready = _resolve_deploy_tip(root, prev_sha, remote_sha)
@@ -3131,7 +3585,7 @@ def try_auto_deploy():
             begin_announced_tree_sync(root)
             _snapshot_db_before_tree_sync(root)
             if not _reset_hard_to(root, remote_sha):
-                clear_announced_copyover(root)
+                abort_announced_tree_sync(root)
                 print(
                     "[auto_deploy] working-tree sync aborted "
                     "(boot probe failed)",
@@ -3139,7 +3593,7 @@ def try_auto_deploy():
                 )
                 return False
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-            clear_announced_copyover(root)
+            abort_announced_tree_sync(root)
             print(f"[auto_deploy] working-tree sync failed: {exc}", flush=True)
             return False
         # A feature tip can land in the same poll batch as Fix commits

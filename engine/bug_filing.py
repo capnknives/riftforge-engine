@@ -20,11 +20,13 @@ def parse_bug_subject(reporter, args, game):
     if not text:
         return None, ""
 
-    from engine.command_support import is_self_name, resolve_named_character
+    from engine.command_support import (
+        is_self_name,
+        peel_shell_arg,
+        resolve_named_character,
+    )
 
-    parts = text.split(None, 1)
-    first = parts[0]
-    rest = parts[1].strip() if len(parts) > 1 else ""
+    first, rest = peel_shell_arg(text)
 
     if is_self_name(first):
         return None, text
@@ -70,7 +72,7 @@ def record_and_confirm(
     )
     ctx = report_context.build(
         context_character, game,
-        history=history, description=description,
+        history=history, description=description, kind=kind,
     )
     account = accounts_mod.account_for_character(game, character)
     account_name = (
@@ -98,6 +100,7 @@ def record_and_confirm(
             about_clause = f" about {_subject_display_name(subject_character)}"
         character.session.send(
             f"Thanks — bug ticket #{entry_id}{about_clause} is logged. "
+            f"Add notes with bugs comment {entry_id} <text>. "
             "Staff will triage it; you'll hear back when it's fixed."
         )
     elif kind == reports.HELP:
@@ -108,11 +111,13 @@ def record_and_confirm(
     elif kind == reports.TYPO:
         character.session.send(
             f"Thanks — typo ticket #{entry_id} is logged. "
+            f"Add notes with typos comment {entry_id} <text>. "
             "Staff will triage it separately from crash reports."
         )
     else:
         character.session.send(
             f"Thanks — suggestion #{entry_id} is logged. "
+            f"Add notes with ideas comment {entry_id} <text>. "
             "Staff will triage it; you'll hear back when it's shipped."
         )
     # Truncate long paste bodies so the staff line stays client-wrappable.
@@ -146,7 +151,9 @@ def record_and_confirm(
         try:
             from engine import discord_staff_reports
 
-            discord_staff_reports.schedule_report(kind, payload)
+            discord_staff_reports.schedule_report(
+                kind, payload, directory=report_dir,
+            )
         except Exception as exc:
             print(f"[discord_staff_reports] schedule skipped: {exc}", flush=True)
     return payload

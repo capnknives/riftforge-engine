@@ -122,51 +122,47 @@ def _encode_frame(payload: bytes, *, opcode: int, fin: bool) -> bytes:
     return header + payload
 
 
-def decode_client_frames(buf: bytes):
-    """Parse client→server frames from ``buf``.
+def decode_client_messages(buf: bytes):
+    """Parse client frames into a list of payloads (one per complete frame).
 
-    Returns (application_bytes, remainder, close_requested):
-      - application_bytes: concatenated text/binary payloads (UTF-8 text only
-        for MVP -- binary is passed through as raw bytes).
-      - remainder: bytes after the last fully parsed frame.
-      - close_requested: True when a CLOSE opcode was seen.
+    JSON HUD envelopes must not be concatenated. Returns
+    (messages, remainder, close_requested).
     """
-    out = bytearray()
+    messages = []
     i = 0
     n = len(buf)
     close_requested = False
     while i < n:
+        start = i
         if i + 2 > n:
             break
         b0 = buf[i]
         b1 = buf[i + 1]
-        fin = bool(b0 & 0x80)
         opcode = b0 & 0x0F
         masked = bool(b1 & 0x80)
         length = b1 & 0x7F
         i += 2
+        extra = 0
         if length == 126:
             if i + 2 > n:
-                i -= 2
+                i = start
                 break
             length = struct.unpack("!H", buf[i : i + 2])[0]
             i += 2
+            extra = 2
         elif length == 127:
             if i + 8 > n:
-                i -= 2
+                i = start
                 break
             length = struct.unpack("!Q", buf[i : i + 8])[0]
             i += 8
+            extra = 8
         if length > MAX_FRAME_PAYLOAD:
-            # Drop the connection-friendly signal by returning close.
-            return bytes(out), buf[i:], True
+            return messages, buf[i:], True
         if not masked:
-            # Client frames must be masked (RFC 6455 §5.1).
-            return bytes(out), buf[i:], True
+            return messages, buf[i:], True
         if i + 4 + length > n:
-            i -= 2
-            if length >= 126:
-                i -= 6 if length < (1 << 16) else 8
+            i = start
             break
         mask_key = buf[i : i + 4]
         i += 4
@@ -178,14 +174,21 @@ def decode_client_frames(buf: bytes):
             close_requested = True
             break
         if opcode == _OPCODE_PING:
-            # Caller may pong at a higher layer; ignore payload here.
             continue
         if opcode in (_OPCODE_TEXT, _OPCODE_BINARY, _OPCODE_CONTINUATION):
-            out.extend(payload)
-        if not fin:
-            # MVP: we do not reassemble fragments -- wait for more or stop.
-            continue
-    return bytes(out), buf[i:], close_requested
+            messages.append(bytes(payload))
+    return messages, buf[i:], close_requested
+
+
+def decode_client_frames(buf: bytes):
+    """Parse client→server frames from ``buf``.
+
+    Returns (application_bytes, remainder, close_requested):
+      concatenated payloads (legacy callers). Prefer decode_client_messages
+      when frames are JSON envelopes.
+    """
+    messages, remainder, close_requested = decode_client_messages(buf)
+    return b"".join(messages), remainder, close_requested
 
 
 def encode_pong(payload: bytes = b"") -> bytes:

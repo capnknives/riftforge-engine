@@ -1,0 +1,676 @@
+/* Mortals and Monsters — browser HUD (gothic on black). */
+:root {
+  --bg: #0a0a0a;
+  --panel: #101214;
+  --rule: #3a3a3a;
+  --silver: #e8e8e8;
+  --teal: #7ec8a8;
+  --muted: #8a8a8a;
+  --gold: #c9a227;
+  --crimson: #8b2942;
+  --input-bg: #121212;
+  --input-border: #333;
+  --hud-width: 420px;
+  --ui-font-size: 15px;
+}
+
+/* High-contrast theme: pure black/white, thicker rules -- never the only
+   way meaning is conveyed (tags/text already carry it), just easier to
+   read for low-vision / bright-room players. */
+body.theme-contrast {
+  --bg: #000000;
+  --panel: #000000;
+  --rule: #ffffff;
+  --silver: #ffffff;
+  --teal: #7fffd4;
+  --muted: #cfcfcf;
+  --gold: #ffd700;
+  --input-bg: #000000;
+  --input-border: #ffffff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--silver);
+  font-family: Consolas, "Courier New", Courier, monospace;
+  font-size: var(--ui-font-size);
+  line-height: 1.35;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+header {
+  flex: 0 0 auto;
+  padding: 0.55rem 1rem;
+  border-bottom: 1px solid var(--rule);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem 1.1rem;
+}
+
+header h1 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+header .meta {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+header .meta a,
+header .hint {
+  color: var(--teal);
+}
+
+header button.hint {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: var(--teal);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 0.12em;
+}
+
+.build-stamp {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+/* Text size / theme now live in the "display" popover (below, near the
+   shortcuts dialog) instead of a permanent full-width header row -- that
+   row was pushing the whole header down a line on every load. */
+.display-pref {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin: 0.6rem 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.display-pref select {
+  background: var(--input-bg);
+  color: var(--silver);
+  border: 1px solid var(--input-border);
+  border-radius: 2px;
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.1rem 0.3rem;
+}
+
+#status {
+  margin-left: auto;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+#status.connected {
+  color: var(--teal);
+}
+
+#status.error {
+  color: #e07070;
+}
+
+#status.wait {
+  color: var(--gold);
+}
+
+#play {
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+}
+
+#play-main {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+#comm-pane {
+  flex: 0 0 auto;
+  max-height: 28vh;
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--rule);
+  background: #0c0e10;
+  min-height: 4.5rem;
+}
+
+.comm-toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem 0.85rem;
+  padding: 0.35rem 0.85rem 0.25rem;
+  border-bottom: 1px solid #222;
+}
+
+/* Chevron toggles shared by comm / atlas / zone / status panes. Collapsing
+   hides the body only -- the header (tabs, gag checkbox, zoom, title)
+   stays visible so state controls are never hidden along with content. */
+.pane-toggle {
+  background: none;
+  border: 0;
+  color: var(--silver);
+  font: inherit;
+  font-size: 0.78rem;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  padding: 0.1rem 0.2rem;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.pane-toggle:hover,
+.pane-toggle:focus {
+  color: var(--teal);
+}
+
+.chevron {
+  display: inline-block;
+  transition: transform 0.12s ease;
+}
+
+.pane-toggle[aria-expanded="false"] .chevron {
+  transform: rotate(-90deg);
+}
+
+.pane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.3rem;
+}
+
+.pane-head .pane-toggle {
+  flex: 1 1 auto;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+#atlas-panel[data-collapsed="true"] #atlas-body,
+#zone-panel[data-collapsed="true"] #zone-body,
+#status-panel[data-collapsed="true"] #status-body,
+#comm-pane[data-collapsed="true"] #comm-body {
+  display: none;
+}
+
+.zoom-controls {
+  display: flex;
+  gap: 0.2rem;
+}
+
+.zoom-btn {
+  background: #161616;
+  color: var(--silver);
+  border: 1px solid var(--input-border);
+  border-radius: 2px;
+  font: inherit;
+  font-size: 0.85rem;
+  line-height: 1;
+  width: 1.5rem;
+  height: 1.5rem;
+  cursor: pointer;
+}
+
+.zoom-btn:hover {
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+#atlas-scroll,
+#zone-scroll {
+  overflow: auto;
+  max-height: 320px;
+}
+
+.comm-tabs {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.comm-tabs button {
+  background: #161616;
+  color: var(--muted);
+  border: 1px solid var(--input-border);
+  border-radius: 2px;
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.15rem 0.55rem;
+  cursor: pointer;
+}
+
+.comm-tabs button[aria-selected="true"] {
+  color: var(--silver);
+  border-color: var(--teal);
+}
+
+.comm-gag {
+  color: var(--muted);
+  font-size: 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.comm-log {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 0.35rem 0.85rem 0.5rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.88rem;
+  min-height: 2.4rem;
+}
+
+.comm-line {
+  display: block;
+}
+
+.comm-line .chan {
+  color: var(--gold);
+}
+
+/* Own-input echo: shows what you typed in the transcript before the
+   server's reply lands. Muted + italic so it never reads like game prose. */
+.echo-line {
+  display: block;
+  color: var(--muted);
+  font-style: italic;
+}
+
+#output {
+  flex: 1 1 auto;
+  margin: 0;
+  padding: 0.85rem 1rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-width: 0;
+}
+
+#hud {
+  flex: 0 0 var(--hud-width);
+  width: var(--hud-width);
+  border-left: 1px solid var(--rule);
+  background: var(--panel);
+  padding: 0.65rem 0.7rem 0.85rem;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+#atlas-panel {
+  flex: 0 0 auto;
+}
+
+#atlas {
+  display: block;
+  width: 100%;
+  height: auto;
+  image-rendering: pixelated;
+  background: #080a0e;
+  border: 1px solid var(--rule);
+  cursor: crosshair;
+}
+
+#atlas-caption {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-top: 0.3rem;
+}
+
+#zone-panel {
+  flex: 0 0 auto;
+}
+
+#zone-map {
+  display: block;
+  width: 100%;
+  height: auto;
+  image-rendering: pixelated;
+  background: #080a0e;
+  border: 1px solid var(--rule);
+  cursor: pointer;
+}
+
+#zone-caption {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-top: 0.3rem;
+}
+
+#status-panel {
+  flex: 0 0 auto;
+}
+
+#compass {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin-bottom: 0.5rem;
+}
+
+#compass button {
+  background: #161616;
+  color: var(--silver);
+  border: 1px solid var(--input-border);
+  border-radius: 2px;
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 0.2rem 0.4rem;
+  cursor: pointer;
+}
+
+#compass button:hover {
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+.gauge {
+  margin-bottom: 0.4rem;
+}
+
+.gauge-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-bottom: 0.12rem;
+}
+
+.gauge-label strong {
+  color: var(--silver);
+  font-weight: 600;
+}
+
+.gauge-track {
+  height: 8px;
+  background: #1a1a1a;
+  border: 1px solid var(--rule);
+  overflow: hidden;
+}
+
+.gauge-fill {
+  height: 100%;
+  background: var(--teal);
+  width: 0%;
+}
+
+.gauge-fill.hp {
+  background: #8b2942;
+}
+
+.gauge-fill.stamina {
+  background: #c9a227;
+}
+
+.gauge-fill.energy {
+  background: #6080c0;
+}
+
+.gauge-fill.fuel {
+  background: #a060a0;
+}
+
+.gauge-fill.mana {
+  background: #7ec8a8;
+}
+
+.gauge-fill.momentum {
+  background: #e8d080;
+}
+
+#prompt-mirror {
+  flex: 0 0 auto;
+  padding: 0.15rem 1rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+  border-top: 1px solid #222;
+  min-height: 1.2rem;
+}
+
+#input-row {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.65rem 1rem 0.85rem;
+  border-top: 1px solid var(--rule);
+  background: #080808;
+}
+
+#cmd {
+  flex: 1 1 auto;
+  background: var(--input-bg);
+  color: var(--silver);
+  border: 1px solid var(--input-border);
+  border-radius: 3px;
+  padding: 0.5rem 0.65rem;
+  font: inherit;
+}
+
+#cmd:focus {
+  outline: 1px solid var(--teal);
+  border-color: var(--teal);
+}
+
+#cmd:disabled {
+  opacity: 0.5;
+}
+
+#send {
+  background: #1a1a1a;
+  color: var(--silver);
+  border: 1px solid var(--input-border);
+  border-radius: 3px;
+  padding: 0.5rem 0.85rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+#send:hover:not(:disabled) {
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+#send:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+#ctx-menu {
+  position: fixed;
+  z-index: 20;
+  margin: 0;
+  padding: 0.25rem 0;
+  list-style: none;
+  background: #141414;
+  border: 1px solid var(--gold);
+  min-width: 11rem;
+}
+
+#ctx-menu li {
+  margin: 0;
+}
+
+#ctx-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  color: var(--silver);
+  border: 0;
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 0.35rem 0.7rem;
+  cursor: pointer;
+}
+
+#ctx-menu button:hover,
+#ctx-menu button:focus {
+  background: #1e1a12;
+  color: var(--gold);
+}
+
+.skip {
+  position: absolute;
+  left: -9999px;
+  top: 0.5rem;
+  z-index: 50;
+  background: #141414;
+  color: var(--teal);
+  border: 1px solid var(--teal);
+  padding: 0.35rem 0.7rem;
+  text-decoration: none;
+}
+
+.skip:focus {
+  left: 0.5rem;
+}
+
+body.screenreader #atlas-panel,
+body.screenreader #zone-panel {
+  display: none;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Text size preference -- a plain scale on the root font-size variable,
+   not a separate zoom system, so every panel (transcript, comm log, HUD
+   labels) grows together. */
+body[data-fontsize="small"] { --ui-font-size: 13px; }
+body[data-fontsize="normal"] { --ui-font-size: 15px; }
+body[data-fontsize="large"] { --ui-font-size: 18px; }
+body[data-fontsize="xlarge"] { --ui-font-size: 22px; }
+
+#shortcuts-dialog,
+#display-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.65);
+}
+
+/* An ID selector for display:flex would outrank the browser's own
+   [hidden] { display: none; } rule (author styles always beat the UA
+   stylesheet, no matter the specificity) -- so toggling `hidden` in JS
+   would never actually hide the dialog. Make both states explicit. */
+#shortcuts-dialog[hidden],
+#display-dialog[hidden] {
+  display: none;
+}
+
+#shortcuts-dialog:not([hidden]),
+#display-dialog:not([hidden]) {
+  display: flex;
+}
+
+#shortcuts-panel,
+#display-panel {
+  background: #141414;
+  border: 1px solid var(--gold);
+  padding: 1rem 1.25rem;
+  max-width: 28rem;
+  max-height: 80vh;
+  overflow: auto;
+}
+
+#shortcuts-panel h2,
+#display-panel h2 {
+  margin: 0 0 0.6rem;
+  font-size: 0.95rem;
+  color: var(--silver);
+}
+
+#shortcuts-panel dl {
+  margin: 0 0 0.9rem;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 0.9rem;
+  font-size: 0.82rem;
+}
+
+#shortcuts-panel dt {
+  color: var(--gold);
+  white-space: nowrap;
+}
+
+#shortcuts-panel dd {
+  margin: 0;
+  color: var(--muted);
+}
+
+#shortcuts-close,
+#display-close {
+  background: #1a1a1a;
+  color: var(--silver);
+  border: 1px solid var(--input-border);
+  border-radius: 3px;
+  padding: 0.35rem 0.8rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+#shortcuts-close:hover,
+#display-close:hover {
+  border-color: var(--teal);
+  color: var(--teal);
+}
+
+@media (max-width: 720px) {
+  #play {
+    flex-direction: column;
+  }
+  #hud {
+    flex: 0 0 auto;
+    width: 100%;
+    border-left: 0;
+    border-top: 1px solid var(--rule);
+    max-height: 42vh;
+  }
+}

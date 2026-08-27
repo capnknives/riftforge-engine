@@ -57,6 +57,19 @@ def _parse_menu_choice(pick, tagged):
         for i, (_section, entry) in enumerate(tagged, start=1):
             if entry is LINK_EXISTING_MARKER:
                 return i
+    # Staff (and assigned-cast) menus: type Ash / Dean instead of hunting
+    # a shifting roster number. Exact key, given name, or vault face only.
+    exact = []
+    for i, (_section, entry) in enumerate(tagged, start=1):
+        if entry in (CREATE_NEW_MARKER, LINK_EXISTING_MARKER):
+            continue
+        key = (getattr(entry, "key", None) or "").strip().lower()
+        given = (getattr(entry, "given_name", None) or "").strip().lower()
+        face = (getattr(entry, "face", None) or "").strip().lower()
+        if low == key or (given and low == given) or (face and low == face):
+            exact.append(i)
+    if len(exact) == 1:
+        return exact[0]
     return None
 
 
@@ -79,13 +92,15 @@ def _send_character_menu(session, game, account, tagged):
                 session.send("  -- Characters --")
             elif section == "cast":
                 session.send("  -- Cast --")
+            elif section == "assigned_character":
+                session.send("  -- Assigned Characters --")
             else:
                 session.send("  -- Actions --")
             last_section = section
         face = _menu_face(game, entry)
         online = ""
         if (
-            section in ("character", "cast")
+            section in ("character", "cast", "assigned_character")
             and entry not in (CREATE_NEW_MARKER, LINK_EXISTING_MARKER)
             and not getattr(entry, "is_vaulted_menu_entry", False)
             and getattr(entry, "session", None)
@@ -105,11 +120,11 @@ async def _persist_account_change(game, *, reason):
     """
     from engine import persistence
 
-    try:
-        persistence.save_accounts(game.db, game)
-    except Exception as exc:
+    if not persistence.flush_accounts_now(
+        game.db, game, reason=f"account_login:{reason}",
+    ):
         print(
-            f"[account_login] save_accounts failed ({reason}): {exc!r}",
+            f"[account_login] save_accounts failed ({reason})",
             flush=True,
         )
 
@@ -320,7 +335,7 @@ async def _prompt_character_menu(session, game, account):
     _send_character_menu(session, game, account, tagged)
     while True:
         session.send(
-            "Enter a number (e.g. 1), or type create / link:"
+            "Enter a number, a character name (e.g. Ash), or type create / link:"
         )
         pick = await _read_player_line(session)
         if pick is None:
@@ -328,7 +343,7 @@ async def _prompt_character_menu(session, game, account):
         idx = _parse_menu_choice(pick, tagged)
         if idx is None:
             session.send(
-                "Pick the menu number (e.g. 1), or type create or link."
+                "Pick the menu number, a character name, or type create or link."
             )
             continue
         if idx < 1 or idx > len(tagged):
@@ -477,6 +492,7 @@ async def _finish_new_character_after_chargen(session, game, account, char):
         start_room = game.start_room
     char.chargen_start_room_key = None
     char.chargen_draft = False
+    char.chargen_step = 0
     draft_mod.finish_chargen_draft(account, game)
     char.move_to(start_room)
     session._promote_to_sessions()
@@ -497,7 +513,9 @@ async def _finish_new_character_after_chargen(session, game, account, char):
     return AccountLoginResult(character=char, is_new=True)
 
 
-async def _flow_resume_chargen(session, game, account, char):
+async def _flow_resume_chargen(
+    session, game, account, char, *, after_copyover=False,
+):
     """Resume create-flow chargen for a draft body."""
     from engine import char_identity as identity_mod
     from engine import gm_notify
@@ -506,7 +524,13 @@ async def _flow_resume_chargen(session, game, account, char):
     session.character = char
     session._set_creating()
     legal = identity_mod.legal_public_name(char, force_surname=True)
-    session.send(f"Resuming character creation for {legal}...")
+    if after_copyover:
+        session.send(
+            f"The world finished rewriting. You are still creating "
+            f"{legal} -- picking up at the same step."
+        )
+    else:
+        session.send(f"Resuming character creation for {legal}...")
     gm_notify.ping_gms(
         game,
         f"{legal} is resuming chargen{{from}}.",
@@ -518,6 +542,32 @@ async def _flow_resume_chargen(session, game, account, char):
         return None
     return await _finish_new_character_after_chargen(
         session, game, account, char,
+    )
+
+
+async def resume_chargen_after_hold(session):
+    """Resume create-flow after copyover / gateway reattach.
+
+    ``session.character`` must already be the draft body. Returns an
+    ``AccountLoginResult`` on success, or None if the client hung up.
+    """
+    game = session.game
+    char = getattr(session, "character", None)
+    if char is None:
+        return None
+    account_name = (getattr(char, "account", None) or "").strip()
+    account = accounts_mod.find_account(game, account_name) if account_name else None
+    if account is None:
+        session.send(
+            "Your create session survived the rewrite, but the account "
+            "link is missing. Disconnect and log in to resume."
+        )
+        draft_mod.vault_chargen_draft(char, game, None)
+        return None
+    if accounts_mod.account_is_staff(account):
+        session.staff_account = account.name
+    return await _flow_resume_chargen(
+        session, game, account, char, after_copyover=True,
     )
 
 
@@ -630,10 +680,15 @@ async def _flow_link_existing(session, game, account):
     return body
 
 
-async def run_account_login_flow(session, *, known_account=None):
-    """Account-first login. Returns ``AccountLoginResult`` or None."""
+async def run_account_login_flow(session, *, known_account=None, skip_password=False):
+    """Account-first login. Returns ``AccountLoginResult`` or None.
+
+    ``skip_password`` is set after soft ``logout`` on the same TCP session:
+    the player already proved the account password this connection.
+    """
     game = session.game
     use_known = known_account
+    trusted_password = False
 
     while True:
         if use_known:
@@ -645,9 +700,15 @@ async def run_account_login_flow(session, *, known_account=None):
             if account is None:
                 session.send("No such account.")
                 return None
-            session.send(
-                f"Account {account.display_name} -- enter password:"
-            )
+            trusted_password = skip_password
+            if trusted_password:
+                session.send(
+                    f"Account {account.display_name} -- choose a character:"
+                )
+            else:
+                session.send(
+                    f"Account {account.display_name} -- enter password:"
+                )
             is_new_account = False
             use_known = None
         else:
@@ -666,8 +727,9 @@ async def run_account_login_flow(session, *, known_account=None):
                         "or check the spelling."
                     )
                     continue
+            trusted_password = False
 
-        if not is_new_account:
+        if not is_new_account and not trusted_password:
             ok = await _authenticate_account_password(session, account)
             if ok is None:
                 return None
@@ -729,6 +791,9 @@ async def run_account_login_flow(session, *, known_account=None):
             if live_holder is not None:
                 session._take_over_session(live_holder)
                 takeover = True
+            accounts_mod.stamp_rpc_cast_login_session(
+                game, session, account, picked,
+            )
             return AccountLoginResult(
                 character=picked, is_new=False, takeover=takeover,
             )

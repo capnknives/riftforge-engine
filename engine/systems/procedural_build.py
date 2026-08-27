@@ -28,6 +28,13 @@ _APARTMENT_FLOOR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Penthouse corridor: "Penthouse Floor" or structured
+# "Lebanon - Apartments - Penthouse".
+_PENTHOUSE_FLOOR_RE = re.compile(
+    r"(?:penthouse\s+floor|apartments?\s*(?:-|)\s*penthouse)\b",
+    re.IGNORECASE,
+)
+
 # Look-name pattern for hotel corridors: "Hotel Floor 1" or
 # "Lebanon - Hotel - Floor 2".
 _HOTEL_FLOOR_RE = re.compile(
@@ -323,6 +330,42 @@ def parse_street_name(room):
     return f"{head} {suffix}"
 
 
+# Civic plazas (Town Square) share the residential ``Square`` suffix.
+# populate homes / civic construction must not treat them as street hubs.
+CIVIC_PLAZA_REFUSE = (
+    "This is a civic plaza, not a residential street. "
+    "Town Square and other plaza hubs cannot take populate homes "
+    "or populate neighborhood. Stand on a Street / Lane / Drive hub "
+    "(Valley Square is fine; Town Square is not)."
+)
+
+
+def is_civic_plaza(room):
+    """True for town plazas that must never grow street homes.
+
+    ``Square`` is a valid residential suffix (Valley Square), but civic
+    Town Square rooms also match that suffix. Gate on ``is_start``, the
+    ``plaza`` resource tag, and a Town Square leaf name.
+    """
+    if room is None:
+        return False
+    if getattr(room, "is_start", False):
+        return True
+    resources = getattr(room, "resources", None) or ()
+    try:
+        if "plaza" in resources:
+            return True
+    except TypeError:
+        pass
+    leaf = (
+        street_hub_leaf(_room_look_name(room)) or _room_look_name(room) or ""
+    )
+    leaf_l = leaf.strip().lower()
+    if leaf_l == "town square" or leaf_l.endswith(" town square"):
+        return True
+    return False
+
+
 def is_street_hub(room):
     """True when the room is a populate-homes street hub (not a porch/unit).
 
@@ -332,6 +375,8 @@ def is_street_hub(room):
     leading house numbers / room sub-labels.
     """
     if room is None:
+        return False
+    if is_civic_plaza(room):
         return False
     if getattr(room, "is_house", False) or getattr(room, "private_home", False):
         return False
@@ -357,9 +402,38 @@ def is_street_hub(room):
     return parse_street_name(room) is not None
 
 
+# ``populate neighborhood`` stamps this blurb on prepared hubs (even at 0 homes).
+_NEIGHBORHOOD_HUB_STAMP = "quiet residential stretch"
+
+
+def is_neighborhood_build_hub(room, game=None):
+    """True when civic construction may stake homes on this street hub.
+
+    Town spine, cemetery roads, and other civic connectors match
+    ``is_street_hub`` but are not neighborhoods. Only hubs stamped by
+    ``populate neighborhood`` (description blurb below) or authored with
+    that residential blurb qualify — existing stray porches alone do not.
+    """
+    if not is_street_hub(room):
+        return False
+    desc = (getattr(room, "description", None) or "").lower()
+    return _NEIGHBORHOOD_HUB_STAMP in desc
+
+
 def is_apartment_floor(room):
     """True when the room is an Apartment Floor corridor."""
     return parse_apartment_floor_letter(room) is not None
+
+
+def is_penthouse_floor(room):
+    """True when the room is a Penthouse Floor corridor (luxury tier)."""
+    if room is None:
+        return False
+    name = _room_look_name(room)
+    key = str(getattr(room, "key", "") or "")
+    return bool(
+        _PENTHOUSE_FLOOR_RE.search(name) or _PENTHOUSE_FLOOR_RE.search(key)
+    )
 
 
 def parse_hotel_floor_number(room):
@@ -529,6 +603,141 @@ def parse_street_home_key(key):
         match.group("addr").strip(),
         match.group("sub").strip(),
     )
+
+
+def _map_entries_by_key(rooms):
+    """Index map ``rooms[]`` dicts by ``key`` and ``legacy_key``."""
+    by_key = {}
+    for entry in rooms:
+        key = entry.get("key")
+        if key:
+            by_key[str(key)] = entry
+        legacy = str(entry.get("legacy_key") or "").strip()
+        if legacy:
+            by_key[legacy] = entry
+    return by_key
+
+
+def _street_home_parts_from_room_or_entry(room_or_entry):
+    """``(street, addr, sub)`` from legacy key, room key, or structured title."""
+    if isinstance(room_or_entry, dict):
+        legacy = str(room_or_entry.get("legacy_key") or "").strip()
+        key = str(room_or_entry.get("key") or "").strip()
+        title = str(room_or_entry.get("title") or "").strip()
+    else:
+        legacy = str(getattr(room_or_entry, "legacy_key", None) or "").strip()
+        key = str(getattr(room_or_entry, "key", None) or "").strip()
+        title = str(getattr(room_or_entry, "title", None) or "").strip()
+    for candidate in (legacy, key):
+        parsed = parse_street_home_key(candidate)
+        if parsed:
+            return parsed
+    if title:
+        _city, main, sub = split_structured_title(title)
+        if main:
+            parts = main.split()
+            if parts and parts[0].isdigit() and len(parts) >= 2:
+                addr = parts[0]
+                street = " ".join(parts[1:])
+                sub_name = (sub or "").strip()
+                if sub_name:
+                    return street, addr, sub_name
+    return None
+
+
+def porch_house_number(room_or_entry):
+    """House digits for a porch row, or None."""
+    parsed = _street_home_parts_from_room_or_entry(room_or_entry)
+    if not parsed:
+        return None
+    _street, addr, sub = parsed
+    if str(sub).lower() != "porch":
+        return None
+    return addr
+
+
+def _is_home_porch(room_or_entry):
+    if isinstance(room_or_entry, dict):
+        if not room_or_entry.get("private_home"):
+            return False
+        if not room_or_entry.get("outdoor"):
+            return False
+    else:
+        if not getattr(room_or_entry, "private_home", False):
+            return False
+        if not getattr(room_or_entry, "outdoor", False):
+            return False
+    return porch_house_number(room_or_entry) is not None
+
+
+def _find_street_home_room(rooms, street, addr, sub):
+    """Find a live Room by legacy name or title / legacy scan."""
+    legacy = f"{street} {addr} {sub}"
+    hit = rooms.get(legacy)
+    if hit is not None:
+        return hit
+    addr_s = str(addr)
+    sub_l = str(sub).lower()
+    street_s = str(street)
+    for room in rooms.values():
+        parsed = _street_home_parts_from_room_or_entry(room)
+        if not parsed:
+            continue
+        s, a, sb = parsed
+        if s == street_s and a == addr_s and sb.lower() == sub_l:
+            return room
+    return None
+
+
+def _sync_hub_number_exits_from_porches_map(
+    rooms, by_key, changed_keys, exit_patches,
+):
+    """Add missing digit exits on street hubs from porch ``out`` edges."""
+    for entry in rooms:
+        if not _is_home_porch(entry):
+            continue
+        addr = porch_house_number(entry)
+        porch_key = entry.get("key")
+        street_key = (entry.get("exits") or {}).get("out")
+        if not street_key or street_key not in by_key:
+            continue
+        street_entry = by_key[street_key]
+        se = dict(street_entry.get("exits") or {})
+        if se.get(addr) == porch_key:
+            continue
+        se[addr] = porch_key
+        street_entry["exits"] = se
+        exit_patches += 1
+        sk = street_entry.get("key")
+        if sk and sk not in changed_keys:
+            changed_keys.append(sk)
+    return exit_patches
+
+
+def _sync_hub_number_exits_from_porches_live(rooms):
+    """Live heal: wire street digit exits from porch ``out`` (VNUM era)."""
+    touched = 0
+    for porch in rooms.values():
+        if not _is_home_porch(porch):
+            continue
+        addr = porch_house_number(porch)
+        street = (porch.exits or {}).get("out")
+        if isinstance(street, str):
+            street = rooms.get(street)
+        if street is None:
+            continue
+        if not hasattr(street, "exits"):
+            continue
+        if (
+            getattr(street, "private_home", False)
+            and getattr(street, "outdoor", False)
+        ):
+            continue
+        if (street.exits or {}).get(addr) is porch:
+            continue
+        street.exits[addr] = porch
+        touched += 1
+    return touched
 
 
 def expected_street_home_title(city, street, addr, sub):
@@ -928,15 +1137,28 @@ def _build_one_home(street_room, street_name, address, *, rng, large=False):
 _POPULATE_HOMES_BATCH_CAP = 20
 
 
-def populate_homes(game, street_room, count, *, large=False, rng=None):
+def populate_homes(
+    game,
+    street_room,
+    count,
+    *,
+    large=False,
+    rng=None,
+    skip_amenity_catchup=False,
+):
     """Create ``count`` claimable street homes off the standing street.
 
     Returns (ok, message). ``large`` builds the backyard + upstairs layout.
+    ``skip_amenity_catchup`` defers lodging/fridge scans until the caller
+    runs ``map_store.run_append_amenity_catchup`` once after a batch.
     """
     if count < 1:
         return False, "Usage: populate homes <n> [large]"
     if count > _POPULATE_HOMES_BATCH_CAP:
         return False, f"Cap is {_POPULATE_HOMES_BATCH_CAP} homes per populate call."
+
+    if is_civic_plaza(street_room):
+        return False, CIVIC_PLAZA_REFUSE
 
     street_name = parse_street_name(street_room)
     if not street_name:
@@ -983,6 +1205,7 @@ def populate_homes(game, street_room, count, *, large=False, rng=None):
         street_room,
         new_rooms,
         extra_exits={street_room.key: street_exits},
+        skip_amenity_catchup=skip_amenity_catchup,
     )
     size = "large " if large else ""
     addr_list = ", ".join(str(a) for a in addresses)
@@ -1281,6 +1504,8 @@ def populate_neighborhood(
                 "That room is a hospital floor -- use populate hospitals "
                 "instead of populate neighborhood."
             )
+        if is_civic_plaza(hub):
+            return False, CIVIC_PLAZA_REFUSE
 
         # Existing hub without a homes target: wipe old houses/porches.
         # With a homes target: keep them so we can top up the count.
@@ -1345,6 +1570,8 @@ def populate_neighborhood(
                 "This room is a hospital floor -- use populate hospitals "
                 "instead of populate neighborhood."
             )
+        if is_civic_plaza(hub):
+            return False, CIVIC_PLAZA_REFUSE
         wipe_notes.extend(_prepare_neighborhood_hub(game, hub, keep=None))
 
     # How many homes already hang off this hub (numeric street exits /
@@ -1638,13 +1865,15 @@ def fix_shell_in_map_doc(doc):
     Returns ``(rooms_changed, exit_patches, sample_keys)``.
     """
     rooms = doc.get("rooms") or []
-    by_key = {e.get("key"): e for e in rooms if e.get("key")}
+    by_key = _map_entries_by_key(rooms)
     changed_keys = []
     exit_patches = 0
 
     for entry in rooms:
         key = entry.get("key") or ""
         parsed = parse_street_home_key(key)
+        if not parsed:
+            parsed = _street_home_parts_from_room_or_entry(entry)
         if not parsed:
             continue
         street, addr, sub = parsed
@@ -1672,8 +1901,11 @@ def fix_shell_in_map_doc(doc):
                 mutated = True
             living_key = f"{street} {addr} Living"
             pe = dict(entry.get("exits") or {})
-            if pe.get("in") != living_key and living_key in by_key:
-                pe["in"] = living_key
+            in_target = pe.get("in")
+            if not in_target or in_target not in by_key:
+                in_target = living_key if living_key in by_key else None
+            if in_target and pe.get("in") != in_target:
+                pe["in"] = in_target
                 entry["exits"] = pe
                 mutated = True
         elif sub_l == "backyard":
@@ -1688,8 +1920,11 @@ def fix_shell_in_map_doc(doc):
             if sub_l == "living":
                 porch_key = f"{street} {addr} Porch"
                 le = dict(entry.get("exits") or {})
-                if le.get("out") != porch_key and porch_key in by_key:
-                    le["out"] = porch_key
+                out_target = le.get("out")
+                if not out_target or out_target not in by_key:
+                    out_target = porch_key if porch_key in by_key else None
+                if out_target and le.get("out") != out_target:
+                    le["out"] = out_target
                     entry["exits"] = le
                     mutated = True
                 if not entry.get("is_house"):
@@ -1717,7 +1952,10 @@ def fix_shell_in_map_doc(doc):
             if not str(direction).isdigit():
                 continue
             dest_s = str(dest or "")
+            dest_entry = by_key.get(dest_s)
             parsed = parse_street_home_key(dest_s)
+            if parsed is None and dest_entry is not None:
+                parsed = _street_home_parts_from_room_or_entry(dest_entry)
             if parsed is None:
                 continue
             street, addr, sub = parsed
@@ -1726,8 +1964,13 @@ def fix_shell_in_map_doc(doc):
             if sub.lower() == "porch":
                 continue
             porch_key = f"{street} {addr} Porch"
-            if porch_key in by_key:
-                exits[direction] = porch_key
+            porch_target = porch_key if porch_key in by_key else None
+            if porch_target is None and dest_entry is not None:
+                porch_addr = porch_house_number(dest_entry)
+                if porch_addr == str(addr):
+                    porch_target = dest_entry.get("key")
+            if porch_target and exits.get(direction) != porch_target:
+                exits[direction] = porch_target
                 dirty = True
                 exit_patches += 1
         if dirty:
@@ -1735,7 +1978,172 @@ def fix_shell_in_map_doc(doc):
             if key not in changed_keys:
                 changed_keys.append(key)
 
+    exit_patches = _sync_hub_number_exits_from_porches_map(
+        rooms, by_key, changed_keys, exit_patches,
+    )
+
     return len(changed_keys), exit_patches, changed_keys
+
+
+def _iter_game_characters(game, rooms):
+    """Yield character-like objects (game.characters plus room contents)."""
+    seen = set()
+    for character in list(getattr(game, "characters", None) or []):
+        cid = id(character)
+        if cid not in seen:
+            seen.add(cid)
+            yield character
+    for room in (rooms or {}).values():
+        for obj in list(getattr(room, "contents", None) or []):
+            if not hasattr(obj, "move_to"):
+                continue
+            cid = id(obj)
+            if cid in seen:
+                continue
+            seen.add(cid)
+            yield obj
+
+
+def _purge_rooms_live(game, doomed, *, relocate):
+    """Drop doomed rooms from live ``game.rooms`` when JSON rewrite is unavailable.
+
+    Used by boot heal tests and as a fallback when map_store cannot resolve
+    the plaza's zone file. Returns how many room objects were removed.
+    """
+    rooms = getattr(game, "rooms", None) or {}
+    for key in list(doomed):
+        room = rooms.get(key)
+        if room is None:
+            continue
+        for obj in list(getattr(room, "contents", None) or []):
+            if hasattr(obj, "move_to") and relocate is not None:
+                try:
+                    obj.move_to(relocate)
+                    continue
+                except Exception:
+                    pass
+    for room in list(rooms.values()):
+        exits = getattr(room, "exits", None) or {}
+        for direction, dest in list(exits.items()):
+            dest_key = getattr(dest, "key", None) if dest is not None else dest
+            if dest_key in doomed:
+                del exits[direction]
+    removed = 0
+    for key in doomed:
+        if rooms.pop(key, None) is not None:
+            removed += 1
+    return removed
+
+
+def _civic_plaza_stray_home_keys(game, plaza):
+    """House-graph keys wrongly hung off a civic plaza (linked + orphans)."""
+    doomed = _collect_wipe_keys(game, plaza, keep=None)
+    street_name = parse_street_name(plaza)
+    rooms = getattr(game, "rooms", None) or {}
+    if street_name:
+        prefix = f"{street_name} "
+        for key, room in list(rooms.items()):
+            if not str(key).startswith(prefix):
+                continue
+            if not _is_neighborhood_wipe_candidate(room, plaza):
+                continue
+            doomed.add(key)
+    return doomed
+
+
+def heal_civic_plaza_street_homes(game):
+    """Boot heal: strip street-home graphs that sprouted on civic plazas.
+
+    Civic construction and populate homes treated Town Square as a street
+    because Square is an address suffix. Idempotent. Relocates occupants
+    onto the plaza, clears home_room_key, deletes the house rooms, and
+    rewrites zone JSON when map_store can resolve the file.
+
+    Returns a stats dict for logs / targeted smoke.
+    """
+    stats = {"plazas": 0, "removed_rooms": 0, "cleared_homes": 0}
+    if game is None:
+        return stats
+    rooms = getattr(game, "rooms", None) or {}
+    if not isinstance(rooms, dict):
+        return stats
+
+    for plaza in list(rooms.values()):
+        if not is_civic_plaza(plaza):
+            continue
+        doomed = _civic_plaza_stray_home_keys(game, plaza)
+        if not doomed:
+            continue
+        stats["plazas"] += 1
+        for character in _iter_game_characters(game, rooms):
+            home_key = getattr(character, "home_room_key", None)
+            if home_key in doomed:
+                character.home_room_key = getattr(plaza, "key", None)
+                stats["cleared_homes"] += 1
+        try:
+            removed, _msg = map_store.delete_hand_rooms(
+                game, plaza, doomed, relocate_to=plaza,
+            )
+        except (ValueError, OSError, TypeError):
+            removed = _purge_rooms_live(game, doomed, relocate=plaza)
+        stats["removed_rooms"] += int(removed or 0)
+    return stats
+
+
+def _stray_street_home_keys_on_hub(game, hub):
+    """House-graph keys that should not hang off a non-neighborhood hub."""
+    if is_neighborhood_build_hub(hub, game):
+        return set()
+    doomed = _collect_wipe_keys(game, hub, keep=None)
+    street_name = parse_street_name(hub)
+    rooms = getattr(game, "rooms", None) or {}
+    if street_name:
+        prefix = f"{street_name} "
+        for key, room in list(rooms.items()):
+            if not str(key).startswith(prefix):
+                continue
+            if not _is_neighborhood_wipe_candidate(room, hub):
+                continue
+            doomed.add(key)
+    return doomed
+
+
+def heal_stray_street_homes_on_invalid_hubs(game):
+    """Boot heal: strip house graphs from non-neighborhood street hubs.
+
+    Cemetery Road, Main Street spine, lake/forest connectors, and similar
+    rooms match address suffixes but lack the ``populate neighborhood``
+    residential stamp. Idempotent; rewrites zone JSON when possible.
+    """
+    stats = {"hubs": 0, "removed_rooms": 0, "cleared_homes": 0}
+    if game is None:
+        return stats
+    rooms = getattr(game, "rooms", None) or {}
+    if not isinstance(rooms, dict):
+        return stats
+
+    for hub in list(rooms.values()):
+        if not is_street_hub(hub):
+            continue
+        if is_neighborhood_build_hub(hub, game):
+            continue
+        doomed = _stray_street_home_keys_on_hub(game, hub)
+        if not doomed:
+            continue
+        stats["hubs"] += 1
+        for character in _iter_game_characters(game, rooms):
+            home_key = getattr(character, "home_room_key", None)
+            if home_key in doomed:
+                character.home_room_key = getattr(hub, "key", None)
+                stats["cleared_homes"] += 1
+        try:
+            removed, _msg = map_store.delete_hand_rooms(
+                game, hub, doomed, relocate_to=hub,
+            )
+        except (ValueError, OSError, TypeError):
+            removed = _purge_rooms_live(game, doomed, relocate=hub)
+        stats["removed_rooms"] += int(removed or 0)
+    return stats
 
 
 def heal_street_home_shell_live(game):
@@ -1750,6 +2158,8 @@ def heal_street_home_shell_live(game):
     rooms = getattr(game, "rooms", None) or {}
     for key, room in list(rooms.items()):
         parsed = parse_street_home_key(key)
+        if not parsed:
+            parsed = _street_home_parts_from_room_or_entry(room)
         if not parsed:
             continue
         street, addr, sub = parsed
@@ -1776,8 +2186,7 @@ def heal_street_home_shell_live(game):
             if getattr(room, "is_house", False):
                 room.is_house = False
                 changed = True
-            living_key = f"{street} {addr} Living"
-            living = rooms.get(living_key)
+            living = _find_street_home_room(rooms, street, addr, "Living")
             if living is not None and room.exits.get("in") is not living:
                 room.exits["in"] = living
                 changed = True
@@ -1790,7 +2199,7 @@ def heal_street_home_shell_live(game):
                 room.outdoor = False
                 changed = True
             if sub_l == "living":
-                porch = rooms.get(f"{street} {addr} Porch")
+                porch = _find_street_home_room(rooms, street, addr, "Porch")
                 if porch is not None and room.exits.get("out") is not porch:
                     room.exits["out"] = porch
                     changed = True
@@ -1807,14 +2216,17 @@ def heal_street_home_shell_live(game):
             dest_key = getattr(dest, "key", None) or ""
             parsed = parse_street_home_key(dest_key)
             if parsed is None:
+                parsed = _street_home_parts_from_room_or_entry(dest)
+            if parsed is None:
                 continue
             street, addr, sub = parsed
             if str(direction) != addr or sub.lower() == "porch":
                 continue
-            porch = rooms.get(f"{street} {addr} Porch")
-            if porch is not None:
+            porch = _find_street_home_room(rooms, street, addr, "Porch")
+            if porch is not None and room.exits.get(direction) is not porch:
                 room.exits[direction] = porch
                 touched += 1
+    touched += _sync_hub_number_exits_from_porches_live(rooms)
     return touched
 
 

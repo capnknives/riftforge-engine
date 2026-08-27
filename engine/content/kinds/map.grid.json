@@ -86,10 +86,20 @@
       "required": false,
       "doc": "Default Cadence zone id for cells."
     },
+    "terrain_rows": {
+      "type": "list",
+      "required": false,
+      "doc": "Compact atlas: height strings of width terrain glyphs (y=0 south). Space void, ~ ocean, o lake, . plains, ^ mountains, T forest, ' wetland, , desert. Named mouths stay in cell_overrides."
+    },
+    "road_rows": {
+      "type": "list",
+      "required": false,
+      "doc": "Compact atlas: matching interstate overlay (= | / \\ + or space). City letters still win via cell_overrides map_glyph."
+    },
     "cell_overrides": {
       "type": "object",
       "required": false,
-      "doc": "Per-cell override map keyed by x,y."
+      "doc": "Per-cell override map keyed by x,y. Sparse on layer atlases (cities, dungeon mouths); full paint when terrain_rows is omitted."
     },
     "portals": {
       "type": "list",

@@ -22,6 +22,8 @@ PORTABLE_PHONE_CATALOG_IDS = frozenset({"flip_phone"})
 PAYPHONE_FEE = 1
 MAX_CONTACTS = 40
 MAX_ALIAS_LEN = 24
+# Player-to-player SMS body cap (shorter than IC mail).
+SMS_TEXT_MAX = 320
 
 _phone_catalog_ids = set(PHONE_CATALOG_IDS)
 _payphone_catalog_ids = set(PAYPHONE_CATALOG_IDS)
@@ -101,6 +103,26 @@ def deliver_giver_tip_text(character, giver_name, summary, *, kind=None):
     return False
 
 
+def _append_pending_text(character, line):
+    """Queue a formatted one-way SMS line for login / ``phone`` flush."""
+    pending = getattr(character, "pending_phone_texts", None)
+    if not isinstance(pending, list):
+        character.pending_phone_texts = []
+        pending = character.pending_phone_texts
+    pending.append(line)
+
+
+def _deliver_text_line(character, line):
+    """Deliver one SMS line now, or queue when ``session`` is None."""
+    session = getattr(character, "session", None)
+    if session is not None:
+        from engine import snoop as snoop_module
+        snoop_module.tell_paragraph(character, line)
+        return True
+    _append_pending_text(character, line)
+    return True
+
+
 def deliver_official_text(character, sender_label, body):
     """One-way official SMS. Queues for offline handset holders."""
     if character is None or not (body or "").strip():
@@ -109,17 +131,64 @@ def deliver_official_text(character, sender_label, body):
         return False
     sender = (sender_label or "Sheriff's Office").strip() or "Sheriff's Office"
     msg = f"{tag_phone(character)} {sender}: {(body or '').strip()}"
-    session = getattr(character, "session", None)
-    if session is not None:
-        from engine import snoop as snoop_module
-        snoop_module.tell_paragraph(character, msg)
-        return True
-    pending = getattr(character, "pending_phone_texts", None)
-    if not isinstance(pending, list):
-        character.pending_phone_texts = []
-        pending = character.pending_phone_texts
-    pending.append(msg)
-    return True
+    return _deliver_text_line(character, msg)
+
+
+def send_player_text(sender, target_raw, body, game):
+    """Queue or deliver a player SMS to a handset holder.
+
+    Addressing uses phonebook alias or number (not character name).
+    True-offline recipients (``session is None``) queue until login;
+    live and idlemode sessions get immediate delivery. Cadence never
+    auto-replies to inbound texts.
+    """
+    if not has_portable_phone(sender):
+        return False, "You need a flip phone in hand to text."
+    label = (target_raw or "").strip()
+    text = (body or "").strip()
+    if not label or not text:
+        return False, "Usage: phone text <alias|number> <message>"
+    if len(text) > SMS_TEXT_MAX:
+        return False, f"Texts are limited to {SMS_TEXT_MAX} characters."
+    if is_special_dial(label):
+        return False, "That line does not take texts."
+    number, err = resolve_dial_target(sender, label, game)
+    if err:
+        return False, err
+    if not number:
+        return False, "That does not look like a phone number or saved alias."
+    item, holder, _room = find_item_by_number(game, number)
+    if item is None or holder is None:
+        return False, f"{tag_phone(sender)} No handset at that number."
+    if is_payphone_item(item):
+        return False, "Payphones are not SMS inboxes."
+    if holder is sender:
+        return False, "You cannot text your own handset."
+    if getattr(holder, "is_npc", False):
+        return False, f"{tag_phone(sender)} That line does not take texts."
+    if not has_portable_phone(holder):
+        return (
+            False,
+            f"{tag_phone(sender)} They are not carrying a flip phone.",
+        )
+    if not same_plane(sender, holder):
+        return (
+            False,
+            f"{tag_phone(sender)} No signal — that phone is on another plane.",
+        )
+    my_phone = primary_handset(sender)
+    from_number = (
+        ensure_phone_number(my_phone, game) if my_phone is not None else "?"
+    )
+    sender_name = (getattr(sender, "key", None) or "someone").strip()
+    msg = (
+        f"{tag_phone(holder)} SMS from {sender_name} ({from_number}): {text}"
+    )
+    _deliver_text_line(holder, msg)
+    session = getattr(holder, "session", None)
+    if session is None:
+        return True, f"You text {number}. It will arrive when they log in."
+    return True, f"You text {number}."
 
 
 def flush_pending_phone_texts(character):
@@ -374,7 +443,9 @@ def save_contact(character, alias, number):
             "Alias must start with a letter "
             f"(up to {MAX_ALIAS_LEN} letters/digits/_-)."
         )
-    if label in ("wknz", "save", "forget", "contacts", "number", "ask"):
+    if label in (
+        "wknz", "save", "forget", "contacts", "number", "ask", "text",
+    ):
         return False, "That alias is reserved."
     num = normalize_number(number)
     if not num or is_special_dial(num):
@@ -873,7 +944,8 @@ def status_text(character, game):
     lines.append(f"  Echo voicemail: {vm} ('echo voicemail on|off')")
     lines.append(
         "  Try: dial/call <number|alias> | answer | hangup | "
-        "phone say <text> | phone ask group|food|water|help | "
-        "phone request <song> | phone save|forget|contacts"
+        "phone text <alias|number> <msg> | phone say <text> | "
+        "phone ask group|food|water|help | phone request <song> | "
+        "phone save|forget|contacts"
     )
     return "\r\n".join(lines)

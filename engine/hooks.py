@@ -60,6 +60,9 @@ _park_gm_spirit_on_disconnect = None
 # engine/gmcp.py sends). fn(character) -> dict or None.
 _gmcp_char_vitals = None
 _gmcp_char_status = None
+# Browser atlas right-click verbs. fn(character, map_id, x, y, landmark) ->
+# list of {"label", "command"} using player-facing names only.
+_web_map_cell_verbs = None
 # Prompt %Tg: fn(character, game) -> foe lifeforce band str or "".
 _prompt_target_band = None
 # Prompt %Nd: fn(character, game) -> lifestyle need word or "".
@@ -73,6 +76,7 @@ _prompt_supplemental_bands = None
 
 # System topic pages for bare `help` (game content; engine verbs read these).
 _help_topics = {}
+_gm_only_help_keywords = frozenset()
 _help_categories = []
 
 # Player-verb dispatch: engine/npc_act.py needs to run one raw command line
@@ -122,6 +126,7 @@ _look_extra_lines = None
 # decides whether the game's rules allow walking through it right now.
 # fn(character, room, dest, game) -> block message str, or None to allow.
 _move_gate = None
+_character_placement_block = None
 _clinic_on_admit = None
 _clinic_on_discharge = None
 _clinic_casualty_meter = None
@@ -174,6 +179,7 @@ _lodging_bed_eligibility = None
 _lodging_sleep_policy = None
 _lodging_rent_tick = None
 _lodging_room_stamper = None
+_lodging_look_home_detail_lines = None
 
 # Paced travel (H3b): overland handler, player hop, cadence step, edge_ok, …
 _paced_travel_overland_handler = None
@@ -224,6 +230,7 @@ _can_see_hellhound = None
 # fn(viewer, other) -> bool when other is hidden but swinging at viewer.
 _can_target_hidden_attacker = None
 _can_notice_stealth = None
+_extra_affect_rows = None
 # Staff gm-on look pierce for hidden presences (stealth, etc.) -- tagged
 # ``(hidden)`` instead of omitted. fn(viewer, other) -> bool.
 _staff_tags_hidden_presence = None
@@ -244,6 +251,10 @@ _in_veil = None
 _veil_visible_to = None
 _veil_look_tag = None
 _veil_soul_label = None
+# Floor / targeting visibility for Veil-layer Items (ghost mirror gear).
+# Default: every Item is visible. SUPERS hides spirit copies from mortals.
+_item_visible_to = None
+_item_in_veil = None
 
 # Dark-room sight gate (D67): can `character` see in a dark room without
 # a carried light? Engine default is False (torch required). SUPERS
@@ -271,6 +282,10 @@ _after_arrive = None
 # Optional fn(character, direction, dest, game) after a successful room step
 # (combat-pit pose feed). Kept separate from after_arrive so direction is known.
 _after_move_step = None
+# Door parity: auto open/unlock before leave; auto close afterward.
+# fn(character, from_room, direction, dest, game) -> None
+_before_move_crossing = None
+_after_move_crossing = None
 
 # Public leave/arrive display name (Celestial riding a host -> host key).
 # fn(character, game) -> str | None. None / missing hook -> character.key.
@@ -663,6 +678,40 @@ async def gateway_resume_hook(game):
         await result
 
 
+_open_veil_playable_hook = None  # fn(game) -> None
+
+
+def set_open_veil_playable_hook(fn):
+    """Register fn(game) that opens look/who after gateway copyover reattach.
+
+    SUPERS registers ``boot_seed._open_veil_playable`` (tick handlers +
+    rewrite-complete). Pass None to restore the lean fallback.
+    """
+    global _open_veil_playable_hook
+    _open_veil_playable_hook = fn
+
+
+def open_veil_playable(game):
+    """Let reattached copyover clients type (Circle/Diku copyover_recover).
+
+    Gap-fill heals must not hold this gate. Lean engine: just clear the
+    veil event so ``Session.play`` can start.
+    """
+    if game is None:
+        return
+    if _open_veil_playable_hook is not None:
+        _open_veil_playable_hook(game)
+        return
+    game._veil_world_ready = True
+    game._veil_hold_ready_until_announce = False
+    ev = getattr(game, "_veil_ready_event", None)
+    if ev is not None and not ev.is_set():
+        ev.set()
+    from engine import copyover as copyover_mod
+
+    copyover_mod.mark_copyover_ready()
+
+
 _deferred_boot_seed_hook = None  # fn(game) -> None
 _deferred_boot_seed_async_hook = None  # async fn(game) -> None
 
@@ -680,8 +729,9 @@ def set_deferred_boot_seed_hook(fn):
 def set_deferred_boot_seed_async_hook(fn):
     """Register async fn(game) for gateway welcome (yields between phases).
 
-    When set, ``run_deferred_boot_seed_async`` uses this so held clients
-    can type while heals run. Falls back to the sync hook if unset.
+    When set, ``run_deferred_boot_seed_async`` uses this so gap-fill
+    heals can run after look/who. Gateway welcome must not await this
+    on the IPC read loop. Falls back to the sync hook if unset.
     """
     global _deferred_boot_seed_async_hook
     _deferred_boot_seed_async_hook = fn
@@ -701,6 +751,21 @@ async def run_deferred_boot_seed_async(game):
         return
     if _deferred_boot_seed_hook is not None:
         run_deferred_boot_seed(game)
+
+
+_flush_pending_report_thanks_hook = None
+
+
+def set_flush_pending_report_thanks(fn):
+    """Register fn(game) to deliver queued bug/suggestion thank-yous."""
+    global _flush_pending_report_thanks_hook
+    _flush_pending_report_thanks_hook = fn
+
+
+def flush_pending_report_thanks(game):
+    """Best-effort flush after Veil rewrite announce (SUPERS registers)."""
+    if _flush_pending_report_thanks_hook is not None:
+        _flush_pending_report_thanks_hook(game)
 
 
 def set_character_attacher(fn):
@@ -1166,6 +1231,60 @@ def gmcp_char_status(character):
     return None
 
 
+def set_web_map_cell_verbs(fn):
+    """Register browser atlas right-click verbs, or None to clear."""
+    global _web_map_cell_verbs
+    _web_map_cell_verbs = fn
+
+
+def web_map_cell_verbs(character, map_id, x, y, landmark):
+    """Player-safe {label, command} rows for one atlas cell.
+
+    Engine fallback: Enter using pocket enter_as aliases only. SUPERS
+    adds walk / drive / atlas hub commands via the hook.
+    """
+    if _web_map_cell_verbs is not None:
+        try:
+            rows = _web_map_cell_verbs(character, map_id, x, y, landmark)
+            if isinstance(rows, list):
+                return _sanitize_web_map_verbs(rows)
+        except Exception:
+            return []
+    return _default_web_map_verbs(landmark)
+
+
+def _sanitize_web_map_verbs(rows):
+    """Keep only label+command dicts with no internal keys in the command."""
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        label = str(row.get("label") or "").strip()
+        command = str(row.get("command") or "").strip()
+        if not label or not command:
+            continue
+        lower = command.lower()
+        if "hub_room" in lower or "plot:" in lower or "gmspirit:" in lower:
+            continue
+        out.append({"label": label[:80], "command": command[:120]})
+    return out
+
+
+def _default_web_map_verbs(landmark):
+    """Engine-only enter aliases when SUPERS has not registered a hook."""
+    if not isinstance(landmark, dict):
+        return []
+    name = str(landmark.get("label") or "").strip()
+    aliases = landmark.get("enter_as") or []
+    if not aliases:
+        return []
+    alias = str(aliases[0]).strip()
+    if not alias:
+        return []
+    shown = name or alias
+    return [{"label": f"Enter {shown}", "command": f"enter {alias}"}]
+
+
 def set_help(topics, categories):
     """Inject HELP_TOPICS dict and HELP_CATEGORIES list for cmd_help.
 
@@ -1185,6 +1304,19 @@ def get_help_topics():
 def get_help_categories():
     """Return the injected HELP_CATEGORIES list (may be empty)."""
     return _help_categories
+
+
+def set_gm_only_help_keywords(keywords):
+    """Register static help topic keys visible only to staff (``_is_gm``)."""
+    global _gm_only_help_keywords
+    _gm_only_help_keywords = frozenset(
+        (k or "").strip().lower() for k in (keywords or ()) if (k or "").strip()
+    )
+
+
+def is_gm_only_help(keyword):
+    """True when a static HELP_TOPICS key requires GM rank to view."""
+    return (keyword or "").strip().lower() in _gm_only_help_keywords
 
 
 def set_dispatch(fn):
@@ -1499,6 +1631,24 @@ def move_gate_block(character, room, dest, game):
     """Return a message blocking this move, or None to allow it through."""
     if _move_gate is not None:
         return _move_gate(character, room, dest, game)
+    return None
+
+
+def set_character_placement_block(fn):
+    """Register fn(character, dest, game) -> block message or None.
+
+    Called from ``Character.move_to`` before a character enters ``dest``
+    (teleports, gm goto, cageproject, boot heals, …). Walks still hit
+    ``move_gate_block`` first via ``cmd_move``.
+    """
+    global _character_placement_block
+    _character_placement_block = fn
+
+
+def character_placement_block(character, dest, game):
+    """Return a message blocking placement into ``dest``, or None."""
+    if _character_placement_block is not None:
+        return _character_placement_block(character, dest, game)
     return None
 
 
@@ -2332,6 +2482,45 @@ def veil_soul_label(viewer, other, base_label: str) -> str:
     return f"{veil_look_tag()} {base_label}".strip()
 
 
+def set_item_visible_to(fn):
+    """Register fn(viewer, item) -> bool for floor/target Item sight.
+
+    Pass None to restore the default: every Item is visible.
+    """
+    global _item_visible_to
+    _item_visible_to = fn
+
+
+def item_visible_to(viewer, item):
+    """Can ``viewer`` perceive ``item`` on the floor or in targeting?
+
+    Default (no game installed): True. SUPERS hides Veil-layer ghost
+    copies from ordinary living sight.
+    """
+    if _item_visible_to is not None:
+        return bool(_item_visible_to(viewer, item))
+    return True
+
+
+def set_item_in_veil(fn):
+    """Register fn(item) -> bool for Veil-layer floor gear.
+
+    Pass None to restore the default: no Item is Veil-layer.
+    """
+    global _item_in_veil
+    _item_in_veil = fn
+
+
+def item_in_veil(item):
+    """Is ``item`` Veil-layer ghost gear (look tag / scavenger skip)?
+
+    Default (no game installed): False.
+    """
+    if _item_in_veil is not None:
+        return bool(_item_in_veil(item))
+    return False
+
+
 def set_can_notice_stealth(fn):
     """Register fn(viewer, other, game=None) -> bool for hide/sneak pierce."""
     global _can_notice_stealth
@@ -2345,6 +2534,23 @@ def can_notice_stealth(viewer, other, game=None):
     if _can_notice_stealth is not None:
         return bool(_can_notice_stealth(viewer, other, game))
     return True
+
+
+def set_extra_affect_rows(fn):
+    """Register fn(character) -> list[dict] for ``aff`` / ``affects``."""
+    global _extra_affect_rows
+    _extra_affect_rows = fn
+
+
+def extra_affect_rows(character):
+    """Optional game-provided affect rows (combat conditions, veils, …)."""
+    if _extra_affect_rows is None:
+        return []
+    try:
+        rows = _extra_affect_rows(character)
+    except Exception:
+        return []
+    return list(rows or [])
 
 
 def set_can_perceive_trickster_laylow(fn):
@@ -2471,6 +2677,30 @@ def after_move_step(character, direction, dest, game):
         _after_move_step(character, direction, dest, game)
 
 
+def set_before_move_crossing(fn):
+    """Register fn(character, from_room, direction, dest, game) before leave."""
+    global _before_move_crossing
+    _before_move_crossing = fn
+
+
+def before_move_crossing(character, from_room, direction, dest, game):
+    """Auto open/unlock structure doors the actor may pass (SUPERS hook)."""
+    if _before_move_crossing is not None:
+        _before_move_crossing(character, from_room, direction, dest, game)
+
+
+def set_after_move_crossing(fn):
+    """Register fn(character, from_room, direction, dest, game) after move."""
+    global _after_move_crossing
+    _after_move_crossing = fn
+
+
+def after_move_crossing(character, from_room, direction, dest, game):
+    """Auto close doors left open for a permitted crossing (SUPERS hook)."""
+    if _after_move_crossing is not None:
+        _after_move_crossing(character, from_room, direction, dest, game)
+
+
 def set_move_public_name(fn):
     """Register fn(character, game) -> str for leave/arrive broadcast names.
 
@@ -2590,6 +2820,71 @@ def presence_face_for(viewer, subject):
     if _presence_face_for is not None:
         return _presence_face_for(viewer, subject)
     return None
+
+
+# Crowd-throttled hub traffic + watch-room stance (SUPERS public_watch).
+# One paired registrar so move-hears sampling and traffic-quiet prefs
+# cannot drift apart (same pattern as set_tips_hooks).
+_movement_hears_predicate = None
+_is_watching_room = None
+
+
+def set_public_watch_hooks(movement_hears_fn=None, is_watching_room_fn=None):
+    """Register public-watch hooks for move hears + traffic quiet prefs.
+
+    movement_hears_fn(mover, origin, dest, game, base_hears) -> predicate
+    is_watching_room_fn(character, game=None) -> bool
+    Pass None to clear either slot (bare engine: pass through base_hears /
+    not watching).
+    """
+    global _movement_hears_predicate, _is_watching_room
+    _movement_hears_predicate = movement_hears_fn
+    _is_watching_room = is_watching_room_fn
+
+
+def movement_hears_predicate(mover, origin, dest, game, base_hears):
+    """Wrap base_hears with crowd/watch sampling, or pass through when unset."""
+    if _movement_hears_predicate is not None:
+        return _movement_hears_predicate(mover, origin, dest, game, base_hears)
+    return base_hears
+
+
+def is_watching_room(character, game=None):
+    """True when the actor holds room-surveillance stance; False when unset."""
+    if _is_watching_room is not None:
+        return bool(_is_watching_room(character, game=game))
+    return False
+
+
+# Helper-ticket pings (query / queryread). Bare engine still opens tickets;
+# these only notify online helpers / the reporter.
+_query_notify_event = None
+_query_notify_reporter_live = None
+
+
+def set_query_notify_hooks(event_fn=None, reporter_live_fn=None):
+    """Register query-ticket notify helpers, or None to clear.
+
+    event_fn(game, entry, *, event) -> None
+    reporter_live_fn(game, entry, *, author_key, text) -> None
+    """
+    global _query_notify_event, _query_notify_reporter_live
+    _query_notify_event = event_fn
+    _query_notify_reporter_live = reporter_live_fn
+
+
+def notify_query_event(game, entry, *, event="open"):
+    """Ping online helpers about a query change, or no-op when unset."""
+    if _query_notify_event is not None:
+        _query_notify_event(game, entry, event=event)
+
+
+def notify_reporter_live(game, entry, *, author_key, text):
+    """Tell the reporter a helper replied, or no-op when unset."""
+    if _query_notify_reporter_live is not None:
+        _query_notify_reporter_live(
+            game, entry, author_key=author_key, text=text,
+        )
 
 
 def set_account_roster_label_for(fn):
@@ -2767,6 +3062,23 @@ def try_restore_folded_login(game, name):
     return _try_restore_folded_login(game, name)
 
 
+# fn(game, character_key) -> Character | None
+_try_restore_assigned_character = None
+
+
+def set_try_restore_assigned_character(fn):
+    """Register fn(game, key) -> Character|None for vaulted assigned cast."""
+    global _try_restore_assigned_character
+    _try_restore_assigned_character = fn
+
+
+def try_restore_assigned_character(game, key):
+    """Hydrate a vaulted immersion cast body for RPC assignment lists."""
+    if _try_restore_assigned_character is None:
+        return None
+    return _try_restore_assigned_character(game, key)
+
+
 # fn(game, given_name, surname="") -> Character | None
 _try_restore_folded_login_identity = None
 
@@ -2861,6 +3173,42 @@ def extract_to_vault(character, game, *, folded_by=None, skip_save=False):
     )
 
 
+# fn(character, game, folded_by=None) -> bool
+_upsert_vault_snapshot = None
+
+
+def set_upsert_vault_snapshot(fn):
+    """Register a vault upsert that does not despawn the live body."""
+    global _upsert_vault_snapshot
+    _upsert_vault_snapshot = fn
+
+
+def upsert_vault_snapshot(character, game, *, folded_by=None):
+    """Snapshot ``character`` into the vault without removing them."""
+    if _upsert_vault_snapshot is None:
+        return False
+    return bool(
+        _upsert_vault_snapshot(character, game, folded_by=folded_by)
+    )
+
+
+# fn(game, name) -> Character | None -- mid-create copyover restore.
+_try_restore_chargen_draft = None
+
+
+def set_try_restore_chargen_draft(fn):
+    """Register fn(game, name) -> Character for copyover chargen resume."""
+    global _try_restore_chargen_draft
+    _try_restore_chargen_draft = fn
+
+
+def try_restore_chargen_draft(game, name):
+    """Hydrate a chargen-draft vault row without placing it in a room."""
+    if _try_restore_chargen_draft is None:
+        return None
+    return _try_restore_chargen_draft(game, name)
+
+
 # Account login menu: hard-folded bodies still listed on an account roster.
 # fn(game, account, live_character_keys_low: set[str])
 #     -> list[(section, entry)]
@@ -2915,6 +3263,11 @@ _map_center_room = None
 # fn(character, direction, game) -> bool
 _try_directional_move = None
 
+# Game-layer ``open <dir>`` / ``close <dir>`` (SUPERS lodging/structure
+# doors). Distinct from ``engine/systems/doors.py`` persisted lock/open
+# graph state -- do not merge the two.
+_try_directional_open = None
+
 # Landmark / dual-layer `enter` before classic zone_entries.
 # True = handled. fn(character, args, game) -> bool
 _try_enter_zone = None
@@ -2926,13 +3279,18 @@ _try_vehicle_enter_as_house_in = None
 
 # --- Fuel-loop roster hook (lag P8.4) -------------------------------------
 # SUPERS keeps ``game.fuel_loop_characters`` in sync so ``fuel.tick_all``
-# never walks the full live roster. fn(game, character, *, op) where op is
+# never walks the full live roster, and also invalidates Cadence town /
+# hostile-tail caches. fn(game, character, *, op) where op is
 # ``add`` | ``remove`` | ``rebuild`` (character ignored on rebuild).
+# Do not add a second after-index-mutate registrar beside this one.
 _fuel_loop_roster_hook = None
 
 
 def set_fuel_loop_roster_hook(fn):
-    """Register fuel-loop index maintenance, or None to clear."""
+    """Register live-roster mutate side effects, or None to clear.
+
+    SUPERS uses this for the fuel-loop index *and* Cadence roster caches.
+    """
     global _fuel_loop_roster_hook
     _fuel_loop_roster_hook = fn
 
@@ -3049,6 +3407,24 @@ def try_directional_move(character, direction, game):
     return False
 
 
+def set_try_directional_open(fn):
+    """Register fn(character, game, args, *, open_) -> bool for structure doors.
+
+    True means the game handled ``open north`` / ``close west`` (home door,
+    interior lodging door). False falls through to container lockbox open.
+    Pass None to clear. This is *not* ``engine/systems/doors.py``.
+    """
+    global _try_directional_open
+    _try_directional_open = fn
+
+
+def try_directional_open(character, game, args, *, open_):
+    """True when a registered game handler consumed directional open/close."""
+    if _try_directional_open is not None:
+        return bool(_try_directional_open(character, game, args, open_=open_))
+    return False
+
+
 def set_try_enter_zone(fn):
     """Register fn(character, args, game) -> bool for special zone enter.
 
@@ -3149,6 +3525,27 @@ def vehicle_park_spot_blocked_extra(room, game, character):
     return False
 
 
+_vehicle_park_scrub_exempt = None
+
+
+def set_vehicle_park_scrub_exempt(fn):
+    """Register fn(game, veh, park_room, owner) -> bool.
+
+    When True, ``save_parking_state`` leaves ``parked_room`` alone even when
+    the curb fails ``room_is_valid_park_spot`` (e.g. no-park plaza
+    drive-through; timed municipal tow owns enforcement). Pass None to clear.
+    """
+    global _vehicle_park_scrub_exempt
+    _vehicle_park_scrub_exempt = fn
+
+
+def vehicle_park_scrub_exempt(game, veh, park_room, owner):
+    """True when an invalid curb should not be save-scrubbed."""
+    if _vehicle_park_scrub_exempt is not None:
+        return bool(_vehicle_park_scrub_exempt(game, veh, park_room, owner))
+    return False
+
+
 _vehicle_invalid_park_rehome = None
 
 
@@ -3156,7 +3553,7 @@ def set_vehicle_invalid_park_rehome(fn):
     """Register fn(game, veh, park_room, owner) -> room_key or None.
 
     When ``save_parking_state`` scrubs an invalid curb, the hook may send
-    no-park plazas to municipal impound instead of a random neighbor exit.
+    off-Earth parks to municipal impound instead of a random neighbor exit.
     Pass None to clear.
     """
     global _vehicle_invalid_park_rehome
@@ -3320,6 +3717,7 @@ _dungeon_entry_refusal = None
 # returns a player-facing refusal string to block the drop, or None to allow
 # it. fn(character, item) -> str | None.
 _item_drop_refusal = None
+_item_give_refusal = None
 _inventory_item_match_rank = None
 
 # Clear a character's dual-layer overland coordinates when they step into a
@@ -3590,6 +3988,23 @@ def item_drop_refusal(character, item):
     return None
 
 
+def set_item_give_refusal(fn):
+    """Register fn(character, item) -> str|None for item-give gates.
+
+    A returned string is shown to the giver and blocks the transfer; None
+    allows it. Pass None to restore the no-op default.
+    """
+    global _item_give_refusal
+    _item_give_refusal = fn
+
+
+def item_give_refusal(character, item):
+    """Return an item-give refusal message, or None to allow the give."""
+    if _item_give_refusal is not None:
+        return _item_give_refusal(character, item)
+    return None
+
+
 def set_inventory_item_match_rank(fn):
     """Register fn(character, item) -> int for duplicate inventory picks.
 
@@ -3780,6 +4195,7 @@ def auto_deploy_map_heal(root):
 # Games register real implementations in supers/bootstrap.py register_all_hooks.
 
 _is_gm_spirit = None
+_is_rpc_staff = None
 _resolve_gm_body = None
 _stamp_input_activity = None
 _blob_codec_reload = None
@@ -3808,6 +4224,7 @@ _say_drunk_meter = None
 _say_slur_text = None
 _say_drunk_tag = None
 _say_maybe_stumble_tell = None
+_say_voice_mod = None
 _deliver_say = None
 
 _autoloot_is_combat_zone = None
@@ -3836,6 +4253,19 @@ def is_gm_spirit(character):
     """True when character is a GM staff spirit (not a playable body)."""
     if _is_gm_spirit is not None:
         return _is_gm_spirit(character)
+    return False
+
+
+def set_is_rpc_staff(fn):
+    """Register fn(character) -> bool for Roleplay Council / GM staff chat."""
+    global _is_rpc_staff
+    _is_rpc_staff = fn
+
+
+def is_rpc_staff(character):
+    """True for GMs or player archangels (RPC) -- never immersion NPCs."""
+    if _is_rpc_staff is not None:
+        return _is_rpc_staff(character)
     return False
 
 
@@ -3877,6 +4307,28 @@ def reload_blob_codec():
     """Reload game blob codec from disk before copyover snapshot."""
     if _blob_codec_reload is not None:
         _blob_codec_reload()
+
+
+# Post-overlay diagnostics (auto_deploy). Games register extra warning
+# lines (e.g. SUPERS cuff blob_fragment probe, bug 739). Not gameplay.
+_post_overlay_game_checks = None
+
+
+def set_post_overlay_game_checks(fn):
+    """Register fn() -> list[str] for deploy_guard overlay diagnostics."""
+    global _post_overlay_game_checks
+    _post_overlay_game_checks = fn
+
+
+def post_overlay_game_checks():
+    """Game-registered post-overlay warnings; default empty."""
+    if _post_overlay_game_checks is None:
+        return []
+    try:
+        out = _post_overlay_game_checks()
+        return list(out) if out else []
+    except Exception as exc:
+        return [f"post-overlay game check failed: {exc}"]
 
 
 def set_taxi_mode_saver(fn):
@@ -3985,7 +4437,14 @@ def set_map_store_append_hand_rooms(fn):
     _map_store_append_hand_rooms = fn
 
 
-def map_store_append_hand_rooms(game, anchor_room, new_rooms, *, extra_exits=None):
+def map_store_append_hand_rooms(
+    game,
+    anchor_room,
+    new_rooms,
+    *,
+    extra_exits=None,
+    skip_amenity_catchup=False,
+):
     """Batch-create hand rooms + persist JSON (SUPERS ``map_store`` hook)."""
     if _map_store_append_hand_rooms is None:
         raise RuntimeError(
@@ -3993,7 +4452,11 @@ def map_store_append_hand_rooms(game, anchor_room, new_rooms, *, extra_exits=Non
             "(supers.bootstrap.register_core_hooks)."
         )
     return _map_store_append_hand_rooms(
-        game, anchor_room, new_rooms, extra_exits=extra_exits,
+        game,
+        anchor_room,
+        new_rooms,
+        extra_exits=extra_exits,
+        skip_amenity_catchup=skip_amenity_catchup,
     )
 
 
@@ -4109,6 +4572,18 @@ def set_say_maybe_stumble_tell(fn):
 def say_maybe_stumble_tell(character, level):
     if _say_maybe_stumble_tell is not None:
         return _say_maybe_stumble_tell(character, level)
+    return None
+
+
+def set_say_voice_mod(fn):
+    global _say_voice_mod
+    _say_voice_mod = fn
+
+
+def say_voice_mod(character):
+    """Return third-person voice flavor for ``say`` (e.g. ``in a gravelly voice``)."""
+    if _say_voice_mod is not None:
+        return _say_voice_mod(character)
     return None
 
 
@@ -4732,6 +5207,21 @@ def stamp_lodging_room(room):
     """Apply game lodging room stamp hook, or no-op."""
     if _lodging_room_stamper is not None:
         _lodging_room_stamper(room)
+
+
+def set_lodging_look_home_detail_lines(fn):
+    """Register fn(room, game, character=None) -> list[str] for look houses."""
+    global _lodging_look_home_detail_lines
+    _lodging_look_home_detail_lines = fn
+
+
+def lodging_look_home_detail_lines(room, game, character=None):
+    """For-sale home rows, or [] when no game / no listings."""
+    if _lodging_look_home_detail_lines is not None:
+        result = _lodging_look_home_detail_lines(room, game, character)
+        if result:
+            return list(result)
+    return []
 
 
 # --- Paced travel hooks (H3b) --------------------------------------------

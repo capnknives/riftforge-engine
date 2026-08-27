@@ -7,9 +7,11 @@ reboot via a seeded RNG. Tornadoes are rare severe overlays that move
 on the America atlas and can injure unsheltered people in town cells.
 
 Player surfaces: ``weather`` / ``forecast``, outdoor look clauses,
-hybrid look vision (always-on hard-to-see overlay + chance whiteout),
-radio / Discord WX (scheduled top-of-hour every 4 game-hours), sparse
-atmospheric beats. Staff: ``gm weather``.
+hybrid look vision (storms, tornadoes, and blowing snow -- ordinary
+snow is look flavor only), geography bands so generic atlas land is
+not one nationwide plains roll, radio / Discord WX (scheduled
+top-of-hour every 4 game-hours), sparse atmospheric beats. Staff:
+``gm weather``.
 
 CONUS mechanics apply only to prime-material (Earth) rooms. Every public
 surface below is gated on ``elemental.is_elemental_realm`` and, for a
@@ -146,10 +148,13 @@ ATMOS_COOLDOWN_TICKS = {
 # Bare outdoor look: chance to hide desc / people / items / exits.
 # Rain gets overlay only (no whiteout). Nearby tornado uses the
 # ``tornado`` key even when the day-condition is not storm.
+# Ordinary snow is look flavor only -- whiteout is reserved for
+# strong-wind snow (blizzard-like). Gusty snow uses overlay, no wipe.
 VISION_WHITEOUT_CHANCE = {
     "rain": 0.0,
     "storm": 0.32,
-    "snow": 0.38,
+    "snow": 0.0,       # gusty snow: overlay only
+    "blizzard": 0.38,  # snow + strong wind
     "tornado": 0.55,
 }
 # Car windows soften whiteout; auto-look after a step rarely whites out.
@@ -317,7 +322,7 @@ def _macro_xy_for_room(room, game, character=None):
                 return (int(oex[0]), int(oex[1]))
             except (TypeError, ValueError):
                 pass
-    return (35, 10)  # Lebanon default
+    return (44, 32)  # Lebanon default (CONUS atlas)
 
 
 def _override_map(pack):
@@ -347,6 +352,52 @@ def _glyph_at(game, mx, my):
         return None
 
 
+def _climate_band_for_xy(mx, my):
+    """Pick a CONUS climate region from atlas coordinates.
+
+    The 78x18 America atlas uses x west→east and y south→north (Miami
+    is about (57, 2), Seattle (7, 15), Lebanon (35, 10)). Hub
+    ``atlas_overrides`` still win; this is the fill so generic land
+    glyphs are not one nationwide Great Plains roll.
+    """
+    try:
+        x, y = int(mx), int(my)
+    except (TypeError, ValueError):
+        return FALLBACK_REGION
+    # West coast / desert.
+    if x <= 16:
+        if y >= 13:
+            return "pacific_nw"
+        if y >= 6:
+            return "california"
+        return "southwest_desert"
+    # Rockies / Great Basin / southwest.
+    if x <= 31:
+        if y >= 8:
+            return "rockies"
+        if y <= 5:
+            return "southwest_desert"
+        return "interior_west"
+    # Continental plains (Kansas, Nebraska, north Texas).
+    if x <= 44:
+        if y <= 3:
+            return "gulf_coast"
+        return "great_plains"
+    # Lakes vs inland south.
+    if x <= 56:
+        if y >= 10:
+            return "great_lakes"
+        if y <= 4:
+            return "gulf_coast"
+        return "southeast"
+    # East seaboard.
+    if y >= 9:
+        return "northeast"
+    if y <= 4:
+        return "gulf_coast"
+    return "southeast"
+
+
 def _nearest_land_region(game, mx, my, pack, overrides):
     """BFS to nearest non-water cell with a resolvable region."""
     from collections import deque
@@ -364,12 +415,8 @@ def _nearest_land_region(game, mx, my, pack, overrides):
             return overrides[(x, y)]
         g = _glyph_at(game, x, y)
         if g is not None and g not in water:
-            mapped = glyph_default.get(g, FALLBACK_REGION)
-            if mapped:
-                return mapped
-            # Landmark letters / roads → plains default.
-            if g not in water:
-                return FALLBACK_REGION
+            # Geography band, not glyph_default plains-for-all-land.
+            return _climate_band_for_xy(x, y)
         for dx, dy in (
             (0, -1), (0, 1), (-1, 0), (1, 0),
             (-1, -1), (1, -1), (-1, 1), (1, 1),
@@ -393,35 +440,31 @@ def resolve_region(room, game, character=None):
         # Authored zone JSON sometimes stamps climate on the room dict
         # only; also check game.zones metadata when present.
         zkey = getattr(room, "zone", None)
-        if isinstance(zkey, str) and game is not None:
-            zones = getattr(game, "zones", None) or {}
-            zmeta = zones.get(zkey) if isinstance(zones, dict) else None
-            if isinstance(zmeta, dict) and zmeta.get("climate_region"):
-                return str(zmeta["climate_region"])
+        if isinstance(zkey, str):
+            if game is not None:
+                zones = getattr(game, "zones", None) or {}
+                zmeta = zones.get(zkey) if isinstance(zones, dict) else None
+                if isinstance(zmeta, dict) and zmeta.get("climate_region"):
+                    return str(zmeta["climate_region"])
             # Lebanon town pocket → great_plains without atlas stamp.
             if "lebanon" in zkey.lower():
                 return "great_plains"
 
     mx, my = _macro_xy_for_room(room, game, character)
     overrides = _override_map(pack)
-    # 2–3. Atlas override at cell.
+    # 2–3. Atlas override at cell (hubs / explicit paint).
     if (mx, my) in overrides:
         return overrides[(mx, my)]
-    # 4. Glyph heuristic (+ nearest land for water).
+    # 4. Water → nearest land. Other land uses a longitude/latitude band
+    # so driving east of Kansas is not the same Great Plains snapshot.
     glyph = _glyph_at(game, mx, my)
     glyph_default = pack.get("glyph_default") or {}
-    if glyph is not None:
-        mapped = glyph_default.get(glyph, "__missing__")
-        if mapped is None:
-            return _nearest_land_region(game, mx, my, pack, overrides)
-        if mapped != "__missing__":
-            return str(mapped)
-        # Unknown glyph (hub letter, highway): treat as land → plains/nearest.
-        if glyph in ("~", "o"):
-            return _nearest_land_region(game, mx, my, pack, overrides)
-        return FALLBACK_REGION
-    # 5. Fallback.
-    return FALLBACK_REGION
+    water = {g for g, rid in glyph_default.items() if rid is None}
+    if glyph is not None and glyph in water:
+        return _nearest_land_region(game, mx, my, pack, overrides)
+    # 5. Geography fill (generic plains glyph, roads, hub letters, or
+    # no atlas loaded yet).
+    return _climate_band_for_xy(mx, my)
 
 
 # ---------------------------------------------------------------------------
@@ -520,8 +563,8 @@ def _period_temp_factor(period):
     }.get(period or "day", 0.7)
 
 
-def _forecast_line(condition, season, rng):
-    """One short outlook stub."""
+def _forecast_line(condition, season, rng, wind=""):
+    """One short outlook stub. Strong-wind snow reads as blowing snow."""
     options = {
         "clear": (
             "Skies stay fair through the next watch.",
@@ -547,8 +590,15 @@ def _forecast_line(condition, season, rng):
             "Snow tapers; roads stay slick overnight.",
             "Additional flurries possible toward morning.",
         ),
+        "blizzard": (
+            "Blowing snow; travel delayed overnight.",
+            "Strong wind keeps drifts moving through morning.",
+        ),
     }
-    pool = list(options.get(condition, options["cloudy"]))
+    key = condition
+    if condition == "snow" and (wind or "").lower() == "strong":
+        key = "blizzard"
+    pool = list(options.get(key, options["cloudy"]))
     if season == "winter" and condition == "rain":
         pool.append("Rain may mix with ice on untreated roads.")
     return rng.choice(pool)
@@ -609,7 +659,7 @@ def _roll_region_day(game, region_id, cal=None):
         "wind": wind,
         "season": season,
         "day_period": period,
-        "forecast": _forecast_line(condition, season, rng),
+        "forecast": _forecast_line(condition, season, rng, wind),
         "rolled_at_tick": ticks,
         "region": region_id,
         "region_name": region_display_name(region_id),
@@ -771,11 +821,12 @@ def report_lines(game, room=None, character=None):
     period = w.get("day_period") or "day"
     forecast = w.get("forecast") or "Conditions unchanged."
     region = w.get("region_name") or region_display_name(w.get("region"))
+    disp = _condition_display(cond, wind)
     lines = [
-        f"Regional conditions ({region}) for {date_bit}: {cond}, "
+        f"Regional conditions ({region}) for {date_bit}: {disp}, "
         f"about {temp} degrees, {wind} wind, {period}.",
         f"Forecast: {forecast}",
-        f"Traveler advisory: roads are ordinary for {cond} weather.",
+        f"Traveler advisory: roads are ordinary for {disp} weather.",
     ]
     if w.get("tornado_watch") or _region_has_active_tornado(game, w.get("region")):
         lines.insert(
@@ -797,7 +848,8 @@ def current_blurb(character=None):
     if game is None:
         return "Conditions ordinary; check the weather dial for a bulletin."
     w = weather_for_room(room, game, character) if room else snapshot(game)
-    bit = f"{w['condition']}, about {w['temp_f']}F, {w.get('wind', 'calm')} wind"
+    disp = _condition_display(w.get("condition"), w.get("wind"))
+    bit = f"{disp}, about {w['temp_f']}F, {w.get('wind', 'calm')} wind"
     if _nearby_tornado(game, room, character):
         return f"[WARNING] Tornado threat nearby. {bit}."
     return f"{bit}."
@@ -842,6 +894,54 @@ def _pit_look_clause(room, *, screenreader=False):
     return f"[WX] {line}"
 
 
+def _condition_display(condition, wind=""):
+    """Player-facing condition words. Stored id stays snow/rain/storm."""
+    wind = (wind or "").lower()
+    if condition == "snow" and wind == "strong":
+        return "blowing snow"
+    if condition == "snow" and wind == "gusty":
+        return "wind-driven snow"
+    return condition or "clear"
+
+
+def _vision_severity(condition, wind="", tornado_near=False):
+    """Internal vision key, or None when look should not fight the player.
+
+    Ordinary snow (calm / light / moderate wind) stays on the [WX] look
+    line only. Gusty snow gets a soft overlay. Strong-wind snow is the
+    blizzard whiteout. Storms and nearby tornadoes keep their own keys.
+    """
+    if tornado_near:
+        return "tornado"
+    if condition == "rain":
+        return "rain"
+    if condition == "storm":
+        return "storm"
+    if condition == "snow":
+        wind = (wind or "").lower()
+        if wind == "strong":
+            return "blizzard"
+        if wind == "gusty":
+            return "snow"
+        return None
+    return None
+
+
+def _room_vision_token(room):
+    """Per-room seed so whiteout is not one all-day region-wide coin flip.
+
+    Same room + same game-day stays stable (snoop / replay). Different
+    streets can differ. Internal token only -- never player prose.
+    """
+    key = getattr(room, "key", None)
+    if key:
+        return str(key)
+    om = getattr(room, "overland_macro", None)
+    if isinstance(om, (list, tuple)) and len(om) == 2:
+        return f"macro:{om[0]}:{om[1]}"
+    return "anon"
+
+
 def look_clause(room, game, *, screenreader=False, character=None):
     """One look-line for weather (outdoor full / indoor dampen).
 
@@ -879,10 +979,11 @@ def look_clause(room, game, *, screenreader=False, character=None):
             f"[WX] {cond}, about {temp} F, {wind} wind."
         )
     if outdoor:
+        disp = _condition_display(cond, wind)
         if screenreader:
-            base = f"Weather: {cond}. {wind} wind. About {temp} F."
+            base = f"Weather: {disp}. {wind} wind. About {temp} F."
         else:
-            base = f"[WX] {cond}, about {temp} F, {wind} wind."
+            base = f"[WX] {disp}, about {temp} F, {wind} wind."
         ambient = _look_ambient_line(cond, wind, screenreader=screenreader)
         if ambient:
             return f"{base} {ambient}"
@@ -928,6 +1029,12 @@ def assess_look_vision(
     """
     if room is None or game is None or character is None:
         return None
+    # Staff GM form: full situational awareness -- no weather whiteout or
+    # hard-to-see overlay (bug report 804 / TRUE_GM_SIGHT ops expectation).
+    from engine.command_support import staff_perfect_vision
+
+    if staff_perfect_vision(character):
+        return None
     if _is_elemental_realm(room):
         # Ambient-only: never fight the player for vision on a Reach.
         return None
@@ -941,13 +1048,12 @@ def assess_look_vision(
 
     w = weather_for_room(room, game, character)
     cond = w.get("condition") or "clear"
+    wind = w.get("wind") or "calm"
     near = _nearby_tornado(game, room, character, radius=1)
-    # Severity key: funnel nearby beats day-condition.
-    if near:
-        severity = "tornado"
-    elif cond in ("rain", "storm", "snow"):
-        severity = cond
-    else:
+    # Severity: funnel nearby beats day-condition. Ordinary snow does
+    # not fight vision -- only gusty overlay / strong-wind blizzard.
+    severity = _vision_severity(cond, wind, tornado_near=bool(near))
+    if severity is None:
         return None
 
     overlay = _vision_overlay_line(severity, screenreader=screenreader)
@@ -960,24 +1066,25 @@ def assess_look_vision(
     if after_move:
         chance *= VISION_AFTER_MOVE_WHITEOUT_MULT
 
-    # Seed whiteout the same way day-condition rolls are seeded -- unseeded
-    # ``random`` made outdoor snow/storm looks nondeterministic (and often
-    # wiped people/items on a fresh tick-0 boot). Callers may still pass
-    # an explicit ``rng`` for tests.
+    # Seed whiteout per room + region-day so one coin flip cannot sock
+    # in the entire Great Plains all day. Callers may still pass an
+    # explicit ``rng`` for tests.
     if rng is not None:
         roller = rng
     else:
         cal = _cal(game)
         doy = _day_of_year(cal)
         rid = resolve_region(room, game, character)
+        token = _room_vision_token(room)
         roller = _rng_for(
-            int(cal.get("year") or 2015), doy, f"{rid}:vision",
+            int(cal.get("year") or 2015), doy, f"{rid}:vision:{token}",
         )
     whiteout = bool(chance > 0 and roller.random() < chance)
     fail_line = None
     if whiteout:
+        fail_key = "snow" if severity == "blizzard" else severity
         fail_line = _vision_fail_line(
-            severity, screenreader=screenreader, rng=roller,
+            fail_key, screenreader=screenreader, rng=roller,
         )
     return {
         "overlay": overlay,
@@ -992,7 +1099,8 @@ def _vision_overlay_line(severity, *, screenreader=False):
         lines = {
             "rain": "Weather: rain makes it hard to see far.",
             "storm": "Weather: storm curtains make it hard to see far.",
-            "snow": "Weather: blowing snow cuts visibility.",
+            "snow": "Weather: wind-driven snow makes the far ground hard to pick out.",
+            "blizzard": "Weather: blowing snow cuts visibility to a few paces.",
             "tornado": (
                 "Weather warning: debris and rain make it almost "
                 "impossible to see."
@@ -1002,7 +1110,8 @@ def _vision_overlay_line(severity, *, screenreader=False):
         lines = {
             "rain": "[WX] Rain sheets make it hard to see far.",
             "storm": "[WX] Curtains of rain and wind make it hard to see far.",
-            "snow": "[WX] Blowing snow cuts visibility to a few paces.",
+            "snow": "[WX] Wind-driven snow makes the far ground hard to pick out.",
+            "blizzard": "[WX] Blowing snow cuts visibility to a few paces.",
             "tornado": (
                 "[WX] Debris and rain whip past; you can barely see."
             ),
@@ -1069,9 +1178,10 @@ def player_weather_report(character, game):
             f"{_elemental_flavor_line(room)}"
         )
     w = weather_for_room(room, game, character)
+    disp = _condition_display(w.get("condition"), w.get("wind"))
     lines = [
         f"[WX] {w.get('region_name') or region_display_name(w.get('region'))}",
-        f"Condition: {w['condition']}. Temp: about {w['temp_f']} F "
+        f"Condition: {disp}. Temp: about {w['temp_f']} F "
         f"(day range {w.get('tmin_f')}–{w.get('tmax_f')} F).",
         f"Wind: {w.get('wind')}. Period: {w.get('day_period')}.",
         f"Forecast: {w.get('forecast')}",
@@ -1093,9 +1203,10 @@ def player_forecast_report(character, game):
             f"{_elemental_flavor_line(room)}"
         )
     w = weather_for_room(room, game, character)
+    disp = _condition_display(w.get("condition"), w.get("wind"))
     return (
         f"[WX] Forecast ({w.get('region_name')}): {w.get('forecast')}\r\n"
-        f"Now: {w['condition']}, about {w['temp_f']} F, {w.get('wind')} wind."
+        f"Now: {disp}, about {w['temp_f']} F, {w.get('wind')} wind."
     )
 
 
@@ -1314,10 +1425,11 @@ def _step_tornado(game, track):
     if rng.random() < 0.35:
         track["heading"] = _veer_heading(track.get("heading") or "n", rng)
     dx, dy = _HEADING_DELTA.get(track.get("heading") or "n", (0, -1))
-    mx, my = track.get("macro_xy") or (35, 10)
+    mx, my = track.get("macro_xy") or (44, 32)
     nx, ny = int(mx) + dx, int(my) + dy
-    # Atlas bounds (78×18).
-    if nx < 0 or ny < 0 or nx >= 78 or ny >= 18:
+    from engine.systems import overland as overland_mod
+
+    if not overland_mod.clamp_macro(nx, ny):
         return False
     if _is_ocean_cell(game, nx, ny):
         return False
@@ -1404,7 +1516,7 @@ def _macro_is_settled(game, mx, my):
     except Exception:
         pass
     # Lebanon coords always count.
-    return (mx, my) in ((35, 10), (35, 11), (36, 10))
+    return (mx, my) in ((44, 32), (44, 33), (45, 32))
 
 
 def _characters_on_macro(game, mx, my):
@@ -1580,7 +1692,7 @@ def _maybe_natural_tornado(game, region_id, snap):
         if r.get("region") == region_id
     ]
     if not candidates:
-        candidates = [(35, 10)]
+        candidates = [(44, 32)]
     rng = _rng_for(snap.get("year"), snap.get("day_of_year"), f"spawn:{region_id}")
     mx, my = rng.choice(candidates)
     spawn_tornado(game, mx=mx, my=my, natural=True)
@@ -1596,14 +1708,17 @@ def _home_bulletin_line(state):
     period = state.get("day_period") or "day"
     forecast = state.get("forecast") or "Conditions unchanged."
     region = state.get("region_name") or region_display_name(HOME_REGION)
+    disp = _condition_display(cond, wind)
     line = (
-        f"Local conditions ({region}): {cond}, about {temp} degrees, "
+        f"Local conditions ({region}): {disp}, about {temp} degrees, "
         f"{wind} wind, {period}. Forecast: {forecast}"
     )
-    kind = "warning" if cond in ("storm", "snow") else "weather"
+    kind = "weather"
     if cond == "storm":
+        kind = "warning"
         line = f"Severe weather watch -- {line}"
-    elif cond == "snow":
+    elif cond == "snow" and (wind or "").lower() in ("gusty", "strong"):
+        kind = "warning"
         line = f"Winter travel advisory -- {line}"
     if state.get("tornado_watch"):
         kind = "warning"

@@ -93,7 +93,10 @@ COLORS = {
     "combat_in": "\x1b[31m",
     "combat_other": "\x1b[37m",
     "combat_mitigate": "\x1b[90m",
-    "ooc": "\x1b[90m",
+    # OOC / questions *body* (parens + letters are layered separately).
+    # White at 16-color so gold OOC letters pop; not dim grey (90) that
+    # vanished into room chrome.
+    "ooc": "\x1b[37m",
     "say": "\x1b[37m",
     "emote": "\x1b[35m",
     "tell": "\x1b[36m",
@@ -146,7 +149,9 @@ COLORS_XTERM256 = {
     "combat_in": "\x1b[38;5;174m",
     "combat_other": "\x1b[38;5;250m",
     "combat_mitigate": "\x1b[38;5;242m",
-    "ooc": "\x1b[38;5;245m",
+    # Warm parchment -- distinct from room prose grey (250) so global
+    # OOC does not blend into look text (player report 2026-08-26).
+    "ooc": "\x1b[38;5;187m",
     "say": "\x1b[38;5;111m",
     "emote": "\x1b[38;5;97m",
     "tell": "\x1b[38;5;110m",
@@ -221,6 +226,43 @@ def paint(role, text, depth="ansi"):
     if code is None:
         return text
     return f"{code}{text}{RESET}"
+
+
+# Mudlet auto-detects https:// only when the URL is not inside an ANSI span.
+# Login splash uses _login_discord_splash_line for the same reason; staff chat
+# and Kokid wiznet lines need the same treatment.
+_URL_SPAN_RE = re.compile(r"https?://[^\s<>\"]+")
+
+
+def _trim_trailing_url_punct(url):
+    """Drop sentence punctuation glued to a URL (not part of the path)."""
+    while url and url[-1] in ".,;:!?)":
+        url = url[:-1]
+    return url
+
+
+def paint_preserving_urls(role, text, depth="ansi"):
+    """Paint *text* but leave ``http(s)://`` spans bare for Mudlet click-detect."""
+    if not text:
+        return text
+    text = str(text)
+    parts = []
+    last = 0
+    for match in _URL_SPAN_RE.finditer(text):
+        if match.start() > last:
+            parts.append(paint(role, text[last:match.start()], depth=depth))
+        raw = match.group(0)
+        url = _trim_trailing_url_punct(raw)
+        parts.append(url)
+        tail = raw[len(url):]
+        if tail:
+            parts.append(paint(role, tail, depth=depth))
+        last = match.end()
+    if last < len(text):
+        parts.append(paint(role, text[last:], depth=depth))
+    if not parts:
+        return paint(role, text, depth=depth)
+    return "".join(parts)
 
 
 def paint_blood(text, depth="ansi"):
@@ -304,6 +346,27 @@ def strip_paint_markup(text):
     if "<" not in plain:
         return plain
     return _TAG_RE.sub("", plain)
+
+
+def literal_angle_syntax(text):
+    """Show command placeholder syntax without raw ``<tag>`` angle brackets.
+
+    ``format_commands_list`` one-liners repeat syntax like ``<item>`` and
+    ``<name>``. Those strings are painted, not passed through ``render()``,
+    but many telnet clients still treat ``<word>`` as markup (MUD color
+    tags, MXP, or the same tag names as ``COLORS``). A lone ``<item>`` can
+    open styling that never closes and makes later lines (``[GM]``,
+    ``[TRAIL]``, …) look bold until the client restarts.
+
+    Replace ``<`` / ``>`` with single guillemets so placeholders stay
+    readable (``‹name›``) without tripping client parsers.
+    """
+    if not text:
+        return text
+    s = str(text)
+    if "<" not in s and ">" not in s:
+        return s
+    return s.replace("<", "\u2039").replace(">", "\u203a")
 
 
 def visible_len(text):
@@ -497,10 +560,33 @@ LOGIN_CREATOR = "CapnKnives"
 LOGIN_ENGINE = "Riftforge"
 LOGIN_STATUS = "Pre-alpha"
 # Community invite shown on the connect splash (staff override via gm gamestate).
-LOGIN_DISCORD_URL = "https://discord.gg/pyxTSc5Td"
+# Public site / gateway read the same URL from ``.discord_invite.json`` after
+# GM ``discord invite`` (see ``supers.release_display.publish_discord_invite_json``).
+LOGIN_DISCORD_URL = "https://discord.com/invite/KZbeRd389"
+# Gitignored sidecar at repo root; nginx aliases GET /discord.json to this file.
+LOGIN_DISCORD_INVITE_JSON = ".discord_invite.json"
+# Gitignored who-count + last-change sidecar; nginx aliases GET /status.json.
+LOGIN_PUBLIC_STATUS_JSON = ".public_status.json"
 # Spaced title kept for the sighted who-list banner (brand continuity).
 # Login splash uses LOGIN_GAME_TITLE (unspaced) for TTS -- see format_login_banner.
 LOGIN_SPACED_TITLE = "M O R T A L S   &   M O N S T E R S"
+
+
+def _login_discord_splash_line(invite, width):
+    """Centered splash row: teal ``Discord:`` label, bare invite URL.
+
+    Mudlet auto-detects ``https://`` only when the URL is not inside an
+    ANSI span. ``paint()`` around the whole line brackets the scheme with
+    escape codes and breaks click-to-open; color the label only.
+    """
+    w = max(40, int(width))
+    label = "Discord: "
+    centered = pad(f"{label}{invite}", w, "center")
+    url_at = centered.find(invite)
+    if url_at < 0:
+        # Truncated invite — fall back to all-teal (link already unusable).
+        return paint("teal", centered)
+    return paint("teal", centered[:url_at]) + centered[url_at:]
 
 
 def format_login_banner(width=WHO_WIDTH, status_text=None, discord_url=None):
@@ -534,11 +620,11 @@ def format_login_banner(width=WHO_WIDTH, status_text=None, discord_url=None):
     )
     lines = ["", rule, title]
     invite = (discord_url or "").strip()
+    while invite and invite[-1] in ".,;":
+        invite = invite[:-1].rstrip()
     if invite:
-        # Label: value. for TTS; teal accent is decoration only.
-        lines.append(
-            paint("teal", pad(f"Discord: {invite}.", w, "center"))
-        )
+        # Bare URL (no trailing period, no ANSI wrap) for Mudlet click/copy.
+        lines.append(_login_discord_splash_line(invite, w))
     lines.extend([rule, ""])
     for line in blurb:
         lines.append(paint("muted", pad(line, w, "center")))
@@ -1191,7 +1277,9 @@ def format_commands_list(entries, *, gm_entries=None, width=TOME_WIDTH,
     def _entry_rows(label, blurb):
         """One verb row, plus hang-indented wrap lines for a long blurb."""
         label = str(label)
-        blurb = str(blurb).strip()
+        # Escape ``<arg>`` placeholders before paint/wrap (see
+        # ``literal_angle_syntax`` -- clients must not see raw ``<item>``).
+        blurb = literal_angle_syntax(str(blurb).strip())
         words = _soft_tokens(blurb) if blurb else []
         # Show the verb even when help_text is somehow empty.
         if not words:
@@ -1270,7 +1358,12 @@ def format_commands_list(entries, *, gm_entries=None, width=TOME_WIDTH,
         heavy,
         render("<gold> TOME: <dark_magenta>Commands"),
         heavy,
-        paint("dark_grey", " Type 'help <name>' for topics.  One-liners below."),
+        paint(
+            "dark_grey",
+            " Type 'help "
+            + literal_angle_syntax("<name>")
+            + "' for topics.  One-liners below.",
+        ),
         "",
     ]
     for label, blurb in entries or []:
@@ -1289,6 +1382,92 @@ def format_commands_list(entries, *, gm_entries=None, width=TOME_WIDTH,
         "muted",
         " For system topics (training, divine, death, ...), type: help",
     ))
+    lines.append(heavy)
+    return lines
+
+
+def format_commands_compact(entry_labels, *, gm_labels=None, width=TOME_WIDTH,
+                            screenreader=False):
+    """Compact ``commands`` index -- grouped alias labels only, no blurbs.
+
+    ``entry_labels`` / ``gm_labels`` are pre-sorted verb label strings
+    (``attack/kill``, ``n/s/e/w/...``, …). Full one-liners live on
+    ``commands detail`` or ``commands <verb>`` (``format_commands_list``).
+    """
+    labels = [str(x) for x in (entry_labels or [])]
+    gm_labels = [str(x) for x in (gm_labels or [])]
+    w = max(40, int(width))
+    indent = "  "
+
+    def _comma_rows(items):
+        """Wrap comma-separated labels to ``width`` without mid-label breaks."""
+        if not items:
+            return []
+        rows = []
+        current = indent
+        for label in items:
+            sep = "" if current == indent else ", "
+            trial = current + sep + label
+            if len(trial) > w and current != indent:
+                rows.append(current.rstrip())
+                current = indent + label
+            else:
+                current = trial
+        if current.strip():
+            rows.append(current.rstrip())
+        return rows
+
+    footer_sr = (
+        "Type commands <verb> for a one-line tip, or commands detail "
+        "for the full list. System topics: help."
+    )
+    footer_sighted = paint(
+        "muted",
+        " Type commands "
+        + literal_angle_syntax("<verb>")
+        + " for a one-line tip, or commands detail for the full list. "
+        + "System topics: help.",
+    )
+
+    if screenreader:
+        lines = ["", "Commands.", ""]
+        lines.extend(_comma_rows(labels))
+        if gm_labels:
+            lines.append("")
+            lines.append("GM COMMANDS:")
+            lines.extend(_comma_rows(gm_labels))
+        lines.append("")
+        lines.append(footer_sr)
+        lines.append("")
+        return lines
+
+    heavy = paint("dark_red", rule_equals(w))
+    light = paint("dark_grey", hrule(w))
+    lines = [
+        heavy,
+        render("<gold> TOME: <dark_magenta>Commands"),
+        heavy,
+        paint(
+            "dark_grey",
+            " Verb names only. "
+            + literal_angle_syntax("commands <verb>")
+            + " for a tip; commands detail for blurbs.",
+        ),
+        "",
+    ]
+    lines.extend(
+        [paint("silver", row) for row in _comma_rows(labels)]
+    )
+    if gm_labels:
+        lines.append("")
+        lines.append(paint("dark_magenta", "GM COMMANDS:"))
+        lines.append(paint("dark_grey", hrule(min(40, w))))
+        lines.extend(
+            [paint("silver", row) for row in _comma_rows(gm_labels)]
+        )
+    lines.append("")
+    lines.append(light)
+    lines.append(footer_sighted)
     lines.append(heavy)
     return lines
 

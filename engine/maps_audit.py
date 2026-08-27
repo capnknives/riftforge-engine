@@ -38,18 +38,6 @@ def builder_audit_lines(*, rooms, start_room=None):
     lines = []
     if start_room is None:
         lines.append("WARN no is_start room resolved at load")
-        description = getattr(room, "description", None) or ""
-        if not str(description).strip():
-            lines.append(f"WARN room {key!r}: missing description")
-        title = getattr(room, "title", None) or ""
-        area_type = getattr(room, "area_type", None) or ""
-        if area_type in ("city", "commercial", "wilderness") and not str(
-            title,
-        ).strip():
-            lines.append(
-                f"WARN room {key!r}: {area_type} room missing title "
-                "(ROOM NAME)"
-            )
 
     for key, room in sorted(rooms.items(), key=lambda item: str(item[0])):
         exits = getattr(room, "exits", None) or {}

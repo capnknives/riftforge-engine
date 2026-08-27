@@ -116,6 +116,15 @@ Call these **before** constructing `Character`s or loading a save:
 | Mine alloy recipes | `set_mine_alloy_recipes(fn)` | `[]` | `supers/mine/forge_recipes.py` |
 | Mine forge recipes | `set_mine_forge_recipes(fn)` | `[]` | `supers/mine/forge_recipes.py` |
 | Mine blast (parked) | `set_mine_blast(fn)` | no-op | GM `gm mine blast` test only in v1 |
+| Public watch (crowd traffic + watch room) | `set_public_watch_hooks(movement_hears_fn, is_watching_room_fn)` | `movement_hears_predicate` → `base_hears` unchanged; `is_watching_room` → `False` | `supers.public_watch` via `register_all_hooks` |
+| Helper query notify | `set_query_notify_hooks(event_fn, reporter_live_fn)` | no-op | `supers.query_notify` via `register_all_hooks` |
+| `look houses` detail rows | `set_lodging_look_home_detail_lines(fn)` | `[]` | `supers.lodging_browse.look_home_detail_lines` via `_register_lodging_walk_hooks` |
+| `open` / `close <dir>` structure doors | `set_try_directional_open(fn)` | `False` (fall through to container open) | `supers.doors.try_directional_open` via `register_all_hooks` |
+| Live roster mutate (fuel-loop index + Cadence caches) | `set_fuel_loop_roster_hook(fn)` | no-op | `supers.fuel.fuel_loop_roster_hook` via `register_core_hooks` |
+| Horse ride (scenic fuel) | `engine.systems.vehicles.set_vehicle_is_horse_ride` | `False` (stranded = out of gas) | `supers.bootstrap._register_vehicle_hooks` → `horses.is_horse_ride` (not `vehicle_is_motorcycle`, which SUPERS uses for open-top mount UX) |
+| Quest giver cast ensure | `engine.systems.quests.set_quest_ensure_giver` | no-op | `supers.quests.policy.register_quest_hooks` → `require_for_needed` + `maybe_restore_for_cast_key` |
+| Vault folded_by tag | `set_vault_folded_by(fn)` | `None` | `supers.fold_vault.vault_folded_by` |
+| Post-overlay game checks | `set_post_overlay_game_checks(fn)` | `[]` | `supers.bootstrap._post_overlay_cuff_checks` (cuff `blob_fragment` / `load_fragment` probe) |
 
 SUPERS auto-registers attach + blob when the `supers` package is imported
 (`supers.bootstrap.register_core_hooks`). Everything else (chargen, help,
@@ -383,7 +392,8 @@ Phases **H1–H7** landed on `feature/purity-h-track-remaining` (see
 `engine/map_ui.py`, `engine/systems/{vehicles,lodging,paced_travel,phone,appearance,persona_registry,relationships}`,
 `engine/map_store.py`, plus **H4** wiring (`hospital`→`clinic`, `crime`→`justice`).
 **Deep `player_shops` → `civic_shop`** remains DEFERRED. **H8** (kind
-grandparents) and **H9** (`v0.5.0` tag) **landed**; SUPERS pin is **`@v0.5.3`**.
+grandparents) and **H9** (`v0.5.0` tag) **landed**; SUPERS pin is **`@v0.6.1`**
+(2026-08-27; **`v0.6.0`** was 2026-08-21).
 
 
 ## Hook bundles (engine mudlib unification)

@@ -13,15 +13,15 @@ def _require_account(character, game):
     account = account_for_character(game, character)
     if account is None:
         character.session.send(
-            "Link an account first (help account). Blocks and public "
+            "Link an account first (help account). Mutes and public "
             "channels are stored on your account."
         )
         return None
     return account
 
 
-def cmd_block(character, args, game):
-    """Block an account on OOC and player public channels (not IC speech)."""
+def cmd_mute(character, args, game):
+    """Ignore an account on OOC and player public channels (not IC speech)."""
     account = _require_account(character, game)
     if account is None:
         return
@@ -31,8 +31,8 @@ def cmd_block(character, args, game):
     character.session.send(msg)
 
 
-def cmd_unblock(character, args, game):
-    """Clear an OOC/public-channel block for one account."""
+def cmd_unmute(character, args, game):
+    """Clear an OOC/public-channel ignore for one account."""
     account = _require_account(character, game)
     if account is None:
         return
@@ -42,8 +42,8 @@ def cmd_unblock(character, args, game):
     character.session.send(msg)
 
 
-def cmd_blocks(character, args, game):
-    """List accounts you block on OOC and player public channels."""
+def cmd_mutes(character, args, game):
+    """List accounts you ignore on OOC and player public channels."""
     account = _require_account(character, game)
     if account is None:
         return
@@ -52,12 +52,12 @@ def cmd_blocks(character, args, game):
     labels = ooc_list_blocked(game, account)
     if not labels:
         character.session.send(
-            "You are not blocking anyone on OOC or player public channels. "
-            "Use block <account|character> to mute an account out-of-character."
+            "You are not muting anyone on OOC or player public channels. "
+            "Use mute <account|character> to ignore an account out-of-character."
         )
         return
     character.session.send(
-        "Blocked on OOC / public channels (say, tell, phone unchanged):"
+        "Muted on OOC / public channels (say, tell, phone unchanged):"
     )
     for label in labels:
         character.session.send(f"  {label}")

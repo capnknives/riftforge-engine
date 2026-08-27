@@ -127,11 +127,21 @@ def normalize_query(raw):
 
 
 def parse_coordinates(raw):
-    """Return (x, y) ints from ``20 20`` / ``20,20``, or None."""
+    """Return (x, y) ints from ``20 20`` / ``20,20``, or None.
+
+    Two numbers with a space (or one comma) -- no parentheses -- so
+    screenreader players can type walk 20 5 / drive 35 10 the same way
+    sighted players do. Three-token strings like ``1 2 3`` do not match.
+    """
     match = _COORD_RE.match((raw or "").strip())
     if not match:
         return None
     return int(match.group(1)), int(match.group(2))
+
+
+def format_atlas_coords(x, y):
+    """Player-facing atlas cell with no parentheses (screenreader-safe)."""
+    return f"atlas {int(x)} {int(y)}"
 
 
 def _is_vnum_token(text):
@@ -312,15 +322,17 @@ def rooms_in_zone(game, zone):
     if not zone or game is None:
         return []
     rooms = getattr(game, "rooms", None) or {}
-    n = len(rooms)
+    from engine.char_index import room_graph_cache_token
+
+    token = room_graph_cache_token(game)
     cache = getattr(game, "_rooms_by_zone_cache", None)
-    if cache is None or cache[0] != n:
+    if cache is None or cache[0] != token:
         index = {}
         for room in rooms.values():
             z = getattr(room, "zone", None)
             if z:
                 index.setdefault(z, []).append(room)
-        game._rooms_by_zone_cache = (n, index)
+        game._rooms_by_zone_cache = (token, index)
         cache = game._rooms_by_zone_cache
     return list(cache[1].get(zone, ()))
 
@@ -435,8 +447,16 @@ def _hub_ok(hub, from_room, actor=None, game=None):
     )
 
 
-def next_hop_toward_destination(start, dest_key, actor=None, game=None):
-    """BFS first hop toward ``dest_key``, including pocket enter/exit edges."""
+def next_hop_toward_destination(start, dest_key, actor=None, game=None,
+                                max_nodes=600):
+    """BFS first hop toward ``dest_key``, including pocket enter/exit edges.
+
+    Caps expansions at ``max_nodes`` (default 600 -- same numeric cap as
+    sibling ``path_hop_distances_from`` / ``path_hop_count``, matching
+    ``supers.pathfind.HOMEWARD_BFS_MAX_NODES``). Engine cannot import
+    supers; without this cap a player ``walk`` / look-adjacent hop would
+    flood the ~12k-cell Earth atlas on one command.
+    """
     if start is None or not dest_key:
         return None
     if start.key == dest_key:
@@ -451,6 +471,8 @@ def next_hop_toward_destination(start, dest_key, actor=None, game=None):
         if neighbor is None or neighbor in seen:
             return
         if neighbor is start and hop is not None:
+            return
+        if max_nodes is not None and len(seen) >= max_nodes:
             return
         seen.add(neighbor)
         queue.append((neighbor, hop))
@@ -479,11 +501,15 @@ def next_hop_toward_destination(start, dest_key, actor=None, game=None):
             hop = ("exit", None) if first_hop is None else first_hop
             _push(exit_to, hop)
 
+    expanded = 0
     _expand(start, None)
     while queue:
         room, first_hop = queue.popleft()
         if room.key == dest_key:
             return first_hop
+        expanded += 1
+        if max_nodes is not None and expanded > max_nodes:
+            return None
         _expand(room, first_hop)
     return None
 

@@ -15,8 +15,10 @@ What this does:
     (owns public :4000), then run `server.py` as a child with IPC to the
     gateway. On .py / content change, SIGUSR1 the game so it announces
     (Veil / hold on) then exits; this wrapper respawns it — clients stay
-    on the gateway and get the settle line on reattach. Crashes still
-    hard-respawn (no time to announce).
+    on the gateway and get the settle line on reattach. SIGUSR1 waits for
+    ``.copyover_ready`` (veil open) so a merge storm cannot terminate a
+    child still inside ``Game()``. At most one copyover is queued. Crashes
+    still hard-respawn (no time to announce).
 
   - Hung game (PID alive, asyncio thread stuck): ``server.py`` touches
     ``.game_heartbeat`` each tick; if that stamp goes stale the watcher
@@ -55,7 +57,6 @@ Not meant for a real production deployment (polling is a blunt instrument)
 """
 
 import fnmatch
-import glob
 import importlib
 import os
 import signal
@@ -77,40 +78,75 @@ from engine import crash_recovery
 from engine import world_backup
 from engine import watcher_request
 
-POLL_SECONDS = 1.0        # how often to check for changed files
+# Default 5s -- 1s recursive glob+stat on Windows Docker bind-mounts pegs
+# a core (tools/ alone is ~1500 .py files). Copyover already waits
+# COPYOVER_SETTLE_SECONDS (default 30). Override with
+# RIFTFORGE_WATCH_POLL_SECONDS=1 for the old cadence.
+_POLL_SECONDS_DEFAULT = 5.0
 
-# Every .py file below this directory, plus world JSON (content/) and game
-# catalogs (supers/content/) -- either kind of change should trigger the
-# same hot-reload (map editor saves, item/origin/persona edits, etc.).
-#
-# Exception: content/maps/** and content/zones/** are NOT watched.
-# In-game ``room dig`` / ``rset`` and Area Studio Live-edit rewrite those
-# files while builders are inside; watching them used to SIGUSR1 a full
-# copyover mid-dig. Live rooms already update in-process; Studio pushes
-# go through ``supers.studio_reload`` (no process restart).
-_WATCHED_GLOBS = (
-    "**/*.py",
-    "content/**/*.json",
-    "supers/content/**/*.json",
-)
+# Populated on every ``_snapshot()`` call (wall/cpu ms + path counts).
+_LAST_SNAPSHOT_METRICS = {}
 
-# Relative path prefixes (POSIX or Windows) skipped even when they match
-# ``content/**/*.json`` above.
+# Directory names never descended (pruned in os.walk, not skip-after-glob).
+# tools/ is smoke/dev scripts -- not imported by server.py; watching them
+# was ~41% of the old **/*.py snapshot.
+_SKIP_DIR_NAMES = {
+    ".git",
+    "__pycache__",
+    "tools",
+    "backups",
+    ".cursor",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".junie",
+    ".claude",
+    ".vscode",
+    ".secrets",
+    "node_modules",
+}
+
+# Under content/, these trees are live-edited (dig / Studio) or snapshots.
+_CONTENT_SKIP_DIRS = {
+    "maps",
+    "zones",
+    "map_backups",
+    "map_archives",
+}
+
+# Relative path prefixes still skipped if a walk leaks a match.
 _COPYOVER_SKIP_PREFIXES = (
     "content/maps",
     "content/zones",
-    # Safety snapshots / nag state are not live runtime content. Room dig,
-    # remodel, and Studio saves refresh these paths on every validated map
-    # write; watching them caused an unnecessary copyover after each build.
     "content/map_backups",
     "content/map_archives",
     "backups",
+    "tools",
+)
+
+# Compiled / boot-rewritten JSON at content/ (not a live catalog). Boot and
+# auto-deploy rewrite changelog_index.json whenever CHANGELOG sources are
+# ahead; watching it copyover-stormed Azure playtest (Veil loop + mixed
+# imports like ``witch_veilform``). Same class as map_backups: artifact, not
+# a reason to SIGUSR1 the game.
+_COPYOVER_SKIP_FILES = (
+    "content/changelog_index.json",
 )
 
 
 def _repo_root():
     """Repo root (watch_and_run.py lives in engine/)."""
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def poll_seconds():
+    """Seconds between watcher snapshots (env ``RIFTFORGE_WATCH_POLL_SECONDS``)."""
+    raw = (os.environ.get("RIFTFORGE_WATCH_POLL_SECONDS") or "").strip()
+    if not raw:
+        return _POLL_SECONDS_DEFAULT
+    try:
+        return max(0.25, float(raw))
+    except ValueError:
+        return _POLL_SECONDS_DEFAULT
 
 
 def _copyover_boot_grace_seconds():
@@ -120,6 +156,31 @@ def _copyover_boot_grace_seconds():
         return max(0.0, float(raw))
     except ValueError:
         return 45.0
+
+
+def copyover_child_ready(
+    spawn_wall,
+    *,
+    boot_grace=None,
+    now=None,
+    root=None,
+):
+    """True when SIGUSR1 is safe: this spawn wrote ``.copyover_ready``.
+
+    Sending SIGUSR1 during ``Game()`` (handler not installed) is the
+    default terminate signal -- that is how merge storms killed a child
+    still loading SQLite. The child stamps ``.copyover_ready`` when look
+    works (copyover-recover skip included). Boot grace is kept on the
+    signature for callers but is not an extra wait after the stamp.
+    """
+    if spawn_wall is None:
+        return True
+    from engine import copyover as copyover_mod
+
+    # ``boot_grace`` / ``now`` are unused: the stamp is the gate. A 45s
+    # AND with grace would still delay SIGUSR1 after players can type.
+    _ = (boot_grace, now)
+    return copyover_mod.copyover_ready_since(spawn_wall, root=root)
 
 
 def _copyover_settle_seconds():
@@ -137,7 +198,7 @@ def _copyover_settle_seconds():
 
 
 def reload_auto_deploy():
-    """Reload apply_pr_fix + deploy_notify + hooks + auto_deploy from disk.
+    """Reload apply_pr_fix + deploy_notify + hooks + changelog stamp + auto_deploy.
 
     The watcher is long-lived (often PID 1). A one-shot ``from engine.auto_deploy
     import try_auto_deploy`` at boot keeps the pre-patch function forever after
@@ -147,20 +208,28 @@ def reload_auto_deploy():
     Reloads ``tools.apply_pr_fix`` first (protect lists), then
     ``engine.deploy_notify`` and ``engine.hooks`` (batch ``bug_ids`` /
     ``queue_catchup_resolves`` / map heal must match disk), then
-    ``engine.auto_deploy``. Call on every deploy poll.
+    ``engine.changelog_ids`` / ``engine.changelog_index`` (fill-stamp
+    ``#N``), then ``engine.discord_patch_notes`` (numbered Discord
+    footer), then ``engine.auto_deploy``. Call on every deploy poll.
 
     Without reloading ``deploy_notify``, a tip-only ``auto_deploy`` reload
     can call ``queue_deploy(..., bug_ids=...)`` against a stale module and
     error-loop every poll (reset --hard + protect restore → copyover churn).
     """
     import engine.auto_deploy as auto_deploy
+    import engine.changelog_ids as changelog_ids
+    import engine.changelog_index as changelog_index
     import engine.deploy_notify as deploy_notify
+    import engine.discord_patch_notes as discord_patch_notes
     import engine.hooks as hooks
     import tools.apply_pr_fix as apply_pr_fix
 
     importlib.reload(apply_pr_fix)
     importlib.reload(deploy_notify)
     importlib.reload(hooks)
+    importlib.reload(changelog_ids)
+    importlib.reload(changelog_index)
+    importlib.reload(discord_patch_notes)
     # Watcher is not the game child — bootstrap never re-registers map
     # heal after this hooks reload. Late-bind so the next reset --hard
     # actually merges content/map_backups into zone/map JSON.
@@ -179,6 +248,71 @@ def _gateway_mode():
     return raw not in ("0", "false", "False", "no", "NO")
 
 
+def _snap_log_enabled():
+    """True when snapshot cost lines go to docker logs (default on)."""
+    raw = os.environ.get("RIFTFORGE_WATCH_SNAP_LOG", "1").strip()
+    return raw not in ("0", "false", "False", "no", "NO")
+
+
+def _snap_warn_ms():
+    """Log when snapshot wall time meets or exceeds this (milliseconds)."""
+    raw = os.environ.get("RIFTFORGE_WATCH_SNAP_WARN_MS", "200").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 200.0
+
+
+def _snap_log_every():
+    """Log every Nth main poll tick even when wall time is below warn."""
+    raw = os.environ.get("RIFTFORGE_WATCH_SNAP_EVERY", "30").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 30
+
+
+def _path_git_hit(path):
+    """True when a glob hit touches ``.git`` (bind-mount noise diagnostic)."""
+    if path.startswith(".git") or path.startswith(".git" + os.sep):
+        return True
+    norm = path.replace("\\", "/")
+    if norm.startswith(".git/"):
+        return True
+    if "/.git/" in norm:
+        return True
+    if "\\.git\\" in path:
+        return True
+    return False
+
+
+def _maybe_log_snapshot_metrics(*, poll_tick, periodic_ok):
+    """Print one grep-friendly line when snapshot cost warrants it."""
+    if not _snap_log_enabled():
+        return
+    metrics = _LAST_SNAPSHOT_METRICS
+    if not metrics:
+        return
+    wall_ms = metrics.get("wall_ms", 0.0)
+    warn_ms = _snap_warn_ms()
+    every = _snap_log_every()
+    if wall_ms < warn_ms and not (
+        periodic_ok and poll_tick > 0 and (poll_tick % every) == 0
+    ):
+        return
+    print(
+        "[watch_and_run] snapshot "
+        f"wall_ms={wall_ms:.1f} "
+        f"cpu_ms={metrics.get('cpu_ms', 0.0):.1f} "
+        f"globbed={metrics.get('globbed', 0)} "
+        f"skipped={metrics.get('skipped', 0)} "
+        f"stated={metrics.get('stated', 0)} "
+        f"git_hits={metrics.get('git_hits', 0)} "
+        f"poll_s={poll_seconds()}",
+        flush=True,
+    )
+
+
 def _skip_copyover_path(path):
     """True when ``path`` must not trigger copyover.
 
@@ -187,6 +321,7 @@ def _skip_copyover_path(path):
     - ``content/maps`` / ``content/zones`` (dig + Studio live-edit)
     - ``content/map_backups`` / ``content/map_archives`` snapshot churn from
       validated map saves (backups + daily archive nag state)
+    - ``content/changelog_index.json`` (boot/deploy compiled ``changes`` feed)
     - Repo-root ad-hoc ``_*.py`` probes (``live_ssh.run_remote_script`` uses
       ``/tmp`` instead -- dropping ``_remote_probe*.py`` in the bind-mount
       used to SIGUSR1 mid-chargen in a tight loop)
@@ -196,6 +331,8 @@ def _skip_copyover_path(path):
     ``glob`` still match the skip list.
     """
     norm = os.path.normpath(path).replace("\\", "/")
+    if norm in _COPYOVER_SKIP_FILES:
+        return True
     for prefix in _COPYOVER_SKIP_PREFIXES:
         if norm == prefix or norm.startswith(prefix + "/"):
             return True
@@ -208,30 +345,88 @@ def _skip_copyover_path(path):
     return False
 
 
-def _snapshot():
-    """{path: mtime} for every watched file below this directory.
+def _rel_posix(path):
+    """Forward-slash relative path for skip/watch checks."""
+    return os.path.normpath(path).replace("\\", "/")
 
-    glob's `**` with recursive=True walks subdirectories too. `__pycache__`
-    is skipped -- .pyc files there change on every import and would cause a
-    restart LOOP (reload -> import -> .pyc changes -> reload -> ...).
-    Map/zone JSON under ``content/maps`` / ``content/zones`` is also
-    skipped, as are backup/archive snapshot trees under ``content/`` (see
-    ``_COPYOVER_SKIP_PREFIXES``).
+
+def _file_is_watched(rel):
+    """True when ``rel`` (from repo root) should be in the mtime snapshot."""
+    norm = _rel_posix(rel)
+    if _skip_copyover_path(norm):
+        return False
+    base = os.path.basename(norm)
+    if base.endswith(".py"):
+        return True
+    if base.endswith(".json") and (
+        norm.startswith("content/") or norm.startswith("supers/content/")
+    ):
+        return True
+    return False
+
+
+def _snapshot():
+    """{path: mtime} for watched runtime files below cwd.
+
+    Uses ``os.walk`` and prunes ``tools/``, ``.git``, ``backups/``,
+    ``content/maps``, ``content/zones``, and snapshot trees *before*
+    listing files -- skip-after-glob still paid the bind-mount walk.
+
+    Watches ``*.py`` (except pruned trees / root ``_*.py`` probes) plus
+    JSON under ``content/`` and ``supers/content/``. Map/zone JSON stays
+    off the copyover list (dig + Studio live-edit), as does the compiled
+    ``content/changelog_index.json`` feed (boot/deploy rewrite).
+
+    Updates ``_LAST_SNAPSHOT_METRICS`` (see ``RIFTFORGE_WATCH_SNAP_*``).
     """
+    wall_start = time.perf_counter()
+    cpu_start = time.process_time()
+    globbed = 0
+    skipped = 0
+    stated = 0
+    git_hits = 0
     snapshot = {}
-    for pattern in _WATCHED_GLOBS:
-        for path in glob.glob(pattern, recursive=True):
-            if "__pycache__" in path:
+    root = os.getcwd()
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = os.path.relpath(dirpath, root)
+        if rel_dir == ".":
+            rel_dir_posix = ""
+        else:
+            rel_dir_posix = _rel_posix(rel_dir)
+        dirnames[:] = [name for name in dirnames if name not in _SKIP_DIR_NAMES]
+        if rel_dir_posix == "content":
+            dirnames[:] = [
+                name for name in dirnames if name not in _CONTENT_SKIP_DIRS
+            ]
+        for name in filenames:
+            globbed += 1
+            rel = name if not rel_dir_posix else f"{rel_dir_posix}/{name}"
+            rel = _rel_posix(rel)
+            if _path_git_hit(rel):
+                git_hits += 1
+            if not _file_is_watched(rel):
+                skipped += 1
                 continue
-            if _skip_copyover_path(path):
-                continue
+            abs_path = os.path.join(dirpath, name)
             try:
-                snapshot[path] = os.path.getmtime(path)
+                snapshot[rel] = os.path.getmtime(abs_path)
+                stated += 1
             except OSError:
-                # A file can vanish between glob() listing it and us stat-ing
-                # it (e.g. an editor's atomic save briefly renames it) --
-                # harmless, just skip it this round.
+                # Vanishes between walk and stat (editor atomic save).
                 pass
+    wall_ms = (time.perf_counter() - wall_start) * 1000.0
+    cpu_ms = (time.process_time() - cpu_start) * 1000.0
+    _LAST_SNAPSHOT_METRICS.clear()
+    _LAST_SNAPSHOT_METRICS.update(
+        {
+            "wall_ms": wall_ms,
+            "cpu_ms": cpu_ms,
+            "globbed": globbed,
+            "skipped": skipped,
+            "stated": stated,
+            "git_hits": git_hits,
+        }
+    )
     return snapshot
 
 
@@ -275,23 +470,40 @@ def _reap_orphans(proc):
                 proc.returncode = -1
 
 
-def _spawn_game(env=None):
+def _spawn_game(env=None, *, cold=False):
     """Start server.py; return ``(Popen, spawn_wall_time)``.
 
     Clears any leftover ``.game_heartbeat`` so a previous child's last
     stamp cannot look like this new process is already healthy.
     Inherits env so ``RIFTFORGE_GATEWAY`` reaches the child.
+
+    ``cold=True`` is a compose / gateway bounce (full content ensures).
+    Default is a game-only reload: gateway holds clients; the child skips
+    historical boot heals (Evennia Server reload / Diku copyover_recover).
+    Direct telnet (gateway off) is always cold — deferred seed runs in
+    ``Game()`` and there is no portal to distinguish the two.
     """
     game_heartbeat.clear_heartbeat()
+    from engine import boot_kind as boot_kind_mod
     from engine import boot_stability
+    from engine import copyover as copyover_mod
+    from engine import crash_recovery
     from engine import env_file
 
     root = _repo_root()
+    crash_recovery.clear_gateway_ipc_down(root=root)
+    copyover_mod.clear_copyover_ready(root=root)
     env_file.apply_repo_env(root)
     boot_stability.reset_post_tick_counter()
+    if cold or not _gateway_mode():
+        kind = boot_kind_mod.COLD
+    else:
+        kind = boot_kind_mod.RELOAD
     child_env = os.environ.copy()
     if env:
         child_env.update(env)
+    child_env[boot_kind_mod.ENV_KEY] = kind
+    print(f"[watch] spawning game boot_kind={kind}", flush=True)
     proc = subprocess.Popen(
         [sys.executable, "server.py"],
         env=child_env,
@@ -574,7 +786,7 @@ def _maybe_watcher_request(
                 _stop_gateway(gateway_proc)
             new_gateway = _spawn_gateway()
             time.sleep(0.4)
-        new_proc, wall = _spawn_game()
+        new_proc, wall = _spawn_game(cold=True)
         return new_proc, wall, True, new_gateway
     if op == "revert_stable":
         ok, detail = crash_recovery.revert_to_last_stable(
@@ -646,7 +858,7 @@ def _maybe_watcher_request(
             flush=True,
         )
         crash_recovery.mark_planned_restart()
-        new_proc, wall = _spawn_game()
+        new_proc, wall = _spawn_game(cold=True)
         return new_proc, wall, True, gateway_proc
     return noop
 
@@ -669,9 +881,10 @@ def main():
     else:
         print("[watch] starting server.py (direct telnet, no gateway)", flush=True)
 
-    proc, game_spawn_wall = _spawn_game()
+    proc, game_spawn_wall = _spawn_game(cold=True)
     before = _snapshot()
     pending_copyover = False
+    copyover_wait_logged = False
     copyover_boot_grace = _copyover_boot_grace_seconds()
     copyover_settle_seconds = _copyover_settle_seconds()
     settle_deadline = None
@@ -679,6 +892,7 @@ def main():
     backup_running = False
     # Log boot/db hold once when respawn pauses — not every 1s poll tick.
     hold_pause_announced = False
+    poll_tick = 0
 
     # First load (and later deploy polls reload) so auto_deploy patches that
     # arrive via reset --hard actually run inside this long-lived watcher.
@@ -689,10 +903,16 @@ def main():
     auto_deploy.ensure_git_safe_directory(root)
 
     deploy_every = auto_deploy.poll_interval_seconds()
-    ticks_until_deploy = 0
+    seconds_until_deploy = 0.0
+    poll_s = poll_seconds()
+    print(
+        f"[watch] file poll every {poll_s:.1f}s "
+        f"(RIFTFORGE_WATCH_POLL_SECONDS, default {_POLL_SECONDS_DEFAULT:.0f})",
+        flush=True,
+    )
     print(
         f"[watch] auto-deploy polling every {deploy_every}s "
-        "(AUTO_DEPLOY=0 to disable; module reloads each poll)",
+        "(AUTO_DEPLOY=0 to disable; modules reload only when deploy is on)",
         flush=True,
     )
     if game_heartbeat.hang_check_enabled():
@@ -714,7 +934,9 @@ def main():
         )
 
     while True:
-        time.sleep(POLL_SECONDS)
+        poll_s = poll_seconds()
+        time.sleep(poll_s)
+        poll_tick += 1
 
         proc, new_wall, restarted, gateway_proc = _maybe_watcher_request(
             proc,
@@ -726,6 +948,7 @@ def main():
             if new_wall is not None:
                 game_spawn_wall = new_wall
             before = _snapshot()
+            _maybe_log_snapshot_metrics(poll_tick=poll_tick, periodic_ok=False)
             pending_copyover = False
             settle_deadline = None
             continue
@@ -808,7 +1031,7 @@ def main():
                 _stop_game(proc)
                 gateway_proc = _spawn_gateway()
                 time.sleep(0.4)
-                proc, game_spawn_wall = _spawn_game()
+                proc, game_spawn_wall = _spawn_game(cold=True)
                 before = _snapshot()
                 pending_copyover = False
                 settle_deadline = None
@@ -887,7 +1110,7 @@ def main():
                     _stop_gateway(gateway_proc)
                     gateway_proc = _spawn_gateway()
                     time.sleep(0.4)
-                    proc, game_spawn_wall = _spawn_game()
+                    proc, game_spawn_wall = _spawn_game(cold=True)
                     before = _snapshot()
                     pending_copyover = False
                     settle_deadline = None
@@ -971,25 +1194,54 @@ def main():
                 pending_copyover = False
                 before = _snapshot()
                 continue
-            if (time.time() - game_spawn_wall) >= copyover_boot_grace:
+            if copyover_child_ready(
+                game_spawn_wall,
+                boot_grace=copyover_boot_grace,
+                root=root,
+            ):
                 print(
                     "[watch] deferred copyover -- signaling game "
-                    "(boot grace elapsed; gateway holds clients)",
+                    "(copyover ready; gateway holds clients)",
                     flush=True,
                 )
                 if not _signal_planned_copyover(proc):
                     _stop_game(proc)
                     proc, game_spawn_wall = _spawn_game()
                 pending_copyover = False
+                copyover_wait_logged = False
                 settle_deadline = None
                 before = _snapshot()
                 continue
+            # One queued reload: absorb bind-mount churn until the stamp.
+            before = _snapshot()
+            continue
 
         after = _snapshot()
+        _maybe_log_snapshot_metrics(poll_tick=poll_tick, periodic_ok=True)
+
+        from engine import auto_deploy as auto_deploy_mod
 
         def _fire_copyover(*, reason_label):
-            """SIGUSR1 the game child for a deliberate reload."""
-            nonlocal proc, game_spawn_wall, before, pending_copyover, settle_deadline
+            """SIGUSR1 the game child, or queue until ``.copyover_ready``."""
+            nonlocal proc, game_spawn_wall, before, pending_copyover
+            nonlocal settle_deadline, copyover_wait_logged
+            if not copyover_child_ready(
+                game_spawn_wall,
+                boot_grace=copyover_boot_grace,
+                root=root,
+            ):
+                pending_copyover = True
+                settle_deadline = None
+                before = after
+                if not copyover_wait_logged:
+                    print(
+                        f"[watch] {reason_label} -- queued until "
+                        "copyover ready (Game() / veil stamp)",
+                        flush=True,
+                    )
+                    copyover_wait_logged = True
+                return
+            copyover_wait_logged = False
             if use_gateway:
                 print(
                     f"[watch] {reason_label} -- "
@@ -1008,6 +1260,20 @@ def main():
             settle_deadline = None
             before = after
 
+        # Veil/sync announced exactly one deliberate reload (even during quiesce).
+        if auto_deploy_mod.announced_copyover_pending(root):
+            auto_deploy_mod.clear_announced_copyover(root)
+            _fire_copyover(reason_label="announced deploy sync")
+            continue
+
+        # Post-sync protect-restore rewrites hundreds of mtimes. Absorb them
+        # until stable boot at the new HEAD (quiesce cleared in write_stable).
+        if auto_deploy_mod.tree_sync_quiesce_active(root):
+            before = after
+            pending_copyover = False
+            settle_deadline = None
+            continue
+
         # Batched reload: quiet period elapsed since the last mtime churn.
         if (
             copyover_settle_seconds > 0
@@ -1021,14 +1287,6 @@ def main():
                     "[watch] revert hold active -- clearing settled copyover",
                     flush=True,
                 )
-                settle_deadline = None
-                continue
-            in_boot_grace = (
-                copyover_boot_grace > 0
-                and (time.time() - game_spawn_wall) < copyover_boot_grace
-            )
-            if in_boot_grace:
-                pending_copyover = True
                 settle_deadline = None
                 continue
             _fire_copyover(reason_label="settled code/content change")
@@ -1061,27 +1319,11 @@ def main():
                 _stop_gateway(gateway_proc)
                 gateway_proc = _spawn_gateway()
                 time.sleep(0.4)
-                proc, game_spawn_wall = _spawn_game()
+                proc, game_spawn_wall = _spawn_game(cold=True)
                 before = after
                 pending_copyover = False
                 continue
-            in_boot_grace = (
-                copyover_boot_grace > 0
-                and (time.time() - game_spawn_wall) < copyover_boot_grace
-            )
-            if in_boot_grace:
-                print(
-                    "[watch] code change during boot grace -- "
-                    "deferring copyover",
-                    flush=True,
-                )
-                pending_copyover = True
-                settle_deadline = None
-                before = after
-                continue
-            from engine import auto_deploy as auto_deploy_mod
-            announced = auto_deploy_mod.announced_copyover_pending(root)
-            if copyover_settle_seconds > 0 and not announced:
+            if copyover_settle_seconds > 0:
                 settle_deadline = time.time() + copyover_settle_seconds
                 print(
                     "[watch] code/content change detected -- "
@@ -1091,21 +1333,26 @@ def main():
                 )
                 before = after
                 continue
-            if announced:
-                auto_deploy_mod.clear_announced_copyover(root)
-                _fire_copyover(reason_label="announced deploy sync")
-                continue
             _fire_copyover(reason_label="code/content change detected")
             continue
 
-        ticks_until_deploy += 1
-        if ticks_until_deploy >= deploy_every:
-            ticks_until_deploy = 0
+        seconds_until_deploy += poll_s
+        # gm autodeploy now: skip the remaining poll wait (still respects
+        # revert-hold / override-off via poll_skip_reason).
+        force_deploy = False
+        immediate_fn = getattr(auto_deploy, "immediate_requested", None)
+        if callable(immediate_fn) and immediate_fn(root):
+            skip_now = auto_deploy.poll_skip_reason(root)
+            if skip_now is None:
+                force_deploy = True
+                print(
+                    "[watch] immediate catch-up requested -- "
+                    "polling auto-deploy now",
+                    flush=True,
+                )
+        if force_deploy or seconds_until_deploy >= deploy_every:
+            seconds_until_deploy = 0.0
             try:
-                # Reload before each poll so protect/stash fixes on disk are
-                # not stuck behind a stale one-shot import (live map wipe).
-                auto_deploy = reload_auto_deploy()
-                deploy_every = auto_deploy.poll_interval_seconds()
                 # A revert hold forces auto-deploy off (see auto_deploy._enabled)
                 # so a fix pushed while held would otherwise sit unused until
                 # someone remembers `gm recover clearhold`. Check on the same
@@ -1116,7 +1363,17 @@ def main():
                     )
                     if resumed:
                         print(f"[watch] auto-resume: {detail}", flush=True)
-                auto_deploy.try_auto_deploy()
+                skip = auto_deploy.poll_skip_reason(root)
+                if skip is None:
+                    # Reload only when deploy would actually run -- re-parsing
+                    # hooks.py every 30s with AUTO_DEPLOY=0 was wasted CPU.
+                    auto_deploy = reload_auto_deploy()
+                    deploy_every = auto_deploy.poll_interval_seconds()
+                    deployed = auto_deploy.try_auto_deploy()
+                    if deployed:
+                        before = _snapshot()
+                        pending_copyover = False
+                        settle_deadline = None
             except Exception as exc:
                 print(f"[watch] auto_deploy error (will retry): {exc}", flush=True)
 

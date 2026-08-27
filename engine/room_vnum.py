@@ -3,9 +3,11 @@ room_vnum.py -- Hand-room vnum helpers (letter prefix + 5 digits).
 
 Hand-authored rooms (map/zone ``rooms[]``) get a stable human id like
 ``CA00001`` (first + last A–Z of the display name, both uppercase, plus a
-zero-padded sequence under that prefix). Storage keys stay unchanged;
-GMCP ``Room.Info.num`` uses :func:`pack_vnum` so Mudlet stock mappers get
-an integer.
+zero-padded sequence under that prefix). New missing VNUMs use
+:func:`scramble_vnum` (hash-seeded neighborhood band) instead of always
+``00001``; :func:`next_vnum` remains the lowest-free fallback. Storage
+keys stay unchanged; GMCP ``Room.Info.num`` uses :func:`pack_vnum` so
+Mudlet stock mappers get an integer.
 
 Grid / wilderness cells never receive a vnum (``grid_prefix`` set).
 Engine-pure: no ``supers`` imports.
@@ -13,6 +15,7 @@ Engine-pure: no ``supers`` imports.
 
 from __future__ import annotations
 
+import hashlib
 import re
 
 # Human form: two A–Z letters + exactly five decimal digits.
@@ -26,6 +29,12 @@ _FALLBACK_PREFIX = "XX"
 
 # Per-prefix sequence ceiling (5 digits).
 _MAX_SEQ = 99999
+
+# Scramble band for first-of-prefix picks (house-number analog).
+_SCRAMBLE_BAND_MIN = 10000
+_SCRAMBLE_BAND_MAX = 89999
+# Child rooms step off an anchor hub like porch numbers off a street hub.
+_CHILD_OFFSET_STEP = 2
 
 
 def is_hand_room(room) -> bool:
@@ -163,16 +172,100 @@ def unpack_vnum(i: int) -> str:
     return format_vnum(prefix, digits)
 
 
-def next_vnum(prefix: str, taken: set[str]) -> str:
-    """Allocate the next free ``PREFIX#####`` under ``prefix``.
+def _stable_hash_int(text: str) -> int:
+    """Deterministic 32-bit int from ``text`` (stable across runs/machines)."""
+    digest = hashlib.blake2b(text.encode("utf-8"), digest_size=4).digest()
+    return int.from_bytes(digest, "big")
 
-    ``taken`` holds already-used vnum strings (any casing; compared upper).
-    Raises ``ValueError`` if the 5-digit space is exhausted.
-    """
+
+def _normalize_taken(taken) -> set[str]:
+    """Upper-case set of claimed vnum strings."""
+    return {str(v).strip().upper() for v in (taken or ()) if v}
+
+
+def _validate_prefix(prefix: str) -> str:
+    """Return normalized two-letter A–Z prefix or raise."""
     pref = str(prefix or "").strip().upper()
     if len(pref) != 2 or not all("A" <= ch <= "Z" for ch in pref):
         raise ValueError(f"vnum prefix must be two A–Z letters, got {prefix!r}")
-    used = {str(v).strip().upper() for v in (taken or ()) if v}
+    return pref
+
+
+def _child_seq_candidates(anchor_n: int, *, go_high: bool):
+    """Yield free sequence slots stepped by 2 off an anchor hub."""
+    if go_high:
+        for i in range(1, _MAX_SEQ):
+            n = anchor_n + _CHILD_OFFSET_STEP * i
+            if n > _MAX_SEQ:
+                break
+            yield n
+    else:
+        for i in range(1, _MAX_SEQ):
+            n = anchor_n - _CHILD_OFFSET_STEP * i
+            if n < 1:
+                break
+            yield n
+
+
+def scramble_vnum(
+    prefix: str,
+    taken: set[str],
+    *,
+    anchor: str | None = None,
+    seed: str | None = None,
+    sequential: bool = False,
+) -> str:
+    """Pick a collision-free ``PREFIX#####`` in a neighborhood band.
+
+  Default (not ``sequential``):
+
+  - **No anchor:** hash-seeded slot in ``10000``–``89999``, walking forward
+    on collision (deterministic for a given ``seed``).
+  - **Anchor hub:** child offsets ``+2`` / ``-2`` from the anchor digits
+    when the anchor shares the same letter prefix (populate porch analog).
+
+  Falls back to :func:`next_vnum` when the band is exhausted.
+  ``sequential=True`` skips scramble and uses lowest-free digits only.
+    """
+    if sequential:
+        return next_vnum(prefix, taken)
+
+    pref = _validate_prefix(prefix)
+    used = _normalize_taken(taken)
+
+    parsed_anchor = parse_vnum(anchor) if anchor else None
+    if parsed_anchor is not None:
+        anchor_pref, anchor_n = parsed_anchor
+        if anchor_pref == pref:
+            seed_text = str(seed or anchor or pref)
+            go_high = (_stable_hash_int(seed_text) % 2) == 0
+            for high_first in (go_high, not go_high):
+                for n in _child_seq_candidates(anchor_n, go_high=high_first):
+                    candidate = format_vnum(pref, n)
+                    if candidate not in used:
+                        return candidate
+
+    seed_text = str(seed if seed is not None else pref)
+    span = _SCRAMBLE_BAND_MAX - _SCRAMBLE_BAND_MIN + 1
+    start = _SCRAMBLE_BAND_MIN + (_stable_hash_int(seed_text) % span)
+    for offset in range(span):
+        n = _SCRAMBLE_BAND_MIN + ((start - _SCRAMBLE_BAND_MIN + offset) % span)
+        candidate = format_vnum(pref, n)
+        if candidate not in used:
+            return candidate
+
+    return next_vnum(pref, used)
+
+
+def next_vnum(prefix: str, taken: set[str]) -> str:
+    """Allocate the lowest free ``PREFIX#####`` under ``prefix``.
+
+    Lowest-free fallback for scramble exhaustion, tests, and
+    ``--sequential`` tooling. ``taken`` holds already-used vnum strings
+    (any casing; compared upper). Raises ``ValueError`` if exhausted.
+    """
+    pref = _validate_prefix(prefix)
+    used = _normalize_taken(taken)
     for n in range(1, _MAX_SEQ + 1):
         candidate = format_vnum(pref, n)
         if candidate not in used:
@@ -197,14 +290,41 @@ def collect_taken_vnums(rooms_or_dicts) -> set[str]:
     return taken
 
 
-def allocate_vnum_for_name(key: str, title=None, *, taken: set[str]) -> str:
-    """Derive prefix from display name and return the next free vnum."""
+def allocate_vnum_for_name(
+    key: str,
+    title=None,
+    *,
+    taken: set[str],
+    anchor: str | None = None,
+    seed: str | None = None,
+    sequential: bool = False,
+) -> str:
+    """Derive prefix from display name and return a scrambled free vnum.
+
+    ``seed`` stabilizes hash picks (batch tools: ``filename:key``; runtime:
+    ``key:title``). ``anchor`` clusters child rooms off a parent hub vnum.
+    ``sequential=True`` uses lowest-free digits only (legacy / diffs).
+    """
     name = display_name_for_vnum(key, title)
     prefix = letter_prefix(name)
-    return next_vnum(prefix, taken)
+    if seed is None:
+        seed = f"{key}:{name}"
+    return scramble_vnum(
+        prefix,
+        taken,
+        anchor=anchor,
+        seed=seed,
+        sequential=sequential,
+    )
 
 
-def stamp_hand_room(game, room, *, taken: set[str] | None = None) -> str:
+def stamp_hand_room(
+    game,
+    room,
+    *,
+    taken: set[str] | None = None,
+    anchor: str | None = None,
+) -> str:
     """Allocate a VNUM when missing and register the room under it.
 
     Mutates ``room.key``, ``room.vnum``, ``room.legacy_key`` (when the
@@ -241,7 +361,10 @@ def stamp_hand_room(game, room, *, taken: set[str] | None = None) -> str:
                     rooms.values() if isinstance(rooms, dict) else ()
                 )
             vnum = allocate_vnum_for_name(
-                old_key, getattr(room, "title", None), taken=taken,
+                old_key,
+                getattr(room, "title", None),
+                taken=taken,
+                anchor=anchor,
             )
     else:
         if taken is None:
@@ -249,7 +372,10 @@ def stamp_hand_room(game, room, *, taken: set[str] | None = None) -> str:
                 rooms.values() if isinstance(rooms, dict) else ()
             )
         vnum = allocate_vnum_for_name(
-            old_key, getattr(room, "title", None), taken=taken,
+            old_key,
+            getattr(room, "title", None),
+            taken=taken,
+            anchor=anchor,
         )
     room.vnum = vnum
     if taken is not None:

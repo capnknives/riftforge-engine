@@ -107,6 +107,11 @@ def is_scavengeable_floor_item(item, game=None):
     # Sealed lockboxes / strongboxes stay for players to crack.
     if getattr(item, "locked", False) and getattr(item, "loot", None):
         return False
+    try:
+        if hooks_mod.item_in_veil(item):
+            return False
+    except Exception:
+        pass
     dropped = getattr(item, "floor_dropped_tick", None)
     if dropped is not None and game is not None:
         now = int(getattr(game, "game_time_ticks", 0) or 0)

@@ -51,10 +51,13 @@ def enrich_bug_payload(entry, game=None):
     from engine import accounts as accounts_mod
     from engine import report_context
 
+    from engine import reports as reports_mod
+
     fresh = report_context.build(
         character, game,
         history=out.get("history"),
         description=out.get("description"),
+        kind=reports_mod.BUG,
     )
     account = accounts_mod.account_for_character(game, character)
     if account is not None:

@@ -277,8 +277,12 @@ def cmd_hang(character, args, game):
     mouth_key = getattr(room, "mouth_key", None)
     room_id = getattr(room, "mine_room_id", None)
     mouth = graph_mod.get_mouth(game, mouth_key)
-    node = graph_mod.room_by_id(mouth, room_id)
+    node = graph_mod.room_by_id(mouth, room_id) if mouth else None
     if not node:
+        _send(
+            character,
+            "This chamber isn't wired to the mine -- you can't hang anything here.",
+        )
         return
     if kind in ("torch", "lantern"):
         _hang_light(character, game, room, node, kind)
@@ -339,8 +343,12 @@ def try_lock_gate(character, game, args, *, unlock=False):
     mouth_key = getattr(room, "mouth_key", None)
     room_id = getattr(room, "mine_room_id", None)
     mouth = graph_mod.get_mouth(game, mouth_key)
-    node = graph_mod.room_by_id(mouth, room_id)
+    node = graph_mod.room_by_id(mouth, room_id) if mouth else None
     if not node:
+        _send(
+            character,
+            "This chamber isn't wired to the mine -- no gate to lock here.",
+        )
         return True
     face = graph_mod.get_face(node, direction)
     gate = face.get("gate") or {}

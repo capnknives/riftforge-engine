@@ -277,8 +277,11 @@ def _items_in_container(holder, viewer):
     out = list(_surface_items(holder))
     for bag in worn_bags(holder):
         out.extend(bag_contents(bag))
-    gear = hooks_mod.containers_ensure_gear_bag(holder)
-    out.extend(list(gear or []))
+    # Worn kit bags already contributed their contents above. Only add the
+    # legacy virtual ``gear_bag`` list when no worn kit bag exists.
+    if designated_gear_bag(holder) is None:
+        gear = hooks_mod.containers_ensure_gear_bag(holder)
+        out.extend(list(gear or []))
     return out
 
 
@@ -654,6 +657,9 @@ def route_acquired_item(character, item):
         _ensure_open_inventory_holds(character, item)
         return None
     if try_merge_carried_stack(character, item, dest=dest):
+        # Merged pickups must not leave a ghost row on the belt when a caller
+        # pre-appended before routing (cmd_open strongbox loot, etc.).
+        _remove_carried_item(character, item)
         return None
     if _item_resting_place(character, item) == dest:
         return None
@@ -797,6 +803,9 @@ def _find_matching_stack_item(items, item, viewer):
     if not key:
         return None
     for piece in items or []:
+        # Never fold a row into itself (``give`` pre-appends before merge).
+        if piece is item:
+            continue
         if stack_key(piece, viewer) == key:
             return piece
     return None
@@ -1006,6 +1015,24 @@ def worn_bags(character):
     return out
 
 
+def iter_carried_items(character):
+    """Yield open inventory, worn bag contents, and virtual gear-bag rows.
+
+    When a kit bag is worn, ``containers_ensure_gear_bag`` returns that
+    bag's contents — the same list already yielded from ``worn_bags``.
+    Skip the third pass in that case so haul-weight math does not
+    double-count salt, ammo, and other kit rows.
+    """
+    for item in list(getattr(character, "inventory", None) or []):
+        yield item
+    for bag in worn_bags(character):
+        for item in bag_contents(bag):
+            yield item
+    if designated_gear_bag(character) is None:
+        for item in hooks_mod.containers_ensure_gear_bag(character):
+            yield item
+
+
 def make_starter_kit_bag(where="kit"):
     """Catalog starter kit bag Item."""
     return hooks_mod.make_world_item(
@@ -1106,20 +1133,30 @@ def grant_and_wear_starter_kit_bag(character, *, where="kit"):
     if existing is not None:
         migrate_virtual_gear_bag(character)
         return existing
-    bag = make_starter_kit_bag(where=where)
-    if bag is None:
-        return None
     inv = getattr(character, "inventory", None)
     if inv is None:
         character.inventory = []
         inv = character.inventory
-    inv.append(bag)
-    slot = "back"
-    if ensure_containers_map(character).get("back") is not None:
-        slot = "shoulder"
-    wear_bag(character, bag, slot)
+    # Reuse an unworn spare before minting another empty bag (bug report 867:
+    # scavenger kit grants only checked the worn slot, spamming floor drops).
+    bag = None
+    for item in inv:
+        if is_gear_bag_item(item):
+            bag = item
+            break
+    if bag is None:
+        bag = make_starter_kit_bag(where=where)
+        if bag is None:
+            return None
+        inv.append(bag)
+    for slot in ("back", "shoulder"):
+        ok, _msg = wear_bag(character, bag, slot)
+        if ok:
+            break
     migrate_virtual_gear_bag(character)
-    return bag
+    collapse_duplicate_kit_bags(character)
+    rebind_containers_from_inventory(character)
+    return designated_gear_bag(character) or bag
 
 
 def migrate_virtual_gear_bag(character):

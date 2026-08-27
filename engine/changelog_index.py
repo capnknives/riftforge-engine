@@ -1,8 +1,8 @@
 """Pre-built JSON index for in-game ``changes`` (fast load).
 
 Authoring stays in ``CHANGELOG.md`` / ``CHANGELOG.d/*.md``. Maintainers rebuild
-``content/changelog_index.json`` via ``tools/build_changelog_index.py`` on
-``main`` (post-merge CI) or locally; boot and deploy rebuild when stale.
+``content/changelog_index.json`` via ``tools/build_changelog_index.py``
+locally; boot and auto-deploy rebuild when stale.
 Feature PRs should not commit the index — it conflicts on bundled merges.
 """
 
@@ -184,13 +184,89 @@ def rebuild_index_from_sources(repo_root: str) -> int:
     return len(entries)
 
 
+def should_mint_ids_on_boot() -> bool:
+    """Mint ``#N`` on live/copyover ``Game()`` boot; skip host smokes.
+
+    Smokes and ``tools/local_ci.py`` share the real ``CHANGELOG.d`` tree
+    (temp SQLite only). Minting there dirties developer checkouts — a
+    pre-push boot probe already restamped five live fragments that way.
+
+    Live/staging Docker sets ``RIFTFORGE_GATEWAY=1`` on the game child
+    (and overlay ``boot_probe`` inside compose). That is the copyover
+    guaranteed mint. Opt in on a non-gateway boot with
+    ``RIFTFORGE_CHANGELOG_MINT=1``.
+    """
+    import sys
+
+    raw = (os.environ.get("RIFTFORGE_SMOKE") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return False
+    argv0 = os.path.basename(sys.argv[0] or "").lower()
+    if "smoke" in argv0 or "local_ci" in argv0:
+        return False
+    if "smoke_test" in sys.modules:
+        return False
+    mint = (os.environ.get("RIFTFORGE_CHANGELOG_MINT") or "").strip().lower()
+    if mint in ("0", "false", "no", "off"):
+        return False
+    if mint in ("1", "true", "yes", "on"):
+        return True
+    gateway = (os.environ.get("RIFTFORGE_GATEWAY") or "").strip()
+    return gateway not in ("0", "false", "False", "no", "NO", "")
+
+
+def stamp_pending_and_ensure_index(
+    repo_root: str,
+    *,
+    log_prefix: str | None = None,
+    mint_ids: bool = True,
+) -> bool:
+    """Fill-stamp missing ``#N`` ids, then rebuild the compiled index.
+
+    After a stamp rewrite, always rebuild — do not trust mtime comparison.
+    Boot can compile the unstamped tree in the same second the stamper
+    writes, which would skip ``ensure_compiled_index`` and leave ``changes``
+    serving ``id: 0`` until the next origin advance.
+
+    ``mint_ids=False`` rebuilds the compiled feed only (``Game()`` smokes).
+    """
+    rewritten = 0
+    if mint_ids:
+        try:
+            from engine import changelog_ids
+
+            _planned, rewritten = changelog_ids.assign_all(
+                repo_root, dry_run=False,
+            )
+        except Exception as exc:
+            if log_prefix:
+                print(f"{log_prefix} changelog id stamp skipped: {exc}", flush=True)
+            rewritten = 0
+        else:
+            if rewritten and log_prefix:
+                print(
+                    f"{log_prefix} stamped {rewritten} changelog id(s)",
+                    flush=True,
+                )
+    if rewritten:
+        count = rebuild_index_from_sources(repo_root)
+        if log_prefix:
+            print(
+                f"{log_prefix} changelog index rebuilt ({count} entries)",
+                flush=True,
+            )
+        return True
+    return ensure_compiled_index(repo_root, log_prefix=log_prefix)
+
+
 def ensure_compiled_index(repo_root: str, *, log_prefix: str | None = None) -> bool:
     """Rebuild the compiled index when sources are ahead of it.
 
     Called on game boot and after auto-deploy sync/overlay so ``changes`` never
     depends on agents remembering ``tools/build_changelog_index.py`` or paid
     GitHub Actions gates. Uses full mtime + count checks (not per ``changes``
-    tap — that path stays count-only via ``index_likely_stale``).
+    tap — that path stays count-only via ``index_likely_stale`` unless
+    headlines are still missing ``#N``).
     """
     if not index_needs_rebuild(repo_root):
         return False
@@ -242,7 +318,14 @@ def write_index(repo_root: str, sig: tuple, entries: list) -> str:
         "source_signature": signature_to_json(repo_root, sig),
         "entries": entries,
     }
+    blob = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                if fh.read() == blob:
+                    return path
+        except OSError:
+            pass
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
-        fh.write("\n")
+        fh.write(blob)
     return path

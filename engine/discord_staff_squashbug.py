@@ -21,6 +21,19 @@ def report_directory(root=None) -> str:
     return str(base)
 
 
+def _ensure_fixer_env(root=None) -> None:
+    """Load fixer webhook keys from ``.env`` when compose did not inject them."""
+    from engine import bug_webhook
+    from engine import env_file
+
+    if bug_webhook.webhook_url():
+        return
+    env_file.apply_repo_env(
+        report_directory(root),
+        keys=("CURSOR_BUG_WEBHOOK_URL", "CURSOR_BUG_WEBHOOK_AUTH"),
+    )
+
+
 def parse_bug_id(text: str) -> int | None:
     """Parse ``92``, ``#92``, or ``bug 92`` from Discord command args."""
     raw = (text or "").strip()
@@ -43,17 +56,19 @@ def execute_squashbug(
     bug_id: int,
     *,
     root=None,
+    game=None,
 ) -> tuple[bool, str]:
     """Queue one open bug id for the Cursor fixer webhook."""
     from engine import bug_webhook
 
+    _ensure_fixer_env(root)
     if not bug_webhook.webhook_url():
         return False, "CURSOR_BUG_WEBHOOK_URL is not configured — cannot queue fixer runs."
-    directory = report_directory(root)
+    directory = str(getattr(game, "report_dir", None) or report_directory(root))
     scheduled, total, scheduled_ids = bug_webhook.schedule_open_bugs(
         directory,
         bug_ids=[bug_id],
-        game=None,
+        game=game,
     )
     if total == 0:
         return False, (
@@ -62,23 +77,40 @@ def execute_squashbug(
         )
     if scheduled == 0:
         return False, f"Bug report {bug_id} matched but webhook queue failed."
+    if game and scheduled_ids:
+        try:
+            from engine import kokid_notify
+
+            kokid_notify.announce_pickup(game, scheduled_ids)
+            kokid_notify.poll_after_pickup(game, scheduled_ids)
+        except Exception as exc:
+            print(f"[discord_staff_squashbug] kokid pickup skipped: {exc}", flush=True)
     return True, f"Queued bug report {bug_id} for the fixer webhook."
 
 
-def execute_squashbugs_all(*, root=None) -> tuple[bool, str]:
+def execute_squashbugs_all(*, root=None, game=None) -> tuple[bool, str]:
     """Queue every open bug report for the Cursor fixer webhook."""
     from engine import bug_webhook
 
+    _ensure_fixer_env(root)
     if not bug_webhook.webhook_url():
         return False, "CURSOR_BUG_WEBHOOK_URL is not configured — cannot queue fixer runs."
-    directory = report_directory(root)
-    scheduled, total, _scheduled_ids = bug_webhook.schedule_open_bugs(
+    directory = str(getattr(game, "report_dir", None) or report_directory(root))
+    scheduled, total, scheduled_ids = bug_webhook.schedule_open_bugs(
         directory,
         bug_ids=None,
-        game=None,
+        game=game,
     )
     if total == 0:
         return False, "No open bugs to send."
     if scheduled == 0:
         return False, f"Matched {total} open bug(s) but webhook queue failed."
+    if game and scheduled_ids:
+        try:
+            from engine import kokid_notify
+
+            kokid_notify.announce_pickup(game, scheduled_ids)
+            kokid_notify.poll_after_pickup(game, scheduled_ids)
+        except Exception as exc:
+            print(f"[discord_staff_squashbug] kokid pickup skipped: {exc}", flush=True)
     return True, f"Queued {scheduled}/{total} open bug(s) for the fixer webhook."

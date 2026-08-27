@@ -65,8 +65,13 @@ class Account:
         self.bugs_squashed = 0
         # Resolved suggestions shipped from player ideas (log is source of truth).
         self.features_suggested = 0
+        # Peer / staff gifted account points (counts toward account totals).
+        self.gifted = 0
+        # Spendable pool for ``giftpoints`` (1 banked per hour active online).
+        self.gift_bank = 0
+        self.gift_bank_last_accrual_ts = 0.0
         # Prefs: which face OOC uses; whether GM form appends (Account).
-        self.ooc_identity = OOC_IDENTITY_CHARACTER
+        self.ooc_identity = OOC_IDENTITY_ACCOUNT
         self.gm_see_accounts = False
         # Staff "wizard invisibility": when True (default), this account's
         # GM form (`gm on`) is visible only to other GM-form staff. Toggle
@@ -76,16 +81,24 @@ class Account:
         self.wizinvis = True
         # Playtester diagnostic tools (``playtest`` / ``playtester add``).
         self.playtester = False
+        # Volunteer player helper (``gm set … helper on``).
+        self.player_helper = False
         # Visit-ceiling for in-game ``changes`` (new since last acknowledgment).
         # Legacy ``last_seen_changelog_id`` is uplifted once on read.
         self.last_seen_changelog_sort_ts = ""
         self.changelog_visit_migrated = False
+        # Partial ``changes unread`` paging cursor (oldest ship on the last
+        # unread page). Empty = read from the visit ceiling downward.
+        self.last_seen_changelog_unread_cursor = ""
         # Legacy numeric watermark (pre Aug 2026 timestamp-only feed).
         self.last_seen_changelog_id = 0
         # Phase 5: storage key of a body mid create-flow chargen (resume draft).
         self.chargen_draft_key = ""
         # Account names blocked on OOC + player public channels (not IC say/tell).
         self.ooc_blocked_accounts = []
+        # Catalog bodies on loan for RPC tenure (Gabriel, Dean, …).
+        # Never ``character_keys`` / ``.account`` -- see Assigned Characters menu.
+        self.assigned_characters = []
 
     def to_blob(self):
         """JSON-serializable extras for the accounts.data column."""
@@ -95,14 +108,20 @@ class Account:
             "gm_spirit_key": self.gm_spirit_key,
             "bugs_squashed": int(self.bugs_squashed or 0),
             "features_suggested": int(self.features_suggested or 0),
+            "gifted": int(getattr(self, "gifted", 0) or 0),
+            "gift_bank": int(getattr(self, "gift_bank", 0) or 0),
+            "gift_bank_last_accrual_ts": float(
+                getattr(self, "gift_bank_last_accrual_ts", 0) or 0
+            ),
             "ooc_identity": (
                 self.ooc_identity
                 if self.ooc_identity in OOC_IDENTITY_CHOICES
-                else OOC_IDENTITY_CHARACTER
+                else OOC_IDENTITY_ACCOUNT
             ),
             "gm_see_accounts": bool(self.gm_see_accounts),
             "wizinvis": bool(self.wizinvis),
             "playtester": bool(self.playtester),
+            "player_helper": bool(self.player_helper),
             "last_seen_changelog_id": int(
                 getattr(self, "last_seen_changelog_id", 0) or 0
             ),
@@ -112,11 +131,17 @@ class Account:
             "changelog_visit_migrated": bool(
                 getattr(self, "changelog_visit_migrated", False)
             ),
+            "last_seen_changelog_unread_cursor": str(
+                getattr(self, "last_seen_changelog_unread_cursor", "") or ""
+            ),
             "chargen_draft_key": str(
                 getattr(self, "chargen_draft_key", "") or ""
             ),
             "ooc_blocked_accounts": list(
                 getattr(self, "ooc_blocked_accounts", None) or []
+            ),
+            "assigned_characters": list(
+                getattr(self, "assigned_characters", None) or []
             ),
         }
 
@@ -144,14 +169,23 @@ class Account:
         )
         self.bugs_squashed = int(data.get("bugs_squashed", 0) or 0)
         self.features_suggested = int(data.get("features_suggested", 0) or 0)
-        ooc = (data.get("ooc_identity") or OOC_IDENTITY_CHARACTER).strip().lower()
+        self.gifted = int(data.get("gifted", 0) or 0)
+        self.gift_bank = int(data.get("gift_bank", 0) or 0)
+        try:
+            self.gift_bank_last_accrual_ts = float(
+                data.get("gift_bank_last_accrual_ts", 0) or 0
+            )
+        except (TypeError, ValueError):
+            self.gift_bank_last_accrual_ts = 0.0
+        ooc = (data.get("ooc_identity") or OOC_IDENTITY_ACCOUNT).strip().lower()
         self.ooc_identity = (
-            ooc if ooc in OOC_IDENTITY_CHOICES else OOC_IDENTITY_CHARACTER
+            ooc if ooc in OOC_IDENTITY_CHOICES else OOC_IDENTITY_ACCOUNT
         )
         self.gm_see_accounts = bool(data.get("gm_see_accounts", False))
         # Missing key = default staff-invisible (old saves keep prior behavior).
         self.wizinvis = bool(data.get("wizinvis", True))
         self.playtester = bool(data.get("playtester", False))
+        self.player_helper = bool(data.get("player_helper", False))
         self.last_seen_changelog_id = int(
             data.get("last_seen_changelog_id", 0) or 0
         )
@@ -160,6 +194,9 @@ class Account:
         )
         self.changelog_visit_migrated = bool(
             data.get("changelog_visit_migrated", False)
+        )
+        self.last_seen_changelog_unread_cursor = str(
+            data.get("last_seen_changelog_unread_cursor", "") or ""
         )
         self.chargen_draft_key = str(data.get("chargen_draft_key", "") or "")
         blocked = data.get("ooc_blocked_accounts") or []
@@ -173,6 +210,21 @@ class Account:
                 seen_blocked.add(key)
                 cleaned_blocked.append(key)
         self.ooc_blocked_accounts = cleaned_blocked
+        grants = (
+            data.get("assigned_characters")
+            or data.get("cast_grants")
+            or []
+        )
+        cleaned_grants = []
+        seen_grants = set()
+        if isinstance(grants, (list, tuple)):
+            for raw in grants:
+                k = str(raw or "").strip()
+                if not k or k.lower() in seen_grants:
+                    continue
+                seen_grants.add(k.lower())
+                cleaned_grants.append(k)
+        self.assigned_characters = cleaned_grants
 
 
 def normalize_account_name(raw):
@@ -225,6 +277,62 @@ def ensure_accounts_dict(game):
         accounts = {}
         game.accounts = accounts
     return accounts
+
+
+def contribution_points(account):
+    """Resolved bug + suggestion + gifted credits (leaderboard / totals)."""
+    if account is None:
+        return 0
+    bugs = int(getattr(account, "bugs_squashed", 0) or 0)
+    ideas = int(getattr(account, "features_suggested", 0) or 0)
+    gifted = int(getattr(account, "gifted", 0) or 0)
+    return max(0, bugs + ideas + gifted)
+
+
+def refresh_contribution_totals(game, account):
+    """Recompute ``bugs_squashed`` / ``features_suggested`` from report logs.
+
+    Report JSONL is the source of truth (same bar as score / leaderboard).
+    Returns ``(bugs, ideas)``; leaves fields unchanged when logs are unreadable.
+    """
+    if account is None or game is None:
+        return (0, 0)
+    try:
+        from engine import reports as reports_mod
+
+        bug_counts = {}
+        for entry in reports_mod.recent(
+            reports_mod.BUG, None, directory=game.report_dir,
+        ):
+            if entry.get("status") != "resolved":
+                continue
+            key = (entry.get("reporter") or "").strip()
+            if key:
+                bug_counts[key] = bug_counts.get(key, 0) + 1
+        suggest_counts = {}
+        for entry in reports_mod.recent(
+            reports_mod.SUGGEST, None, directory=game.report_dir,
+        ):
+            if entry.get("status") != "resolved":
+                continue
+            key = (entry.get("reporter") or "").strip()
+            if key:
+                suggest_counts[key] = suggest_counts.get(key, 0) + 1
+        bugs = 0
+        suggests = 0
+        for key in list(account.character_keys):
+            k = (key or "").strip()
+            if not k:
+                continue
+            bugs += int(bug_counts.get(k, 0))
+            suggests += int(suggest_counts.get(k, 0))
+        account.bugs_squashed = bugs
+        account.features_suggested = suggests
+        return (bugs, suggests)
+    except Exception:
+        bugs = int(getattr(account, "bugs_squashed", 0) or 0)
+        ideas = int(getattr(account, "features_suggested", 0) or 0)
+        return (bugs, ideas)
 
 
 def register_account(game, account):
@@ -346,13 +454,38 @@ def unlink_character(game, account, character, *, clear_back_pointer=True):
 
 
 def account_for_character(game, character):
-    """Resolve the Account linked to ``character``, or None."""
+    """Resolve the Account linked to ``character``, or None.
+
+    Prefers the body back-pointer (``character.account``). When that drifted
+    empty but the storage key still sits on an account roster (boot heal /
+    wipe recovery), match via ``character_keys`` and repair the pointer
+    (bug report 740: promoted staff could not ``gm on`` on a roster body).
+    """
     if character is None:
         return None
     name = (getattr(character, "account", None) or "").strip()
-    if not name:
+    if name:
+        acct = find_account(game, name)
+        if acct is not None:
+            return acct
+    if game is None:
         return None
-    return find_account(game, name)
+    key = (getattr(character, "key", None) or "").strip()
+    if not key:
+        return None
+    low = key.lower()
+    for account in ensure_accounts_dict(game).values():
+        roster = {
+            (raw or "").strip().lower()
+            for raw in (getattr(account, "character_keys", None) or [])
+            if (raw or "").strip()
+        }
+        if low not in roster:
+            continue
+        if (getattr(character, "account", None) or "") != account.name:
+            character.account = account.name
+        return account
+    return None
 
 
 def account_name_for_character_key(game, speaker_key) -> Optional[str]:
@@ -377,7 +510,7 @@ def resolve_block_target_account(game, name):
     """
     raw = (name or "").strip()
     if not raw:
-        return None, "Usage: block <account|character>"
+        return None, "Usage: mute <account|character>"
     acct = find_account(game, raw)
     if acct is not None:
         return acct, None
@@ -425,13 +558,13 @@ def ooc_block_account(game, listener_account, target_name):
     if target is None:
         return False, err or "Could not resolve that name."
     if listener_account is None:
-        return False, "You need a linked account to block someone."
+        return False, "You need a linked account to mute someone on OOC."
     if account_lookup_key(target.name) == account_lookup_key(listener_account.name):
-        return False, "You cannot block yourself."
+        return False, "You cannot mute yourself."
     blocked = list(getattr(listener_account, "ooc_blocked_accounts", None) or [])
     key = account_lookup_key(target.name)
     if key in {account_lookup_key(x) for x in blocked}:
-        return False, f"You already block {target.display_name or target.name} on OOC channels."
+        return False, f"You already mute {target.display_name or target.name} on OOC channels."
     blocked.append(target.name)
     listener_account.ooc_blocked_accounts = blocked
     try:
@@ -450,9 +583,9 @@ def ooc_unblock_account(game, listener_account, target_name):
     """Clear one OOC/public-channel block. Returns ``(ok, message)``."""
     raw = (target_name or "").strip()
     if not raw:
-        return False, "Usage: unblock <account|character>"
+        return False, "Usage: unmute <account|character>"
     if listener_account is None:
-        return False, "You need a linked account to manage blocks."
+        return False, "You need a linked account to manage OOC mutes."
     target_key = account_lookup_key(raw)
     blocked = list(getattr(listener_account, "ooc_blocked_accounts", None) or [])
     kept = []
@@ -468,7 +601,7 @@ def ooc_unblock_account(game, listener_account, target_name):
     if removed_label is None:
         target, err = resolve_block_target_account(game, raw)
         if target is None:
-            return False, err or f"You are not blocking '{raw}'."
+            return False, err or f"You are not muting '{raw}'."
         kept = [
             x for x in blocked
             if account_lookup_key(x) != account_lookup_key(target.name)
@@ -659,6 +792,25 @@ def reconcile_accounts(game):
         # Ensure gm_spirit_key is stamped when ranked.
         if account.gm_rank in ("gm", "head_gm"):
             account.gm_spirit_key = gm_spirit_key_for_account(account)
+        # Drop stale RPC cast grants (folded cast, typos, renamed keys).
+        grant_kept = []
+        grant_seen = set()
+        for raw_key in list_assigned_character_keys(account):
+            low = raw_key.lower()
+            char = by_key.get(low)
+            if char is None or getattr(char, "is_npc", False):
+                dropped_stale += 1
+                continue
+            if not getattr(char, "immersion", False):
+                dropped_stale += 1
+                continue
+            if low in grant_seen:
+                continue
+            grant_seen.add(low)
+            grant_kept.append(getattr(char, "key", raw_key) or raw_key)
+        if grant_kept != list_assigned_character_keys(account):
+            account.assigned_characters = grant_kept
+            roster_repaired += 1
 
     # Live bodies may carry ``character.account`` without a roster row when
     # a prior boot dropped them while vaulted (old reconcile) or link only
@@ -788,6 +940,85 @@ def heal_restored_player_accounts(game):
                 )
 
     return {"created": created, "linked": linked, "accounts": len(accounts)}
+
+
+def _gm_rank_order(rank):
+    """Sort key for staff ranks (higher = more privileged)."""
+    return {"": 0, "gm": 1, "head_gm": 2}.get((rank or "").strip(), 0)
+
+
+def _account_has_staff_spirit_evidence(game, account):
+    """True when a permanent GM spirit exists or is parked for ``account``."""
+    if game is None or account is None:
+        return False
+    spirit_key = gm_spirit_key_for_account(account)
+    if not spirit_key:
+        return False
+    finder = getattr(game, "find_character", None)
+    if callable(finder):
+        spirit = finder(spirit_key)
+        if spirit is not None and (
+            getattr(spirit, "gm_spirit_permanent", False)
+            or getattr(spirit, "gm_spirit", False)
+        ):
+            return True
+    # P0 vault hook: same tag supers.fold_vault.GM_SPIRIT_VAULT_TAG.
+    from engine import hooks as hooks_mod
+    if (spirit_key or "").lower().startswith("gmspirit:"):
+        if hooks_mod.vault_folded_by(game, spirit_key) == "gm-spirit-parked":
+            return True
+    db = getattr(game, "db", None)
+    if db is not None:
+        try:
+            from engine import persistence
+
+            row = persistence.vault_get(db, spirit_key)
+            if row is not None and (row[3] or "") == "gm-spirit-parked":
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def heal_drifted_staff_ranks(game):
+    """Restore account ``gm_rank`` after wipe/heal drift (bug report 740).
+
+    When an account row is recreated without staff rank but roster bodies
+    still carry a legacy ``gm_rank``, or a parked ``gmspirit:{account}``
+  row proves the account used GM form before, stamp the account rank and
+    run ``migrate_legacy_gm_ranks`` so ``gm on`` works again.
+
+    Idempotent. Returns ``{"healed": N}``.
+    """
+    if game is None:
+        return {"healed": 0}
+    accounts = ensure_accounts_dict(game)
+    finder = getattr(game, "find_character", None)
+    healed = 0
+    for account in accounts.values():
+        want = (account.gm_rank or "").strip()
+        for key in roster_character_keys(game, account):
+            if not callable(finder):
+                continue
+            char = finder(key)
+            if char is None:
+                continue
+            legacy = (getattr(char, "gm_rank", None) or "").strip()
+            if legacy in ("gm", "head_gm") and _gm_rank_order(
+                legacy
+            ) > _gm_rank_order(want):
+                want = legacy
+        if not want and _account_has_staff_spirit_evidence(game, account):
+            want = "gm"
+        if want in ("gm", "head_gm") and _gm_rank_order(
+            want
+        ) > _gm_rank_order(account.gm_rank or ""):
+            account.gm_rank = want
+            account.gm_spirit_key = gm_spirit_key_for_account(account)
+            healed += 1
+    if healed:
+        migrate_legacy_gm_ranks(game)
+    return {"healed": healed}
 
 
 def _roster_password_hash(game, key):
@@ -959,6 +1190,186 @@ def list_immersion_cast(game):
     return found
 
 
+def _resolve_immersion_cast_by_name(game, raw):
+    """Match one live immersion-cast body by key or given name."""
+    needle = (raw or "").strip()
+    if not needle or game is None:
+        return None
+    low = needle.lower()
+    exact = []
+    loose = []
+    for cast in list_immersion_cast(game):
+        key = (getattr(cast, "key", None) or "")
+        if key.lower() == low:
+            exact.append(cast)
+            continue
+        given = (getattr(cast, "given_name", None) or "").lower()
+        if low in key.lower() or (given and low in given):
+            loose.append(cast)
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None
+    if len(loose) == 1:
+        return loose[0]
+    return None
+
+
+def list_assigned_character_keys(account):
+    """Storage keys on ``account.assigned_characters`` (stable order)."""
+    if account is None:
+        return []
+    keys = []
+    seen = set()
+    for raw in list(getattr(account, "assigned_characters", None) or []):
+        k = str(raw or "").strip()
+        if not k or k.lower() in seen:
+            continue
+        seen.add(k.lower())
+        keys.append(k)
+    return keys
+
+
+def list_assigned_characters(game, account):
+    """Live immersion bodies assigned to ``account`` for RPC tenure."""
+    found = []
+    if game is None or account is None:
+        return found
+    for key in list_assigned_character_keys(account):
+        char = game.find_character(key)
+        if char is None:
+            from engine import hooks as hooks_mod
+
+            char = hooks_mod.try_restore_assigned_character(game, key)
+        if char is None:
+            finder = getattr(game, "find_login_character", None)
+            char = finder(key) if callable(finder) else None
+        if char is None or getattr(char, "is_npc", False):
+            continue
+        if not getattr(char, "immersion", False):
+            continue
+        found.append(char)
+    return found
+
+
+def account_has_assigned_character(account, character_key):
+    """True when ``character_key`` is on this account's Assigned Characters list."""
+    if account is None or not character_key:
+        return False
+    low = str(character_key).strip().lower()
+    return any(k.lower() == low for k in list_assigned_character_keys(account))
+
+
+def assign_character_to_account(game, account, character_name, *, quiet=False):
+    """Staff RPC: loan one catalog body until revoked (Assigned Characters menu).
+
+    Returns ``(True, msg)`` or ``(False, err)``.
+    """
+    if account is None:
+        return False, "No such account."
+    cast = _resolve_immersion_cast_by_name(game, character_name)
+    if cast is None:
+        return False, f"No immersion cast named '{character_name}'."
+    key = getattr(cast, "key", None) or ""
+    if not key:
+        return False, "That character has no storage key."
+    if account_has_assigned_character(account, key):
+        if quiet:
+            return True, f"{key} is already on Assigned Characters."
+        return False, (
+            f"Account '{account.display_name}' already has {key} "
+            "on Assigned Characters."
+        )
+    account.assigned_characters.append(key)
+    try:
+        from engine.persistence import mark_account_dirty
+        mark_account_dirty(game, account)
+    except Exception:
+        pass
+    return (
+        True,
+        f"Assigned {key} to account '{account.display_name}' for the run. "
+        f"They will see {key} under Assigned Characters at login.",
+    )
+
+
+def revoke_character_from_account(game, account, character_name):
+    """Remove one Assigned Characters loan from ``account``.
+
+    Returns ``(True, msg)`` or ``(False, err)``.
+    """
+    if account is None:
+        return False, "No such account."
+    cast = _resolve_immersion_cast_by_name(game, character_name)
+    key_low = (
+        (getattr(cast, "key", None) or "").lower()
+        if cast is not None
+        else (character_name or "").strip().lower()
+    )
+    if not key_low:
+        return False, f"No immersion cast named '{character_name}'."
+    before = list_assigned_character_keys(account)
+    kept = [k for k in before if k.lower() != key_low]
+    if len(kept) == len(before):
+        return False, (
+            f"Account '{account.display_name}' has no Assigned Character "
+            f"named '{character_name}'."
+        )
+    account.assigned_characters = kept
+    try:
+        from engine.persistence import mark_account_dirty
+        mark_account_dirty(game, account)
+    except Exception:
+        pass
+    label = cast.key if cast is not None else character_name
+    return (
+        True,
+        f"Removed {label} from Assigned Characters on "
+        f"'{account.display_name}'.",
+    )
+
+
+# Legacy names (same PR branch -- keep grep-friendly aliases).
+list_cast_grant_keys = list_assigned_character_keys
+list_granted_cast = list_assigned_characters
+account_has_cast_grant = account_has_assigned_character
+grant_cast_to_account = assign_character_to_account
+revoke_cast_from_account = revoke_character_from_account
+
+
+def _first_owned_playable_body(game, account, *, exclude=None):
+    """First non-immersion PC on ``account`` (for cast-grant return keys)."""
+    if game is None or account is None:
+        return None
+    for key in roster_character_keys(game, account):
+        finder = getattr(game, "find_login_character", None)
+        body = finder(key) if callable(finder) else None
+        if body is None:
+            body = game.find_character(key)
+        if body is None or body is exclude:
+            continue
+        if getattr(body, "is_npc", False) or getattr(body, "immersion", False):
+            continue
+        return body
+    return None
+
+
+def stamp_rpc_cast_login_session(game, session, account, character):
+    """When login picks a granted cast, stamp return PC on the Session."""
+    if session is None or account is None or character is None:
+        return
+    if account_is_staff(account):
+        return
+    if not getattr(character, "immersion", False):
+        return
+    if not account_has_assigned_character(account, getattr(character, "key", "")):
+        return
+    session.cast_grant_account = account.name
+    body = _first_owned_playable_body(game, account, exclude=character)
+    if body is not None:
+        session.cast_grant_return_key = getattr(body, "key", None) or ""
+
+
 def account_is_staff(account):
     """True when ``account`` holds ordinary or head GM rank."""
     if account is None:
@@ -1023,6 +1434,13 @@ def account_login_choices(game, account):
             # Cast linked as a PC stays in Characters only.
             seen.add(low)
             choices.append(("cast", cast))
+    else:
+        for body in list_assigned_characters(game, account):
+            low = (getattr(body, "key", None) or "").lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            choices.append(("assigned_character", body))
     return choices
 
 
@@ -1102,11 +1520,21 @@ def resolve_staff_switch_target(game, account, name):
     if len(matches) > 1:
         names = ", ".join(getattr(c, "key", "?") for c in matches)
         return None, f"Ambiguous -- matches: {names}."
-    # 2) Immersion cast (staff accounts only).
-    if not account_is_staff(account):
-        return None, f"No account character named '{raw}'."
+    # 2) Immersion cast (staff: full roster; others: RPC cast grants only).
+    cast_pool = []
+    if account_is_staff(account):
+        cast_pool = list_immersion_cast(game)
+    else:
+        cast_pool = list_assigned_characters(game, account)
+    if not cast_pool:
+        if account_is_staff(account):
+            return None, f"No account character named '{raw}'."
+        return None, (
+            f"'{raw}' is not on your account roster. "
+            "Ask staff for an Assigned Character (help account)."
+        )
     cast_matches = []
-    for cast in list_immersion_cast(game):
+    for cast in cast_pool:
         key = (getattr(cast, "key", None) or "")
         if key.lower() == low:
             return cast, None
@@ -1118,8 +1546,12 @@ def resolve_staff_switch_target(game, account, name):
     if len(cast_matches) > 1:
         names = ", ".join(getattr(c, "key", "?") for c in cast_matches)
         return None, f"Ambiguous cast -- matches: {names}."
+    if account_is_staff(account):
+        return None, (
+            f"'{raw}' is not on your account roster or immersion cast."
+        )
     return None, (
-        f"'{raw}' is not on your account roster or immersion cast."
+        f"'{raw}' is not on your account roster or assigned cast list."
     )
 
 

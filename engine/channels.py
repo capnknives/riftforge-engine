@@ -11,7 +11,7 @@ Scopes:
   private -- one-to-one tells (per-session ring)
 
 Audience (who may hear / speak):
-  all, staff, gm, origin:<id> (via engine.hooks.channel_audience_ok)
+  all, staff, gm, helper, origin:<id> (via engine.hooks.channel_audience_ok)
 
 Stdlib only.
 """
@@ -36,9 +36,11 @@ SCOPE_PRIVATE = "private"
 AUDIENCE_ALL = "all"
 AUDIENCE_STAFF = "staff"
 AUDIENCE_GM = "gm"
+AUDIENCE_HELPER = "helper"
 
 # format kinds for render + gateway export
 FORMAT_OOC = "ooc"
+FORMAT_QUESTIONS = "questions"
 FORMAT_WIZNET = "wiznet"
 FORMAT_SAY = "say"
 FORMAT_TELL = "tell"
@@ -47,8 +49,10 @@ FORMAT_PLAIN = "plain"
 _VERB_RE = re.compile(r"^[a-z][a-z0-9_]{1,15}$")
 MAX_PLAYER_CHANNELS_PER_ACCOUNT = 3
 RESERVED_CHANNEL_VERBS = frozenset({
-    "say", "tell", "ooc", "wiznet", "emote", "who", "help", "block",
-    "unblock", "blocks", "chans", "channel", "reply", "whisper",
+    "say", "tell", "ooc", "questions", "answers", "wiznet", "emote", "who",
+    "help", "mute", "unmute", "mutes", "chans", "channel", "reply",
+    "whisper", "block", "unblock", "blocks", "query", "queries",
+    "querylist", "queryread", "querycomment", "queryclose",
 })
 
 
@@ -238,7 +242,10 @@ def audience_ok(viewer, audience: str, game) -> bool:
     if aud == AUDIENCE_GM:
         from engine.command_support import _is_gm
         return _is_gm(viewer)
-    if aud.startswith("origin:"):
+    if aud == AUDIENCE_HELPER:
+        from engine.player_helpers import is_player_helper
+        return is_player_helper(game, viewer)
+    if aud.startswith("origin:") or aud.startswith("helper:"):
         return hooks.channel_audience_ok(viewer, aud, game)
     return hooks.channel_audience_ok(viewer, aud, game)
 
@@ -389,8 +396,8 @@ def _normalize_ooc_loaded(data: list) -> list:
     return entries
 
 
-def _serialize_ooc_ring(game) -> list:
-    history = ring(game, "ooc") or []
+def _serialize_ooc_ring(game, *, channel_name: str = "ooc") -> list:
+    history = ring(game, channel_name) or []
     entries = []
     for item in history:
         if isinstance(item, str):
@@ -421,7 +428,7 @@ def load_channel(conn, channel_name: str) -> list:
     if spec is None:
         return []
     raw = _load_json_list(conn, spec.meta_key, ring_max=spec.ring_max)
-    if spec.format == FORMAT_OOC:
+    if spec.format in (FORMAT_OOC, FORMAT_QUESTIONS):
         return _normalize_ooc_loaded(raw)
     if spec.format == FORMAT_WIZNET:
         return [line for line in raw if isinstance(line, str)]
@@ -434,6 +441,8 @@ def save_channel(conn, game, channel_name: str) -> None:
         return
     if spec.format == FORMAT_OOC:
         items = _serialize_ooc_ring(game)
+    elif spec.format == FORMAT_QUESTIONS:
+        items = _serialize_ooc_ring(game, channel_name=channel_name)
     elif spec.format == FORMAT_WIZNET:
         items = _serialize_wiznet_ring(game)
     else:
@@ -709,7 +718,7 @@ def set_channel_audience(game, name: str, audience: str) -> tuple[bool, str]:
     spec = get_channel(key)
     if spec is None:
         return False, f"No channel named '{key}'."
-    if spec.builtin and key in ("ooc", "wiznet"):
+    if spec.builtin and key in ("ooc", "wiznet", "questions", "answers"):
         return False, f"Built-in '{key}' audience is fixed."
     aud = (audience or AUDIENCE_ALL).strip().lower()
     new = ChannelSpec(
@@ -745,10 +754,15 @@ def render_ooc_entry(entry, viewer, game) -> str:
     return ooc_channel.format_ooc_history_entry(entry, viewer, game)
 
 
+def render_questions_entry(entry, viewer, game) -> str:
+    from engine import questions_channel
+    return questions_channel.format_questions_history_entry(entry, viewer, game)
+
+
 def replay_wiznet_entry(entry) -> str:
     from engine import style
     plain = entry if isinstance(entry, str) else str(entry)
-    return style.paint("absinthe_green", plain)
+    return style.paint_preserving_urls("absinthe_green", plain)
 
 
 def render_room_say_entry(entry, viewer, game) -> str:
@@ -782,6 +796,7 @@ def render_room_say_entry(entry, viewer, game) -> str:
         you_verb=you_verb,
         they_verb=they_verb,
         tone=tone,
+        voice_phrase=entry.get("voice_phrase"),
     )
     return f"{prefix}{line}" if prefix else line
 
@@ -876,6 +891,8 @@ def replay_global(character, game, channel_name: str) -> None:
             continue
         if spec.format == FORMAT_OOC:
             line = render_ooc_entry(entry, character, game)
+        elif spec.format == FORMAT_QUESTIONS:
+            line = render_questions_entry(entry, character, game)
         elif spec.format == FORMAT_WIZNET:
             line = replay_wiznet_entry(entry)
         else:
@@ -972,16 +989,13 @@ def speak_custom_global(
             continue
         display_prefs.ensure_display_defaults(other)
         line = _render_for(other)
-        session.send(line)
-        session.send("")
-        gmcp.push_comm(session, spec.verb, message, speaker_face)
+        gmcp.deliver_comm(session, spec.verb, message, speaker_face, line, "")
         delivered = True
     if not delivered and getattr(speaker, "session", None) is not None:
         sess = speaker.session
         display_prefs.ensure_display_defaults(speaker)
         line = _render_for(speaker)
-        sess.send(line)
-        sess.send("")
+        gmcp.deliver_comm(sess, spec.verb, message, speaker_face, line, "")
         delivered = True
     return delivered
 
@@ -1030,10 +1044,34 @@ def export_gateway_plain_line(
                 plain = entry.get("plain")
                 if isinstance(plain, str) and plain.strip():
                     return plain.strip()
-                face = "?"
+                fallback = ooc_channel._ooc_fallback_face(entry)
+                face = fallback if fallback else "?"
             else:
                 face = ooc_channel.speaker_face_for_character(speaker, game)
             return ooc_channel.format_ooc_line(face, message, kind=kind)
+        return None
+    if channel_name == "questions":
+        from engine import questions_channel
+        if isinstance(entry, str):
+            return entry.strip() or None
+        if isinstance(entry, dict):
+            message = str(entry.get("message") or "").strip()
+            if not message:
+                return None
+            speaker_key = entry.get("speaker")
+            finder = getattr(game, "find_character", None)
+            speaker = (
+                finder(speaker_key) if callable(finder) and speaker_key else None
+            )
+            if speaker is None:
+                plain = entry.get("plain")
+                if isinstance(plain, str) and plain.strip():
+                    return plain.strip()
+                fallback = entry.get("face")
+                face = fallback if isinstance(fallback, str) and fallback else "?"
+            else:
+                face = questions_channel.speaker_face_for_character(speaker, game)
+            return questions_channel.format_questions_line(face, message)
         return None
     if channel_name == "wiznet":
         if isinstance(entry, str) and entry.strip():
@@ -1094,6 +1132,48 @@ register_channel(
         prefix="((OOC))",
         color_role="ooc",
         title="OOC",
+    )
+)
+
+register_channel(
+    ChannelSpec(
+        name="questions",
+        verb="questions",
+        game_attr="questions_history",
+        meta_key="questions_history",
+        scope=SCOPE_GLOBAL,
+        audience=AUDIENCE_ALL,
+        replay_header="Recent questions (last 20):",
+        empty_message="No recent questions. Type 'questions <message>' to ask.",
+        usage_message="Usage: questions <message>  (bare questions replays history)",
+        ring_max=DEFAULT_RING_MAX,
+        builtin=True,
+        gateway_stitch=True,
+        format=FORMAT_QUESTIONS,
+        prefix="((QUESTIONS))",
+        color_role="ooc",
+        title="Questions",
+    )
+)
+
+register_channel(
+    ChannelSpec(
+        name="answers",
+        verb="answers",
+        game_attr="answers_history",
+        meta_key="answers_history",
+        scope=SCOPE_GLOBAL,
+        audience=AUDIENCE_HELPER,
+        replay_header="Recent answers (last 20):",
+        empty_message="No recent answers. Helpers: type 'answers <message>'.",
+        usage_message="Usage: answers <message>  (bare answers replays history)",
+        ring_max=DEFAULT_RING_MAX,
+        builtin=True,
+        gateway_stitch=True,
+        format=FORMAT_PLAIN,
+        prefix="((ANSWERS))",
+        color_role="absinthe_green",
+        title="Answers",
     )
 )
 

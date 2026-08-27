@@ -232,7 +232,10 @@ def main():
         f"lean demo should be one room, got {len(rooms)} "
         f"(maps_dir={maps.get_maps_dir()!r})"
     )
-    assert start_room.key in ("Demo Start", "DT00001"), start_room.key
+    # JSON authors "Demo Start"; world_maps may stamp a DT vnum on load.
+    assert start_room.key == "Demo Start" or (
+        isinstance(start_room.key, str) and start_room.key.startswith("DT")
+    ), start_room.key
 
     # Phase 4b: soft-optional commands + server with SUPERS absent.
     import commands as commands_mod
@@ -247,7 +250,10 @@ def main():
     # Lean Game: maps + persistence, no Cadence seed; still one-room demo.
     lean_game = server_mod.Game(db_path=":memory:")
     assert lean_game.start_room is not None
-    assert lean_game.start_room.key in ("Demo Start", "DT00001"), lean_game.start_room.key
+    assert lean_game.start_room.key == "Demo Start" or (
+        isinstance(lean_game.start_room.key, str)
+        and lean_game.start_room.key.startswith("DT")
+    ), lean_game.start_room.key
     assert len(lean_game.rooms) == 1, len(lean_game.rooms)
     assert lean_game.find_character("a training dummy") is None
 

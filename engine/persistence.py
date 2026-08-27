@@ -54,9 +54,18 @@ _PERSIST_FULL_EVERY_DEFAULT = 30
 # Cap how many dirty bodies / floor rooms one incremental autosave rewrites.
 # Excess keys stay in the dirty sets for the next pass.
 _PERSIST_DIRTY_CHAR_CAP_DEFAULT = 40
+_PERSIST_OFFLINE_DIRTY_SHARDS_DEFAULT = 8
+# Offline Echo priority tier: recently active bodies drain before cold roster.
+_PERSIST_DIRTY_RECENT_ACTIVE_S = 7 * 24 * 3600
 _PERSIST_DIRTY_ROOM_CAP_DEFAULT = 80
 # How many DELETE/INSERT batches between cooperative yields on apply/collect.
-_PERSIST_SAVE_YIELD_EVERY_DEFAULT = 1
+# Default 8 (was 1): collect still yields, but not after every single row.
+_PERSIST_SAVE_YIELD_EVERY_DEFAULT = 8
+# Yield collect when this many milliseconds of CPU elapse even if the
+# row count has not hit ``persist_save_yield_every`` yet. Stops a
+# force_full blob storm from pinning the loop for the whole 180s
+# autosave interval.
+_PERSIST_COLLECT_YIELD_MS_DEFAULT = 12.0
 # How many changed characters/rooms share one SQLite commit during the
 # incremental async apply (lag P11.3). Each commit is a separate fsync under
 # the default DELETE journal mode; committing per-character (the old
@@ -70,6 +79,15 @@ _PERSIST_APPLY_COMMIT_BATCH_DEFAULT = 25
 # Max milliseconds one autosave may spend in save_async before deferring
 # optional meta slices to the next scheduled pass (lag 2026-08 live freezes).
 _PERSIST_SAVE_WALL_BUDGET_MS_DEFAULT = 5000
+# Lag P12: log a character's blob-build time when it alone crosses this
+# floor, so a slow autosave collect names the actual culprit instead of
+# only reporting an aggregate collect_ms. 20ms is well above the ~1-3ms a
+# normal character blob costs -- see docs/plans/lag_p12_collect_profile.md.
+_PERSIST_SLOW_CHAR_LOG_MS = 20.0
+# Cap how many slow-character (name, ms) pairs one autosave keeps -- this
+# is diagnostic breadcrumbs, not a full profile; a handful of names is
+# enough to point a GM at the right character with ``gm cadence why``.
+_PERSIST_SLOW_CHAR_LOG_CAP = 8
 
 
 def persist_save_wall_budget_ms():
@@ -109,6 +127,17 @@ def persist_save_yield_every():
     return _PERSIST_SAVE_YIELD_EVERY_DEFAULT
 
 
+def persist_collect_yield_ms():
+    """Max CPU ms between collect yields (0 = row-count only)."""
+    raw = (os.environ.get("RIFTFORGE_PERSIST_COLLECT_YIELD_MS") or "").strip()
+    if not raw:
+        return _PERSIST_COLLECT_YIELD_MS_DEFAULT
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return _PERSIST_COLLECT_YIELD_MS_DEFAULT
+
+
 def persist_apply_commit_batch():
     """Changed characters/rooms per SQLite commit in the incremental async
     apply (lag P11.3). ``RIFTFORGE_PERSIST_APPLY_COMMIT_BATCH`` overrides.
@@ -130,11 +159,174 @@ def _persist_env_int(name, default):
         return int(default)
 
 
+def _persist_env_bool(name, default):
+    """Parse a truthy env flag."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return raw.strip().lower() not in ("0", "off", "false", "no", "")
+
+
+def persist_background_writer_enabled():
+    """True when autosave apply runs on the dedicated writer thread.
+
+    Unset env stays False so ``Game()`` smokes do not start a writer
+    thread. Production compose / live ``.env`` default the flag on
+    (``RIFTFORGE_PERSIST_BACKGROUND_WRITER=1``).
+    """
+    return _persist_env_bool("RIFTFORGE_PERSIST_BACKGROUND_WRITER", False)
+
+
+def persist_writer_drain_timeout_s():
+    """Max seconds to wait for the writer queue to drain on shutdown."""
+    return _persist_env_int("RIFTFORGE_PERSIST_WRITER_DRAIN_TIMEOUT_S", 120)
+
+
+def persist_background_writer_ready():
+    """True only once the writer thread actually started.
+
+    The env flag alone (``persist_background_writer_enabled``) is not
+    enough to route a save onto the writer: two live sqlite3 connections
+    to the same on-disk file are only safe under WAL (rollback-journal
+    "DELETE" mode serializes writers at the OS file-lock level and two
+    threads contending for that lock is the exact "database disk image
+    is malformed" corruption class this repo has hit before). Boot
+    verifies WAL before calling ``start_persistence_writer`` -- if that
+    check failed, ``_writer`` stays unset and callers must fall back to
+    the synchronous single-connection save path instead of raising.
+    """
+    if not persist_background_writer_enabled():
+        return False
+    try:
+        from engine.persistence_writer import writer_started
+        return writer_started()
+    except ImportError:
+        return False
+
+
+def persist_save_busy(game):
+    """True while autosave is collecting or applying on the asyncio loop.
+
+    P30 writer-thread apply is intentionally excluded -- Cadence and other
+    tick handlers may run while SQLite fsync is off-loop. Save scheduling
+    uses ``persist_writer_in_flight()`` separately so a follow-up collect
+    still waits for the writer without freezing town life.
+    """
+    if game is None:
+        return False
+    if getattr(game, "_save_collecting", False):
+        return True
+    if getattr(game, "_autosave_running", False):
+        return True
+    return False
+
+
+def _collect_idle_event(game):
+    """Event that is set while world-save collect is idle."""
+    import asyncio
+
+    ev = getattr(game, "_persist_collect_idle_event", None)
+    if ev is None:
+        ev = asyncio.Event()
+        ev.set()
+        game._persist_collect_idle_event = ev
+    return ev
+
+
+def note_collect_started(game):
+    """Clear the collect-idle Event before ``_save_collecting`` is set."""
+    if game is None:
+        return
+    try:
+        _collect_idle_event(game).clear()
+    except Exception:
+        pass
+
+
+def note_collect_finished(game):
+    """Set the collect-idle Event after ``_save_collecting`` is cleared."""
+    if game is None:
+        return
+    try:
+        _collect_idle_event(game).set()
+    except Exception:
+        pass
+
+
+async def wait_collect_idle_async(game, *, timeout=None):
+    """Park until on-loop collect finishes -- no ``sleep(0)`` spin."""
+    if game is None or not persist_save_busy(game):
+        return
+    import asyncio
+
+    ev = _collect_idle_event(game)
+    if ev.is_set():
+        return
+    if timeout is None:
+        await ev.wait()
+        return
+    try:
+        await asyncio.wait_for(ev.wait(), timeout=float(timeout))
+    except asyncio.TimeoutError:
+        return
+
+
+def persist_writer_in_flight():
+    """True when the P30 writer thread still has queued or applying work.
+
+    Distinct from ``persist_save_busy`` so schedulers can coalesce a
+    follow-up save without launching a waiter task that busy-polls.
+    """
+    if not persist_background_writer_ready():
+        return False
+    try:
+        from engine.persistence_writer import writer_busy
+        return writer_busy()
+    except ImportError:
+        return False
+
+
+async def wait_writer_idle_async(*, timeout=None):
+    """Await writer drain without spinning the asyncio loop.
+
+    ``asyncio.sleep(0)`` while ``writer_busy()`` is the P30 flag-on CPU
+    peg: the loop keeps waking itself until SQLite apply finishes.
+    """
+    if not persist_background_writer_ready():
+        return
+    from engine.persistence_writer import wait_until_idle_async
+    await wait_until_idle_async(timeout=timeout)
+
+
 def persist_full_every():
     """Autosaves between full-verify wipe passes."""
     return _persist_env_int(
         "RIFTFORGE_PERSIST_FULL_EVERY", _PERSIST_FULL_EVERY_DEFAULT,
     )
+
+
+def _persist_schedule_world_full_if_due(game):
+    """Arm a full-verify world save for the *next* autosave (lag P23.3).
+
+    Does not set ``_persist_force_full`` in the same ``save_async`` pass as
+    SUPERS meta -- that used to force every meta slice to rewrite on count-30
+    ticks.
+    """
+    if game is None:
+        return
+    count = int(getattr(game, "_persist_autosave_count", 0) or 0)
+    every = persist_full_every()
+    if every > 0 and count % every == 0:
+        game._persist_world_full_scheduled = True
+
+
+def _persist_apply_scheduled_world_full(game):
+    """Consume a deferred world full-verify flag at snapshot collect time."""
+    if game is None:
+        return
+    if getattr(game, "_persist_world_full_scheduled", False):
+        game._persist_force_full = True
+        game._persist_world_full_scheduled = False
 
 
 def persist_dirty_char_cap(game=None):
@@ -154,6 +346,27 @@ def persist_dirty_room_cap(game=None):
     return _persist_env_int(
         "RIFTFORGE_PERSIST_DIRTY_ROOM_CAP", _PERSIST_DIRTY_ROOM_CAP_DEFAULT,
     )
+
+
+def persist_offline_dirty_shards():
+    """Spread offline lifestyle dirty marks across N autosave generations.
+
+    With ~250+ offline bodies and a per-pass dirty cap of ~40, queuing every
+    Echo every generation keeps ``n_deferred_chars`` pegged high and inflates
+    collect. Each body only joins the dirty set when
+    ``crc32(key) % shards == generation % shards`` (lag P28 follow-on).
+    """
+    return _persist_env_int(
+        "RIFTFORGE_PERSIST_OFFLINE_DIRTY_SHARDS",
+        _PERSIST_OFFLINE_DIRTY_SHARDS_DEFAULT,
+    )
+
+
+def _offline_dirty_shard_allows(char_key, generation, shards):
+    if shards <= 1:
+        return True
+    slot = zlib.crc32(str(char_key).encode("utf-8")) & 0xFFFFFFFF
+    return (slot % shards) == (int(generation) % shards)
 
 
 def meta_persist_fingerprint(payload):
@@ -647,15 +860,29 @@ def _sqlite_journal_mode():
     return "DELETE"
 
 
+_SHARED_MEMORY_URI = "file:riftforge_persist_shared?mode=memory&cache=shared"
+
+
+def _sqlite_connect_target(path):
+    """Return (connect_target, uri_mode) for sqlite3.connect."""
+    if path == ":memory:" and persist_background_writer_enabled():
+        return _SHARED_MEMORY_URI, True
+    return path, False
+
+
 def connect(path):
     """Open (or create) the database at `path` and ensure the tables exist.
 
     `path` may also be ":memory:" -- SQLite's built-in throwaway mode, which
-    the smoke test uses so test runs never touch a real file. Journal modes
-    only make sense for a real file -- ":memory:" has no journal to speak
-    of and rejects the pragma with an OperationalError.
+    the smoke test uses so test runs never touch a real file. When the
+    background writer is enabled, ``:memory:`` uses a shared-cache URI so
+    the writer thread's second connection sees the same schema.
     """
-    conn = sqlite3.connect(path)
+    connect_target, uri = _sqlite_connect_target(path)
+    if uri:
+        conn = sqlite3.connect(connect_target, uri=True)
+    else:
+        conn = sqlite3.connect(connect_target)
     if path != ":memory:":
         mode = _sqlite_journal_mode()
         try:
@@ -674,6 +901,13 @@ def connect(path):
         sqlite_wal_mod.maybe_checkpoint_on_boot(conn, path)
     conn.executescript(_SCHEMA)   # executescript runs several statements at once
     _migrate(conn)
+    # Writer thread already sets this; the loop connection did not, so
+    # login / help FTS / player ``save`` hit SQLITE_BUSY immediately
+    # during WAL TRUNCATE or a long writer transaction.
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+    except sqlite3.Error:
+        pass
     return conn
 
 
@@ -1418,6 +1652,16 @@ def save_author_mantle_event(conn, game):
     _save_meta_dict(conn, "author_mantle_event", game, "author_mantle_event")
 
 
+def load_amara_pressure_state(conn):
+    """Load world Unmade pressure meter from meta (default {})."""
+    return _load_meta_dict(conn, "amara_pressure_state")
+
+
+def save_amara_pressure_state(conn, game):
+    """Persist game.amara_pressure_state across copyover."""
+    _save_meta_dict(conn, "amara_pressure_state", game, "amara_pressure_state")
+
+
 def load_chuck_heaven_claim(conn):
     """Load Heaven-claim Author reaction state from meta (default {})."""
     return _load_meta_dict(conn, "chuck_heaven_claim")
@@ -1477,6 +1721,126 @@ def mark_account_dirty(game, account_or_name):
         dirty = set()
         game._persist_dirty_accounts = dirty
     dirty.add(key)
+
+
+def _sqlite_busy_error(exc):
+    """True when *exc* is a transient SQLite lock/contention failure."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _persist_on_asyncio_loop():
+    """True when called from the running tick/command loop.
+
+    The persistence writer and Cadence planner threads never have a
+    running asyncio loop. Login and ``changes`` flush *do* -- and those
+    used to ``time.sleep`` until SQLite finished, pinning the same thread
+    Cadence needs (P30.2).
+    """
+    try:
+        import asyncio
+
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _wait_for_persistence_writer_idle(*, timeout_s=2.0):
+    """Brief pause so the background writer can release the DB write lock.
+
+    Never ``time.sleep`` on the asyncio thread -- that froze town life for
+    the whole writer apply. Callers retry ``SQLITE_BUSY`` instead.
+    """
+    if not persist_background_writer_ready():
+        return
+    if _persist_on_asyncio_loop():
+        return
+    try:
+        from engine.persistence_writer import writer_thread_busy
+    except ImportError:
+        return
+    import time
+
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while writer_thread_busy() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def flush_accounts_now(conn, game, *, reason=""):
+    """Write dirty account rows immediately (changelog cursors, login menu).
+
+    Waits briefly for the background persistence writer, then retries on
+    SQLITE_BUSY. Returns True when ``save_accounts`` completes.
+    """
+    import time
+
+    if conn is None or game is None:
+        return False
+    _wait_for_persistence_writer_idle()
+    attempts = 3
+    for attempt in range(attempts):
+        try:
+            save_accounts(conn, game)
+            return True
+        except sqlite3.OperationalError as exc:
+            if not _sqlite_busy_error(exc) or attempt + 1 >= attempts:
+                print(
+                    f"[persistence] flush_accounts_now failed "
+                    f"reason={reason!r} ({exc!r})",
+                    flush=True,
+                )
+                return False
+            # Do not pin Cadence with a blocking sleep; WAL retries are
+            # instant on the tick loop and still succeed between writer
+            # statements most of the time.
+            if not _persist_on_asyncio_loop():
+                time.sleep(0.05 * (attempt + 1))
+        except Exception as exc:
+            print(
+                f"[persistence] flush_accounts_now failed "
+                f"reason={reason!r} ({exc!r})",
+                flush=True,
+            )
+            return False
+    return False
+
+
+def flush_character_checkpoint_now(conn, game, character, *, reason=""):
+    """Checkpoint one character row; retry on SQLITE_BUSY."""
+    import time
+
+    if conn is None or game is None or character is None:
+        return False
+    _wait_for_persistence_writer_idle()
+    attempts = 3
+    char_key = getattr(character, "key", "") or ""
+    for attempt in range(attempts):
+        ok, msg = persist_save_character(
+            conn, game, character, player_checkpoint=False,
+        )
+        if ok:
+            return True
+        low = (msg or "").lower()
+        if "locked" not in low and "busy" not in low:
+            print(
+                f"[persistence] flush_character_checkpoint_now failed "
+                f"reason={reason!r} char={char_key!r} ({msg!r})",
+                flush=True,
+            )
+            return False
+        if attempt + 1 >= attempts:
+            print(
+                f"[persistence] flush_character_checkpoint_now failed "
+                f"reason={reason!r} char={char_key!r} ({msg!r})",
+                flush=True,
+            )
+            return False
+        if not _persist_on_asyncio_loop():
+            time.sleep(0.05 * (attempt + 1))
+    return False
 
 
 def _account_row_digest(name, display, password_hash, blob):
@@ -1833,6 +2197,16 @@ def save_winchester_failsafe(conn, game):
     _save_meta_dict(conn, "winchester_failsafe", game, "winchester_failsafe")
 
 
+def load_winchester_pursuit(conn):
+    """Load Winchester evil-monster pursuit state from meta (default {})."""
+    return _load_meta_dict(conn, "winchester_pursuit")
+
+
+def save_winchester_pursuit(conn, game):
+    """Persist game.winchester_pursuit (active mark) to meta."""
+    _save_meta_dict(conn, "winchester_pursuit", game, "winchester_pursuit")
+
+
 def load_cadence_airport(conn):
     """Load GM Cadence airport travel toggle from meta (default off)."""
     return _load_meta_dict(conn, "cadence_airport")
@@ -2122,6 +2496,22 @@ def _item_container_blob(item):
         "slot": getattr(item, "slot", None),
         "mods": dict(getattr(item, "mods", None) or {})
         if isinstance(getattr(item, "mods", None), dict) else None,
+        # God Forge domain: permanent gear-bless tier counter (caps
+        # relicforge stacking at gear_bless_max_tier) -- must survive
+        # logout or the cap is bypassable by relogging and re-blessing.
+        "god_forge_blessed_tier": (
+            int(item.god_forge_blessed_tier)
+            if getattr(item, "god_forge_blessed_tier", None) else None
+        ),
+        "god_war_manifest": bool(getattr(item, "god_war_manifest", False)),
+        "god_war_owner_key": getattr(item, "god_war_owner_key", None),
+        "grip": getattr(item, "grip", None),
+        # Host soul-bound angel blade growth (suggestion 215).
+        "bound_angel_id": getattr(item, "bound_angel_id", None),
+        "angel_blade_growth_tier": (
+            int(item.angel_blade_growth_tier)
+            if getattr(item, "angel_blade_growth_tier", None) else None
+        ),
         "materials": list(getattr(item, "materials", None) or [])
         if getattr(item, "materials", None) else None,
         "color": getattr(item, "color", None),
@@ -2174,6 +2564,10 @@ def _item_container_blob(item):
         "is_ethereal": bool(getattr(item, "is_ethereal", False)),
         "is_spirit_mirror": bool(getattr(item, "is_spirit_mirror", False)),
         "spirit_mirror_source_key": getattr(item, "spirit_mirror_source_key", None),
+        # Bela theft contract plants (supers/contracts/runtime.py).
+        "_contract_id": getattr(item, "_contract_id", None),
+        "_contract_prize": bool(getattr(item, "_contract_prize", False)),
+        "_contract_lockbox": bool(getattr(item, "_contract_lockbox", False)),
         "body_equipment": {
             str(slot): {
                 "key": getattr(piece, "key", None),
@@ -2302,18 +2696,97 @@ _ITEM_INSERT_SQL = (
 )
 
 
+def _persistable_reseat_body(obj):
+    """True when an unroomed body should be parked before skip-save.
+
+    Account-linked Echoes, immersion cast, and essential fixtures must keep
+    a SQLite row across cold boot. Hostile NPCs, guests, and parked
+    ``gmspirit:`` / ``husk:`` keys stay out of this path.
+    """
+    if obj is None:
+        return False
+    if getattr(obj, "is_guest", False) or getattr(obj, "gm_mode", False):
+        return False
+    key_low = (getattr(obj, "key", None) or "").lower()
+    if key_low.startswith("gmspirit:") or key_low.startswith("husk:"):
+        return False
+    if (getattr(obj, "account", None) or "").strip():
+        return True
+    if getattr(obj, "immersion", False) or getattr(obj, "essential", False):
+        return True
+    return False
+
+
+def _reseat_account_linked_if_unroomed(obj, game):
+    """Put a persistable body back on a live map room before snapshot.
+
+    Cold-boot hub heals can leave an Echo or catalog Cast with
+    ``location is None`` (or on a Room object that was replaced in
+    ``game.rooms``). The next full snapshot then ``DELETE FROM characters``.
+    Home / start is enough to survive until deferred unstick runs.
+    """
+    loc = getattr(obj, "location", None)
+    rooms = getattr(game, "rooms", None) or {}
+    dest = None
+    if loc is not None:
+        live = rooms.get(getattr(loc, "key", None))
+        if live is loc:
+            return loc
+        dest = live
+    if not _persistable_reseat_body(obj):
+        return loc
+    if dest is None:
+        dest = rooms.get(getattr(obj, "home_room_key", None))
+    if dest is None:
+        dest = getattr(game, "start_room", None)
+    if dest is None or dest is loc:
+        return loc
+    mover = getattr(obj, "move_to", None)
+    if callable(mover) and mover(dest):
+        return dest
+    return loc
+
+
 def _should_skip_character_save(obj, game, seen_names):
     """Return True when this live Character must not be written to SQLite."""
-    room = getattr(obj, "location", None)
+    room = _reseat_account_linked_if_unroomed(obj, game)
     if room is None:
         return True
     if getattr(obj, "tutorial_mentor_for", None):
+        return True
+    if getattr(obj, "pit_merchant", False) or getattr(obj, "pit_run_tag", None):
         return True
     if getattr(obj, "is_guest", False):
         return True
     if getattr(obj, "transient_soul", False):
         return True
     key_low = (getattr(obj, "key", None) or "").lower()
+    if getattr(obj, "character_kind", None) == "riftcrash_avatar":
+        return True
+    if key_low.startswith("riftcrash:"):
+        return True
+    if getattr(obj, "riftcrash_trash", False):
+        return True
+    # Account-linked login Echoes must hit SQLite even when a kit/heal left
+    # is_npc set. Skipping them on the first cold-boot snapshot DELETE FROM
+    # characters's the row. GM-form and spirit keys still skip below.
+    account = (getattr(obj, "account", None) or "").strip()
+    if (
+        account
+        and not key_low.startswith("gmspirit:")
+        and not key_low.startswith("husk:")
+        and not getattr(obj, "gm_mode", False)
+        and not getattr(obj, "is_guest", False)
+    ):
+        save_name = getattr(obj, "key", None) or ""
+        if save_name in seen_names:
+            print(
+                f"[persistence] skip duplicate character key "
+                f"{save_name!r} in {getattr(room, 'key', '?')}",
+                flush=True,
+            )
+            return True
+        return False
     if key_low.startswith("gmspirit:"):
         permanent = bool(getattr(obj, "gm_spirit_permanent", False))
         if not permanent:
@@ -2363,8 +2836,12 @@ def _should_skip_character_save(obj, game, seen_names):
 
 def _character_save_rows(game, obj, seen_names):
     """Build INSERT rows for one persistable Character (or None to skip)."""
-    room = getattr(obj, "location", None)
+    # Reseat runs inside skip-save; read location only after that so a
+    # None/stale room that just got parked is the key we write.
     if _should_skip_character_save(obj, game, seen_names):
+        return None
+    room = getattr(obj, "location", None)
+    if room is None:
         return None
     save_name = getattr(obj, "key", None) or ""
     seen_names.add(save_name)
@@ -2536,18 +3013,91 @@ def _floor_room_snapshot_hash(room_rows):
     return _snapshot_hash_adler32(room_rows)
 
 
-def mark_character_dirty(game, character):
-    """Queue one character for the next incremental world save."""
+def _persist_stamp_dirty_write_gen(game, key, *, floor=False):
+    """Record which dirty-write epoch last queued this key.
+
+    Collect bumps the epoch, then the writer-thread ack drops a written
+    key only when its stamp is still at or before the snapshot's epoch.
+    Cadence re-marking the same Echo during SQLite apply gets a newer
+    stamp and survives -- otherwise town life during P30 apply would
+    silently lose meters and inventory.
+    """
+    if game is None or not key:
+        return
+    epoch = int(getattr(game, "_persist_dirty_write_epoch", 0) or 0)
+    attr = (
+        "_persist_dirty_floor_write_gen" if floor
+        else "_persist_dirty_char_write_gen"
+    )
+    gens = getattr(game, attr, None)
+    if gens is None:
+        gens = {}
+        setattr(game, attr, gens)
+    gens[key] = epoch
+
+
+def _persist_begin_dirty_write_epoch(game):
+    """Snapshot the ack epoch, then bump so later marks outlive this save."""
+    if game is None:
+        return 0
+    ack_epoch = int(getattr(game, "_persist_dirty_write_epoch", 0) or 0)
+    game._persist_dirty_write_epoch = ack_epoch + 1
+    return ack_epoch
+
+
+def mark_character_dirty(game, character, *, force=False):
+    """Queue one character for the next incremental world save.
+
+    Offline bodies (Echoes and Cadence NPCs) used to re-enter the dirty set
+    every heartbeat when needs decay moved a float meter, keeping the dirty-
+    char cap saturated on quiet servers (lag P28). Coalesce their non-
+    ``force`` dirties to once per autosave generation; online sessions and
+    ``force=True`` hard mutations always queue immediately.
+    """
     if game is None or character is None:
         return
     key = getattr(character, "key", None)
     if not key:
         return
+    if not force:
+        session = getattr(character, "session", None)
+        is_online = session is not None and not getattr(session, "silent", False)
+        if not is_online:
+            generation = int(
+                getattr(game, "_persist_echo_dirty_generation", 0) or 0,
+            )
+            last_marked = int(
+                getattr(character, "_persist_dirty_generation", -1),
+            )
+            if last_marked == generation:
+                skipped = int(
+                    getattr(game, "_persist_echo_coalesce_skipped", 0) or 0,
+                )
+                game._persist_echo_coalesce_skipped = skipped + 1
+                # Still stamp the writer-ack generation: the key is already
+                # in the dirty set, and Cadence will re-touch it during P30
+                # apply. Without the stamp the ack would drop the live
+                # mutation with the snapshot it just wrote.
+                _persist_stamp_dirty_write_gen(game, key)
+                return
+            shards = persist_offline_dirty_shards()
+            if not _offline_dirty_shard_allows(key, generation, shards):
+                character._persist_dirty_generation = generation
+                skipped = int(
+                    getattr(game, "_persist_echo_coalesce_skipped", 0) or 0,
+                )
+                game._persist_echo_coalesce_skipped = skipped + 1
+                dirty_now = getattr(game, "_persist_dirty_characters", None)
+                if dirty_now and key in dirty_now:
+                    _persist_stamp_dirty_write_gen(game, key)
+                return
+            character._persist_dirty_generation = generation
     dirty = getattr(game, "_persist_dirty_characters", None)
     if dirty is None:
         dirty = set()
         game._persist_dirty_characters = dirty
     dirty.add(key)
+    _persist_stamp_dirty_write_gen(game, key)
 
 
 # Display / checkpoint verbs that do not change the persisted character blob.
@@ -2651,15 +3201,97 @@ def mark_floor_room_dirty(game, room):
         dirty = set()
         game._persist_dirty_floor_rooms = dirty
     dirty.add(key)
+    _persist_stamp_dirty_write_gen(game, key, floor=True)
 
 
 def _persist_clear_dirty(game):
-    """Drop dirty queues after a successful world save."""
+    """Drop dirty queues after a successful *synchronous* world save.
+
+    Writer-path ack uses ``_persist_ack_written_dirty`` instead -- a
+    blind wipe here would drop keys Cadence marked while SQLite applied
+    on the background thread.
+    """
     if game is None:
         return
     game._persist_dirty_characters = set()
     game._persist_dirty_floor_rooms = set()
     game._persist_force_full = False
+
+
+def _persist_drop_acked_dirty(dirty, written, gens, ack_epoch):
+    """Drop written keys whose stamp is still at or before ``ack_epoch``.
+
+    Keys re-dirtied after collect have a newer stamp and stay queued.
+    """
+    if dirty is None or not written:
+        return
+    drop = set()
+    for key in written:
+        if key not in dirty:
+            continue
+        gen = 0
+        if gens is not None:
+            try:
+                gen = int(gens.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                gen = 0
+        if gen <= ack_epoch:
+            drop.add(key)
+    if not drop:
+        return
+    dirty.difference_update(drop)
+    if gens:
+        for key in drop:
+            gens.pop(key, None)
+
+
+def _persist_ack_written_dirty(game, meta, char_rows):
+    """Remove only keys this batch wrote; keep dirties marked during apply.
+
+    Collect leaves the dirty sets intact until ack. A full wipe-and-restore
+    of deferred keys dropped anything Cadence/commands queued while the
+    writer thread held SQLite -- the P30 "Cadence runs during apply" path
+    would silently lose those saves.
+
+    Keys that were in the snapshot *and* re-dirtied during apply keep
+    their dirty bit via ``_persist_dirty_*_write_gen`` (P30.2). Rolling
+    deploys whose in-flight meta has no ``ack_epoch`` fall back to the
+    older difference_update (new keys survive; re-dirtied snapshot keys
+    do not).
+    """
+    if game is None:
+        return
+    written_chars = set(meta.get("changed_chars") or ())
+    written_chars.update(meta.get("removed_chars") or ())
+    if meta.get("force_full"):
+        written_chars.update(row[0] for row in (char_rows or ()) if row)
+    written_rooms = set(meta.get("changed_floor_rooms") or ())
+    if "ack_epoch" not in meta:
+        dirty_c = getattr(game, "_persist_dirty_characters", None)
+        if dirty_c is not None and written_chars:
+            dirty_c.difference_update(written_chars)
+        dirty_r = getattr(game, "_persist_dirty_floor_rooms", None)
+        if dirty_r is not None and written_rooms:
+            dirty_r.difference_update(written_rooms)
+    else:
+        try:
+            ack_epoch = int(meta.get("ack_epoch") or 0)
+        except (TypeError, ValueError):
+            ack_epoch = 0
+        _persist_drop_acked_dirty(
+            getattr(game, "_persist_dirty_characters", None),
+            written_chars,
+            getattr(game, "_persist_dirty_char_write_gen", None),
+            ack_epoch,
+        )
+        _persist_drop_acked_dirty(
+            getattr(game, "_persist_dirty_floor_rooms", None),
+            written_rooms,
+            getattr(game, "_persist_dirty_floor_write_gen", None),
+            ack_epoch,
+        )
+    if meta.get("force_full"):
+        game._persist_force_full = False
 
 
 def _persist_should_skip_world_save(game):
@@ -2880,12 +3512,33 @@ async def _collect_floor_save_pass_async(
     return item_rows, changed_floor_rooms, new_floor_hashes
 
 
+def _persist_dirty_priority_key(game, char_key):
+    """Sort key: online (0) < recently active (1) < everyone else (2).
+
+    Lower sorts first so the dirty-char cap always drains live sessions
+    before cold offline Echoes. Ties within a tier fall back to ``char_key``
+    for the same determinism the old plain alphabetical sort gave tests.
+    """
+    find = getattr(game, "find_character", None)
+    char = find(char_key) if callable(find) else None
+    if char is None:
+        return (2, char_key)
+    session = getattr(char, "session", None)
+    if session is not None and not getattr(session, "silent", False):
+        return (0, char_key)
+    last_active = float(getattr(char, "last_active_at", 0.0) or 0.0)
+    if last_active and (time.time() - last_active) <= _PERSIST_DIRTY_RECENT_ACTIVE_S:
+        return (1, char_key)
+    return (2, char_key)
+
+
 def _persist_cap_dirty_sets(game, force_full):
     """Return (dirty_chars, dirty_rooms, deferred_chars, deferred_rooms).
 
-    When not force_full, take only the first N dirty keys (sorted for
-    determinism) and leave the rest queued for the next autosave. Full
-    verify passes ignore the cap -- they rewrite everything.
+    When not force_full, take only the first N dirty keys (priority-sorted
+    for characters, alphabetical for rooms) and leave the rest queued for
+    the next autosave. Full verify passes ignore the cap -- they rewrite
+    everything.
     """
     dirty_chars = set(getattr(game, "_persist_dirty_characters", None) or set())
     dirty_rooms = set(getattr(game, "_persist_dirty_floor_rooms", None) or set())
@@ -2893,13 +3546,25 @@ def _persist_cap_dirty_sets(game, force_full):
         return dirty_chars, dirty_rooms, set(), set()
     char_cap = persist_dirty_char_cap(game)
     room_cap = persist_dirty_room_cap(game)
-    char_sorted = sorted(dirty_chars)
+    char_sorted = sorted(
+        dirty_chars, key=lambda k: _persist_dirty_priority_key(game, k),
+    )
     room_sorted = sorted(dirty_rooms)
     take_chars = set(char_sorted[:char_cap])
     take_rooms = set(room_sorted[:room_cap])
     deferred_chars = set(char_sorted[char_cap:])
     deferred_rooms = set(room_sorted[room_cap:])
     return take_chars, take_rooms, deferred_chars, deferred_rooms
+
+
+def _persist_bump_echo_generation(game):
+    """Advance Echo coalesce generation after a successful world save."""
+    if game is None:
+        return
+    game._persist_echo_coalesce_skipped = 0
+    game._persist_echo_dirty_generation = int(
+        getattr(game, "_persist_echo_dirty_generation", 0) or 0,
+    ) + 1
 
 
 def _persist_restore_deferred_dirty(game, deferred_chars, deferred_rooms):
@@ -2922,6 +3587,7 @@ def _persist_restore_deferred_dirty(game, deferred_chars, deferred_rooms):
 
 def _collect_world_save_snapshot(game):
     """In-memory snapshot; skips unchanged characters/rooms when hashes warm."""
+    _persist_apply_scheduled_world_full(game)
     prev_char = getattr(game, "_persist_char_snapshot_hashes", None)
     prev_floor = getattr(game, "_persist_floor_room_hashes", None)
     force_full = (
@@ -2973,6 +3639,7 @@ async def _collect_world_save_snapshot_async(
     if yield_every is None:
         yield_every = persist_save_yield_every()
 
+    _persist_apply_scheduled_world_full(game)
     prev_char = getattr(game, "_persist_char_snapshot_hashes", None)
     prev_floor = getattr(game, "_persist_floor_room_hashes", None)
     force_full = (
@@ -2993,6 +3660,17 @@ async def _collect_world_save_snapshot_async(
     new_char_hashes = {}
     n = 0
     wall_budget_hit = False
+    last_yield = time.perf_counter()
+    yield_ms = persist_collect_yield_ms()
+    # Lag P12: name the specific character(s) whose blob build is slow
+    # instead of only knowing the aggregate collect_ms (docs/plans/
+    # lag_p12_collect_profile.md). Cheap -- one perf_counter() pair per
+    # dirty character, only kept for the handful that actually run
+    # _character_save_rows (clean bodies stay on the cheap hash-skip path
+    # above and are never timed).
+    slow_chars = []
+    char_build_total_ms = 0.0
+    char_build_count = 0
     for obj in iter_characters(game):
         if wall_start is not None and _persist_save_over_wall_budget(
             wall_start, wall_budget_ms,
@@ -3022,7 +3700,13 @@ async def _collect_world_save_snapshot_async(
                 continue
             alive_names.add(name)
             continue
+        t_char = time.perf_counter()
         payload = _character_save_rows(game, obj, seen_names)
+        char_ms = (time.perf_counter() - t_char) * 1000.0
+        char_build_total_ms += char_ms
+        char_build_count += 1
+        if char_ms >= _PERSIST_SLOW_CHAR_LOG_MS:
+            slow_chars.append((name, round(char_ms, 2)))
         if payload is None:
             continue
         char_row, owned_items = payload
@@ -3035,8 +3719,15 @@ async def _collect_world_save_snapshot_async(
         if not force_full:
             changed_chars.append(name)
         n += 1
-        if yield_every and n % yield_every == 0:
+        due_count = yield_every and n % yield_every == 0
+        due_time = (
+            yield_ms > 0
+            and (time.perf_counter() - last_yield) * 1000.0 >= yield_ms
+        )
+        if due_count or due_time:
             await asyncio.sleep(0)
+            last_yield = time.perf_counter()
+    slow_chars.sort(key=lambda pair: pair[1], reverse=True)
     removed_chars = []
     if not force_full and prev_char:
         removed_chars = sorted(set(prev_char.keys()) - alive_names)
@@ -3078,6 +3769,15 @@ async def _collect_world_save_snapshot_async(
         ),
         "n_dirty_chars_this_pass": len(dirty_chars) if not force_full else -1,
         "n_dirty_rooms_this_pass": len(dirty_rooms) if not force_full else -1,
+        # Lag P12 breadcrumbs -- see _PERSIST_SLOW_CHAR_LOG_MS above.
+        "slow_chars": slow_chars[:_PERSIST_SLOW_CHAR_LOG_CAP],
+        "char_build_total_ms": round(char_build_total_ms, 2),
+        "char_build_count": char_build_count,
+        "char_build_avg_ms": (
+            round(char_build_total_ms / char_build_count, 2)
+            if char_build_count
+            else 0.0
+        ),
     }
     return char_rows, item_rows, meta
 
@@ -3301,6 +4001,7 @@ async def _apply_world_save_snapshot_async(
 
 async def save_world_async(
     conn, game, *, yield_every=None, wall_start=None, wall_budget_ms=0,
+    writer_handoff=None,
 ):
     """Cooperative autosave: snapshot with yields, then chunked apply."""
     import asyncio
@@ -3318,6 +4019,7 @@ async def save_world_async(
             "n_item_rows": 0,
         }
         return
+    ack_epoch = _persist_begin_dirty_write_epoch(game)
     t_collect = time.perf_counter()
     char_rows, item_rows, meta = await _collect_world_save_snapshot_async(
         game,
@@ -3326,6 +4028,7 @@ async def save_world_async(
         wall_budget_ms=wall_budget_ms,
     )
     collect_ms = (time.perf_counter() - t_collect) * 1000.0
+    meta["ack_epoch"] = ack_epoch
     if meta.get("skipped_wall_budget"):
         _persist_restore_deferred_dirty(
             game,
@@ -3363,25 +4066,55 @@ async def save_world_async(
             return
     # Let queued player commands run before SQLite work.
     await asyncio.sleep(0)
+    deferred_chars = set(meta.get("deferred_chars") or ())
+    deferred_rooms = set(meta.get("deferred_rooms") or ())
+    if persist_background_writer_ready() and writer_handoff is not None:
+        from engine.persistence_writer import WorldSnapshotPacket
+
+        writer_handoff["world"] = WorldSnapshotPacket(
+            char_rows=char_rows, item_rows=item_rows, meta=meta,
+        )
+        writer_handoff["collect_ms"] = collect_ms
+        writer_handoff["meta"] = meta
+        writer_handoff["char_rows"] = char_rows
+        writer_handoff["item_rows"] = item_rows
+        game._last_world_save_stats = _persist_provisional_world_stats(
+            game,
+            collect_ms=collect_ms,
+            meta=meta,
+            char_rows=char_rows,
+            item_rows=item_rows,
+            deferred_chars=deferred_chars,
+            deferred_rooms=deferred_rooms,
+        )
+        # World snapshot already captured force_full. Clear the live flag
+        # before writer meta so save_supers_meta does not rewrite every
+        # slice on the GIL (P23.3 hitch, now on the writer thread).
+        if meta.get("force_full"):
+            game._persist_force_full = False
+        return
     t_apply = time.perf_counter()
     await _apply_world_save_snapshot_async(
         conn, char_rows, item_rows, meta, yield_every=yield_every,
     )
     apply_ms = (time.perf_counter() - t_apply) * 1000.0
-    deferred_chars = set(meta.get("deferred_chars") or ())
-    deferred_rooms = set(meta.get("deferred_rooms") or ())
-    _persist_store_snapshot_hashes(game, meta)
-    _persist_clear_dirty(game)
-    _persist_restore_deferred_dirty(game, deferred_chars, deferred_rooms)
-    count = int(getattr(game, "_persist_autosave_count", 0) or 0) + 1
-    game._persist_autosave_count = count
-    every = persist_full_every()
-    if count % every == 0:
-        game._persist_force_full = True
-    game._last_world_save_stats = {
+    _persist_ack_world_save(
+        game, meta, apply_ms=apply_ms, collect_ms=collect_ms,
+        char_rows=char_rows, item_rows=item_rows,
+        deferred_chars=deferred_chars, deferred_rooms=deferred_rooms,
+    )
+
+
+def _persist_provisional_world_stats(
+    game, *, collect_ms, meta, char_rows, item_rows,
+    deferred_chars, deferred_rooms,
+):
+    """Stats visible before the writer thread acks the apply."""
+    return {
         "skipped": False,
         "collect_ms": round(collect_ms, 2),
-        "apply_ms": round(apply_ms, 2),
+        "apply_ms": 0.0,
+        "writer_pending": True,
         "force_full": bool(meta.get("force_full")),
         "n_char_rows": len(char_rows),
         "n_item_rows": len(item_rows),
@@ -3389,9 +4122,106 @@ async def save_world_async(
         "n_changed_rooms": len(meta.get("changed_floor_rooms") or ()),
         "n_deferred_chars": len(deferred_chars),
         "n_deferred_rooms": len(deferred_rooms),
-        "autosave_count": count,
-        "full_every": every,
+        "autosave_count": int(getattr(game, "_persist_autosave_count", 0) or 0),
+        "full_every": persist_full_every(),
+        "slow_chars": meta.get("slow_chars"),
+        "char_build_total_ms": meta.get("char_build_total_ms"),
+        "char_build_count": meta.get("char_build_count"),
+        "char_build_avg_ms": meta.get("char_build_avg_ms"),
     }
+
+
+def _persist_ack_world_save(
+    game, meta, *, apply_ms, collect_ms, char_rows, item_rows,
+    deferred_chars=None, deferred_rooms=None,
+):
+    """Post-apply bookkeeping on the asyncio loop (never on writer thread)."""
+    if deferred_chars is None:
+        deferred_chars = set(meta.get("deferred_chars") or ())
+    if deferred_rooms is None:
+        deferred_rooms = set(meta.get("deferred_rooms") or ())
+    _persist_store_snapshot_hashes(game, meta)
+    if persist_background_writer_ready():
+        _persist_ack_written_dirty(game, meta, char_rows)
+        _persist_restore_deferred_dirty(
+            game, deferred_chars, deferred_rooms,
+        )
+    else:
+        _persist_clear_dirty(game)
+        _persist_restore_deferred_dirty(
+            game, deferred_chars, deferred_rooms,
+        )
+    count = int(getattr(game, "_persist_autosave_count", 0) or 0) + 1
+    game._persist_autosave_count = count
+    _persist_schedule_world_full_if_due(game)
+    _persist_bump_echo_generation(game)
+    game._last_world_save_stats = {
+        "skipped": False,
+        "collect_ms": round(collect_ms, 2),
+        "apply_ms": round(float(apply_ms or 0.0), 2),
+        "force_full": bool(meta.get("force_full")),
+        "n_char_rows": len(char_rows),
+        "n_item_rows": len(item_rows),
+        "n_changed_chars": len(meta.get("changed_chars") or ()),
+        "n_changed_rooms": len(meta.get("changed_floor_rooms") or ()),
+        "n_deferred_chars": len(deferred_chars),
+        "n_deferred_rooms": len(deferred_rooms),
+        "n_dirty_chars_queued": meta.get("n_dirty_chars_queued"),
+        "n_dirty_rooms_queued": meta.get("n_dirty_rooms_queued"),
+        "echo_coalesce_skipped": int(
+            getattr(game, "_persist_echo_coalesce_skipped", 0) or 0,
+        ),
+        "autosave_count": count,
+        "full_every": persist_full_every(),
+        "slow_chars": meta.get("slow_chars"),
+        "char_build_total_ms": meta.get("char_build_total_ms"),
+        "char_build_count": meta.get("char_build_count"),
+        "char_build_avg_ms": meta.get("char_build_avg_ms"),
+    }
+
+
+def save_world_before_process_exit(conn, game, *, reason="shutdown"):
+    """Force a full world snapshot before copyover exit or gateway shutdown.
+
+    Incremental dirty-cap passes can defer bodies that sold/fenced during
+    the post-deploy autosave window; a terminating save must rewrite every
+    live character or inventory and wallet drift apart after restart (bug
+    report 690).
+    """
+    if conn is None or game is None:
+        return
+    if persist_background_writer_enabled():
+        from engine.persistence_writer import shutdown_persistence_writer
+        shutdown_persistence_writer(timeout=persist_writer_drain_timeout_s())
+    game._persist_force_full = True
+    save_world(conn, game)
+
+
+def maybe_persist_commerce_immediately(game, character):
+    """Flush one live seller during the post-deploy autosave defer window.
+
+    Sell removes inventory and credits wallet in memory; when autosave is
+    deferred after a deploy reset, a game-only restart can reload the old
+    item rows while the in-memory payout already landed -- or lose the sale
+    entirely. A single-character checkpoint keeps inventory and wallet in
+    sync without scheduling a full-world snapshot on every fence.
+    """
+    if game is None or character is None:
+        return
+    if getattr(character, "session", None) is None:
+        return
+    import os
+    from engine import auto_deploy
+
+    blocked, _since, _window = auto_deploy.deploy_save_defer_status(
+        getattr(game, "report_dir", None) or os.getcwd(),
+    )
+    if not blocked:
+        return
+    conn = getattr(game, "db", None)
+    if conn is None:
+        return
+    persist_save_character(conn, game, character, player_checkpoint=False)
 
 
 def save_world(conn, game):
@@ -3405,7 +4235,8 @@ def save_world(conn, game):
 
     Callers that are about to terminate the process (copyover / planned
     restart) must set ``game._persist_force_full = True`` first -- otherwise
-    deferred dirty bodies past the per-save cap are never flushed.
+    deferred dirty bodies past the per-save cap are never flushed. Prefer
+    :func:`save_world_before_process_exit` for shutdown paths.
 
     Runs inside one transaction so a crash mid-save can never leave
     the file half-written -- SQLite rolls it back.
@@ -3436,9 +4267,8 @@ def save_world(conn, game):
     _persist_restore_deferred_dirty(game, deferred_chars, deferred_rooms)
     count = int(getattr(game, "_persist_autosave_count", 0) or 0) + 1
     game._persist_autosave_count = count
-    every = persist_full_every()
-    if count % every == 0:
-        game._persist_force_full = True
+    _persist_schedule_world_full_if_due(game)
+    _persist_bump_echo_generation(game)
     game._last_world_save_stats = {
         "skipped": False,
         "collect_ms": round(collect_ms, 2),
@@ -3450,8 +4280,13 @@ def save_world(conn, game):
         "n_changed_rooms": len(meta.get("changed_floor_rooms") or ()),
         "n_deferred_chars": len(deferred_chars),
         "n_deferred_rooms": len(deferred_rooms),
+        "n_dirty_chars_queued": meta.get("n_dirty_chars_queued"),
+        "n_dirty_rooms_queued": meta.get("n_dirty_rooms_queued"),
+        "echo_coalesce_skipped": int(
+            getattr(game, "_persist_echo_coalesce_skipped", 0) or 0,
+        ),
         "autosave_count": count,
-        "full_every": every,
+        "full_every": persist_full_every(),
     }
 
 
@@ -3584,6 +4419,24 @@ def load_world(conn, game):
             item.slot = state["slot"]
         if isinstance(state.get("mods"), dict):
             item.mods = dict(state["mods"])
+        if state.get("god_forge_blessed_tier"):
+            try:
+                item.god_forge_blessed_tier = int(state["god_forge_blessed_tier"])
+            except (TypeError, ValueError):
+                pass
+        if state.get("god_war_manifest"):
+            item.god_war_manifest = True
+        if state.get("god_war_owner_key"):
+            item.god_war_owner_key = str(state["god_war_owner_key"])
+        if state.get("grip"):
+            item.grip = str(state["grip"]).strip().lower()
+        if state.get("bound_angel_id"):
+            item.bound_angel_id = str(state["bound_angel_id"])
+        if state.get("angel_blade_growth_tier"):
+            try:
+                item.angel_blade_growth_tier = int(state["angel_blade_growth_tier"])
+            except (TypeError, ValueError):
+                pass
         if isinstance(state.get("materials"), list):
             item.materials = list(state["materials"])
         if state.get("color"):
@@ -3665,6 +4518,12 @@ def load_world(conn, game):
             item.spirit_mirror_source_key = str(
                 state["spirit_mirror_source_key"]
             ).strip()
+        if state.get("_contract_id"):
+            item._contract_id = str(state["_contract_id"])
+        if state.get("_contract_prize"):
+            item._contract_prize = True
+        if state.get("_contract_lockbox"):
+            item._contract_lockbox = True
         body_eq = state.get("body_equipment")
         if isinstance(body_eq, dict):
             item.body_equipment = dict(body_eq)
@@ -3981,6 +4840,24 @@ def item_from_saved_container(key, description, container):
         item.slot = state["slot"]
     if isinstance(state.get("mods"), dict):
         item.mods = dict(state["mods"])
+    if state.get("god_forge_blessed_tier"):
+        try:
+            item.god_forge_blessed_tier = int(state["god_forge_blessed_tier"])
+        except (TypeError, ValueError):
+            pass
+    if state.get("god_war_manifest"):
+        item.god_war_manifest = True
+    if state.get("god_war_owner_key"):
+        item.god_war_owner_key = str(state["god_war_owner_key"])
+    if state.get("grip"):
+        item.grip = str(state["grip"]).strip().lower()
+    if state.get("bound_angel_id"):
+        item.bound_angel_id = str(state["bound_angel_id"])
+    if state.get("angel_blade_growth_tier"):
+        try:
+            item.angel_blade_growth_tier = int(state["angel_blade_growth_tier"])
+        except (TypeError, ValueError):
+            pass
     if isinstance(state.get("materials"), list):
         item.materials = list(state["materials"])
     if state.get("color"):
@@ -4043,6 +4920,12 @@ def item_from_saved_container(key, description, container):
         item.furniture = True
     if state.get("is_ethereal"):
         item.is_ethereal = True
+    if state.get("_contract_id"):
+        item._contract_id = str(state["_contract_id"])
+    if state.get("_contract_prize"):
+        item._contract_prize = True
+    if state.get("_contract_lockbox"):
+        item._contract_lockbox = True
     if state.get("ammo_charges") is not None:
         try:
             item.ammo_charges = int(state["ammo_charges"])

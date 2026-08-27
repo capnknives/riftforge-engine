@@ -36,6 +36,8 @@ DRIVE_TICKS = SCENIC_STEP_EVERY + 2
 _vehicle_scenic_macro_step = None
 _vehicle_tick_drive_extra = None
 _vehicle_scenic_step_every = None
+_vehicle_scenic_step_player_line = None
+_vehicle_scenic_abort_line = None
 
 
 def set_vehicle_scenic_macro_step(fn):
@@ -56,8 +58,43 @@ def set_vehicle_scenic_step_every(fn):
     _vehicle_scenic_step_every = fn
 
 
+def set_vehicle_scenic_step_player_line(fn):
+    """Register fn(game, veh, nx, ny) -> str|None for macro step You-lines."""
+    global _vehicle_scenic_step_player_line
+    _vehicle_scenic_step_player_line = fn
+
+
+def vehicle_scenic_step_player_line(game, veh, nx, ny):
+    if _vehicle_scenic_step_player_line is not None:
+        try:
+            line = _vehicle_scenic_step_player_line(game, veh, nx, ny)
+            if line:
+                return line
+        except Exception:
+            pass
+    return f"The road rolls on -- overland ({nx}, {ny})."
+
+
+def set_vehicle_scenic_abort_line(fn):
+    """Register fn(game, veh) -> str|None when a scenic path hits blocked terrain."""
+    global _vehicle_scenic_abort_line
+    _vehicle_scenic_abort_line = fn
+
+
+def vehicle_scenic_abort_line(game, veh):
+    if _vehicle_scenic_abort_line is not None:
+        try:
+            line = _vehicle_scenic_abort_line(game, veh)
+            if line:
+                return line
+        except Exception:
+            pass
+    return None
+
+
 # Motorcycle / charter hooks (SUPERS registers at bootstrap).
 _vehicle_is_motorcycle = None
+_vehicle_is_horse_ride = None
 _vehicle_rider_on_curb = None
 _vehicle_motorcycle_occupants = None
 _vehicle_mount_one = None
@@ -74,6 +111,23 @@ def set_vehicle_is_motorcycle(fn):
 def vehicle_is_motorcycle(veh):
     if _vehicle_is_motorcycle is not None:
         return bool(_vehicle_is_motorcycle(veh))
+    return False
+
+
+def set_vehicle_is_horse_ride(fn):
+    """Register fn(veh) -> bool for ephemeral horse rides (not motorcycles).
+
+    Distinct from ``vehicle_is_motorcycle``: SUPERS wires that hook as
+    open-top (bike *or* horse) for mount UX. Horses skip the scenic
+    out-of-gas abort; motorcycles do not.
+    """
+    global _vehicle_is_horse_ride
+    _vehicle_is_horse_ride = fn
+
+
+def vehicle_is_horse_ride(veh):
+    if _vehicle_is_horse_ride is not None:
+        return bool(_vehicle_is_horse_ride(veh))
     return False
 
 
@@ -263,6 +317,13 @@ def canonical_park_key(game, key):
     return key
 
 
+def park_keys_match(game, left, right):
+    """True when two park strings refer to the same room (VNUM or legacy)."""
+    if not left or not right:
+        return left == right
+    return canonical_park_key(game, left) == canonical_park_key(game, right)
+
+
 def load_parking_state(game):
     """Return {vehicle_id: park_info} from disk, or {}."""
     path = parking_path(game)
@@ -304,89 +365,114 @@ def load_parking_state(game):
     return out
 
 
-def save_parking_state(game):
-    """Atomically write every vehicle's park room and/or overland coords."""
-    if not getattr(game, "vehicles", None):
-        return
-    if not getattr(game, "_parking_save_scrubbing", False):
-        game._parking_save_scrubbing = True
-        try:
-            rooms = getattr(game, "rooms", None) or {}
-            for veh in game.vehicles.values():
-                if not isinstance(veh, dict):
-                    continue
-                park_key = veh.get("parked_room")
-                interior_key = veh.get("interior_key")
-                if not park_key:
-                    continue
-                from engine.room_vnum import lookup_room
-                from engine.systems.vehicles import canonical_park_key
+def tick_scrub_invalid_vehicle_parks(game):
+    """Skippable heartbeat: rehome nested/invalid parks off the drive path.
 
-                park_room = rooms.get(park_key)
-                if park_room is None:
-                    park_room = lookup_room(game, park_key)
-                if park_room is None:
-                    park_room = lookup_room(
-                        game, canonical_park_key(game, park_key),
-                    )
-                nested = bool(
-                    (interior_key and park_key == interior_key)
-                    or (
-                        isinstance(park_key, str)
-                        and park_key.startswith("Inside ")
-                    )
+    ``save_parking_state`` used to walk every vehicle through ``lookup_room``
+    (linear scan of ``game.rooms`` on a miss) on every street hop. Azure
+    billed that to Cadence nest-helper ``north`` as ``dir_veh`` ~4s.
+    """
+    if game is None or not getattr(game, "vehicles", None):
+        return
+    if getattr(game, "_parking_save_scrubbing", False):
+        return
+    game._parking_save_scrubbing = True
+    try:
+        rooms = getattr(game, "rooms", None) or {}
+        for veh in game.vehicles.values():
+            if not isinstance(veh, dict):
+                continue
+            park_key = veh.get("parked_room")
+            interior_key = veh.get("interior_key")
+            if not park_key:
+                continue
+            from engine.room_vnum import lookup_room
+
+            park_room = rooms.get(park_key)
+            if park_room is None:
+                park_room = lookup_room(game, park_key)
+            if park_room is None:
+                park_room = lookup_room(
+                    game, canonical_park_key(game, park_key),
                 )
-                if not nested and park_room is not None:
-                    nested = is_vehicle_interior_room(park_room, game)
-                if not nested and park_room is not None:
-                    if not room_is_valid_park_spot(park_room, game):
-                        nested = True
-                if not nested:
-                    continue
-                owner = None
-                owner_key = (veh.get("owner_key") or "").strip()
-                if owner_key:
-                    find = getattr(game, "find_character", None)
-                    if callable(find):
-                        owner = find(owner_key)
-                if park_room is None:
-                    park_room = rooms.get(park_key)
-                if park_room is None:
-                    park_room = lookup_room(game, park_key)
-                rehome = hooks_mod.vehicle_invalid_park_rehome(
-                    game, veh, park_room, owner,
+            nested = bool(
+                (interior_key and park_key == interior_key)
+                or (
+                    isinstance(park_key, str)
+                    and park_key.startswith("Inside ")
                 )
-                if rehome and rehome != park_key:
-                    rehome_room = lookup_room(game, rehome) or rooms.get(rehome)
-                    if rehome_room is not None:
-                        veh["parked_room"] = rehome
-                        veh["macro_pos"] = None
-                        veh["micro_pos"] = None
+            )
+            if not nested and park_room is not None:
+                nested = is_vehicle_interior_room(park_room, game)
+            if not nested and park_room is not None:
+                if not room_is_valid_park_spot(park_room, game):
+                    owner = None
+                    owner_key = (veh.get("owner_key") or "").strip()
+                    if owner_key:
+                        find = getattr(game, "find_character", None)
+                        if callable(find):
+                            owner = find(owner_key)
+                    if hooks_mod.vehicle_park_scrub_exempt(
+                        game, veh, park_room, owner,
+                    ):
                         continue
-                dest = nearest_driveable_park_key(
-                    game, park_room or rooms.get(park_key), character=owner,
-                )
-                if not dest:
-                    dest = safe_park_room_key(
-                        game,
-                        owner,
-                        avoid_keys={interior_key} if interior_key else None,
-                    )
-                if dest and dest != park_key:
-                    veh["parked_room"] = dest
+                    nested = True
+            if not nested:
+                continue
+            owner = None
+            owner_key = (veh.get("owner_key") or "").strip()
+            if owner_key:
+                find = getattr(game, "find_character", None)
+                if callable(find):
+                    owner = find(owner_key)
+            if park_room is None:
+                park_room = rooms.get(park_key)
+            if park_room is None:
+                park_room = lookup_room(game, park_key)
+            rehome = hooks_mod.vehicle_invalid_park_rehome(
+                game, veh, park_room, owner,
+            )
+            if rehome and rehome != park_key:
+                rehome_room = lookup_room(game, rehome) or rooms.get(rehome)
+                if rehome_room is not None:
+                    veh["parked_room"] = rehome
                     veh["macro_pos"] = None
                     veh["micro_pos"] = None
                     continue
+            dest = nearest_driveable_park_key(
+                game, park_room or rooms.get(park_key), character=owner,
+            )
+            if not dest:
                 dest = safe_park_room_key(
                     game,
+                    owner,
                     avoid_keys={interior_key} if interior_key else None,
                 )
-                if dest and dest != park_key:
-                    veh["parked_room"] = dest
-                    veh["macro_pos"] = None
-                    veh["micro_pos"] = None
-        finally:
-            game._parking_save_scrubbing = False
+            if dest and dest != park_key:
+                veh["parked_room"] = dest
+                veh["macro_pos"] = None
+                veh["micro_pos"] = None
+                continue
+            dest = safe_park_room_key(
+                game,
+                avoid_keys={interior_key} if interior_key else None,
+            )
+            if dest and dest != park_key:
+                veh["parked_room"] = dest
+                veh["macro_pos"] = None
+                veh["micro_pos"] = None
+    finally:
+        game._parking_save_scrubbing = False
+
+
+def save_parking_state(game):
+    """Atomically write every vehicle's park room and/or overland coords.
+
+    Invalid-park scrub lives on ``tick_scrub_invalid_vehicle_parks`` so a
+    Cadence street hop does not walk the whole room table.
+    """
+    if not getattr(game, "vehicles", None):
+        return
     path = parking_path(game)
     try:
         prior = load_parking_state(game)
@@ -653,6 +739,33 @@ def look_area_source_room(game, room):
     return host if host is not None else room
 
 
+def room_is_garage_berth(room):
+    """True when an indoor room is an authored garage bay (not a living room).
+
+    Homestead yard pads and remodeled bays may ship without ``vehicle_berth``
+    on older saves; ``save_parking_state`` used to scrub those curbs onto the
+    porch (bug report 674).
+    """
+    if room is None:
+        return False
+    if getattr(room, "homestead_garage_pad", False):
+        return True
+    rtype = (getattr(room, "remodel_type", None) or "").strip().lower()
+    if rtype == "garage":
+        return True
+    label = (getattr(room, "remodel_inbound_exit", None) or "").strip().lower()
+    if label == "garage":
+        return True
+    if getattr(room, "vehicle_berth", False):
+        return True
+    title = (
+        getattr(room, "title", None) or getattr(room, "key", None) or ""
+    ).lower()
+    if getattr(room, "is_house", False) and "garage" in title:
+        return True
+    return False
+
+
 def room_is_valid_park_spot(room, game=None, *, character=None):
     """True when a vehicle may list ``room`` as its curb (``parked_room``)."""
     if room is None:
@@ -665,9 +778,23 @@ def room_is_valid_park_spot(room, game=None, *, character=None):
         return False
     if getattr(room, "outdoor", False):
         return True
+    if room_is_garage_berth(room):
+        if not getattr(room, "vehicle_berth", False):
+            room.vehicle_berth = True
+        return True
     if getattr(room, "vehicle_berth", False):
         return True
     return False
+
+
+def _rooms_items_snapshot(rooms):
+    """Stable ``(key, room)`` pairs -- park gates may insert overland cells."""
+    if not rooms:
+        return []
+    try:
+        return list(rooms.items())
+    except RuntimeError:
+        return list(rooms.items())
 
 
 def nearest_driveable_park_key(game, room, *, character=None):
@@ -696,7 +823,7 @@ def nearest_driveable_park_key(game, room, *, character=None):
         return indoor_berth[0]
     zone = getattr(room, "zone", None)
     if zone:
-        for key, cand in rooms.items():
+        for key, cand in _rooms_items_snapshot(rooms):
             if getattr(cand, "zone", None) != zone:
                 continue
             if room_is_valid_park_spot(cand, game, character=character):
@@ -741,10 +868,19 @@ def safe_park_room_key(game, character=None, *, preferred=None, avoid_keys=None)
     for key in candidates:
         if _ok(key):
             return key
-    for key, room in rooms.items():
+    # Copyover used to walk every world room here for each body whose
+    # location was a cabin (zone=None, so nearest_driveable_park_key
+    # cannot zone-scan). Live billed that as ~15s ``_owned_vehicles``.
+    # Reuse the first valid curb for this process.
+    cached = getattr(game, "_vehicle_park_fallback_key", None)
+    if cached and _ok(cached):
+        return cached
+    for key, room in _rooms_items_snapshot(rooms):
         if key in avoid:
             continue
         if room_is_valid_park_spot(room, game, character=character):
+            if game is not None:
+                game._vehicle_park_fallback_key = key
             return key
     return None
 
@@ -810,6 +946,18 @@ def _vehicle_parked_in_room(game, veh, room):
     return park is room
 
 
+# Generic board words must never pick a stranger's kit (bug report 850).
+_GENERIC_BOARD_NEEDLES = frozenset({
+    "car",
+    "ride",
+    "vehicle",
+    "truck",
+    "bike",
+    "my car",
+    "my ride",
+})
+
+
 def find_vehicle_at(game, room, query, character=None):
     """Return vehicle dict parked in ``room`` matching ``query``, or None."""
     ensure_game_vehicles(game)
@@ -830,11 +978,25 @@ def find_vehicle_at(game, room, query, character=None):
             matches.append(veh)
     if not matches:
         return None
+    owner_key = getattr(character, "key", None) if character is not None else None
+
+    def _is_owned(veh):
+        if owner_key and veh.get("owner_key") == owner_key:
+            return True
+        vid = veh.get("id")
+        if character is not None and vid and character_owns_vehicle_id(character, vid):
+            return True
+        return False
+
+    if needle in _GENERIC_BOARD_NEEDLES:
+        owned = [v for v in matches if _is_owned(v)]
+        if not owned:
+            return None
+        return owned[0]
     if len(matches) == 1:
         return matches[0]
-    owner_key = getattr(character, "key", None) if character is not None else None
     if owner_key:
-        owned = [v for v in matches if v.get("owner_key") == owner_key]
+        owned = [v for v in matches if _is_owned(v)]
         if len(owned) == 1:
             return owned[0]
         if owned:
@@ -859,6 +1021,169 @@ def vehicle_by_id(game, vid):
     return game.vehicles.get(vid)
 
 
+def character_owns_vehicle_id(character, vid):
+    """True when ``vid`` is this character's owned kit (may not be stamped yet).
+
+    Owned kits (`owned:Name:slot`) are stamped onto ``game.vehicles`` after
+    load-time Phase C normalize. Clearing board flags while the id still
+    matches the save soft-locks ``drive`` / ``leave`` (bug report 675).
+    """
+    if character is None or not vid:
+        return False
+    text = str(vid).strip()
+    if not text:
+        return False
+    for kit in getattr(character, "owned_vehicles", None) or []:
+        if not isinstance(kit, dict):
+            continue
+        kit_id = (kit.get("id") or "").strip()
+        if kit_id == text:
+            return True
+    if text.startswith("owned:"):
+        parts = text.split(":")
+        if len(parts) >= 2 and parts[1] == getattr(character, "key", None):
+            return True
+    return False
+
+
+def _legacy_owned_interior_key(kit, owner_key):
+    """Pre-VNUM cabin key shape (must stay aligned with vehicle_kit helper)."""
+    safe_name = re.sub(r"[^a-zA-Z0-9 ]+", "", (kit or {}).get("name") or "Car").strip()
+    safe_owner = re.sub(r"[^a-zA-Z0-9_\-]+", "_", str(owner_key or "anon"))
+    return f"Inside {safe_name} ({safe_owner})"
+
+
+def _move_to_live_interior(character, veh, room):
+    """Shift ``character`` onto ``veh``'s live cabin when ``room`` is stale."""
+    live = veh.get("interior")
+    if live is None:
+        return veh
+    if live is not room:
+        character.move_to(live)
+    return veh
+
+
+def _character_in_vehicle_cabin(character, veh):
+    """True when ``character`` stands in ``veh``'s kit interior room."""
+    room = getattr(character, "location", None)
+    if room is None or veh is None:
+        return False
+    interior = veh.get("interior")
+    if interior is not None and room is interior:
+        return True
+    room_key = getattr(room, "key", None)
+    interior_key = veh.get("interior_key")
+    return bool(room_key and interior_key and room_key == interior_key)
+
+
+def eject_motorcycle_from_cabin(character, game, veh):
+    """Move a motorcycle rider off the kit cabin and onto the parked curb.
+
+    Motorcycles mount on the curb, not inside their storage cabin. Bodies
+    saved or healed into ``Inside …`` without a curb mount must land on
+    ``parked_room`` so ``leave``, exits, and ``stuck`` work (bug report 846).
+    """
+    if character is None or game is None or veh is None:
+        return False
+    if not vehicle_is_motorcycle(veh):
+        return False
+    if not _character_in_vehicle_cabin(character, veh):
+        return False
+    park_key = veh.get("parked_room")
+    if not park_key:
+        return False
+    rooms = getattr(game, "rooms", None) or {}
+    park = rooms.get(park_key)
+    if park is None:
+        from engine.room_vnum import lookup_room
+
+        park = lookup_room(game, park_key)
+    if park is None or getattr(character, "location", None) is park:
+        return False
+    character.move_to(park)
+    if getattr(character, "in_vehicle", None) == veh.get("id"):
+        character.in_vehicle = None
+        character.vehicle_role = None
+        if veh.get("driver") is character:
+            veh["driver"] = None
+    return True
+
+
+def _resolve_stale_owned_interior(character, game, room):
+    """Return a live owned-kit vehicle when the body sits on a replaced cabin.
+
+    ``ensure_character_vehicles`` can allocate a fresh interior VNUM while
+    the character still references the previous Room object (reconnect /
+    deferred login stamp). Move onto the live cabin before relinking board
+    flags.
+
+    Never grab the first owned ride when several exist -- that mis-assigned
+    ``in_vehicle`` after reconnect (bug report 676). Prefer the saved
+    ``in_vehicle`` kit when several owned rides share a cabin key (677).
+    """
+    if character is None or game is None or room is None:
+        return None
+    if not is_vehicle_interior_room(room, game):
+        return None
+    room_key = getattr(room, "key", None)
+    kits = [
+        k for k in (getattr(character, "owned_vehicles", None) or [])
+        if isinstance(k, dict)
+    ]
+    owner_key = getattr(character, "key", None)
+    preferred = (getattr(character, "in_vehicle", None) or "").strip()
+    if preferred:
+        kits.sort(
+            key=lambda kit: 0
+            if (kit.get("id") or "").strip() == preferred
+            else 1
+        )
+
+    def _live_vehicle(kit):
+        kit_id = (kit.get("id") or "").strip()
+        if not kit_id:
+            return None
+        veh = vehicle_by_id(game, kit_id)
+        if veh is None or veh.get("interior") is None:
+            return None
+        return veh
+
+    # Pass 1: exact live interior / stamped interior_key match.
+    for kit in kits:
+        veh = _live_vehicle(kit)
+        if veh is None:
+            continue
+        live = veh.get("interior")
+        if live is room:
+            return veh
+        if room_key and veh.get("interior_key") == room_key:
+            return _move_to_live_interior(character, veh, room)
+
+    # Pass 2: persisted board id (675) beats stale-cabin guess.
+    saved_vid = getattr(character, "in_vehicle", None)
+    if saved_vid and character_owns_vehicle_id(character, saved_vid):
+        veh = vehicle_by_id(game, saved_vid)
+        if veh is not None and veh.get("interior") is not None:
+            return _move_to_live_interior(character, veh, room)
+
+    # Pass 3: legacy ``Inside Name (Owner)`` key before VNUM stamp.
+    if room_key:
+        for kit in kits:
+            legacy = _legacy_owned_interior_key(kit, owner_key)
+            if room_key != legacy:
+                continue
+            veh = _live_vehicle(kit)
+            if veh is not None:
+                return _move_to_live_interior(character, veh, room)
+
+    # Pass 4: only one owned ride -- safe unambiguous fallback.
+    live_vehs = [v for k in kits if (v := _live_vehicle(k)) is not None]
+    if len(live_vehs) == 1:
+        return _move_to_live_interior(character, live_vehs[0], room)
+
+    return None
+
+
 def heal_character_vehicle_board_state(character, game):
     """Re-link one body's ``in_vehicle`` / ``vehicle_role`` after load.
 
@@ -872,12 +1197,35 @@ def heal_character_vehicle_board_state(character, game):
     ensure_game_vehicles(game)
     ensure_vehicle_defaults(character)
     room = getattr(character, "location", None)
-    veh_here = vehicle_for_interior_room(game, room)
+    # Owned stale cabins before generic interior lookup so a replaced VNUM
+    # does not relink to another parked ride in game.vehicles (677).
+    veh_here = _resolve_stale_owned_interior(character, game, room)
+    if veh_here is None:
+        veh_here = vehicle_for_interior_room(game, room)
     vid = getattr(character, "in_vehicle", None)
 
+    # Saved owned board id outranks a stale-cabin mis-guess (bug 676).
+    if (
+        veh_here is not None
+        and vid
+        and character_owns_vehicle_id(character, vid)
+        and veh_here.get("id") != vid
+    ):
+        saved_veh = vehicle_by_id(game, vid)
+        if saved_veh is not None and saved_veh.get("interior") is not None:
+            veh_here = _move_to_live_interior(character, saved_veh, room)
+
     if veh_here is not None:
+        if vehicle_is_motorcycle(veh_here):
+            if eject_motorcycle_from_cabin(character, game, veh_here):
+                return True
         want_id = veh_here.get("id")
         touched = False
+        live = veh_here.get("interior")
+        if live is not None and live is not room:
+            character.move_to(live)
+            room = live
+            touched = True
         if vid != want_id:
             character.in_vehicle = want_id
             touched = True
@@ -899,12 +1247,16 @@ def heal_character_vehicle_board_state(character, game):
         return False
     veh = vehicle_by_id(game, vid)
     if veh is None:
+        if character_owns_vehicle_id(character, vid):
+            return False
         character.in_vehicle = None
         character.vehicle_role = None
         return True
     from engine.systems import overland as overland_mod
 
     if vehicle_is_motorcycle(veh):
+        if eject_motorcycle_from_cabin(character, game, veh):
+            return True
         interior = veh.get("interior")
         if room is interior:
             park_key = veh.get("parked_room")
@@ -937,6 +1289,28 @@ def heal_character_vehicle_board_state(character, game):
             return False
     interior = veh.get("interior")
     if room is not interior:
+        room_key = getattr(room, "key", None)
+        interior_key = veh.get("interior_key")
+        if (
+            interior is not None
+            and room_key
+            and interior_key
+            and room_key == interior_key
+        ):
+            character.move_to(interior)
+            role = getattr(character, "vehicle_role", None)
+            touched = True
+            if role not in ("driver", "passenger"):
+                clear_stale_driver_slot(game, veh)
+                live_driver = effective_driver(game, veh)
+                if live_driver is not None and live_driver is not character:
+                    character.vehicle_role = "passenger"
+                else:
+                    character.vehicle_role = "driver"
+                    veh["driver"] = character
+            elif role == "driver":
+                veh["driver"] = character
+            return touched
         character.in_vehicle = None
         character.vehicle_role = None
         if veh.get("driver") is character:
@@ -964,6 +1338,75 @@ def heal_vehicle_board_state(game):
             flush=True,
         )
     return healed
+
+
+def stamp_logout_vehicle_anchor(character, game=None):
+    """Remember room + board state when a live Session ends (bug report 683).
+
+    Offline Cadence may board the Echo into an owned ride and drive away.
+    On the next login, ``restore_logout_vehicle_anchor`` puts players who
+    logged off **on foot** back where they stood instead of inside a car
+    the Echo moved across town/plane.
+    """
+    if character is None:
+        return
+    from engine import room_vnum as room_vnum_mod
+
+    room = getattr(character, "location", None)
+    if room is not None:
+        character.logout_room_key = room_vnum_mod.internal_room_key(room)
+    else:
+        character.logout_room_key = None
+    character.logout_in_vehicle = getattr(character, "in_vehicle", None)
+
+
+def restore_logout_vehicle_anchor(character, game):
+    """Login: undo Echo vehicle drift when the player logged off on foot.
+
+    Mirrors staff ``gm_spirit_room_key`` restore (disconnect pins intent;
+    Cadence must not override it for vehicle boarding). Returns True when
+    the body was ejected from a cabin and moved back to ``logout_room_key``.
+    """
+    if character is None or game is None:
+        return False
+
+    logout_room_key = getattr(character, "logout_room_key", None)
+    logout_vid = getattr(character, "logout_in_vehicle", None)
+
+    def _clear_stamp():
+        character.logout_room_key = None
+        character.logout_in_vehicle = None
+
+    if not logout_room_key or logout_vid:
+        _clear_stamp()
+        return False
+
+    ensure_game_vehicles(game)
+    ensure_vehicle_defaults(character)
+    room = getattr(character, "location", None)
+    boarded = bool(getattr(character, "in_vehicle", None))
+    in_cabin = boarded or is_vehicle_interior_room(room, game)
+    if not in_cabin:
+        _clear_stamp()
+        return False
+
+    if boarded:
+        leave_vehicle(character, game, pull_followers=False)
+    else:
+        try_leave_vehicle(character, game, pull_followers=False)
+
+    from engine import room_vnum as room_vnum_mod
+
+    dest = room_vnum_mod.lookup_room(game, logout_room_key)
+    if dest is None:
+        dest = (getattr(game, "rooms", None) or {}).get(logout_room_key)
+    if dest is not None and not is_vehicle_interior_room(dest, game):
+        character.move_to(dest)
+        _clear_stamp()
+        return True
+
+    _clear_stamp()
+    return False
 
 
 def effective_driver(game, veh):
@@ -1169,6 +1612,31 @@ def eject_before_relocate(character, game):
     leave_vehicle(character, game, pull_followers=False)
 
 
+def try_leave_vehicle(character, game, *, pull_followers=True):
+    """Leave when boarded; heal stale cabin / missing board flags first.
+
+    Player ``leave`` and hub ``taxi`` call this so reconnect after deploy
+    cannot soft-lock when the body is still in a cabin but ``in_vehicle``
+    was cleared (bug reports 675 / 677).
+    """
+    ensure_game_vehicles(game)
+    ensure_vehicle_defaults(character)
+    if not getattr(character, "in_vehicle", None):
+        room = getattr(character, "location", None)
+        if is_vehicle_interior_room(room, game):
+            heal_character_vehicle_board_state(character, game)
+    if getattr(character, "in_vehicle", None):
+        return leave_vehicle(character, game, pull_followers=pull_followers)
+    room = getattr(character, "location", None)
+    if is_vehicle_interior_room(room, game):
+        veh = vehicle_for_interior_room(game, room)
+        if veh is not None and eject_motorcycle_from_cabin(character, game, veh):
+            label = (veh.get("key") or "ride").strip()
+            _send(character, f"You step out of the {label}.")
+            return True
+    return False
+
+
 def leave_vehicle(character, game, *, pull_followers=True):
     """Exit the vehicle onto its park room (generic room-graph curb)."""
     ensure_game_vehicles(game)
@@ -1347,7 +1815,6 @@ def tick_drives(game, *, finish_drive_fn=None):
     if not getattr(game, "_vehicles_ready", False):
         return
     now = game.game_time_ticks
-    step_every = _scenic_step_every(game)
     for veh in game.vehicles.values():
         path = veh.get("scenic_path")
         if not (veh.get("scenic_mode") and isinstance(path, list)):
@@ -1356,6 +1823,7 @@ def tick_drives(game, *, finish_drive_fn=None):
                 veh["drive_dest"] = None
             continue
         last = int(veh.get("scenic_last_step") or 0)
+        step_every = int(veh.get("scenic_step_every") or 0) or _scenic_step_every(game)
         if now - last < step_every:
             continue
         if not path:
@@ -1374,24 +1842,26 @@ def tick_drives(game, *, finish_drive_fn=None):
         veh["scenic_last_step"] = now
         if not ok:
             clear_active_drive(veh)
-            for who in vehicle_occupants(game, veh):
-                _send(
-                    who,
+            abort = vehicle_scenic_abort_line(game, veh)
+            if abort is None:
+                abort = (
                     "The road trip aborts -- road blocked. "
-                    "You stay aboard where you are.",
+                    "You stay aboard where you are."
                 )
+            for who in vehicle_occupants(game, veh):
+                _send(who, abort)
             continue
+        line = vehicle_scenic_step_player_line(game, veh, nx, ny)
         for who in vehicle_occupants(game, veh):
-            _send(
-                who,
-                f"The road rolls on -- overland ({nx}, {ny}).",
-            )
+            _send(who, line)
         if _vehicle_tick_drive_extra is not None:
             _vehicle_tick_drive_extra(game, veh, nx, ny)
         if status == "wrecked":
             clear_active_drive(veh)
             continue
         if status == "stranded":
+            if vehicle_is_horse_ride(veh):
+                continue
             clear_active_drive(veh)
             for who in vehicle_occupants(game, veh):
                 _send(who, "The engine dies -- out of gas.")
@@ -1401,6 +1871,11 @@ def tick_drives(game, *, finish_drive_fn=None):
             veh["scenic_path"] = None
             if finish_drive_fn is not None:
                 finish_drive_fn(game, veh)
+
+
+# ``config vehicles compact on`` summarizes ordinary look when more than
+# two unoccupied rides are parked here (three or more).
+_COMPACT_VEHICLES_THRESHOLD = 2
 
 
 def _board_alias_for(veh):
@@ -1413,18 +1888,70 @@ def _board_alias_for(veh):
     return key.split()[0] if key else "vehicle"
 
 
-def look_vehicle_hint(room, game, character=None):
-    """Extra look line when vehicles are parked in this room."""
+def _parked_for_look(room, game):
+    """Unoccupied vehicles parked in ``room`` (hook may filter riders)."""
     ensure_game_vehicles(game)
     if room is None:
-        return None
-    parked = vehicle_parked_without_rider(
+        return []
+    return vehicle_parked_without_rider(
         game, room, parked_vehicles_in(game, room),
     )
+
+
+def _vehicle_look_screenreader(character):
+    if character is None:
+        return False
+    return bool(getattr(character, "screenreader", False))
+
+
+def _wants_compact_vehicle_look(character, game):
+    if character is None:
+        return False
+    from engine import display_prefs
+    prefs = display_prefs.preference_character(character, game)
+    display_prefs.ensure_display_defaults(prefs)
+    return display_prefs.wants_compact_vehicles(prefs)
+
+
+def look_vehicle_detail_lines(room, game, character=None):
+    """Full parked-vehicle rows for ``look vehicles``."""
+    parked = _parked_for_look(room, game)
+    if not parked:
+        return []
+    sr = _vehicle_look_screenreader(character)
+    lines = []
+    for veh in parked:
+        name = veh.get("key") or veh.get("id") or "?"
+        alias = _board_alias_for(veh)
+        verb = "mount" if vehicle_is_motorcycle(veh) else "board"
+        if sr:
+            text = f"{name}. {verb.capitalize()}: enter {alias}."
+        else:
+            text = f"{name} -- {verb}: enter {alias}"
+        lines.append(text)
+    return lines
+
+
+def look_vehicle_hint(room, game, character=None):
+    """Extra look line when vehicles are parked in this room."""
+    parked = _parked_for_look(room, game)
     if not parked:
         return None
+    sr = _vehicle_look_screenreader(character)
+    if (
+        _wants_compact_vehicle_look(character, game)
+        and len(parked) > _COMPACT_VEHICLES_THRESHOLD
+    ):
+        if sr:
+            return (
+                f"Vehicles: quite a few parked here ({len(parked)}). "
+                "Look vehicles for the list."
+            )
+        return (
+            "There are quite a few vehicles here. "
+            "Look vehicles for the full list."
+        )
     names = [v.get("key") or v.get("id") or "?" for v in parked]
-    sr = bool(getattr(character, "screenreader", False)) if character else False
     if len(parked) == 1:
         alias = _board_alias_for(parked[0])
         verb = "mount" if vehicle_is_motorcycle(parked[0]) else "board"

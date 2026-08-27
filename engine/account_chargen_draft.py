@@ -6,6 +6,10 @@ the partial body is vaulted with ``CHARGEN_DRAFT_VAULT_TAG`` and the owning
 account keeps ``chargen_draft_key``. Re-login offers the same roster row with
 a resume label; picking it restores and re-enters chargen instead of treating
 the row like a finished character or a generic fold vault.
+
+Copyover / gateway reattach uses the same vault: mid-create seats stay on
+the TCP, the draft is snapshotted at the current ``chargen_step``, and the
+new process re-enters chargen instead of ``play()``.
 """
 
 from __future__ import annotations
@@ -141,12 +145,32 @@ def is_chargen_draft_vault(game, storage_key) -> bool:
     return tag == CHARGEN_DRAFT_VAULT_TAG
 
 
+def looks_like_finished_play_body(character) -> bool:
+    """True when this body already finished create and is in the world.
+
+    Mid-create drafts are vaulted *without* a room (bug report 618) and
+    may already have a Path. A live PC in a room with a Path must not be
+    treated as still in chargen -- leftover ``chargen_draft`` on a playing
+    body dumps them back into create on copyover (bug report 837).
+    """
+    if character is None:
+        return False
+    if not getattr(character, "path", None):
+        return False
+    return getattr(character, "location", None) is not None
+
+
 def is_chargen_draft_character(game, character) -> bool:
     """True when ``character`` still owes create-flow chargen."""
     if character is None:
         return False
     key = (getattr(character, "key", None) or "").strip()
     if not key:
+        return False
+    # Live-in-world bodies win over a stuck chargen_draft flag.
+    if looks_like_finished_play_body(character):
+        if getattr(character, "chargen_draft", False):
+            character.chargen_draft = False
         return False
     if is_chargen_draft_vault(game, key):
         return True
@@ -201,6 +225,12 @@ def vault_chargen_draft(character, game, account) -> tuple[bool, str]:
         game,
         folded_by=CHARGEN_DRAFT_VAULT_TAG,
     )
+    if (not ok) and "already folded" in (msg or "").lower():
+        # Copyover may have snapshotted the same key moments earlier.
+        ok = hooks.upsert_vault_snapshot(
+            character, game, folded_by=CHARGEN_DRAFT_VAULT_TAG,
+        )
+        msg = "Updated chargen-draft vault snapshot."
     if ok and account is not None:
         stamp_chargen_draft(account, character, game)
     return ok, msg
@@ -211,3 +241,101 @@ def finish_chargen_draft(account, game) -> None:
     if account is None:
         return
     clear_chargen_draft(account, game)
+
+
+def persist_for_copyover(character, game, account) -> bool:
+    """Snapshot an in-progress create body so a Veil rewrite can resume it.
+
+    Does not despawn the live session -- copyover is about to exit this
+    process; the gateway (or inherited fd) keeps the TCP.
+    """
+    if character is None or game is None:
+        return False
+    stamp_chargen_draft(account, character, game)
+    return bool(
+        hooks.upsert_vault_snapshot(
+            character,
+            game,
+            folded_by=CHARGEN_DRAFT_VAULT_TAG,
+        )
+    )
+
+
+def persist_creating_sessions(game) -> int:
+    """Vault-snapshot every mid-chargen connecting session. Returns count.
+
+    Gateway binds are flushed by ``flush_creating_session_binds`` so
+    copyover can drain CTRL frames before exit.
+    """
+    n = 0
+    bucket = getattr(game, "connecting_sessions", None) or []
+    for session in list(bucket):
+        if getattr(session, "login_stage", None) != "creating":
+            continue
+        char = getattr(session, "character", None)
+        if char is None:
+            continue
+        account = None
+        account_name = (getattr(char, "account", None) or "").strip()
+        if account_name:
+            from engine import accounts as accounts_mod
+
+            account = accounts_mod.find_account(game, account_name)
+        if persist_for_copyover(char, game, account):
+            n += 1
+        notify = getattr(session, "_notify_gateway_bound", None)
+        key = getattr(char, "key", None)
+        if callable(notify) and key:
+            notify(key)
+    return n
+
+
+async def flush_creating_session_binds(game) -> None:
+    """Await gateway bound frames for mid-create seats (copyover exit)."""
+    import asyncio
+
+    pending = []
+    bucket = getattr(game, "connecting_sessions", None) or []
+    for session in list(bucket):
+        if getattr(session, "login_stage", None) != "creating":
+            continue
+        char = getattr(session, "character", None)
+        key = getattr(char, "key", None) if char is not None else None
+        bridge = getattr(session, "gateway_bridge", None)
+        sid = getattr(session, "gateway_session_id", None)
+        if not key or bridge is None or not sid:
+            continue
+        notify = getattr(bridge, "notify_bound", None)
+        if not callable(notify):
+            continue
+        pending.append(notify(sid, key))
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def resolve_copyover_chargen_body(game, name):
+    """Return the mid-create body for copyover reattach, or None.
+
+    Prefers a live in-memory draft, then hydrates the chargen-draft vault
+    row without placing the body in a room (bug report 618: never dump a
+    partial shell into town).
+    """
+    if not name or game is None:
+        return None
+    finder = getattr(game, "find_login_character", None)
+    if callable(finder):
+        char = finder(name)
+    else:
+        char = game.find_character(name)
+    if char is not None and is_chargen_draft_character(game, char):
+        return char
+    if is_chargen_draft_vault(game, name):
+        restored = hooks.try_restore_chargen_draft(game, name)
+        if restored is not None:
+            return restored
+    if char is not None and getattr(char, "chargen_draft", False):
+        if looks_like_finished_play_body(char):
+            char.chargen_draft = False
+            return None
+        return char
+    return None

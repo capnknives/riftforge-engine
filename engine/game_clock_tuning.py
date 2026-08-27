@@ -172,6 +172,26 @@ def ticks_for_wall_seconds(seconds, game=None, *, tick_seconds=HEARTBEAT_SECONDS
     return max(1, int(round(float(seconds) / sec_per_tick)))
 
 
+def format_player_tick_span(ticks, game=None, *, tick_seconds=HEARTBEAT_SECONDS):
+    """Wall-clock span with no internal tick count (player verbs / status)."""
+    remaining = max(0, int(ticks or 0))
+    if remaining <= 0:
+        return "now"
+    secs = max(1, approx_wall_seconds_for_ticks(
+        remaining, game, tick_seconds=tick_seconds,
+    ))
+    if secs < 90:
+        return f"about {secs}s"
+    mins = max(1, int(round(secs / 60.0)))
+    if mins < 120:
+        return f"about {mins} min"
+    hours = mins // 60
+    rem_m = mins % 60
+    if rem_m:
+        return f"about {hours}h {rem_m}m"
+    return f"about {hours}h"
+
+
 def format_tick_cooldown_eta(ticks, game=None, *, tick_seconds=HEARTBEAT_SECONDS):
     """Player-facing ETA for a remaining tick-based cooldown."""
     secs = max(1, approx_wall_seconds_for_ticks(
@@ -181,6 +201,27 @@ def format_tick_cooldown_eta(ticks, game=None, *, tick_seconds=HEARTBEAT_SECONDS
         mins = max(1, int(round(secs / 60.0)))
         return f"wait about {ticks} more ticks (~{mins} min)"
     return f"wait about {ticks} more ticks (~{secs}s)"
+
+
+def format_player_cooldown_remaining(ticks, game=None, *, tick_seconds=HEARTBEAT_SECONDS):
+    """Player-facing cooldown ETA without internal tick counts."""
+    remaining = max(0, int(ticks))
+    if remaining <= 0:
+        return "ready now"
+    if remaining == 1:
+        return "ready next heartbeat"
+    secs = max(
+        1,
+        approx_wall_seconds_for_ticks(
+            remaining, game, tick_seconds=tick_seconds,
+        ),
+    )
+    if secs < 90:
+        return f"ready in about {secs} seconds"
+    mins = max(1, int(round(secs / 60.0)))
+    if mins == 1:
+        return "ready in about 1 minute"
+    return f"ready in about {mins} minutes"
 
 
 def format_ticks_report_eta(ticks, game=None, *, tick_seconds=HEARTBEAT_SECONDS):

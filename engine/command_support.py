@@ -23,7 +23,9 @@ across the codebase keeps working unchanged.
 
 from engine.hooks import (
     after_arrive,
+    after_move_crossing,
     after_move_step,
+    before_move_crossing,
     before_relocate,
     can_perceive_reaper,
     can_see_spirit,
@@ -35,8 +37,43 @@ from engine.hooks import (
     veil_visible_to,
 )
 import re
+import shlex
 
 from engine.world import Character
+
+
+def split_shell_args(text):
+    """Split *text* on whitespace, honoring ``'…'`` and ``"…"`` phrases.
+
+    Classic MUD disambiguation: ``bug 'Earl Jacobs'`` and ``goto 'Steve Toth'``
+    must treat the quoted span as one name token, not two partial matches.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    try:
+        return shlex.split(raw, posix=True)
+    except ValueError:
+        # Unclosed quote — fall back so the verb still runs.
+        return raw.split()
+
+
+def peel_shell_arg(text):
+    """Return ``(first_token, rest)`` after one shell-style arg."""
+    tokens = split_shell_args(text)
+    if not tokens:
+        return "", ""
+    first = tokens[0]
+    rest = " ".join(tokens[1:])
+    return first, rest
+
+
+def collapse_shell_args(text):
+    """Turn args into one lookup string; unwrap quotes, keep inner spaces."""
+    tokens = split_shell_args(text)
+    if not tokens:
+        return ""
+    return " ".join(tokens)
 
 
 ASLEEP_WORLD_CLOSED_MSG = (
@@ -145,6 +182,26 @@ def _can_see_gm_away(viewer, body):
     return False
 
 
+def staff_perfect_vision(character):
+    """True when staff GM form pierces weather whiteout and dark rooms.
+
+    Mirrors ``in_gm_mode`` in ``supers/verbs/gm/presence.py`` without
+    importing SUPERS from engine layers (two-repo purity). Permanent
+    ``gmspirit:`` bodies heal ``gm_mode`` on tool checks; the key prefix
+    and ``gm_spirit`` flag cover autosave gaps.
+    """
+    if character is None:
+        return False
+    if getattr(character, "gm_mode", False):
+        return True
+    if getattr(character, "gm_spirit", False):
+        return True
+    if getattr(character, "gm_spirit_permanent", False):
+        return True
+    key_low = (getattr(character, "key", None) or "").lower()
+    return key_low.startswith("gmspirit:")
+
+
 def _can_see_hellhound(viewer, hound):
     """Deal-pursuit hellhound invis pierce (Celestial / glasses / engage).
 
@@ -179,6 +236,11 @@ def _is_presence_hidden(viewer, other):
     # GM staff shell -- wizinvis / parked gate (uses gm_spirit, not spirit).
     if getattr(other, "gm_spirit", False) and not _can_see_spirit(viewer, other):
         return True
+    # RPC / staff observe-cloak -- GMs and other council members pierce.
+    if getattr(other, "staff_cloak", False):
+        from engine import hooks
+        if not _is_gm(viewer) and not hooks.is_rpc_staff(viewer):
+            return True
     if getattr(other, "spirit", False) and not _can_see_spirit(viewer, other):
         return True
     if not _can_perceive_reaper(viewer, other):
@@ -290,12 +352,12 @@ def _presence_hears(actor):
 
 
 def strip_ephemeral_storage_prefix(name):
-    """Peel ``gmspirit:`` / ``husk:`` / ``twin:`` prefixes (nested too).
+    """Peel internal storage prefixes (nested too).
 
-    Storage keys like ``gmspirit:Wits``, ``husk:Castiel``, or
-    ``twin:Gary`` must never reach players as a display name. Also cleans
-    a mistaken ``assumed_face`` that still carries the prefix. Returns
-    ``?`` only when the input is empty after stripping.
+    Storage keys like ``gmspirit:Wits``, ``husk:Castiel``, ``twin:Gary``,
+    or ``gym_dummy:TM00001`` must never reach players as a display name.
+    Also cleans a mistaken ``assumed_face`` that still carries the prefix.
+    Returns ``?`` only when the input is empty after stripping.
     """
     if name is None:
         return "?"
@@ -314,6 +376,9 @@ def strip_ephemeral_storage_prefix(name):
             if not text:
                 return "?"
             continue
+        if low.startswith("gym_dummy:"):
+            # Room suffix is an internal VNUM -- never expose it.
+            return "a training dummy"
         return text
 
 
@@ -337,6 +402,8 @@ def is_staff_stealth_presence(obj):
         )
         if active and not getattr(obj, "wizinvis", True):
             return False
+        return True
+    if getattr(obj, "staff_cloak", False):
         return True
     return bool(
         getattr(obj, "gm_away", False)
@@ -365,7 +432,35 @@ def _presence_face(obj):
         or getattr(obj, "husk_display_name", None)
     )
     if face:
-        return strip_ephemeral_storage_prefix(face)
+        peeled = strip_ephemeral_storage_prefix(face)
+        # assumed_face stuck on the bare storage mononym while legal identity
+        # carries a visible surname (login roster vs room face -- bug 748).
+        if not getattr(obj, "husk_display_name", None):
+            key_face = strip_ephemeral_storage_prefix(
+                getattr(obj, "key", None) or ""
+            )
+            if key_face and peeled.lower() == key_face.lower():
+                try:
+                    from engine.char_identity import (
+                        character_surname,
+                        legal_public_name,
+                        storage_key_has_camel_mash,
+                    )
+                    # Pierre + Dupont on a bare mononym key (bug 748) -- not
+                    # CapnKnives-style account brands with interior humps.
+                    if (
+                        character_surname(obj)
+                        and bool(getattr(obj, "surname_visible", True))
+                        and not storage_key_has_camel_mash(key_face)
+                    ):
+                        legal = legal_public_name(obj)
+                        if legal and legal.lower() != peeled.lower():
+                            return strip_ephemeral_storage_prefix(legal)
+                except Exception:
+                    _log_hook_error(
+                        "legal_public_name", getattr(obj, "key", None)
+                    )
+        return peeled
     # Legal name (given + optional visible surname) when no face overlay.
     try:
         from engine.char_identity import legal_public_name
@@ -460,16 +555,31 @@ def _floor_item_stack_key(item):
     return ("key", key or id(item))
 
 
+def visible_floor_items(viewer, items):
+    """Return floor Items ``viewer`` may perceive.
+
+    Veil-layer ghost copies are omitted unless the viewer pierces the Veil
+    (high Attunement, Spirit Magic, pierceveil, Ghosts, staff).
+    """
+    from engine import hooks
+    if not items:
+        return []
+    return [item for item in items if hooks.item_visible_to(viewer, item)]
+
+
 def floor_item_look_lines(items, character=None):
     """Build look lines for floor Items, stacking identical copies.
 
     One of a kind stays the usual display name (``an angel blade``).
     Two or more become ``N angel blades are here`` with a digit count
     (never ``sixteen``). Wayfinding signs keep muted paint / ``[SIGN]``
-    the same way the old per-item loop did.
+    the same way the old per-item loop did. Veil ghost gear is omitted
+    for ordinary living sight and tagged ``[Veil]`` when pierced.
     """
     from collections import OrderedDict
+    from engine import hooks
 
+    items = visible_floor_items(character, items)
     groups = OrderedDict()
     for item in items:
         groups.setdefault(_floor_item_stack_key(item), []).append(item)
@@ -494,24 +604,28 @@ def floor_item_look_lines(items, character=None):
                 name = f"[SIGN] {name}"
         count = len(group)
         if count == 1:
-            lines.append(name)
-            continue
-        # Strip ANSI before pluralizing so paint on singles does not leak
-        # into the stack noun; re-apply muted paint for wayfinding stacks.
-        from engine.style import strip_ansi
-        bare = _strip_leading_article(strip_ansi(name))
-        # Drop a leading [SIGN] tag from the noun, then re-prefix.
-        sign_prefix = ""
-        if bare.upper().startswith("[SIGN]"):
-            bare = bare[6:].strip()
-            sign_prefix = "[SIGN] "
-        plural = _simple_english_plural(bare)
-        line = f"{sign_prefix}{count} {plural} are here."
-        if is_sign and character is not None and not getattr(
-            character, "screenreader", False
-        ):
-            from engine import style as style_mod
-            line = style_mod.paint_for(character, "muted", line)
+            line = name
+        else:
+            # Strip ANSI before pluralizing so paint on singles does not leak
+            # into the stack noun; re-apply muted paint for wayfinding stacks.
+            from engine.style import strip_ansi
+            bare = _strip_leading_article(strip_ansi(name))
+            # Drop a leading [SIGN] tag from the noun, then re-prefix.
+            sign_prefix = ""
+            if bare.upper().startswith("[SIGN]"):
+                bare = bare[6:].strip()
+                sign_prefix = "[SIGN] "
+            plural = _simple_english_plural(bare)
+            line = f"{sign_prefix}{count} {plural} are here."
+            if is_sign and character is not None and not getattr(
+                character, "screenreader", False
+            ):
+                from engine import style as style_mod
+                line = style_mod.paint_for(character, "muted", line)
+        if character is not None and hooks.item_in_veil(sample):
+            tag = hooks.veil_look_tag()
+            if tag and tag not in line:
+                line = f"{tag} {line}"
         lines.append(line)
     return lines
 
@@ -647,6 +761,27 @@ def _maybe_append_account_tag(name, subject, viewer):
         return name
 
 
+def _shows_wanted_presence_tag(obj):
+    """True when a Character should show ``(criminal)`` in look/who.
+
+    Collared / escorted / jailed crooks are spoken for -- hide the badge
+    without importing SUPERS (bug report 730).
+    """
+    if not isinstance(obj, Character):
+        return False
+    if not getattr(obj, "criminal", False):
+        return False
+    if getattr(obj, "_arrested_by", None):
+        return False
+    if getattr(obj, "_cuffed", False):
+        return False
+    if getattr(obj, "in_jail", False):
+        return False
+    if getattr(obj, "jail_until_tick", None):
+        return False
+    return True
+
+
 def _echo_look_bits(obj):
     """Room-look Echo tags via game hook (quiet vs full -- no SUPERS import)."""
     try:
@@ -662,7 +797,7 @@ def _echo_look_bits(obj):
         bits.append("idle")
     if getattr(obj, "regimen", None):
         bits.append(obj.regimen)
-    if getattr(obj, "criminal", False):
+    if _shows_wanted_presence_tag(obj):
         bits.append("criminal")
     return bits
 
@@ -687,7 +822,7 @@ def _display_name_base(obj, viewer=None):
                     return f"{face} ({', '.join(_echo_look_bits(obj))})"
                 if obj.spirit:
                     return f"{face} (spirit)"
-                if getattr(obj, "criminal", False):
+                if _shows_wanted_presence_tag(obj):
                     return f"{face} (criminal)"
                 return face
         except Exception:
@@ -704,7 +839,7 @@ def _display_name_base(obj, viewer=None):
                     return f"{face} ({', '.join(_echo_look_bits(obj))})"
                 if obj.spirit:
                     return f"{face} (spirit)"
-                if getattr(obj, "criminal", False):
+                if _shows_wanted_presence_tag(obj):
                     return f"{face} (criminal)"
                 return face
         except Exception:
@@ -718,7 +853,7 @@ def _display_name_base(obj, viewer=None):
         return f"{_presence_face(obj)} ({', '.join(_echo_look_bits(obj))})"
     if isinstance(obj, Character) and obj.spirit:
         return f"{_presence_face(obj)} (spirit)"
-    if isinstance(obj, Character) and getattr(obj, "criminal", False):
+    if isinstance(obj, Character) and _shows_wanted_presence_tag(obj):
         return f"{_presence_face(obj)} (criminal)"
     if isinstance(obj, Character):
         return _presence_face(obj)
@@ -765,7 +900,7 @@ def _move_one(character, direction, dest, game, auto_look=True):
     """
     from engine.hooks import (
         move_arrive_line, move_leave_line, move_presence_actor,
-        move_public_name, presence_face_for,
+        move_public_name, movement_hears_predicate, presence_face_for,
     )
     room = character.location
     # True-invis: GM staff spirit, or the Cadence Echo left by gm on.
@@ -779,7 +914,9 @@ def _move_one(character, direction, dest, game, auto_look=True):
     presence = move_presence_actor(character, game)
     # Fallback face when the viewer-relative hook is unset (bare engine).
     fallback_face = move_public_name(presence, game)
-    _hears_move = _presence_hears(presence)
+    _hears_move = movement_hears_predicate(
+        presence, room, dest, game, _presence_hears(presence),
+    )
     # Skip the mover and (when different) the named host so a possessed
     # body does not hear third-person "PulseHost leaves north" about itself.
     exclude = character if presence is character else (character, presence)
@@ -789,6 +926,11 @@ def _move_one(character, direction, dest, game, auto_look=True):
         face = presence_face_for(watcher, presence)
         return face or fallback_face
 
+    import time as _time
+    from engine import lag_watch
+
+    t_leave = _time.perf_counter()
+    before_move_crossing(character, room, direction, dest, game)
     if not stealth:
         room.broadcast(
             lambda w: move_leave_line(
@@ -797,6 +939,7 @@ def _move_one(character, direction, dest, game, auto_look=True):
             exclude=exclude,
             predicate=_hears_move,
         )
+    lag_watch.stamp_move_phase(game, "broadcast", t_leave)
     # Leaving a job site ends an active gig-work shift (checked below, via
     # after_arrive, once we know whether the NEW room is also a work site).
     was_working = getattr(character, "working", False)
@@ -806,6 +949,7 @@ def _move_one(character, direction, dest, game, auto_look=True):
     if train_msg and character.session:
         character.session.send(train_msg)
     character.move_to(dest)
+    after_move_crossing(character, room, direction, dest, game)
     from engine.systems import combat_pursuit as combat_pursuit_mod
     combat_pursuit_mod.notify_character_relocated(
         character, room, dest, game,
@@ -813,7 +957,9 @@ def _move_one(character, direction, dest, game, auto_look=True):
     # Game-specific post-arrival effects: stop work if the job site was
     # left behind, drag a carried body along via cadence, and the lodging
     # owner-walks-in-on-a-stranger check.
+    t_after = _time.perf_counter()
     after_arrive(character, dest, game, was_working)
+    lag_watch.stamp_move_phase(game, "after_arrive", t_after)
     # Opt-in combat-pit pose feed (direction known here; after_arrive does not).
     after_move_step(character, direction, dest, game)
     # A body heaved onto your shoulder (cmd_heave) travels with you, exactly
@@ -821,6 +967,7 @@ def _move_one(character, direction, dest, game, auto_look=True):
     # above already moved it through cadence.move_body so any spirit's
     # body_room stays in sync; this just picks the right broadcast wording.
     carried = getattr(character, "_carrying_body", None)
+    t_arrive = _time.perf_counter()
     if not stealth:
         if carried is not None:
             dest.broadcast(
@@ -838,6 +985,7 @@ def _move_one(character, direction, dest, game, auto_look=True):
                 exclude=exclude,
                 predicate=_hears_move,
             )
+    lag_watch.stamp_move_phase(game, "broadcast", t_arrive)
     # Local import: cmd_look now lives in engine.verbs.basic, a different
     # package from this shared-helper module -- lazy avoids a module-level
     # cross-package import, same reasoning as every other import here.
@@ -846,14 +994,26 @@ def _move_one(character, direction, dest, game, auto_look=True):
     # (and may have session None -- offline Echo).
     # Multi-hop walk passes auto_look=False so only the final room (or an
     # early stop) gets a full look -- encounters still fire below.
-    if auto_look and character.session is not None:
+    # SilentSession (Cadence ``npc_do``) also skips auto-look: town
+    # pathfind.step uses npc_do for immersion broadcasts, but building
+    # look UI into a sink froze the asyncio loop on every hop.
+    session = character.session
+    t_look = _time.perf_counter()
+    if (
+        auto_look
+        and session is not None
+        and not getattr(session, "silent", False)
+    ):
         cmd_look(character, "", game, after_move=True)
+    lag_watch.stamp_move_phase(game, "look", t_look)
+    t_enc = _time.perf_counter()
     encounter_check(game, dest)   # roll AFTER the look, not before --
     # a dungeon-reveal/hostile-spawn message narrating something happening
     # in the room should land once the player has already seen the room
     # itself, not get buried above the room description they haven't read
     # yet (live player report). When auto_look is False the spawn line
     # still arrives; walk stops and looks if combat engages.
+    lag_watch.stamp_move_phase(game, "encounter", t_enc)
 
 
 def start_following(follower, leader):
@@ -985,6 +1145,18 @@ def _pull_followers(leader, origin, direction, game):
         moved.add(id(follower))
         if follower.location is not origin or follower.spirit:
             continue
+        # Own living vessel husks must never trail the Mantle via follow
+        # pulls -- a desynced vacant shell reads as a naked NPC (826).
+        # SUPERS stamps is_vessel_husk on designed husks; bare engine
+        # never sets it, so this is a no-op without importing supers.
+        try:
+            if getattr(follower, "is_vessel_husk", False):
+                owner = getattr(follower, "vessel_owner_key", None)
+                if owner and owner == getattr(leader, "key", None):
+                    stop_following(follower, silent=True)
+                    continue
+        except Exception:
+            _log_hook_error("husk follow peel", getattr(follower, "key", None))
         # Live followers peel off when survival meters spike -- do not drag
         # Sam past bunk/gym while Dean walks (bug report 464).
         if getattr(follower, "session", None) is not None:
@@ -1024,16 +1196,65 @@ def _pull_followers(leader, origin, direction, game):
         pass
 
 
+_ITEM_NAME_TOKEN_SPLIT = re.compile(r"[^a-z0-9]+")
+
+
+def _item_text_tokens(text):
+    """Lowercase word tokens from an item key or alias string."""
+    return [
+        tok
+        for tok in _ITEM_NAME_TOKEN_SPLIT.split(str(text or "").lower())
+        if tok
+    ]
+
+
 def _item_name_matches(needle, item):
-    """True when ``needle`` (lowercased) hits an item key or alias substring."""
+    """True when ``needle`` matches an item key or alias at word boundaries.
+
+  Multi-word queries must appear as a contiguous phrase bounded by
+  non-alphanumerics (``kit bag`` in ``a worn kit bag``). Single-token
+  queries prefix-match whole words only (``kit`` -> kit bag; ``w`` does
+  not match ``worn``). One-letter queries must equal a whole token.
+  """
     if not needle:
         return False
-    if needle in item.key.lower():
-        return True
-    for alias in getattr(item, "aliases", ()) or ():
-        if needle in str(alias).lower():
+    needle = needle.strip().lower()
+    if not needle:
+        return False
+    haystacks = [item.key]
+    haystacks.extend(getattr(item, "aliases", ()) or ())
+    for raw in haystacks:
+        text = str(raw).lower()
+        if " " in needle:
+            pat = rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])"
+            if re.search(pat, text):
+                return True
+            continue
+        tokens = _item_text_tokens(text)
+        if not tokens:
+            continue
+        if len(needle) == 1:
+            if needle in tokens:
+                return True
+            continue
+        if any(tok.startswith(needle) for tok in tokens):
             return True
     return False
+
+
+def drop_item_refusal(character, item):
+    """Return a refuse string when ``item`` may not be dropped, else None."""
+    from engine.hooks import containers_item_worn_on_body, item_drop_refusal
+
+    refuse = item_drop_refusal(character, item)
+    if refuse:
+        return refuse
+    if containers_item_worn_on_body(character, item):
+        return (
+            "You have that on your body -- remove or unequip it "
+            "before dropping it."
+        )
+    return None
 
 
 def _collect_item_matches(query, items):
@@ -1209,27 +1430,103 @@ def is_linked_self(actor, other):
     return False
 
 
-def resolve_named_character(actor, query, game=None, candidates=None):
+def resolve_gm_target_character(game, query):
+    """Resolve a staff target token to a Character world-wide.
+
+    GM verbs (``snoop``, ``goto``, ``stats``, ``force``, …) accept account
+    login names as well as character keys and presence faces. When staff
+    type an account name, prefer the **online** session character on that
+    account; otherwise fall back to the first playable roster body (Echo /
+    offline).
+
+    Resolution order:
+      1. ``game.find_character`` -- keys, faces, NPCs, Echoes, ordinals
+      2. ``find_login_character`` -- bare roster keys / unique given names
+      3. Account name → online session character on that account
+      4. Account name → first playable roster body (Echo / offline)
+    """
+    raw = (query or "").strip()
+    if not raw or game is None:
+        return None
+
+    char = game.find_character(raw)
+    if char is not None:
+        return char
+
+    login_finder = getattr(game, "find_login_character", None)
+    if callable(login_finder):
+        char = login_finder(raw)
+        if char is not None:
+            return char
+
+    from engine.accounts import account_lookup_key, find_account, normalize_account_name
+
+    acct = find_account(game, raw)
+    if acct is None:
+        cleaned, err = normalize_account_name(raw)
+        if not err:
+            acct = find_account(game, cleaned)
+    if acct is None:
+        low = raw.lower()
+        for candidate in (getattr(game, "accounts", None) or {}).values():
+            display = (getattr(candidate, "display_name", None) or "").strip()
+            name = (getattr(candidate, "name", None) or "").strip()
+            if display.lower() == low or name.lower() == low:
+                acct = candidate
+                break
+    if acct is None:
+        return None
+
+    want_key = account_lookup_key(acct.name)
+    for session in list(getattr(game, "sessions", None) or []):
+        character = getattr(session, "character", None)
+        if character is None or getattr(character, "is_npc", False):
+            continue
+        char_acct = (getattr(character, "account", None) or "").strip()
+        if account_lookup_key(char_acct) == want_key:
+            return character
+
+    for key in list(acct.character_keys):
+        body = login_finder(key) if callable(login_finder) else None
+        if body is None:
+            body = game.find_character(key)
+        if body is None or getattr(body, "is_npc", False):
+            continue
+        if getattr(body, "immersion", False):
+            continue
+        return body
+
+    return None
+
+
+def resolve_named_character(actor, query, game=None, candidates=None, *, staff_world=False):
     """Resolve a typed name to a Character; me/self/myself always means `actor`.
 
     Prefer this over bare ``game.find_character`` whenever the typer can
     target themselves (GM ``set me …``, ``stats me``, room look-alikes).
 
     Supports ordinals: ``2.carl``, ``other carl``, ``second carl``.
+    Supports shell quotes: ``'Earl Jacobs'`` resolves as one name.
+
+    When ``staff_world`` is True (GM inspect / moderation verbs), account
+    login names also resolve via ``resolve_gm_target_character``.
 
     Resolution order:
       1. Empty query -> None
       2. Self alias -> ``actor`` (never a world name match)
       3. ``candidates`` list via ``_find_character`` when provided
       4. Else ``game.find_character(query)`` when ``game`` is provided
+      5. When ``staff_world``, account name → online player / roster body
     """
-    raw = (query or "").strip()
+    raw = collapse_shell_args(query)
     if not raw:
         return None
     if is_self_name(raw):
         return actor
     if candidates is not None:
         return _find_character(raw, candidates, self_character=actor)
+    if staff_world and game is not None:
+        return resolve_gm_target_character(game, raw)
     finder = getattr(game, "find_character", None) if game is not None else None
     if finder is not None:
         return finder(raw)
@@ -1503,7 +1800,10 @@ def _find_character(query, characters, self_character=None):
     multiple matches. With no ordinal and multiple hits, returns the
     first match (legacy) -- callers that need ambiguity messages should
     use ``_collect_character_matches`` + ``parse_target_ordinal``.
+
+    Shell quotes: ``'Earl Jacobs'`` is one needle, not ``'Earl`` + ``Jacobs'``.
     """
+    query = collapse_shell_args(query)
     if self_character is not None and is_self_name(query):
         return self_character
     from engine.char_identity import parse_target_ordinal, pick_ordinal
@@ -1519,6 +1819,23 @@ def _find_character(query, characters, self_character=None):
     if ordinal is not None:
         return pick_ordinal(matches, ordinal)
     return matches[0]
+
+
+def _game_for_staff_check(character):
+    """Best-effort Game handle for staff rank checks.
+
+    Prefer the live Session's game; fall back to a room stamp when hooks
+    call ``_is_gm`` without a session game pointer (bug report 740).
+    """
+    session = getattr(character, "session", None)
+    if session is not None:
+        game = getattr(session, "game", None)
+        if game is not None:
+            return game
+    room = getattr(character, "location", None)
+    if room is not None:
+        return getattr(room, "game", None)
+    return None
 
 
 def _staff_identity_character(character, game=None):
@@ -1558,10 +1875,8 @@ def _is_gm(character):
     back to legacy per-character ``gm_rank`` during migration. Immersion
     cast rides keep staff identity via ``session.staff_account``.
     """
-    game = None
     session = getattr(character, "session", None)
-    if session is not None:
-        game = getattr(session, "game", None)
+    game = _game_for_staff_check(character)
     character = _staff_identity_character(character, game)
     if session is not None:
         # Cast / alt ride: Session remembers the staff account from gm on.
@@ -1596,10 +1911,8 @@ def _is_gm(character):
 
 def _is_head_gm(character):
     """Is this character specifically the head GM (can promote/demote)?"""
-    game = None
     session = getattr(character, "session", None)
-    if session is not None:
-        game = getattr(session, "game", None)
+    game = _game_for_staff_check(character)
     character = _staff_identity_character(character, game)
     if session is not None:
         staff_name = getattr(session, "staff_account", None)

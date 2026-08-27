@@ -50,15 +50,16 @@ See: help bug | help hedit | help reports
 changes -- recent changelog entries
 
   changes              last few entries
-  changes <n>          last n entries (scrollback; n up to 100)
+  changes all [n]      longer headline list (n up to 100)
+  changes <n>          open changelog #n in full
   changes unread [n]   only entries you have not read yet
   changes catchup      mark everything read without listing
-  changes detail <ref>   full text (timestamp, slug, or legacy id)
+  changes detail <ref>   full text (timestamp, slug, or #n)
   changes #<ref>         same full-text lookup
 
-Each line shows when a ship landed (UTC) and a short summary. List order
-follows that timestamp. Unread lines show * before the time on the default
-list.
+Each line shows when a ship landed (UTC), a stable # number, and a short
+summary. List order follows that timestamp. Unread lines show * before the
+time on the default list.
 
 See: help bug
 """,

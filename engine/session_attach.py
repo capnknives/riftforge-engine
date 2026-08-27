@@ -10,6 +10,71 @@ Stdlib only; no game imports.
 from __future__ import annotations
 
 
+def detach_stale_sessions(character, game, winner):
+    """Drop other ``game.sessions`` rows still bound to *character*.
+
+    Gateway welcome can open several held TCPs for the same login body after
+    client reconnect loops; reattach only overwrites ``character.session`` and
+    leaves older Session objects in ``game.sessions`` (staff ``gm users`` lists
+    the same name repeatedly).
+    """
+    if character is None or winner is None or game is None:
+        return 0
+    sessions = getattr(game, "sessions", None)
+    if not sessions:
+        return 0
+    removed = 0
+    for session in list(sessions):
+        if session is winner:
+            continue
+        if getattr(session, "character", None) is not character:
+            continue
+        session.alive = False
+        session.character = None
+        try:
+            sessions.remove(session)
+        except ValueError:
+            pass
+        writer = getattr(session, "writer", None)
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        removed += 1
+    character.session = winner
+    return removed
+
+
+def sweep_duplicate_session_attaches(game):
+    """Boot / post-welcome sweep: one live Session row per Character attach."""
+    sessions = getattr(game, "sessions", None)
+    if not sessions:
+        return 0
+    by_char: dict[int, list] = {}
+    for session in list(sessions):
+        char = getattr(session, "character", None)
+        if char is None:
+            continue
+        by_char.setdefault(id(char), []).append((char, session))
+    removed = 0
+    for pairs in by_char.values():
+        if len(pairs) <= 1:
+            continue
+        char = pairs[0][0]
+        winner = getattr(char, "session", None)
+        if winner is None or getattr(winner, "character", None) is not char:
+            winner = None
+            for _, session in pairs:
+                if getattr(session, "alive", False):
+                    winner = session
+                    break
+            if winner is None:
+                winner = pairs[-1][1]
+        removed += detach_stale_sessions(char, game, winner)
+    return removed
+
+
 def find_session_for_character(character, game):
     """Return the live Session whose ``.character`` is *character*, if any."""
     if character is None or game is None:

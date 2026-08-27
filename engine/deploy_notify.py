@@ -211,32 +211,34 @@ def describe_ticket_live_clause(bug_ids=None, suggestion_ids=None):
 
     Bug-only deploys say *fix* so players do not read 'Bug #N is live' as the
     bug itself shipping. Suggestion-only deploys say *ship*; mixed batches keep
-    the neutral 'is live' wording.
+    the neutral *live* wording. Subject-verb agreement follows ticket count
+    (one *is*, two or more *are*).
     """
     bug_ids = list(bug_ids or [])
     suggestion_ids = list(suggestion_ids or [])
     ref = describe_ticket_ref(bug_ids, suggestion_ids)
+    count = len(bug_ids) + len(suggestion_ids)
+    verb = "are" if count > 1 else "is"
     if ref == "A tear in the script":
         return "The mend is live"
     if bug_ids and not suggestion_ids:
-        return f"{ref} fix is live"
+        noun = "fixes" if count > 1 else "fix"
+        return f"{ref} {noun} {verb} live"
     if suggestion_ids and not bug_ids:
-        return f"{ref} ship is live"
-    return f"{ref} is live"
+        noun = "ships" if count > 1 else "ship"
+        return f"{ref} {noun} {verb} live"
+    return f"{ref} {verb} live"
 
 
 def describe_ticket_countdown_verb(bug_ids=None, suggestion_ids=None):
-    """Veil countdown verb: ``has/have been mended/shipped``."""
+    """Veil countdown verb: ``will be mended/shipped`` (not live until reseal)."""
     bug_ids = list(bug_ids or [])
     suggestion_ids = list(suggestion_ids or [])
     if bug_ids and not suggestion_ids:
         base = "mended"
     else:
         base = "shipped"
-    count = len(bug_ids) + len(suggestion_ids)
-    if count > 1:
-        return f"have been {base}"
-    return f"has been {base}"
+    return f"will be {base}"
 
 
 # Signal kinds: Fix/suggestion ships vs silent tree catch-up before copyover.
@@ -253,6 +255,26 @@ GATEWAY_RESTART_WARNING = (
     "\r\n*** [ALERT] The weave that binds you must be torn down and rewoven — "
     "you will fall back to the menu. Return once the rewrite settles. ***"
 )
+HEADS_UP_FACE = "Ash(GM)"
+HEADS_UP_COPYOVER = (
+    "Heads up — a copyover is queued in the next few minutes. "
+    "You should stay connected. Ping me if something's going on and we need "
+    "to halt it."
+)
+HEADS_UP_RESTART = (
+    "Heads up — a full shutdown and restart is queued in the next few minutes, "
+    "not just a copyover. You will drop to the menu and need to log back in. "
+    "Ping me if something's going on and we need to halt it."
+)
+HEADS_UP_FOLLOWUP_RESTART = (
+    "Update — that queued rewrite will now be a full shutdown and restart, "
+    "not a stay-connected copyover. You will drop to the menu and need to log "
+    "back in. Ping me if something's going on and we need to halt it."
+)
+ABORT_OOC = (
+    "The planned rewrite is halted. You're clear — no copyover or restart "
+    "from that queue."
+)
 CATCHUP_READY_LINE = (
     "*** The Veil settles. The rewrite is complete — you are still here. ***"
 )
@@ -266,13 +288,19 @@ def _countdown_tick_line(remaining: int) -> str:
 
 
 def _countdown_done_line(*, gateway_restart: bool) -> str:
-    """After countdown: game-only pause vs full gateway tear (disconnect)."""
+    """After countdown: bridge line before tree sync + copyover MSG_BEFORE.
+
+    Players can still type verbs until copyover freezes the game — do not
+    promise an immediate pause here (gateway hold music follows MSG_BEFORE).
+    """
     if gateway_restart:
         return (
             "*** The countdown ends — you will disconnect. "
             "Log in again when the rewrite is done. ***"
         )
-    return "*** The Veil draws tight — the pause comes now. ***"
+    return (
+        "*** The Veil draws tight — the pause begins when the Veil shudders. ***"
+    )
 
 
 def _fix_countdown_open(
@@ -359,31 +387,106 @@ def _maybe_announce_disconnect_imminent(game):
 
 
 def queue_pending_ready_announce(game, message):
-    """Store the post-boot 'Rewrite complete' line until deferred seed ends."""
+    """Store the post-boot 'rewrite is complete' line until deferred seed ends."""
     if game is None or not (message or "").strip():
         return
     game._veil_pending_ready_announce = (message or "").strip()
 
 
-def announce_rewrite_ready(game):
-    """Broadcast the deferred complete line (after boot seed yields).
+def queue_pending_post_ready_announce(game, message):
+    """Queue ticket-live chrome after the generic rewrite-complete line."""
+    if game is None or not (message or "").strip():
+        return
+    pending = getattr(game, "_veil_pending_post_ready", None)
+    if pending is None:
+        pending = []
+        game._veil_pending_post_ready = pending
+    line = (message or "").strip()
+    if line not in pending:
+        pending.append(line)
 
-    Called from gateway welcome after ``run_deferred_boot_seed_async`` so
-    players never see 'complete' while ``who`` is still frozen on a fat heal.
+
+def _veil_copyover_reattach_pending(game) -> bool:
+    """True while gateway copyover reattach is waiting on deferred boot."""
+    if game is None:
+        return False
+    ev = getattr(game, "_veil_ready_event", None)
+    return ev is not None and not ev.is_set()
+
+
+def deploy_pre_copyover(game) -> bool:
+    """True in the old process while a deploy hand-off waits for copyover.
+
+    After gateway reattach starts, ``_veil_copyover_reattach_pending`` is
+    true instead — the new process should process catch-up resolves then.
+    """
+    if game is None:
+        return False
+    signal = _read_signal(game.report_dir)
+    if not signal:
+        return False
+    if signal.get("phase") not in ("pending", "awaiting_copyover"):
+        return False
+    return not _veil_copyover_reattach_pending(game)
+
+
+def veil_rewrite_messaging_deferred(game) -> bool:
+    """True while ticket-live / thank-you lines must wait for the rewrite arc."""
+    return _veil_copyover_reattach_pending(game) or deploy_pre_copyover(game)
+
+
+def _queue_or_broadcast_ready_line(game, message):
+    """Broadcast ticket-live chrome now, or queue after rewrite-complete."""
+    if game is None or not (message or "").strip():
+        return
+    line = (message or "").strip()
+    if veil_rewrite_messaging_deferred(game):
+        queue_pending_post_ready_announce(game, line)
+        return
+    try:
+        game.broadcast_all(line)
+    except Exception as exc:
+        print(
+            f"[deploy_notify] ready line broadcast failed: {exc!r}",
+            flush=True,
+        )
+
+
+def _catchup_ready_message(bug_ids, suggestion_ids, summary) -> str:
+    """Player-facing line after catch-up resolve (no Veil countdown)."""
+    live_clause = describe_ticket_live_clause(bug_ids, suggestion_ids)
+    return (
+        f"*** The Veil settles. {live_clause} (catch-up): "
+        f"{summary} ***"
+    )
+
+
+def announce_rewrite_ready(game):
+    """Broadcast the deferred complete line when the world is playable.
+
+    Gateway copyover calls this from the playable restore slice so look/who
+    resume while town NPC / immersion heals continue in the background.
+    A second call after background heals is a no-op (pending text already sent).
     """
     if game is None:
         return
     text = getattr(game, "_veil_pending_ready_announce", None)
     game._veil_pending_ready_announce = None
-    if not text:
-        return
+    post = getattr(game, "_veil_pending_post_ready", None) or []
+    game._veil_pending_post_ready = None
     try:
-        game.broadcast_all(text)
+        if text:
+            game.broadcast_all(text)
+        for line in post:
+            game.broadcast_all(line)
     except Exception as exc:
         print(
             f"[deploy_notify] announce_rewrite_ready failed: {exc!r}",
             flush=True,
         )
+    from engine import hooks
+
+    hooks.flush_pending_report_thanks(game)
 
 
 def queue_deploy(directory, *, pr, bug_id=None, bug_ids=None,
@@ -552,12 +655,11 @@ def _apply_catchup_fixes(game, fixes):
                 last_summary = "Player suggestions have been shipped."
             else:
                 last_summary = "Reported bugs have been fixed."
-        live_clause = describe_ticket_live_clause(
-            all_bug_ids, all_suggestion_ids,
-        )
-        game.broadcast_all(
-            f"*** Rewrite complete. {live_clause} (catch-up): "
-            f"{last_summary} ***"
+        _queue_or_broadcast_ready_line(
+            game,
+            _catchup_ready_message(
+                all_bug_ids, all_suggestion_ids, last_summary,
+            ),
         )
 
     for fix in fixes:
@@ -602,8 +704,10 @@ def _apply_catchup_fixes(game, fixes):
     return bool(all_bug_ids or all_suggestion_ids)
 
 
-def _process_catchup_resolves(game):
+def _process_catchup_resolves(game, *, from_resume=False):
     """Mark bugs resolved after autodeploy catch-up (no countdown)."""
+    if not from_resume and deploy_pre_copyover(game):
+        return False
     directory = game.report_dir
     path = catchup_resolve_path(directory)
     if not os.path.isfile(path):
@@ -791,6 +895,73 @@ def reconcile_open_suggestions_from_deployed_fixes(game):
     return bool(to_close)
 
 
+def _heads_up_message(payload) -> str:
+    """Player OOC body for a queued rewrite (copyover vs full restart)."""
+    gateway = bool((payload or {}).get("gateway_restart"))
+    follow = bool((payload or {}).get("follow_up"))
+    if gateway and follow:
+        return HEADS_UP_FOLLOWUP_RESTART
+    if gateway:
+        return HEADS_UP_RESTART
+    return HEADS_UP_COPYOVER
+
+
+def _process_heads_up(game):
+    """OOC from Ash(GM) once when auto-deploy first queues a debounce batch."""
+    if game is None:
+        return
+    from engine import auto_deploy
+    from engine import ooc_channel
+
+    payload = auto_deploy._load_heads_up(game.report_dir)
+    if not payload or payload.get("phase") != "pending":
+        return
+    try:
+        ooc_channel.broadcast_ooc_from_face(
+            game,
+            HEADS_UP_FACE,
+            _heads_up_message(payload),
+            respect_mutes=False,
+        )
+    except Exception as exc:
+        print(f"[deploy_notify] heads-up OOC failed: {exc!r}", flush=True)
+        return
+    payload["phase"] = "announced"
+    auto_deploy._save_heads_up(game.report_dir, payload)
+    print(
+        f"[deploy_notify] heads-up OOC as {HEADS_UP_FACE} "
+        f"({(payload.get('tip_sha') or '')[:12]} "
+        f"gateway_restart={bool(payload.get('gateway_restart'))})",
+        flush=True,
+    )
+
+
+def announce_deploy_aborted(game):
+    """Tell players on OOC that the queued rewrite will not fire."""
+    if game is None:
+        return
+    from engine import ooc_channel
+
+    try:
+        ooc_channel.broadcast_ooc_from_face(
+            game, HEADS_UP_FACE, ABORT_OOC, respect_mutes=False,
+        )
+    except Exception as exc:
+        print(f"[deploy_notify] abort OOC failed: {exc!r}", flush=True)
+
+
+def abort_in_flight(game) -> bool:
+    """Cancel a running Veil countdown task. Returns True if one was live."""
+    global _deploy_task, _started_mtime
+    running = _deploy_task is not None and not _deploy_task.done()
+    if running:
+        _deploy_task.cancel()
+        print("[deploy_notify] in-flight Veil countdown cancelled", flush=True)
+    _deploy_task = None
+    _started_mtime = None
+    return running
+
+
 def tick(game):
     """Called from Game.on_tick() -- start a countdown when a signal appears.
 
@@ -800,6 +971,7 @@ def tick(game):
     global _deploy_task, _started_mtime
 
     directory = game.report_dir
+    _process_heads_up(game)
     _maybe_announce_tree_sync(game)
     _maybe_announce_disconnect_imminent(game)
     if _process_catchup_resolves(game):
@@ -890,13 +1062,45 @@ async def _run_countdown(game, signal):
         )
 
     # Walk second-by-second so we can hit WARN_AT milestones cleanly.
-    for remaining in range(total, 0, -1):
-        if remaining in _COUNTDOWN_WARN_AT and remaining < total:
-            game.broadcast_all(_countdown_tick_line(remaining))
-        await asyncio.sleep(1)
+    from engine import auto_deploy
+
+    try:
+        for remaining in range(total, 0, -1):
+            if auto_deploy.abort_requested(directory):
+                _cleanup(directory)
+                print("[deploy_notify] countdown aborted by GM", flush=True)
+                return
+            if remaining in _COUNTDOWN_WARN_AT and remaining < total:
+                game.broadcast_all(_countdown_tick_line(remaining))
+            await asyncio.sleep(1)
+
+        if auto_deploy.abort_requested(directory):
+            _cleanup(directory)
+            print("[deploy_notify] countdown aborted by GM", flush=True)
+            return
+    except asyncio.CancelledError:
+        _cleanup(directory)
+        print("[deploy_notify] countdown cancelled", flush=True)
+        raise
 
     signal["phase"] = "awaiting_copyover"
     _write_signal(directory, signal)
+
+    # Flush every live body before the host overlays files / copyover runs.
+    # Post-deploy autosave defer can leave fence/sell mutations in RAM only;
+    # without this checkpoint, inventory and wallet diverge after restart.
+    try:
+        from engine import persistence
+
+        persistence.save_world_before_process_exit(
+            game.db, game, reason="pre_deploy",
+        )
+    except Exception as exc:
+        print(
+            f"[deploy_notify] pre-deploy save failed ({exc!r}) -- "
+            "host may still sync; players could lose recent sells",
+            flush=True,
+        )
 
     # Host tools/deploy_bug_fix.py polls for this file before git checkout.
     with open(ready_path(directory), "w", encoding="utf-8") as f:
@@ -917,7 +1121,7 @@ async def on_resume(game):
     directory = game.report_dir
 
     # Catch-up file (watcher) or last_deploy lag (retro after early catch-up).
-    _process_catchup_resolves(game)
+    _process_catchup_resolves(game, from_resume=True)
     _reconcile_missed_fix_resolves_from_auto_deploy_state(game)
 
     signal = _read_signal(directory)
@@ -934,14 +1138,17 @@ async def on_resume(game):
     summary = signal.get("summary") or "A reported bug has been fixed."
     kind = signal.get("kind") or KIND_FIX
 
-    # Soft stitch line now; full "Rewrite complete" after deferred boot seed
-    # so who/look are not frozen under a false done signal.
+    # Generic "rewrite is complete" always lands first; ticket chrome and
+    # reporter thank-yous follow (catch-up resolve may have queued chrome).
     announce_world_stitching(game)
-    if kind == KIND_CATCHUP:
-        queue_pending_ready_announce(game, CATCHUP_READY_LINE)
-    else:
+    existing_ready = getattr(game, "_veil_pending_ready_announce", None)
+    if existing_ready and "rewrite is complete" not in existing_ready.lower():
+        queue_pending_post_ready_announce(game, existing_ready)
+        game._veil_pending_ready_announce = None
+    queue_pending_ready_announce(game, CATCHUP_READY_LINE)
+    if kind == KIND_FIX:
         live_clause = describe_ticket_live_clause(bug_ids, suggestion_ids)
-        queue_pending_ready_announce(
+        queue_pending_post_ready_announce(
             game,
             f"*** The Veil settles. {live_clause}: {summary} ***",
         )

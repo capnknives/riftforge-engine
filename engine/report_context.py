@@ -3,6 +3,10 @@ report_context.py -- diagnostic facts attached to bug/suggest reports.
 
 Keeps engine/ networking-free. Game-specific fields arrive via
 ``hooks.report_context_extra`` (SUPERS registers in bootstrap).
+
+Bugs get the full modular dump. Suggestions, typos, and help proposals
+keep a slim identity/location snapshot so staff and the implementer
+webhook are not buried in combat/Cadence/loadout walls.
 """
 
 from __future__ import annotations
@@ -11,6 +15,15 @@ import json
 import os
 
 _MAX_OCCUPANTS = 15
+
+# Report kinds that must not attach the full diagnostic blob.
+_MINIMAL_KINDS = frozenset(("suggest", "help", "typo"))
+
+# Gameplay keys worth keeping on a suggestion (who/where, not meters).
+_SLIM_GAMEPLAY_KEYS = (
+    "origin", "path", "background", "tier",
+    "home_zone", "away_from_home_zone",
+)
 
 
 def _note_context_error(errors, label, exc):
@@ -118,14 +131,134 @@ def _group_snapshot(character, context_errors=None):
     }
 
 
-def build(character, game, *, history=None, description=None):
+def _is_minimal_kind(kind):
+    """True when this filing kind should skip the full diagnostic dump."""
+    token = str(kind or "").strip().lower()
+    return token in _MINIMAL_KINDS
+
+
+def build_minimal(character, game):
+    """Identity + location only -- used for suggestions / typos / help ideas.
+
+    Staff still need to know *who* filed and *where* they were standing.
+    Combat scene, Cadence trails, vitals, loadout, and modular gameplay
+    dumps stay on bugs.
+    """
+    if character is None:
+        return {}
+
+    from engine import room_vnum as room_vnum_mod
+
+    room = getattr(character, "location", None)
+    report_dir = getattr(game, "report_dir", ".") if game is not None else "."
+    ctx = {
+        "report_kind": "minimal",
+        "character": {
+            "key": _safe_str(getattr(character, "key", None)),
+            "presence": _presence_mode(character),
+        },
+        "room": {
+            "staff_line": room_vnum_mod.describe_actor_room(
+                character, staff=True,
+            ),
+        },
+        "game": {
+            "tick": int(getattr(game, "game_time_ticks", 0) or 0)
+            if game is not None else 0,
+            "deploy_sha": _deploy_sha(report_dir),
+        },
+    }
+    title = _safe_str(getattr(room, "title", None) if room else None, "")
+    if title:
+        ctx["room"]["title"] = title
+    zone = _safe_str(getattr(room, "zone", None) if room else None, "")
+    if zone:
+        ctx["room"]["zone"] = zone
+    gm_rank = getattr(character, "gm_rank", None)
+    if gm_rank:
+        ctx["character"]["gm_rank"] = gm_rank
+
+    gameplay = {}
+    for attr in ("origin", "path", "background"):
+        value = getattr(character, attr, None)
+        if value:
+            gameplay[attr] = value
+    try:
+        tier = int(getattr(character, "tier", 0) or 0)
+    except (TypeError, ValueError):
+        tier = 0
+    if tier:
+        gameplay["tier"] = tier
+    home_zone = getattr(character, "home_zone", None)
+    current_zone = getattr(room, "zone", None) if room is not None else None
+    if home_zone:
+        gameplay["home_zone"] = home_zone
+        gameplay["away_from_home_zone"] = bool(
+            current_zone and home_zone != current_zone
+        )
+    if gameplay:
+        ctx["gameplay"] = gameplay
+    if not ctx["game"].get("deploy_sha"):
+        ctx["game"].pop("deploy_sha", None)
+    return ctx
+
+
+def slim_suggestion_context(context):
+    """Reduce a stored diagnostic blob to suggestion-sized identity/location.
+
+    New filings already use ``build_minimal``. This helper also trims
+    older fat ``suggestions.log`` rows when GM ``sendsuggest`` POSTs them
+    to the implementer webhook.
+    """
+    if not isinstance(context, dict):
+        return {}
+    char = context.get("character") if isinstance(context.get("character"), dict) else {}
+    room = context.get("room") if isinstance(context.get("room"), dict) else {}
+    game = context.get("game") if isinstance(context.get("game"), dict) else {}
+    gameplay = context.get("gameplay") if isinstance(context.get("gameplay"), dict) else {}
+    out = {
+        "report_kind": "minimal",
+        "character": {},
+        "room": {},
+        "game": {},
+    }
+    for key in ("key", "presence", "gm_rank"):
+        if char.get(key) not in (None, ""):
+            out["character"][key] = char[key]
+    for key in ("staff_line", "title", "zone"):
+        if room.get(key) not in (None, ""):
+            out["room"][key] = room[key]
+    if game.get("tick") is not None:
+        out["game"]["tick"] = game["tick"]
+    if game.get("deploy_sha"):
+        out["game"]["deploy_sha"] = game["deploy_sha"]
+    slim_gp = {
+        key: gameplay[key]
+        for key in _SLIM_GAMEPLAY_KEYS
+        if gameplay.get(key) not in (None, "")
+    }
+    if slim_gp:
+        out["gameplay"] = slim_gp
+    account = context.get("account")
+    if account:
+        out["account"] = account
+    return {k: v for k, v in out.items() if v}
+
+
+def build(character, game, *, history=None, description=None, kind=None):
     """Return a JSON-serializable dict of triage facts for a filed report.
 
     Optional ``history`` (session command ring) and ``description`` (bug text)
     select which SUPERS diagnostic modules attach via report_modules.
+
+    ``kind`` of suggest / typo / help skips the modular dump and returns
+    ``build_minimal`` instead.
     """
     if character is None:
         return {}
+
+    if _is_minimal_kind(kind):
+        return build_minimal(character, game)
 
     from engine import display_prefs
     from engine import room_vnum as room_vnum_mod

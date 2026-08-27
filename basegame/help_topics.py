@@ -39,17 +39,19 @@ Umbral shroud). Type weather, exit from Main Street to walk the atlas,
 help tornado-hunter for the desk loop, help origins for Bloodlines,
 help stellar for flight tiers.
 """,
-    "score": """RiftForge reference town -- score
+    "score": """score -- your character sheet
 
-How you play:
-  1. score              compact sheet (path, stats, HP, urgent needs/injuries)
-  2. score vitals       lifeforce / HP focus
-  3. score combat       Balance, Equilibrium, aim zone, per-limb injuries
-  4. score needs        hunger and thirst meters
-  5. score full         verbose whole sheet
+Bare score is a short gothic sheet: who you are, how healthy you feel, your six primaries, cash and bank (when you have savings), and only the rows that matter right now (injuries, exhaustion, fuel, urgent deals). A Detail footer at the bottom lists deeper slices when you want more. Alias: sc.
 
-Regional injuries from active combat persist across reboots. Disabled limbs
-need clinic care. See help active-combat for strikes, aim, and grapple.
+How you play
+  1. score -- compact sheet (start here).
+  2. score combat -- primaries, fight secondaries (Precision, Eva, …), and each limb injury.
+  3. score needs -- hunger / rest meters (same as bare needs).
+  4. score vitals -- lifeforce, stamina, fuel, Spirit, and similar tanks.
+  5. score full -- the long verbose dump (old bare-score style).
+
+More detail: help score more
+See also: help score more | help stats | help needs | help tiers
 """,
     "mail": """RiftForge reference town -- mail
 
@@ -73,9 +75,17 @@ How you play
   5. Leave a dial on      town WX news cuts in at the top of the hour every four game-hours (Discord mirrors that slot)
 
 Hard to see
-  Rain, storm, snow, and nearby tornadoes make outdoor look harder.
-  You always get a [WX] vision line when the sky is bad. Sometimes look whites out -- you keep the room name and weather, but people, items, and exits vanish behind "you can't see through …" until you look again.
-  Cars soften that; sturdy indoor rooms do not white out (roof dampen only). Walking still works by direction even when you cannot see.
+  Rain, storms, nearby tornadoes, and blowing snow (snow plus strong wind)
+  make outdoor look harder. Rain is overlay only -- it never whites out.
+  Ordinary snow still shows on look -- it does not wipe the street. Gusty
+  snow may add a hard-to-see [WX] line. In a true blow, look can white out:
+  you keep the room name and weather, but people, items, and exits vanish
+  behind "you can't see through …" until you look again.
+  Cars soften that; sturdy indoor rooms do not white out (roof dampen only).
+  Walking still works by direction even when you cannot see.
+
+  weather reports the climate band you are standing in, not the whole
+  country. Kansas snow does not mean Miami is snowing.
 
 Tornadoes
   Rare severe events move across the atlas. [WARNING] lines escalate when a funnel is near. Seek sturdy shelter (Storm Watch Office, bunkers, clinics). Vehicles are NOT storm cellars. Strong funnels can injure people who are not strong enough outdoors -- clinic, never loot.
@@ -107,14 +117,26 @@ How you play (desk)
   3. research                 log regional normals for small dollars
   4. radar                    list watches and live tornado tracks
 
-Board (fun chase): anyone at the office can pick up a chase -- on-duty hunters get a turn-in bonus.
+
+
+
+
+
+
+
+
+
+
+
 
 How you play (chase)
-  1. chaseboard / takechase   accept a live funnel or storm-cell probe
+  1. chaseboard take         accept a live funnel or storm-cell probe (also: takechase)
   2. track chase              soft lead toward the target atlas cell
   3. probe                    outdoors within one cell of the target
-  4. reportchase              turn in data at Storm Watch for dollars
-  5. abandonchase             drop the job with no pay
+  4. chaseboard report        turn in data at Storm Watch for dollars (also: reportchase)
+  5. chaseboard abandon       drop the job with no pay (also: abandonchase)
+
+Board (fun chase): anyone at the office can pick up a chase -- on-duty hunters get a turn-in bonus.
 See also: help weather | help work | help radio
 """,
     "reporter": """
@@ -124,16 +146,28 @@ Humans: pick with path reporter -- Spirit, commit / settle, and Mutation Pool st
 Awakened cover: path background reporter on Monster / Celestial -- craft spends Origin fuel, not Spirit (help path | help fuel).
 
 How you play (field)
-  1. photograph       shoot fights, crowds, crime scenes, or sky drama
+  1. photograph       shoot fights, crowds, crime scenes, or sky drama (may tag [PHOTO] hunter tells on stills -- not masquerade heat)
   2. photos           list held shots on your roll
   3. sellphoto        cash a print at the Lebanon Gazette (west of the Library)
 
+
+
+
+
+
+
+
+
+
+
+
+
 How you play (stories)
   1. storyboard       read tips at the Gazette news desk
-  2. takestory        claim a brief (interviews + optional photo)
+  2. storyboard take  claim a brief (interviews + optional photo; also: takestory)
   3. interview <name> quote someone in the room for your open brief
-  4. reportstory      file finished copy for dollars
-  5. abandonstory     drop a brief with no pay
+  4. storyboard report file finished copy for dollars (also: reportstory)
+  5. storyboard abandon drop a brief with no pay (also: abandonstory)
 
 Desk gig (anyone with the job)
   1. work as news_reporter at the Gazette
@@ -158,12 +192,9 @@ steps down one layer.
 
 See also: help origins | help travel | help active-combat
 """,
-    "origins": """
-origins -- what kind of person you are
+    "origins": """origins -- what kind of person you are
 
 Soldier, priest, monster, machine, god -- Lebanon is full of people who used to be something else. Your Origin is which kind of something-else you are; your Path is what that looks like day to day.
-
-Your Origin is the big family you belong to. Under that sits a Path -- the game may call it a Background, Lineage, Mantle, Strain, Tether, Core, or Bloodline depending on the family. Path is the concrete role you play day to day.
 
 How you play
   1. At chargen: mortal or Awakened, then Background or Path (set once)
@@ -179,33 +210,8 @@ How you play
   11. train / spar         grow body stats (help training)
   12. learn <id>           open Disciplines you qualify for
 
-Live chargen families (today)
-  Human Backgrounds     help human — detective, soldier, hunter, witch, …
-  Monster Lineages      help monster — vampire, shifter, ghost, …
-  Celestial Mantles     help angel | help demon | help reaper
-  Divine Faith Gods     help divine | help god -- episode pantheon worship
-  Cosmic Tethers        help elemental | help eldritch | help void-touched
-
-  Type help paths for the full live catalog (built from origins.json).
-  Mutant, Constructed, Alien, and Creation are not player picks at create.
-
-Each Path names three preferred primaries (top stats) -- shown on path and on help paths. Hunter / Occultist / Slayer edges line up with those.
-Echo training uses them for default gym drills (all six primaries have a solo activity). Chargen or kit tools assign non-Human Paths; bare path always shows what you have.
-
-Mortal cover (Monster / Celestial)
-  You keep your Lineage or Mantle. A Mundane Background cover adds the mortal kit (detective, witch, …). Spirit stays Human-only -- cover craft spends your Lineage fuel instead (Ghost Presence, Vampire Blood, Angel Grace, …; check fuel / score). nervework refills that same tank. Type help path for the menu, blocks (no Hunter / Slayer cover), and path background <id>.
-
-Disciplines (learnable powers)
-  learn <id>        open a Discipline you qualify for disciplines       what you know and what you can still open
-  Some Disciplines stay locked until your Origin or Path matches
-  (for example God rites, Hunter arts, Occultist hellcraft).
-
-Useful commands
-  path              show Path; Humans pick a Background once
-  path background   Monster / Celestial mortal cover
-  score             Origin / Path / cover on your sheet
-  alignment         reputation axis good / neutral / evil (help reputation)
-See also: help paths | help newbie | help human | help monster
+More detail: help origins more
+See also: help origins more | help paths | help newbie | help human
 """,
     "shop": """Notbigville -- General Store shopping
 
@@ -233,20 +239,17 @@ How you play:
 See also: help paths (ranger path)
 """,
     "breach": """
-breach -- Leviathan Bone Gate OR Soldier Master combat breach
+breach -- Soldier breach spike
 
 Usage: breach
 
-Two Paths share this verb (same word, different gates):
+How you play
+  1. path soldier; signature Master+; commit
+  2. breach            short outgoing spike
 
-  Leviathan Master+: Stand in the Bone Gate with a bone-white seal key (canonical or a fraying mendkey craft) and Master+ Devouring.
-  Costs heavy fuel. Success clears the Purgatory bind so plane exits work; the fraying key crumbles.
-  Paying the Ledger never frees a Leviathan.
-
-  Human Soldier Master: committed combat breach buff (mundane ladder).
-  See help soldier.
-  Requires Path soldier and Adept+ rank on the Soldier ladder.
-See also: help leviathan | help purgatory | help soldier
+What it does
+  Master signature. Costs 14 Spirit. Short outgoing spike — about half the usual buff window.
+See also: help soldier | help suppress | help laststand | help commit
 """,
     "active-combat": """
 combat -- how fighting works (hub)
@@ -286,7 +289,7 @@ Ending it
   disengage / flee breaks off without leaving the room (help disengage). 0 HP always knocks someone out, never kills outright -- a finish command afterward sends them to the clinic or ends it for good (help death | help hospital). Echoes are never looted for logging off. Immortal foes still need the right method on the finish (stake / decap / folklore steel / help celestial-steel). Exhausted fighters must rest first (help rest).
 
 Practice first
-  Town Gym or Spar Gym -- spar the training dummy, or takequest combat_drill for a slow guided lesson (help combat-drill).
+  Town Gym (Lebanon north Main Street; Lawrence Gym on Massachusetts Street) -- spar the training dummy, or takequest combat_drill for a slow guided lesson (help combat-drill).
 
 Growing stronger
   Real fights pay training progress while you are under softcap, then banked Growth toward the next Tier (help breaking | help training). Spar and gym drills still matter for safe reps.
@@ -338,8 +341,7 @@ Persists across copyover/restart. Protected from auto-deploy overlays
 (help content). Prefer Area Studio for large areas.
 See also: help rset | help lodging | help populate | help build-maps
 """,
-    "phone": """
-phone -- physical handsets, numbers, and plane-local calls
+    "phone": """phone -- physical handsets, numbers, and plane-local calls
 
 Calls go to a **phone number on an item**, not a character name.
 call dean only works after you phone save dean 555-0142 (alias → number on *your* phonebook).
@@ -350,52 +352,59 @@ How you play
   3. phone number          -- show handset number(s)
   4. dial 555-0142         -- ring that handset (same plane only)
      call dean             -- dial a saved alias
+     call sheriff          -- ring whoever holds Lebanon's desk (Calder, Vale, or the officer who took the star). They pick up. Type talk (or talk sheriff) on the line.
   5. answer / hangup       -- pick up or end
   6. phone say hello       -- private line; room sees you talk into a phone
-  7. phone save dean 555-0142
+  7. phone text dean you ok?  -- SMS a saved alias (flip phone on both ends)
+  8. phone save dean 555-0142
      phone forget dean
      phone contacts
-  8. dial WKNZ <text>      -- call-in queue (no radio tune needed)
+  9. dial WKNZ <text>      -- call-in queue (no radio tune needed)
      phone request <song>  -- song request queue
-  9. phone ask group|food|water|help -- when an Echo answers (not voicemail)
+ 10. phone ask group|food|water|help -- when an Echo answers (not voicemail)
+ 11. phone carvana            -- sell or buy rides (help carvana)
 
-Payphones
-  Cost 1 dollars per outbound call. Usable only if the room has a payphone item or the room description mentions a payphone. Outbound only.
-
-Planes
-  Signal stays on the plane you are on (Earth phone cannot ring Hell).
-
-Cadence
-  Offline Echoes and town NPCs on Earth earn toward a flip phone (gig work), then walk to an in-town phone shelf (Ash Garage in Lebanon; gas station in Lawrence) and buy one -- same buy verb players use.
-  Towns without a shelf do not soft-lock on endless grocery gigs.
-  Critical hunger/thirst still outranks shopping.
-  On-shift desk clerks stay at their workplace before the phone grind.
-  Hunters on a haunt / hunt lead may call a close-tie Echo partner
-  (sibling, ashkin, …) with phone ask group so the road trip waits for the meetup -- same ask path players use.
-Echoes
-  Offline bodies can answer unless echo voicemail on. Live players must type answer. See help echo.
-
-Screenreader: lines use [PHONE] / [CALL] tags (never color alone).
-See also: help echo | help radio | help station | help sparaccept
+More detail: help phone more
+See also: help phone more | help echo | help radio | help station
 """,
-    "appearance": """Notbigville -- appearance slots demo
+    "appearance": """appearance -- structured look slots
 
-How you play:
-  1. appearance                 list your slots
-  2. appearance <slot>          list valid option ids
-  3. appearance <slot> <id>       set hair/eyes/etc. and rebuild look self
+No args: list every slot and your current look description.
+  appearance <slot> <id or your own text> Catalog ids (blue, short, …) work as before. Anything else is saved as a custom value (max 40 characters) -- e.g.
+      appearance eye_color storm grey
+      appearance hair_color sun-bleached wheat
 
-Fill every core slot, then look self to see the assembled description.
+How you play
+  Type help appearance more for the full writeup.
+
+More detail: help appearance more
+See also: help appearance more | help pronoun | help setdesc | help setshort
 """,
-    "relationships": """Notbigville -- relationship tags demo
+    "relationships": """
+relationships -- friends, family, rivals, enemies, ashkin, favorites
 
-How you play:
-  1. relate                     list your one-sided tags
-  2. relate <name> friend       tag someone in the world
-  3. friend <name>              shortcut for the same
-  4. relate clear <name>        drop your tag toward them
+Tags are YOUR view of someone -- they do not have to agree. Setting a new kind on a person replaces only that person's tag.
 
-Tags are one-sided; reciprocity is flavor only.
+How you play
+  1. relate -- list your tags and favorite person.
+  2. relate <name> <kind> -- set a tag (friend, rival, love, sibling, ashkin, enemy, …).
+  3. relate clear <name> -- remove your tag.
+  4. favorite <name> -- who the town AI prefers for hangouts when you are lonely.
+  5. favorite clear -- auto-pick from your tags again.
+
+Family kinds
+  sibling -- brother / sister (legacy brother still works).
+  parent -- mom / dad / mentor figure.
+
+Ashkin (help ashkin)
+  A Purgatory war-bond -- closer than a buddy, not blood family. You must carry the Purgatory scar yourself before you can tag someone ashkin.
+
+How the town AI uses tags
+  When social need is high, it prefers your favorite person. Closer tags beat weaker ones for auto-pick (lover, then family, then friend, …). rival stays competitive without murder. enemy and worse can lead to hunt attempts when you share a zone.
+  Offline Echoes use close ties for hunt / rest buddies (never Enemy-tier).
+
+Beckon (help beckon) can pull close Echo / idle ties along as companions. Mutual siblings can die into the afterlife so a sibling may attempt a rescue (help death).
+See also: help ashkin | help beckon | help personality | help echo
 """,
     "personas": """Notbigville -- persona traits demo
 

@@ -109,6 +109,7 @@ IDLE_SPECTATOR = frozenset({
     "regimen",
     # OOC / account (outbound tell/ooc stay spectator; inbound already works)
     "ooc", "tell", "whisper", "reply", "r",
+    "rpseek", "rpwhere",
     "bug", "suggest", "setpass", "quit",
     # Relationship / mission list panes (write shortcuts like friend wake)
     "relate", "relationship",
@@ -130,7 +131,7 @@ IDLE_WAKE_MOVE = frozenset(DIRECTIONS) | frozenset({
 
 # Combat / predation verbs that mean "I'm back in the fight".
 IDLE_WAKE_AGGRESSIVE = frozenset({
-    "attack", "kill", "hit", "fight", "spar",
+    "attack", "kill", "k", "hit", "fight", "spar",
     "bite", "stake", "slay", "maul", "crush", "devour",
     "smite", "judgment", "rend", "gnaw", "howl", "hunt",
     "flee", "disengage",
@@ -276,6 +277,8 @@ def dispatch(character, raw, game, *, force_actor=None):
     actor = force_actor or character
     import time as _time
     from engine import lag_watch
+    if game is not None:
+        game._move_phase_ms = {}
     _cmd_t0 = _time.perf_counter()
     try:
         return _dispatch_body(character, raw, game, verb, args, force_actor=force_actor)
@@ -286,6 +289,7 @@ def dispatch(character, raw, game, *, force_actor=None):
             verb,
             (_time.perf_counter() - _cmd_t0) * 1000.0,
             raw_preview=raw or "",
+            extra=lag_watch.format_move_phases(game),
         )
         log_context.clear_command_context()
         from engine.persistence import (
@@ -356,6 +360,7 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
     _FROZEN_ALLOWED = frozenset({
         "help", "commands", "quit", "logout", "bug", "suggest",
         "score", "sc", "ooc",
+        "rpseek", "rpwhere",
         "tell", "whisper", "reply", "r",
     })
     if getattr(character, "frozen", False) and verb not in _FROZEN_ALLOWED:
@@ -366,7 +371,7 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
             return
         character.session.send(
             "You're frozen by staff. You can still use help, bug, "
-            "suggest, quit, ooc, and tell."
+            "suggest, quit, ooc, rpseek, rpwhere, and tell."
         )
         return
 

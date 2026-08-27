@@ -4,9 +4,10 @@ map_heal.py -- additive merge of live map/zone JSON from hot backups.
 After auto-deploy ``git reset --hard``, ``content/zones/*.json`` and
 ``content/maps/*.json`` follow origin/main. Protected
 ``content/map_backups/<id>.json`` slots may still hold live populate /
-dig rooms. This module merges **missing room keys** (and missing exits
-whose destinations exist) back into the live file without overwriting
-rooms that git already ships.
+dig rooms and player **remodel** stamps. This module merges **missing
+room keys** (and missing exits whose destinations exist) back into the
+live file, and restores remodel prose / ``remodel_type`` / garage inbound
+exit labels on rooms that git already ships (bug report 765).
 
 Used from ``engine.auto_deploy`` after protect-restore on silent main
 advances so live-built neighborhoods survive unrelated PR merges.
@@ -20,8 +21,30 @@ from __future__ import annotations
 import copy
 import json
 import os
+import stat as stat_mod
 
 from engine import world_maps as maps_mod
+
+
+def _restore_path_meta(path, info):
+    """Keep bind-mount owner/mode after a root-in-Docker rewrite.
+
+    Container map heal used to leave zone JSON ``root:root`` mode 600, so
+    the host user could not ``git hash`` the file and later checkouts
+    fought the bind-mount.
+    """
+    if info is None:
+        return
+    mode, uid, gid = info
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+    if hasattr(os, "chown") and uid is not None and gid is not None:
+        try:
+            os.chown(path, uid, gid)
+        except OSError:
+            pass
 
 
 def _backups_dir(root=None):
@@ -66,12 +89,84 @@ def _vnum_index(doc):
     return index
 
 
+# Fields ``map_store.apply_remodel`` writes that must survive git reset.
+_LIVE_EDIT_ROOM_FIELDS = (
+    "title",
+    "description",
+    "remodel_type",
+    "remodel_inbound_exit",
+    "resources",
+    "vehicle_berth",
+    "seed_items",
+    "doors",
+)
+
+# Compass exits remodel may rename to a named label (garage, …).
+_REMODEL_RELABELABLE_EXITS = frozenset({
+    "north", "south", "east", "west",
+    "northeast", "northwest", "southeast", "southwest",
+})
+
+
+def _backup_has_remodel_stamp(backup_room):
+    """True when backup row carries a player/staff remodel stamp."""
+    if not isinstance(backup_room, dict):
+        return False
+    return bool(str(backup_room.get("remodel_type") or "").strip())
+
+
+def _patch_room_remodel_fields(live_room, backup_room):
+    """Copy remodel prose/stamps from backup onto an existing live room."""
+    if not _backup_has_remodel_stamp(backup_room):
+        return False
+    changed = False
+    for field in _LIVE_EDIT_ROOM_FIELDS:
+        if field not in backup_room:
+            continue
+        new_val = copy.deepcopy(backup_room[field])
+        if live_room.get(field) != new_val:
+            live_room[field] = new_val
+            changed = True
+    return changed
+
+
+def _merge_remodel_inbound_exits(live_index, backup_index, live_keys):
+    """Restore named inbound exits (Garage, …) after git reset."""
+    patches = 0
+    for target_key, backup_room in backup_index.items():
+        label = str(backup_room.get("remodel_inbound_exit") or "").strip().lower()
+        if not label:
+            continue
+        if target_key not in live_index:
+            continue
+        for nkey, nbackup in backup_index.items():
+            nlive = live_index.get(nkey)
+            if nlive is None:
+                continue
+            bexits = nbackup.get("exits") or {}
+            if bexits.get(label) != target_key:
+                continue
+            live_exits = dict(nlive.get("exits") or {})
+            prior = dict(live_exits)
+            for direction, dest in list(live_exits.items()):
+                if dest == target_key and direction != label:
+                    if direction in _REMODEL_RELABELABLE_EXITS:
+                        live_exits.pop(direction, None)
+            live_exits[label] = target_key
+            if live_exits != prior:
+                nlive["exits"] = live_exits
+                patches += 1
+    return patches
+
+
 def merge_missing_from_backup(live_doc, backup_doc):
-    """Return (merged_doc, added_room_keys, patched_exit_count, skipped_vnum_keys).
+    """Return (merged_doc, added_room_keys, patched_exit_count, skipped_vnum_keys, remodel_patches).
 
     Additive only: never removes or replaces an existing room entry.
     For rooms present in both, copy missing exit directions from backup
-    when the destination key exists in the merged graph.
+    when the destination key exists in the merged graph. When backup
+    carries ``remodel_type``, also restore remodel prose/stamps and
+    garage-style inbound exit labels on existing rooms.
 
     Backup rooms whose ``vnum`` (or key when vnum is absent) is already
     used by a different live room are **skipped** so auto-deploy heal
@@ -98,8 +193,19 @@ def merge_missing_from_backup(live_doc, backup_doc):
         live_vnums[vnum] = key
         added.append(key)
 
-    exit_patches = 0
     live_index = _room_index(live)
+
+    remodel_patches = 0
+    for key, live_room in live_index.items():
+        backup_room = backup_index.get(key)
+        if backup_room is None:
+            continue
+        if _patch_room_remodel_fields(live_room, backup_room):
+            remodel_patches += 1
+
+    exit_patches = _merge_remodel_inbound_exits(
+        live_index, backup_index, live_keys,
+    )
     for key, live_room in live_index.items():
         backup_room = backup_index.get(key)
         if backup_room is None:
@@ -117,7 +223,7 @@ def merge_missing_from_backup(live_doc, backup_doc):
         if changed:
             live_room["exits"] = live_exits
 
-    return live, sorted(added), exit_patches, sorted(skipped_vnum)
+    return live, sorted(added), exit_patches, sorted(skipped_vnum), remodel_patches
 
 
 def heal_file_from_backup(live_path, backup_path, *, dry_run=False):
@@ -136,10 +242,10 @@ def heal_file_from_backup(live_path, backup_path, *, dry_run=False):
     with open(backup_path, encoding="utf-8") as handle:
         backup_doc = json.load(handle)
 
-    merged, added, exit_patches, skipped_vnum = merge_missing_from_backup(
-        live_doc, backup_doc,
+    merged, added, exit_patches, skipped_vnum, remodel_patches = (
+        merge_missing_from_backup(live_doc, backup_doc)
     )
-    if not added and not exit_patches and not skipped_vnum:
+    if not added and not exit_patches and not skipped_vnum and not remodel_patches:
         return None
 
     map_id = backup_doc.get("id") or live_doc.get("id") or os.path.basename(live_path)
@@ -148,6 +254,8 @@ def heal_file_from_backup(live_path, backup_path, *, dry_run=False):
         parts = [f"map heal {map_id}: +{len(added)} room(s)"]
         if exit_patches:
             parts.append(f"+{exit_patches} exit(s)")
+        if remodel_patches:
+            parts.append(f"+{remodel_patches} remodel(s)")
         if skipped_vnum:
             sample = ", ".join(skipped_vnum[:3])
             if len(skipped_vnum) > 3:
@@ -166,18 +274,26 @@ def heal_file_from_backup(live_path, backup_path, *, dry_run=False):
         msg = _status_prefix().replace("map heal", "would heal", 1)
         return msg
 
-    if added or exit_patches:
+    if added or exit_patches or remodel_patches:
+        extra_keys = maps_mod.collect_map_room_keys(exclude_path=live_path)
         exit_errors = maps_mod.document_hand_exit_graph_errors(
-            os.path.basename(live_path), merged,
+            os.path.basename(live_path), merged, known_keys=extra_keys,
         )
         if exit_errors:
             return (
                 f"map heal {map_id}: skipped write — would break boot "
                 f"({exit_errors[0]})"
             )
+        prior = None
+        try:
+            st = os.stat(live_path)
+            prior = (stat_mod.S_IMODE(st.st_mode), st.st_uid, st.st_gid)
+        except OSError:
+            prior = None
         with open(live_path, "w", encoding="utf-8") as handle:
             json.dump(merged, handle, indent=4, ensure_ascii=False)
             handle.write("\n")
+        _restore_path_meta(live_path, prior)
 
     return _status_prefix()
 

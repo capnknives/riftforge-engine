@@ -175,9 +175,17 @@ def record_wallet_ledger(
         del ledger[: len(ledger) - WALLET_LEDGER_MAX]
 
 
+def _ledger_int(value, default=0):
+    """Parse ledger numeric fields without aborting the whole wallet log."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return default
+
+
 def format_ledger_delta_cents(delta_cents):
     """Signed ``+$12.34`` / ``-$5`` for one bucket."""
-    delta_cents = int(delta_cents or 0)
+    delta_cents = _ledger_int(delta_cents, 0)
     if delta_cents == 0:
         return "$0"
     sign = "+" if delta_cents > 0 else "-"
@@ -187,10 +195,17 @@ def format_ledger_delta_cents(delta_cents):
 
 def format_wallet_ledger_lines(character, game=None, *, limit=15):
     """Player-facing ledger rows (newest first)."""
-    ledger = list(getattr(character, "wallet_ledger", None) or [])
+    raw = getattr(character, "wallet_ledger", None)
+    if not isinstance(raw, list):
+        ledger = []
+    else:
+        ledger = list(raw)
     if not ledger:
         return ["No cash movements logged yet."]
-    limit = max(1, min(int(limit or 15), WALLET_LEDGER_MAX))
+    try:
+        limit = max(1, min(int(limit or 15), WALLET_LEDGER_MAX))
+    except (TypeError, ValueError):
+        limit = 15
     rows = list(reversed(ledger[-limit:]))
     lines = [f"Cash log (last {len(rows)} entries, newest first):"]
     cal_mod = None
@@ -199,42 +214,53 @@ def format_wallet_ledger_lines(character, game=None, *, limit=15):
             from engine import game_calendar as cal_mod
         except ImportError:
             cal_mod = None
+    skipped = 0
     for row in rows:
-        try:
-            tick = int(row.get("tick", 0) or 0)
-        except (TypeError, ValueError):
-            tick = 0
+        if not isinstance(row, dict):
+            skipped += 1
+            continue
+        tick = _ledger_int(row.get("tick", 0), 0)
         if cal_mod is not None and tick > 0:
-            cal = cal_mod.breakdown(tick)
-            stamp = (
-                f"{int(cal['year']):04d}-"
-                f"{int(cal['month']):02d}-"
-                f"{int(cal['day']):02d}"
-            )
+            try:
+                cal = cal_mod.breakdown(tick)
+                stamp = (
+                    f"{int(cal['year']):04d}-"
+                    f"{int(cal['month']):02d}-"
+                    f"{int(cal['day']):02d}"
+                )
+            except (TypeError, ValueError, KeyError):
+                stamp = f"tick {tick}"
         elif tick > 0:
             stamp = f"tick {tick}"
         else:
             stamp = "recent"
         parts = []
-        dw = int(row.get("delta_wallet_cents", 0) or 0)
-        db = int(row.get("delta_bank_cents", 0) or 0)
+        dw = _ledger_int(row.get("delta_wallet_cents", 0), 0)
+        db = _ledger_int(row.get("delta_bank_cents", 0), 0)
         if dw:
             parts.append(f"wallet {format_ledger_delta_cents(dw)}")
         if db:
             parts.append(f"bank {format_ledger_delta_cents(db)}")
         move = ", ".join(parts) if parts else "no change"
+        wallet_total = _ledger_int(row.get("wallet_cents", 0), 0)
+        bank_total = _ledger_int(row.get("bank_cents", 0), 0)
         wallet_after = format_money(
-            int(row.get("wallet_cents", 0) or 0) // 100,
-            int(row.get("wallet_cents", 0) or 0) % 100,
+            wallet_total // 100,
+            wallet_total % 100,
         )
         bank_after = format_money(
-            int(row.get("bank_cents", 0) or 0) // 100,
-            int(row.get("bank_cents", 0) or 0) % 100,
+            bank_total // 100,
+            bank_total % 100,
         )
         reason = row.get("reason") or "Cash movement"
         lines.append(
             f"  [{stamp}] {move} -- {reason} "
             f"(on hand {wallet_after}, bank {bank_after})"
+        )
+    if skipped:
+        lines.append(
+            f"  ({skipped} unreadable entr"
+            f"{'y' if skipped == 1 else 'ies'} skipped.)"
         )
     lines.append("Tip: wallet log [n] for more rows (max %d)." % WALLET_LEDGER_MAX)
     return lines

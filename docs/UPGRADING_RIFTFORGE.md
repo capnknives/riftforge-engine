@@ -3,7 +3,7 @@
 **Status:** Phase 6 remotes **done**; Phase 7 peels **done**; core
 expansion Phases 1-8 **done**; two-repo purity H1-H10 extraction track
 **done**. SUPERS pins public **`capnknives/riftforge-engine`** at
-**`@v0.5.3`** (collapse FSM, robbery theft peel, civic fixture_id mirror).
+**`@v0.6.1`** (purity restore + engine since **`v0.6.0`** / **`v0.5.3`**).
 
 ## Today (during the split)
 
@@ -23,7 +23,7 @@ editable path for dual-checkout hacking.
 2. Private SUPERS (`capnknives/RiftForge`): set in `supers/pyproject.toml`::
 
        dependencies = [
-           "riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.5.3",
+           "riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.6.1",
        ]
 
 3. Run SUPERS targeted smoke (or full `smoke_test.py` when approved).

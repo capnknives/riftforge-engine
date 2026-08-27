@@ -1,7 +1,7 @@
 """
 overland.py -- dual-layer US overland (Finalmap x earth_america).
 
-Macro layer: 78x18 America Overland atlas (vehicles; pure coords).
+Macro layer: 96x60 America Overland CONUS atlas (vehicles; pure coords).
 Micro layer: virtual 10x10 wilderness per macro tile (on foot; never saved
 as map rooms). Static zones stay classic Rooms entered at micro (5, 5).
 
@@ -26,7 +26,7 @@ from engine.world import Room
 
 _FALLBACK_PLAZA_KEY = "Lebanon Square"
 _FALLBACK_OVERLAND_HUB_KEY = "Main Street S9"
-_FALLBACK_BUNKER_OVERLAND_KEY = "America Overland (35, 11)"
+_FALLBACK_BUNKER_OVERLAND_KEY = "America Overland (44, 33)"
 
 
 def _starter_keys():
@@ -78,9 +78,10 @@ _WILDERNESS_KEY_RE = re.compile(
     r"^Wilderness \((\d+),(\d+)\)/(\d+),(\d+)$"
 )
 
-# Classic guideline size (xycoordmapUSguidelines.docx).
-MACRO_WIDTH = 78
-MACRO_HEIGHT = 18
+# Live CONUS atlas size (content/maps/earth_america.json). load_earth_america_atlas()
+# restamps these from the JSON so clamp_macro always tracks the file.
+MACRO_WIDTH = 96
+MACRO_HEIGHT = 60
 MICRO_SIZE = 10
 # City / landmark physical entrance sits at micro center.
 LANDMARK_MICRO = (5, 5)
@@ -125,10 +126,14 @@ _TERRAIN_BLURBS = {
         "Approach roads braid toward a settlement. "
         "Signage and sodium glow mark the edge of town."
     ),
+    "void": (
+        "This cell is off the contiguous United States. "
+        "The brass globe is how you leave the lower forty-eight."
+    ),
 }
 
-# Water / lake block Impala travel (v1 road fantasy).
-_VEHICLE_BLOCKED = frozenset({"ocean", "lake"})
+# Water / lake / off-CONUS void block Impala travel (v1 road fantasy).
+_VEHICLE_BLOCKED = frozenset({"ocean", "lake", "void", "water"})
 
 
 def _content_maps_dir():
@@ -149,7 +154,7 @@ def _parse_pos_pair(value):
 
 
 def clamp_macro(x, y):
-    """Return True when (x, y) is inside the 78×18 macro atlas."""
+    """Return True when (x, y) is inside the live America atlas."""
     return 0 <= x < MACRO_WIDTH and 0 <= y < MACRO_HEIGHT
 
 
@@ -368,26 +373,49 @@ class OverlandAtlas:
         self.default_area = grid.get("area_type") or "ocean"
         self.bestiary_categories = list(grid.get("bestiary_categories") or [])
         self.terrain = {}
-        for key, override in (grid.get("cell_overrides") or {}).items():
-            parts = str(key).split(",")
-            if len(parts) != 2:
-                continue
-            try:
-                x, y = int(parts[0]), int(parts[1])
-            except ValueError:
-                continue
-            area = override.get("area_type") or self.default_area
-            cats = override.get("bestiary_categories")
-            if cats is None:
-                cats = self.bestiary_categories
-            self.terrain[(x, y)] = {
-                "area_type": area,
-                "description": override.get("description"),
-                "map_glyph": override.get("map_glyph"),
-                "map_layer": override.get("map_layer"),
-                "title": override.get("title"),
-                "bestiary_categories": list(cats or []),
-            }
+        from engine.atlas_layers import expand_grid_cell
+        has_layers = bool(grid.get("terrain_rows") or grid.get("road_rows"))
+        if has_layers:
+            # Expand compact glyph rows so .terrain.get still sees highways
+            # (Impala off-road vs asphalt uses map_layer on this dict).
+            for y in range(self.height):
+                for x in range(self.width):
+                    override = expand_grid_cell(grid, x, y)
+                    if not override:
+                        continue
+                    area = override.get("area_type") or self.default_area
+                    cats = override.get("bestiary_categories")
+                    if cats is None:
+                        cats = self.bestiary_categories
+                    self.terrain[(x, y)] = {
+                        "area_type": area,
+                        "description": override.get("description"),
+                        "map_glyph": override.get("map_glyph"),
+                        "map_layer": override.get("map_layer"),
+                        "title": override.get("title"),
+                        "bestiary_categories": list(cats or []),
+                    }
+        else:
+            for key, override in (grid.get("cell_overrides") or {}).items():
+                parts = str(key).split(",")
+                if len(parts) != 2:
+                    continue
+                try:
+                    x, y = int(parts[0]), int(parts[1])
+                except ValueError:
+                    continue
+                area = override.get("area_type") or self.default_area
+                cats = override.get("bestiary_categories")
+                if cats is None:
+                    cats = self.bestiary_categories
+                self.terrain[(x, y)] = {
+                    "area_type": area,
+                    "description": override.get("description"),
+                    "map_glyph": override.get("map_glyph"),
+                    "map_layer": override.get("map_layer"),
+                    "title": override.get("title"),
+                    "bestiary_categories": list(cats or []),
+                }
         # macro (x,y) -> landmark dict
         self.landmarks = {}
         for pocket in data.get("pockets") or []:
@@ -457,11 +485,20 @@ class OverlandAtlas:
 
 
 def load_earth_america_atlas():
-    """Load OverlandAtlas from content/maps/earth_america.json."""
+    """Load OverlandAtlas from content/maps/earth_america.json.
+
+    Also stamps MACRO_WIDTH / MACRO_HEIGHT so clamp_macro follows the
+    live grid (96x60 CONUS after the silhouette swap; 78x18 fallback
+    only until this loader runs).
+    """
+    global MACRO_WIDTH, MACRO_HEIGHT
     path = os.path.join(_content_maps_dir(), "earth_america.json")
     with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
-    return OverlandAtlas(data)
+    atlas = OverlandAtlas(data)
+    MACRO_WIDTH = int(atlas.width)
+    MACRO_HEIGHT = int(atlas.height)
+    return atlas
 
 
 def ensure_game_overland(game):
@@ -769,6 +806,20 @@ def get_virtual_room(game, macro, micro):
                 room.zone_entries[alias] = hub
             # Also allow the hub key lowercase.
             room.zone_entries[hub.key.lower()] = hub
+    # Multi-pocket cells (e.g. bunker + wild den mouths) wire every alias
+    # on the authored America Overland grid cell during map load -- copy
+    # those entries so exit/look at micro 5,5 lists all valid enters.
+    cell_key = f"{atlas.prefix} ({mx}, {my})"
+    mouth = (getattr(game, "rooms", {}) or {}).get(cell_key)
+    cell_entries = getattr(mouth, "zone_entries", None) if mouth is not None else None
+    if (
+        (ux, uy) == LANDMARK_MICRO
+        and isinstance(cell_entries, dict)
+        and cell_entries
+    ):
+        for alias, dest in cell_entries.items():
+            if dest is not None:
+                room.zone_entries[alias] = dest
 
     # Homestead v2: re-wire claimed micro mouths onto fresh virtual rooms.
     from engine import hooks
@@ -942,6 +993,33 @@ def sync_ground_stash(game, room):
         del game.overland_ground[key]
 
 
+def prune_virtual_room_if_empty(game, room):
+    """Drop one ephemeral cell after the last body leaves it.
+
+    Full ``prune_empty_virtual_rooms`` used to run after every foot hop and
+    walked every virtual cell. Nest-helper Cadence ``npc_do`` north billed
+    that whole scan to ``try_dir`` (Azure ~4s).
+    """
+    if game is None or room is None or not is_virtual_room(room):
+        return
+    ensure_game_overland(game)
+    macro = getattr(room, "overland_macro", None)
+    micro = getattr(room, "overland_micro", None)
+    if macro is None or micro is None:
+        return
+    key = _quad_key(macro, micro)
+    live = (getattr(game, "overland_rooms", None) or {}).get(key)
+    if live is None or live is not room:
+        return
+    sync_ground_stash(game, room)
+    from world import Character
+    if any(isinstance(o, Character) for o in room.contents):
+        return
+    if hooks_mod.overland_room_influenced(room, game):
+        return
+    game.overland_rooms.pop(key, None)
+
+
 def prune_empty_virtual_rooms(game):
     """Drop ephemeral rooms with no characters (items stay in ground stash).
 
@@ -961,6 +1039,59 @@ def prune_empty_virtual_rooms(game):
         dead.append(key)
     for key in dead:
         del game.overland_rooms[key]
+
+
+def _prune_after_overland_hop(game, old_room):
+    """O(1) prune of the cell just left -- never a full virtual-map walk.
+
+    A once-per-tick full ``prune_empty_virtual_rooms`` here still billed
+    ~4s to the first Cadence ``north`` of the heartbeat (Azure Wayne Pearson
+    ``phases=try_dir:4400`` after look-skip). Sweep empty cells from the
+    skippable ``overland_prune`` tick instead, 15ms at a time.
+    """
+    prune_virtual_room_if_empty(game, old_room)
+
+
+def tick_prune_empty_virtual_rooms(game, *, max_ms=15.0):
+    """Skippable heartbeat: drop empty America micro-cells, bounded wall.
+
+    Round-robins ``game.overland_rooms`` so a large ephemeral map cannot
+    freeze look. ``max_ms`` is a wall budget, not a completeness gate.
+    """
+    if game is None:
+        return
+    ensure_game_overland(game)
+    rooms = getattr(game, "overland_rooms", None) or {}
+    keys = list(rooms.keys())
+    n = len(keys)
+    if n == 0:
+        return
+    import time as _time
+
+    t0 = _time.perf_counter()
+    start = int(getattr(game, "_overland_prune_rr", 0) or 0) % n
+    scanned = 0
+    while scanned < n and (_time.perf_counter() - t0) * 1000.0 < max_ms:
+        key = keys[(start + scanned) % n]
+        prune_virtual_room_if_empty(game, rooms.get(key))
+        scanned += 1
+    game._overland_prune_rr = (start + scanned) % n
+
+
+def _overland_auto_look(character, game, *, after_move=False):
+    """Room dump after an overland hop -- live players only.
+
+    Cadence ``npc_do`` attaches SilentSession (``session is not None``), so
+    the old gate rebuilt look UI into a sink on every America micro-step.
+    """
+    from engine.npc_act import is_live_session
+
+    if not is_live_session(getattr(character, "session", None)):
+        return
+    from engine.verbs.basic import cmd_look, _push_overland_map_gmcp
+
+    cmd_look(character, "", game, after_move=after_move)
+    _push_overland_map_gmcp(character, game)
 
 
 # ---------------------------------------------------------------------------
@@ -1108,6 +1239,9 @@ def try_overland_move(character, direction, game):
     Returns True when the move was handled (success or blocked message).
     Returns False when the caller should use classic Room.exits movement.
     """
+    import time as _time
+    from engine import lag_watch
+    t_ov = _time.perf_counter()
     if mission_pocket_blocks_overland_move(character):
         return False
     if pit_pocket_blocks_overland_move(character):
@@ -1143,8 +1277,10 @@ def try_overland_move(character, direction, game):
         if hooks_mod.overland_queue_vehicle_macro_move(
             character, direction, game,
         ):
+            lag_watch.stamp_move_phase(game, "ov_veh", t_ov)
             return True
         _send(character, "You cannot drive that way right now.")
+        lag_watch.stamp_move_phase(game, "ov_veh", t_ov)
         return True
 
     if mode == "flying":
@@ -1212,6 +1348,10 @@ def try_overland_move(character, direction, game):
         _send(character, block_msg)
         return True
 
+    import time as _time
+    from engine import lag_watch
+    lag_watch.stamp_move_phase(game, "ov_setup", t_ov)
+    t_place = _time.perf_counter()
     old_room = character.location
     from command_support import _presence_face, is_staff_stealth_presence
     face = _presence_face(character)
@@ -1223,27 +1363,41 @@ def try_overland_move(character, direction, game):
         )
     was_working = _apply_relocate_hooks_before(character)
     place_on_overland(character, game, (mx, my), (ux, uy))
+    lag_watch.stamp_move_phase(game, "ov_place", t_place)
     new_room = character.location
+    t_after = _time.perf_counter()
     _apply_relocate_hooks_after(character, new_room, game, was_working)
+    lag_watch.stamp_move_phase(game, "ov_after", t_after)
     if new_room is not None and not stealth:
         new_room.broadcast(
             f"{face} arrives from the "
             f"{_opposite(direction)}.",
             exclude=character,
         )
-    from engine.verbs.basic import cmd_look
-    if character.session is not None:
-        cmd_look(character, "", game, after_move=True)
+    t_look = _time.perf_counter()
+    _overland_auto_look(character, game, after_move=True)
+    lag_watch.stamp_move_phase(game, "ov_look", t_look)
     # Same on-entry encounter roll classic Room.exits get via _move_one
     # (wilderness hostiles / procedural dungeons / aggro). Drive-layer
     # vehicle steps above skip this -- macro pads are wilderness:false.
+    # Cadence ``npc_do`` attaches SilentSession; pathfind.step used to
+    # skip cmd_move on wilderness so NPCs did not re-roll encounters
+    # every hop. Call encounter only for live players.
     from engine import hooks as _hooks
-    _hooks.encounter_check(game, new_room)
-    prune_empty_virtual_rooms(game)
+    from engine.npc_act import is_live_session
+    t_enc = _time.perf_counter()
+    if is_live_session(getattr(character, "session", None)):
+        _hooks.encounter_check(game, new_room)
+    lag_watch.stamp_move_phase(game, "ov_enc", t_enc)
+    t_prune = _time.perf_counter()
+    _prune_after_overland_hop(game, old_room)
+    lag_watch.stamp_move_phase(game, "ov_prune", t_prune)
     # Classic Room.exits moves call after_move_step from _move_one; on-foot
     # dual-layer hops bypass that path -- still burn wilderness hike exhaustion,
     # stamp tracks, and run move hooks (bug report 220).
+    t_step = _time.perf_counter()
     _hooks.after_move_step(character, direction, new_room, game)
+    lag_watch.stamp_move_phase(game, "ov_step", t_step)
     return True
 
 
@@ -1419,9 +1573,7 @@ def try_exit_to_overland(character, game):
             f"{face} arrives.",
             exclude=character,
         )
-    from engine.verbs.basic import cmd_look
-    if character.session is not None:
-        cmd_look(character, "", game)
+    _overland_auto_look(character, game)
     return True
 
 
@@ -1535,9 +1687,10 @@ def home_hub_macro(game, actor):
         parsed = map_ui.parse_grid_key(bunker_overland_key)
         if parsed:
             return (parsed[1], parsed[2])
-        return (35, 11)
+        return (44, 33)
     # Lebanon default.
-    mouth = rooms.get(starter_town_mod.OVERLAND_HUB_KEY)
+    _, hub_key, _ = _starter_keys()
+    mouth = rooms.get(hub_key)
     if mouth is not None:
         macro = _parse_macro_pair(getattr(mouth, "overland_exit_macro", None))
         if macro is not None:
@@ -1547,7 +1700,7 @@ def home_hub_macro(game, actor):
             parsed = map_ui.parse_grid_key(getattr(exit_to, "key", "") or "")
             if parsed and parsed[0] in _AMERICA_PREFIXES:
                 return (parsed[1], parsed[2])
-    return (35, 10)
+    return (44, 32)
 
 
 def overland_macro_distance(macro_a, macro_b):

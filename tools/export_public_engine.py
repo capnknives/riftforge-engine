@@ -68,14 +68,14 @@ briefs, body parts, content kinds, travel, economy, …). Game-specific lore,
 catalogs, and prose live in a **separate** consumer repo and pin **tagged
 releases** of this package.
 
-**Current release: [`v0.6.0`](https://github.com/capnknives/riftforge-engine/releases/tag/v0.6.0)** — command-dispatch hook peel, universal closable doors, copyover cache + boot-content gates, channel speech block hook, Discord ops restore hook, lag/cooperative-save hardening since `v0.5.3`. Pin `@v0.6.0` until the next semver tag ships from `main`.
+**Current release: [`v0.6.1`](https://github.com/capnknives/riftforge-engine/releases/tag/v0.6.1)** — Phase 2 purity restore (engine never lazy-imports a game package) plus monorepo `engine/` since `v0.6.0`. Pin `@v0.6.1` until the next semver tag ships from `main`.
 
 ## Install
 
 ```bash
 pip install -e .
 # or pin from another project:
-#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.6.0
+#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.6.1
 ```
 
 Requires **Python 3.11+**.
@@ -124,6 +124,22 @@ python tools/scaffold_game_mode.py --slug mygame --label "My Game"
 ```
 
 See [`docs/GAME_MODE_SCHEMA_CHECKLIST.md`](docs/GAME_MODE_SCHEMA_CHECKLIST.md).
+
+## What's new in v0.6.1
+
+- **Phase 2 purity restore** — eight `engine/` modules no longer lazy-import `supers` (vault fold, cadence roster, public watch, cuffs, quests dormant-cast, horses, lodging browse, doors). Games register the same hooks from bootstrap. `tools/engine_smoke.py` text-scan is empty again.
+- **Lean Game boot** — `server.py` creates the player-board log via `engine.thread_log` instead of importing SUPERS at construct time (basegame / classic / `RIFTFORGE_GAME=none` all boot).
+- **Basegame inn rent** — claiming a bunk bumps the home-claimants index on the same tick (so `rent bed` is visible to `claimants_of` immediately).
+- **Monorepo engine since v0.6.0** — doors/dispatch/copyover/lag follow-ons that landed on the private tree after the 2026-08-21 tag.
+
+## What's new in v0.6.0
+
+- **Command dispatch hook** — `hooks.get_dispatch()` / `set_dispatch()` so games own merged `COMMANDS` tables without engine imports of game packages.
+- **Universal closable doors** — `engine/systems/doors.py` + room `doors[]` schema; open/close/knock through engine verbs with game hooks for locks and prose.
+- **Copyover cache + boot-content gates** — hot-reload skips re-reading unchanged JSON; boot probes validate autoload maps before tick.
+- **Channel speech block hook** — `hooks.channel_speech_blocked(character, game)` replaces lazy game imports in `engine/channels.py` (SUPERS wires biokinesis mute).
+- **MSSP + Discord ops hooks** — `default_mssp_description()` and `discord_staff_op_executor(game, op, args)` keep `server.py` and Discord inbox game-agnostic.
+- **Lag / cooperative-save hardening** — tick budget deferrals, autosave yield points, gateway IPC heartbeat desync guard (watch_and_run).
 
 ## What's new in v0.5.3
 
@@ -239,7 +255,7 @@ CI runs all three on every push.
 
 ## Building your own game
 
-1. `pip install -e .` (or pin `@v0.5.3`).
+1. `pip install -e .` (or pin `@v0.6.1`).
 2. Read [`docs/ENGINE_CONSUMER.md`](docs/ENGINE_CONSUMER.md) — hooks for chargen, persist, help, `register_all_hooks()`.
 3. Copy `basegame/` or `classic/` as a skeleton, or register your package via `RIFTFORGE_GAME=yourgame`.
 4. Put catalogs in your repo (`content/kinds/`, maps, NPCs); register kind dirs with `set_content_kinds_dirs`. Run `tools/scaffold_game_mode.py` for a fresh tree.

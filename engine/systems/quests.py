@@ -60,6 +60,7 @@ _quest_begin_prep_handler = None
 _quest_seek_tip_handler = None
 _quest_idle_nudge_extra_handler = None
 _quest_begin_side_effect = None
+_quest_ensure_giver = None
 _quest_step_stamp_handler = None
 _quest_npc_done_line_skip = None
 _quest_empty_log_hint = None
@@ -129,6 +130,22 @@ def set_quest_begin_side_effect(fn):
     """Register fn(character, data, game) after quest begin prep (game policy)."""
     global _quest_begin_side_effect
     _quest_begin_side_effect = fn
+
+
+def set_quest_ensure_giver(fn):
+    """Register fn(game, giver_key) before intro when ``giver_npc`` is set.
+
+    SUPERS uses this to wake vault-until-needed cast and restore dormant
+    bodies so the giver exists for pins / intro. Bare engine: no-op.
+    """
+    global _quest_ensure_giver
+    _quest_ensure_giver = fn
+
+
+def quest_ensure_giver(game, giver_key):
+    """Ensure the quest giver is in-world, or no-op when unset."""
+    if _quest_ensure_giver is not None:
+        _quest_ensure_giver(game, giver_key)
 
 
 def set_quest_step_stamp_handler(fn):
@@ -300,7 +317,43 @@ def _npc_matches_giver(npc, giver_name):
     if npc is None or not giver_name:
         return False
     npc_key = (getattr(npc, "key", None) or "").lower()
-    return str(giver_name).lower() in npc_key
+    giver = str(giver_name).lower().strip()
+    if not npc_key or not giver:
+        return False
+    if giver in npc_key or npc_key in giver:
+        return True
+    try:
+        from engine.char_identity import (
+            character_given_name,
+            character_surname,
+            identity_match_needles,
+        )
+
+        for label in identity_match_needles(npc):
+            if giver in label or label in giver:
+                return True
+        given = character_given_name(npc).lower()
+        sur = character_surname(npc).lower()
+        if given and sur:
+            full = f"{given} {sur}"
+            if giver in full or full in giver:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _npc_lines_for(npc, npc_lines):
+    """Return the ``npc_lines`` bucket for ``npc`` (short or full key)."""
+    if not npc_lines or npc is None:
+        return {}
+    npc_key = getattr(npc, "key", None) or ""
+    if npc_key in npc_lines:
+        return npc_lines.get(npc_key) or {}
+    for key, lines in npc_lines.items():
+        if _npc_matches_giver(npc, key):
+            return lines or {}
+    return {}
 
 
 def close_stale_quest_with_giver(character, quest_id, game, npc, room):
@@ -402,6 +455,10 @@ def _offer_room_matches(room, offer_rooms, game=None):
     return False
 
 
+def _quest_is_parked(data):
+    return bool(data and data.get("parked"))
+
+
 def list_offers_in_room(character, room):
     """Takeable authored cases offered here that the character has not finished.
 
@@ -420,6 +477,8 @@ def list_offers_in_room(character, room):
     prog = _progress(character)
     offers = []
     for qid, data in loader_mod.load_quests().items():
+        if _quest_is_parked(data):
+            continue
         # Starter tutorials (Family Business, Phone Tree, Plane Temper, …).
         if data.get("auto_start"):
             continue
@@ -707,6 +766,28 @@ def _inventory_has(character, needle):
     return False
 
 
+def _payload_item_matches(want, payload):
+    """True when a give/talk payload names the quest ``when.item`` needle.
+
+    ``give`` fires after ``cmd_give`` already moved the item -- match on
+    catalog id or display key fragments (``marker`` vs ``permanent_marker``).
+    """
+    if not want:
+        return True
+    want_l = str(want).lower()
+    candidates = []
+    for key in ("catalog_id", "item"):
+        raw = (payload or {}).get(key)
+        if raw:
+            candidates.append(str(raw).lower())
+    if not candidates:
+        return False
+    for got in candidates:
+        if want_l == got or want_l in got or got in want_l:
+            return True
+    return False
+
+
 def _consume_item(character, needle):
     """Remove one matching inventory/gear item. Return True if consumed."""
     if not needle:
@@ -956,6 +1037,8 @@ def begin(character, quest_id, game=None, *, force=False, defer_step=False):
     data = loader_mod.get_quest(quest_id)
     if data is None:
         return False, f"Unknown quest '{quest_id}'."
+    if _quest_is_parked(data) and not force:
+        return False, "That case is parked for now."
     prog = _progress(character)
     entry = prog.get(quest_id)
     if entry and entry.get("status") == "active" and not force:
@@ -971,6 +1054,11 @@ def begin(character, quest_id, game=None, *, force=False, defer_step=False):
             f"dropped it, type 'restartquest {quest_id} confirm'."
         )
     giver = (data.get("giver_npc") or "").strip()
+    if giver and game is not None:
+        try:
+            quest_ensure_giver(game, giver)
+        except Exception:
+            pass
     if giver and not force:
         for other_id in active_quest_ids(character):
             if other_id == quest_id:
@@ -1157,13 +1245,16 @@ def _match_when(character, when, event, payload):
         "talk_npc", "has_item", "verb", "enter_room", "buy", "gear",
     ):
         return _inventory_has(character, when.get("item"))
-    if kind == "give_item" and event == "talk_npc":
-        # Deliver by talking to the NPC while holding the item.
+    if kind == "give_item" and event in ("talk_npc", "give"):
+        # ``talk_npc``: hand over while holding (consume from pack).
+        # ``give``: ``cmd_give`` already transferred the item -- only match.
         want_npc = (when.get("npc") or "").lower()
         got = (payload.get("npc") or "").lower()
         if want_npc and not (want_npc in got or got in want_npc):
             return False
         item = when.get("item")
+        if event == "give":
+            return _payload_item_matches(item, payload)
         if not _inventory_has(character, item):
             return False
         return _consume_item(character, item)
@@ -1181,10 +1272,13 @@ def _match_when(character, when, event, payload):
         return True
     if kind == "buy" and event == "buy":
         want = (when.get("item") or "").lower()
+        if not want:
+            return True
+        got_id = (payload.get("catalog_id") or "").lower()
+        if got_id and got_id == want:
+            return True
         got = (payload.get("item") or "").lower()
-        if want:
-            return want in got
-        return True
+        return bool(got) and (want in got or got in want)
     if kind == "help_topic" and event == "help_topic":
         want = (when.get("topic") or "").lower()
         got = (payload.get("topic") or "").lower()
@@ -1242,23 +1336,22 @@ def allows_talk(character, npc):
     npc_key = getattr(npc, "key", None) or ""
     if not npc_key:
         return False
-    want = npc_key.lower()
     for qid in active_quest_ids(character):
         data = loader_mod.get_quest(qid) or {}
-        if (data.get("giver_npc") or "").lower() == want:
+        if _npc_matches_giver(npc, data.get("giver_npc") or ""):
             return True
         pin_map = data.get("pin_npcs") or {}
-        if any(str(k).lower() == want for k in pin_map):
+        if any(_npc_matches_giver(npc, k) for k in pin_map):
             return True
         lines = data.get("npc_lines") or {}
-        if any(str(k).lower() == want for k in lines):
+        if any(_npc_matches_giver(npc, k) for k in lines):
             return True
     room = getattr(character, "location", None)
     for data in list_offers_in_room(character, room):
-        if (data.get("giver_npc") or "").lower() == want:
+        if _npc_matches_giver(npc, data.get("giver_npc") or ""):
             return True
         lines = data.get("npc_lines") or {}
-        if any(str(k).lower() == want for k in lines):
+        if any(_npc_matches_giver(npc, k) for k in lines):
             return True
     return False
 
@@ -1313,13 +1406,7 @@ def npc_talk_line(character, npc):
     # Active quest lines first.
     for qid in active_quest_ids(character):
         data = loader_mod.get_quest(qid) or {}
-        lines = (data.get("npc_lines") or {}).get(npc_key) or {}
-        # Also try giver_npc key match.
-        if not lines and data.get("giver_npc"):
-            if (data.get("giver_npc") or "").lower() in npc_key.lower():
-                lines = (data.get("npc_lines") or {}).get(
-                    data.get("giver_npc")
-                ) or {}
+        lines = _npc_lines_for(npc, data.get("npc_lines") or {})
         if not lines:
             continue
         step = current_step(character, qid)
@@ -1348,12 +1435,7 @@ def npc_talk_line(character, npc):
                 break
         if chosen is None:
             chosen = direct_offers[0]
-        lines = (chosen.get("npc_lines") or {}).get(npc_key) or {}
-        if not lines and chosen.get("giver_npc"):
-            if (chosen.get("giver_npc") or "").lower() in npc_key.lower():
-                lines = (chosen.get("npc_lines") or {}).get(
-                    chosen.get("giver_npc")
-                ) or {}
+        lines = _npc_lines_for(npc, chosen.get("npc_lines") or {})
         if lines.get("offer"):
             return lines["offer"]
     # Done flavor -- optional skip (mission boards, etc.).
@@ -1364,12 +1446,7 @@ def npc_talk_line(character, npc):
         if (entry or {}).get("status") != "done":
             continue
         data = loader_mod.get_quest(qid) or {}
-        lines = (data.get("npc_lines") or {}).get(npc_key) or {}
-        if not lines and data.get("giver_npc"):
-            if (data.get("giver_npc") or "").lower() in npc_key.lower():
-                lines = (data.get("npc_lines") or {}).get(
-                    data.get("giver_npc")
-                ) or {}
+        lines = _npc_lines_for(npc, data.get("npc_lines") or {})
         if lines.get("done"):
             return lines["done"]
     return None
@@ -1514,13 +1591,11 @@ def _pin_mentors(game, pin_map):
         room = lookup_room(game, room_key)
         if room is None:
             continue
-        want = (npc_key or "").strip().lower()
         npc = None
         # Prefer a copy already standing in the pin room (Emberwake has one
         # per Reach hub). Global find_character would steal Cinder's copy.
         for obj in room.characters():
-            key = (getattr(obj, "key", None) or "").strip().lower()
-            if key == want:
+            if _npc_matches_giver(obj, npc_key):
                 npc = obj
                 break
         if npc is None:

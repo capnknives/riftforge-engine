@@ -2,8 +2,8 @@
 
 The sidecar bot (``tools/discord_staff_ops_bot.py``) drops JSON requests under
 ``.discord_staff_ops_inbox/`` (gitignored). ``tick_discord_staff_ops_inbox``
-runs on the game heartbeat, applies GM restore logic, and writes a short result
-to ``.discord_staff_ops_outbox/`` for the bot to reply.
+runs on the game heartbeat, applies GM restore / squashbug logic, and writes a
+short result to ``.discord_staff_ops_outbox/`` for the bot to reply.
 
 Restart / revert SHA are handled in the bot via ``watcher_request`` (no game
 tick needed). Only world mutations that need ``Game`` state use this inbox.

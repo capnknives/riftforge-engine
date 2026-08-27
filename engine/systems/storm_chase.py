@@ -133,9 +133,12 @@ def board_lines(game, character=None):
             )
     else:
         lines.append(
-            "  (no live funnels — takechase still assigns a storm cell to probe)"
+            "  (no live funnels — chaseboard take still assigns a storm cell to probe)"
         )
-    lines.append("Commands: takechase | track chase | probe | reportchase | abandonchase")
+    lines.append(
+        "Commands: chaseboard take | track chase | probe | chaseboard report | "
+        "chaseboard abandon (also: takechase, reportchase, abandonchase)"
+    )
     if character is not None and has_chase(character):
         brief = getattr(character, "chase_brief", None) or {}
         flags = getattr(character, "chase_flags", None) or {}
@@ -152,7 +155,7 @@ def takechase(character, game):
     if not is_storm_desk_room(room):
         return False, "Stand at the Storm Watch Office chase board to take a chase.", None
     if has_chase(character):
-        return False, "You already have an open chase. reportchase or abandonchase.", None
+        return False, "You already have an open chase. chaseboard report or chaseboard abandon.", None
 
     from engine.systems import regional_weather as weather_mod
 
@@ -160,7 +163,7 @@ def takechase(character, game):
     ticks = int(getattr(game, "game_time_ticks", 0) or 0)
     if tracks:
         t = tracks[ticks % len(tracks)]
-        mx, my = t.get("macro_xy") or (35, 10)
+        mx, my = t.get("macro_xy") or (44, 32)
         brief = {
             "chase_id": f"live-{t.get('id')}",
             "title": f"Live {t.get('scale')} chase",
@@ -203,7 +206,7 @@ def takechase(character, game):
     msg = (
         f"[CHASE] Accepted: {brief['title']}.\r\n"
         f"{brief['blurb']}\r\n"
-        "track chase → probe near the cell → reportchase here."
+        "track chase → probe near the cell → chaseboard report here."
     )
     room_line = f"{character.key} pins a chase card to their jacket."
     return True, msg, room_line
@@ -212,7 +215,7 @@ def takechase(character, game):
 def track_chase(character, game):
     """Soft lead toward the chase target cell."""
     if not has_chase(character):
-        return False, "No open chase. takechase at Storm Watch Office.", None
+        return False, "No open chase. chaseboard take at Storm Watch Office.", None
     brief = getattr(character, "chase_brief", None) or {}
     tx, ty = int(brief.get("mx", 35)), int(brief.get("my", 10))
     from engine.systems import regional_weather as weather_mod
@@ -247,13 +250,13 @@ def _actor_macro(character, game):
 def probe(character, game):
     """Collect data outdoors near the target macro cell."""
     if not has_chase(character):
-        return False, "No open chase. takechase at Storm Watch Office.", None
+        return False, "No open chase. chaseboard take at Storm Watch Office.", None
     flags = getattr(character, "chase_flags", None)
     if not isinstance(flags, dict):
         flags = {}
         character.chase_flags = flags
     if flags.get("data_collected"):
-        return False, "You already have the data. reportchase at Storm Watch.", None
+        return False, "You already have the data. chaseboard report at Storm Watch.", None
 
     room = getattr(character, "location", None)
     if room is None or not getattr(room, "outdoor", False):
@@ -277,7 +280,7 @@ def probe(character, game):
     bit = f" ({scale})" if scale else ""
     msg = (
         f"[PROBE] You plant sensors and log the cell{bit}. "
-        "Data secured — reportchase at Storm Watch Office."
+        "Data secured — chaseboard report at Storm Watch Office."
     )
     room_line = f"{character.key} kneels with a probe kit, reading the sky."
     return True, msg, room_line

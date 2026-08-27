@@ -208,6 +208,7 @@ def paint_wiz_line(message):
 def wiznet_speaker_label(speaker):
     """Public staff label for wiznet -- never ``gmspirit:`` / ``husk:`` keys."""
     from engine.command_support import _is_gm, _public_label
+    from engine import hooks
     from world import Character
 
     who = _public_label(speaker)
@@ -218,6 +219,13 @@ def wiznet_speaker_label(speaker):
         and not who.endswith("(GM)")
     ):
         who = f"{who}(GM)"
+    elif (
+        isinstance(speaker, Character)
+        and hooks.is_rpc_staff(speaker)
+        and not _is_gm(speaker)
+        and not who.endswith("(RPC)")
+    ):
+        who = f"{who}(RPC)"
     return who
 
 
@@ -235,7 +243,7 @@ def format_wiznet_line(speaker, message):
     plain = format_wiznet_plain(speaker, message)
     if plain is None:
         return None
-    return style.paint("absinthe_green", plain)
+    return style.paint_preserving_urls("absinthe_green", plain)
 
 
 def append_wiznet_history(game, plain_line):
@@ -249,18 +257,27 @@ def send_wiznet_history(character, game):
     channels.replay_global(character, game, "wiznet")
 
 
-def wiznet_broadcast(game, speaker, message, *, exclude=None):
+def wiznet_broadcast(game, speaker, message, *, exclude=None, skip_discord_mirror=False):
     """Send one ``[WIZ]`` line to every online staff GM (not immersion cast).
 
     Unlike ``ping_gms``, this ignores ``gm_notify`` opt-out -- wiznet is
     deliberate staff chat, not an ops ping you mute. Immersion cast stays
-    out so in-character bodies never see the channel.
+    out so in-character bodies never see the channel. In-game lines also
+    mirror to Discord #staff unless *skip_discord_mirror* (inbound Discord).
     """
     plain = format_wiznet_plain(speaker, message)
     if plain is None:
         return False
     append_wiznet_history(game, plain)
-    line = style.paint("absinthe_green", plain)
+    line = format_wiznet_line(speaker, message)
+    sent = _deliver_wiznet_line(game, line, exclude=exclude)
+    if not skip_discord_mirror:
+        _mirror_wiznet_discord(plain)
+    return sent > 0
+
+
+def _deliver_wiznet_line(game, line, *, exclude=None) -> int:
+    """Painted wiznet line to every online staff GM / Archangel RPC."""
     sessions = getattr(game, "sessions", None) or []
     sent = 0
     for session in list(sessions):
@@ -269,11 +286,36 @@ def wiznet_broadcast(game, speaker, message, *, exclude=None):
             continue
         if exclude is not None and other is exclude:
             continue
-        if not _is_staff_gm(other):
+        from engine import hooks
+        if not _is_staff_gm(other) and not hooks.is_rpc_staff(other):
             continue
         send = getattr(session, "send", None)
         if send is None:
             continue
         send(line)
         sent += 1
-    return sent > 0
+    return sent
+
+
+def _mirror_wiznet_discord(plain_line: str) -> None:
+    """Best-effort Discord #staff mirror (fail-soft)."""
+    try:
+        from engine import discord_bridge
+
+        if discord_bridge.is_toggle_on("wiznet"):
+            discord_bridge.schedule_wiznet(plain_line)
+    except Exception as exc:
+        print(f"[wiznet] discord mirror skipped: {exc}", flush=True)
+
+
+def wiznet_broadcast_from_discord(game, face: str, message: str) -> bool:
+    """Inbound Discord #staff chat → in-game wiznet (no echo back to Discord)."""
+    text = (message or "").strip()
+    who = (face or "Discord").strip() or "Discord"
+    if not text:
+        return False
+    plain = f"[WIZ] {who}: {text}"
+    append_wiznet_history(game, plain)
+    line = style.paint_preserving_urls("absinthe_green", plain)
+    _deliver_wiznet_line(game, line)
+    return True

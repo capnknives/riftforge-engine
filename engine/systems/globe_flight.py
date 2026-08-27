@@ -30,9 +30,12 @@ _DIR_DELTA = {
 
 
 def _earth_america_macro_to_lonlat(mx, my):
-    """Rough CONUS lat/lon from America macro coords (78x18)."""
-    lon = -125.0 + (float(mx) / 77.0) * 60.0
-    lat = 49.0 - (float(my) / 17.0) * 24.0
+    """CONUS lat/lon from America macro coords (live atlas size/projection)."""
+    from engine import atlas_geo
+
+    width = int(getattr(overland_mod, "MACRO_WIDTH", 96) or 96)
+    height = int(getattr(overland_mod, "MACRO_HEIGHT", 60) or 60)
+    lat, lon = atlas_geo.cell_to_lonlat(int(mx), int(my), width, height)
     return globe_mod.norm_lon(lon), max(-60.0, min(72.0, lat))
 
 

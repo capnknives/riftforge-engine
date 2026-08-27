@@ -107,7 +107,17 @@ def _entries_for_slugs(root, slugs: list[str]) -> list[dict]:
         return []
     from engine import changelog_index as changelog_index_mod
 
-    changelog_index_mod.ensure_compiled_index(str(root))
+    # Stamp then rebuild — ``ensure_compiled_index`` can keep a same-second
+    # compiled feed with ``id: 0`` after the game host just minted ``#N``.
+    stamp = getattr(changelog_index_mod, "stamp_pending_and_ensure_index", None)
+    if callable(stamp):
+        mint = False
+        should = getattr(changelog_index_mod, "should_mint_ids_on_boot", None)
+        if callable(should):
+            mint = bool(should())
+        stamp(str(root), mint_ids=mint)
+    else:
+        changelog_index_mod.ensure_compiled_index(str(root))
     entries = changelog_index_mod.load_index_file(
         changelog_index_mod.index_path(str(root))
     )
@@ -150,15 +160,29 @@ def format_patch_notes_message(entries: list[dict]) -> str:
     """Build the Discord body for one deploy batch."""
     lines = ["**Patch notes** — what landed in-game:"]
     shown = entries[:_MAX_BULLETS]
+    first_id = 0
     for entry in shown:
         summary = _short_player_summary(entry)
-        if summary:
+        if not summary:
+            continue
+        cid = int(entry.get("id") or 0)
+        if cid:
+            if not first_id:
+                first_id = cid
+            lines.append(f"• #{cid} {summary} — type `changes {cid}` in-game")
+        else:
             lines.append(f"• {summary}")
     extra = len(entries) - len(shown)
     if extra > 0:
         lines.append(f"• …and {extra} more — type `changes` in-game for the full list.")
     lines.append("")
-    lines.append("Full detail: connect and type `changes`.")
+    if first_id:
+        lines.append(
+            f"In-game: type `changes {first_id}` for #{first_id}, "
+            "or `changes` for the recent list."
+        )
+    else:
+        lines.append("Full detail: connect and type `changes`.")
     body = "\n".join(lines)
     if len(body) > _MAX_MESSAGE:
         body = body[: _MAX_MESSAGE - 3] + "..."
@@ -166,10 +190,15 @@ def format_patch_notes_message(entries: list[dict]) -> str:
 
 
 def schedule_patch_notes(entries: list[dict]) -> bool:
-    """Queue one #patch-notes post; return True when scheduled."""
-    if not entries:
+    """Queue one #patch-notes post; return True when scheduled.
+
+    Never post a batch with no ``#N`` — that is the Discord footer
+    ``Full detail: connect and type changes`` with no lookup number.
+    """
+    numbered = [row for row in entries if int(row.get("id") or 0)]
+    if not numbered:
         return False
-    body = format_patch_notes_message(entries)
+    body = format_patch_notes_message(numbered)
     return discord_bridge.schedule_discord("patch_notes", body, kind=None)
 
 
@@ -236,16 +265,19 @@ def pending_player_entries(
 
 
 def schedule_for_deploy(root, from_sha: str, to_sha: str) -> bool:
-    """Post summaries for CHANGELOG.d fragments in a deploy range (once per SHA)."""
+    """Post summaries for CHANGELOG.d fragments once they have in-game ``#N``.
+
+    Same tip SHA may be scanned again: idle polls and copyover mint ids
+    after the first pass. Do not treat ``last_processed_sha`` as done
+    while unnumbered player bullets are still unposted.
+    """
     root_path = Path(root)
     to_sha = (to_sha or "").strip()
     if not to_sha:
         return False
 
     state = _load_state(root_path)
-    if state.get("last_processed_sha") == to_sha:
-        return False
-
+    already = state.get("last_processed_sha") == to_sha
     posted = _posted_slugs(state)
     anchor = _scan_anchor_sha(state, from_sha, to_sha, root=root_path)
     new_entries, slugs = pending_player_entries(
@@ -255,14 +287,35 @@ def schedule_for_deploy(root, from_sha: str, to_sha: str) -> bool:
         posted,
     )
 
+    ready = [row for row in new_entries if int(row.get("id") or 0)]
+    waiting = [row for row in new_entries if not int(row.get("id") or 0)]
+    if waiting:
+        # Hold the whole batch until every player bullet has #N. Posting the
+        # numbered subset first taught Discord "type changes" with no number,
+        # then last_processed_sha blocked the retry after stamp.
+        if not already:
+            print(
+                f"[discord_patch_notes] waiting for changelog id stamp on "
+                f"{len(waiting)} bullet(s) — will retry after copyover "
+                f"or the next idle poll",
+                flush=True,
+            )
+            state["last_processed_sha"] = to_sha
+            state["posted_slugs"] = sorted(posted)
+            _save_state(root_path, state)
+        return False
+
+    if already and not ready:
+        return False
+
     scheduled = False
-    if new_entries:
-        scheduled = schedule_patch_notes(new_entries)
+    if ready:
+        scheduled = schedule_patch_notes(ready)
 
     state["last_processed_sha"] = to_sha
 
     if scheduled:
-        for row in new_entries:
+        for row in ready:
             slug = (row.get("slug") or "").strip()
             if slug:
                 posted.add(slug)
@@ -272,7 +325,7 @@ def schedule_for_deploy(root, from_sha: str, to_sha: str) -> bool:
         state["last_from_sha"] = anchor
         state["slugs"] = slugs
         print(
-            f"[discord_patch_notes] scheduled {len(new_entries)} player bullet(s) "
+            f"[discord_patch_notes] scheduled {len(ready)} player bullet(s) "
             f"anchor={anchor[:12]} tip={to_sha[:12]}",
             flush=True,
         )
@@ -287,12 +340,29 @@ def schedule_for_deploy(root, from_sha: str, to_sha: str) -> bool:
     else:
         print(
             f"[discord_patch_notes] post skipped (webhook/channel?) — "
-            f"{len(new_entries)} pending bullet(s) anchor={anchor[:12]}",
+            f"{len(ready)} pending bullet(s) anchor={anchor[:12]}",
             flush=True,
         )
 
     _save_state(root_path, state)
     return scheduled
+
+
+def retry_deferred_patch_notes(root=None) -> bool:
+    """Re-scan after copyover/idle stamp so Discord can post numbered bullets."""
+    root_path = Path(root) if root is not None else _repo_root()
+    state = _load_state(root_path)
+    to_sha = (state.get("last_processed_sha") or state.get("last_sha") or "").strip()
+    if not to_sha:
+        try:
+            to_sha = _git(["rev-parse", "HEAD"], cwd=str(root_path))
+        except (subprocess.CalledProcessError, OSError):
+            return False
+        to_sha = (to_sha or "").strip()
+    if not to_sha:
+        return False
+    from_sha = (state.get("patch_notes_anchor_sha") or "").strip()
+    return schedule_for_deploy(root_path, from_sha, to_sha)
 
 
 def catch_up_patch_notes(root, from_sha: str, to_sha: str) -> bool:

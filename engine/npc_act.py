@@ -48,6 +48,13 @@ class SilentSession:
     an NPC/Echo produces while npc_do temporarily attaches this session.
     """
 
+    # Duck-type for command_support._move_one: Cadence npc_do attaches this
+    # session so "You ..." lines have somewhere to go. Auto-look after every
+    # town cardinal was still building the full room UI (exits, souls, map)
+    # into this sink -- Azure logged 5-7s NPC ``east`` / ``look`` while
+    # watchers only needed leave/arrive broadcasts.
+    silent = True
+
     def __init__(self, character=None):
         self.lines = []
         # cmd_* / reports look for .history; keep an empty list (not deque)
@@ -68,6 +75,19 @@ class SilentSession:
     def send_gmcp(self, package, payload, force=False):
         """No-op -- NPCs/Echoes have no client to receive GMCP frames."""
         return
+
+
+def is_live_session(session):
+    """True when *session* is a real player client, not Cadence SilentSession.
+
+    ``npc_do`` temporarily attaches SilentSession so "You ..." lines have a
+    sink. Callers that mean "a person is watching this screen" must use this
+    instead of ``session is not None`` -- otherwise every townsfolk hop looks
+    like a logged-in player (mission-giver hail, auto-look, …).
+    """
+    if session is None:
+        return False
+    return not bool(getattr(session, "silent", False))
 
 
 def _log_activity_error(where, character):
@@ -103,6 +123,15 @@ def npc_do(character, raw, game):
     # at boot -- see engine/hooks.py's set_dispatch/get_dispatch.
     from engine import hooks
     from engine import snoop
+    # Cadence lifestyle probe: fail-soft this verb if the current actor
+    # already blew its per-turn ms cap (engine must not import supers).
+    probe = getattr(game, "_cadence_lifestyle_actor_probe", None)
+    if probe:
+        t0, cap_ms = probe
+        if cap_ms > 0:
+            import time as _time
+            if (_time.perf_counter() - t0) * 1000.0 >= cap_ms:
+                return []
     previous = getattr(character, "session", None)
     silent = SilentSession(character)
     character.session = silent

@@ -155,6 +155,15 @@ def write_stable(*, root=None, ticks=None):
     except OSError:
         return None
     _push_stable_history(payload, root=root)
+    # Deploy catch-up protect-restore rewrites hundreds of mtimes; keep the
+    # watcher in quiesce until this stamp so we do not copyover-loop.
+    try:
+        from engine import auto_deploy
+
+        if auto_deploy.tree_sync_quiesce_active(root):
+            auto_deploy.clear_tree_sync_quiesce(root)
+    except Exception:
+        pass
     print(
         f"[boot_stability] stable boot recorded at {sha[:12]} "
         f"({payload['ticks']} ticks)",

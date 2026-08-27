@@ -6,12 +6,28 @@
     "given_name": {
       "type": "string",
       "required": false,
-      "doc": "In-game display name (who / needs targeting); falls back to key."
+      "doc": "Legal given name. Mortal humans require this plus surname (roster lint); civic title may hide it in prose."
     },
     "surname": {
       "type": "string",
       "required": false,
-      "doc": "Optional family name appended to given_name."
+      "doc": "Family name. Required on mortal-human rows (lint); lore or pool-stamped."
+    },
+    "title": {
+      "type": "string",
+      "required": false,
+      "doc": "Civic title that hides given_name in prose (Sheriff, Deputy, Agent, Doctor)."
+    },
+    "public_mononym": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "True = player prose uses given_name only (Ash); surname still on file."
+    },
+    "favorite_bar": {
+      "type": "string",
+      "required": false,
+      "doc": "Hangout catalog id (harvelles, hometown) -- not a stay_home leash."
     },
     "pronoun": {
       "type": "enum",
@@ -87,6 +103,12 @@
       "required": false,
       "default": false,
       "doc": "True = never leave home for leisure (mission_giver also pins)."
+    },
+    "event_sticky": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "True = Cadence will not walk them; offline snap to home_room_key (bandaid event pin)."
     },
     "spar_only": {
       "type": "bool",

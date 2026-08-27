@@ -130,5 +130,7 @@ def breach_eject(character, room, target, *, game=None):
         )
     session = getattr(character, "session", None)
     if session is not None:
-        session.send(f"You burst through {label} into {neighbor.key}.")
+        from engine import room_vnum as room_vnum_mod
+        place = room_vnum_mod.describe_room(neighbor, staff=False)
+        session.send(f"You burst through {label} into {place}.")
     return True

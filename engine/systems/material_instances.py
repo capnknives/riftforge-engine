@@ -45,13 +45,23 @@ def stamp_ingot_instance(item, *, material_id, purity=80, folklore_tags=None):
     return item
 
 
-def instance_weight(item, default=1.0):
-    """Per-item weight from catalog + instance."""
+def instance_weight(item, default=0.0):
+    """Per-item carry weight from catalog + instance.
+
+    Unset weight is **0**, matching ``containers.item_weight`` — kit crumbs
+    and unweighted loot must not eat the haul cap. Pass a positive
+    ``default`` only when a producer already computed a fallback.
+    """
+    from engine.systems import containers as containers_mod
+
+    catalog_w = containers_mod.item_weight(item)
+    if catalog_w > 0:
+        return catalog_w
     try:
         base = float(getattr(item, "weight", None) or default)
     except (TypeError, ValueError):
         base = default
-    return base
+    return max(0.0, float(base))
 
 
 def carried_weight(character):

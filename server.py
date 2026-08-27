@@ -22,6 +22,7 @@ from engine import bug_webhook  # noqa: F401 -- loads webhook helpers (GM squash
 from engine import suggestion_webhook  # noqa: F401 -- GM sendsuggest / squashsuggest
 from engine import ops_webhook  # noqa: F401 -- ops alerts (crash hold / save streak)
 from engine import discord_bridge  # noqa: F401 -- tagged Discord radio bridge
+from engine import discord_staff_reports
 from engine import copyover
 from world import build_world, Character
 from engine.connection import Session
@@ -47,6 +48,7 @@ register_default_ticks = game_select.register_default_ticks
 # Character is constructed (docs/ENGINE_CONSUMER.md).
 try:
     register_all_hooks()
+    discord_staff_reports.register_hooks()
 except Exception as exc:
     # Import-time failures (e.g. jobs.json validation) happen before Game()
     # so the watcher can classify them for boot-hold / thrash guard.
@@ -130,11 +132,28 @@ class Game:
         try:
             from engine import changelog_index as changelog_index_mod
 
-            changelog_index_mod.ensure_compiled_index(
-                os.getcwd(), log_prefix="[boot]",
+            # Copyover / game-child boot is a fresh interpreter — this is
+            # the guaranteed #N mint. The long-lived watcher can still be
+            # holding a stale changelog_index without stamp_pending_*.
+            changelog_index_mod.stamp_pending_and_ensure_index(
+                os.getcwd(),
+                log_prefix="[boot]",
+                mint_ids=changelog_index_mod.should_mint_ids_on_boot(),
             )
         except Exception as exc:
             print(f"[boot] changelog index heal skipped: {exc}", flush=True)
+        else:
+            # Discord may have deferred this SHA until #N existed. Retry
+            # here so the post lands with ``changes N`` after copyover.
+            try:
+                if changelog_index_mod.should_mint_ids_on_boot():
+                    from engine import discord_patch_notes as discord_patch_notes_mod
+
+                    discord_patch_notes_mod.retry_deferred_patch_notes(
+                        os.getcwd(),
+                    )
+            except Exception as exc:
+                print(f"[boot] patch notes retry skipped: {exc}", flush=True)
         boot_profile_mod.mark("changelog_index")
         # Live Character roster (engine/char_index.py). RoomMap stamps
         # room.game on every insert so Room.add/remove keep the set
@@ -148,6 +167,9 @@ class Game:
         # Monster/Celestial fuel-loop subset (supers/fuel.py) -- kept in sync
         # via engine.hooks fuel_loop_roster_notify on register/despawn.
         self.fuel_loop_characters = set()
+        # Authored-room cache generation -- RoomMap bumps this on real
+        # map/dungeon insert/delete, not on overland virtual cells.
+        self._static_room_graph_gen = 0
         self.rooms = RoomMap(self)
         self.rooms.update(raw_rooms)
         # Phase 3 dual-read: legacy dig / JSON keys → VNUM identity.
@@ -169,6 +191,11 @@ class Game:
         # Wall-clock unix time of this process boot -- MSSP UPTIME (engine/mssp.py).
         # Not persisted; resets on every restart / copyover process spawn.
         self.started_at = time.time()
+        from engine.boot_kind import from_env
+
+        # Watcher stamps RIFTFORGE_BOOT_KIND (cold compose vs game-only reload).
+        self._boot_kind = from_env()
+        print(f"[boot] boot_kind={self._boot_kind}", flush=True)
         # Telnet listen port for MSSP PORT metadata (engine/mssp.py listen_port).
         self.listen_port = int(os.environ.get("RIFTFORGE_PORT", "4000"))
         # MSSP DESCRIPTION for listing crawlers (engine/mssp.py build_status).
@@ -207,9 +234,89 @@ class Game:
         from engine import reports as reports_mod
 
         reports_mod.ensure_report_logs(self.report_dir)
+        # Player board log is generic JSONL (engine.thread_log). Filename
+        # matches supers.player_social.PLAYER_SOCIAL_FILE so SUPERS verbs
+        # keep using the same file. Do not import supers here — lean /
+        # basegame / classic Game() must boot without that package.
+        from engine import thread_log as thread_log_mod
 
+        thread_log_mod.ensure_file(
+            os.path.join(self.report_dir, "player_social.log"),
+            log_label="player_social",
+        )
+        from engine import player_queries as player_queries_mod
+
+        player_queries_mod.ensure_log(self.report_dir)
+
+        # GM ``gm lag`` sidecar (``.lag_thread_override``) wins over ``.env``
+        # so an in-game toggle survives copyover / game-only restart.
+        # Skip ``:memory:`` smokes so a leftover checkout sidecar cannot
+        # leak persist/planner threads into Game() tests.
+        if db_path != ":memory:":
+            from engine import lag_threads as lag_threads_mod
+
+            lag_threads_mod.apply_override(self.report_dir)
+
+        # Lag P30 background writer needs WAL journaling *before* the first
+        # connection opens -- SQLite's journal_mode is a file-level property
+        # set by whichever connection touches it first, so setting the env
+        # override only after `persistence.connect()` below would silently
+        # no-op (the file is already DELETE-journaled) and defeat the whole
+        # point of the writer's second connection being safe.
+        if persistence.persist_background_writer_enabled():
+            os.environ.setdefault("RIFTFORGE_SQLITE_JOURNAL", "WAL")
         self.db = persistence.connect(db_path)
+        if persistence.persist_background_writer_enabled():
+            from engine import sqlite_wal
+
+            # ":memory:" is safe by a different mechanism (shared-cache URI
+            # in _sqlite_connect_target, both connections see one buffer) --
+            # SQLite always reports journal_mode "memory" there regardless,
+            # so only real on-disk files need the WAL check below.
+            actual_mode = (
+                "wal" if db_path == ":memory:"
+                else sqlite_wal.journal_mode(self.db)
+            )
+            if actual_mode != "wal":
+                # Two threads holding separate connections to a DELETE-
+                # journaled file is the "database disk image is malformed"
+                # corruption class documented in _sqlite_journal_mode() --
+                # fail soft to the synchronous save path rather than start
+                # a writer thread on an unsafe file.
+                print(
+                    "[persistence_writer] WAL not active "
+                    f"(journal_mode={actual_mode!r}); background writer "
+                    "needs a WAL-backed file for a second connection to be "
+                    "safe -- staying on synchronous saves this boot. Set "
+                    "RIFTFORGE_SQLITE_JOURNAL=WAL explicitly to fix.",
+                    flush=True,
+                )
+            else:
+                import asyncio
+                from engine.persistence_writer import start_persistence_writer
+
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                start_persistence_writer(db_path, loop=loop)
         boot_profile_mod.mark("db_connect")
+        # Lag P31.4 Cadence planner thread (second hard-rule-3 exception --
+        # docs/plans/lag_p31_4_cadence_planner_thread_2026-08-23.md).
+        # Production compose / live .env default the flag on; Python
+        # helper stays False when the env key is unset so Game() smokes
+        # do not leak a planner thread. The thread computes read-only
+        # lifestyle intents; drain still mutates on the asyncio loop.
+        from engine import cadence_planner as cadence_planner_mod
+
+        if cadence_planner_mod.cadence_planner_enabled():
+            import asyncio as _cp_asyncio
+
+            try:
+                _cp_loop = _cp_asyncio.get_event_loop()
+            except RuntimeError:
+                _cp_loop = _cp_asyncio.new_event_loop()
+            cadence_planner_mod.start_cadence_planner(loop=_cp_loop)
         # Milestone E: the compressed clock -- 0 for a fresh world, or
         # wherever a returning world left off (reused for both branches
         # below, so it's loaded once here rather than duplicated in each).
@@ -254,6 +361,7 @@ class Game:
         self.town_construction = {"zones": {}}
         # Chuck Author mantle-resume (meta JSON; idle until load/restore).
         self.author_mantle_event = {}
+        self.amara_pressure_state = {}
         self.chuck_heaven_claim = {}
         self.eclipse_until_tick = 0
         self.moral_event_cooldown_until = 0
@@ -360,19 +468,8 @@ class Game:
                     resolve_pending_demesne_exits(self)
                 except Exception:
                     traceback.print_exc()
-                # Floor items load after player_shops heal — re-strip Dallas
-                # townforge fixtures that save_world persisted on Lebanon VNUMs.
-                try:
-                    from supers import player_shops as player_shops_mod
-                    civic_stats = player_shops_mod.heal_townforge_civic_shop_hosts(
-                        self,
-                    )
-                    if civic_stats.get("purged") or civic_stats.get(
-                        "fixtures_removed",
-                    ):
-                        self.save()
-                except Exception:
-                    traceback.print_exc()
+                # Dallas townforge fixture strip is a one-time migration
+                # (boot_seed deferred, run_once). Do not scan on every Game().
         else:
             # Brand-new world: place the starter items, then record that we did
             # so they're never placed again (see build_world's docstring).
@@ -398,6 +495,10 @@ class Game:
             # so the next save keeps them -- never race SQLite while the
             # live process still holds an older in-memory accounts dict.
             accounts_mod.heal_restored_player_accounts(self)
+            accounts_mod.heal_drifted_staff_ranks(self)
+            # Second pass: roster relinks / staff-rank heal may have moved
+            # legacy body ranks onto accounts after the first migrate.
+            accounts_mod.migrate_legacy_gm_ranks(self)
             accounts_mod.heal_empty_account_passwords(self)
         except Exception:
             print("[server] account reconcile/migrate failed:", flush=True)
@@ -475,10 +576,11 @@ class Game:
         )
         from engine.command_support import (
             _collect_character_matches,
+            collapse_shell_args,
             sort_character_target_matches,
         )
 
-        raw = (name or "").strip()
+        raw = collapse_shell_args(name)
         if not raw:
             return None
         ordinal, rest = parse_target_ordinal(raw)
@@ -706,6 +808,12 @@ class Game:
             # for the "next autosave" that never comes -- skill gains and
             # other late mutations vanish on reload (bug report 372). Force
             # a full world rewrite so every live character hits SQLite.
+            if ep.persist_background_writer_enabled():
+                from engine.persistence_writer import shutdown_persistence_writer
+
+                shutdown_persistence_writer(
+                    timeout=ep.persist_writer_drain_timeout_s(),
+                )
             self._persist_force_full = True
             ep.save_world(self.db, self)
             ep.save_game_time(self.db, self.game_time_ticks)
@@ -713,7 +821,9 @@ class Game:
                 self.db, getattr(self, "calendar_epoch_day", 0)
             )
             ep.save_game_clock_tuning(self.db, self)
-            ep.save_accounts(self.db, self)
+            # Account changelog cursors only lived in memory when incremental
+            # autosave skipped the accounts slice (bug report 744).
+            ep.save_accounts(self.db, self, force_full=True)
             hooks_mod.save_game_meta(self, self.db)
             if _HAS_SUPERS:
                 try:
@@ -794,6 +904,7 @@ class Game:
                 os.environ.get("RIFTFORGE_SLOW_TICK_WARN", "2.0")
             )
             _tick_t0 = _tick_time.perf_counter()
+            _cpu_t0 = lag_watch.cpu_times()
             try:
                 await self.run_heartbeat_async()
             except Exception:
@@ -814,11 +925,33 @@ class Game:
                         f"ticks={self.game_time_ticks}",
                     )
                     metrics_mod.bump(self, "tick_slow")
+            finally:
+                _wall_ms = (_tick_time.perf_counter() - _tick_t0) * 1000.0
+                _cpu_t1, _cpu_user1, _cpu_sys1 = lag_watch.cpu_times()
+                _cpu_ms = (_cpu_t1 - _cpu_t0[0]) * 1000.0
+                _user_ms = None
+                _sys_ms = None
+                if _cpu_t0[1] is not None and _cpu_user1 is not None:
+                    _user_ms = (_cpu_user1 - _cpu_t0[1]) * 1000.0
+                    _sys_ms = (_cpu_sys1 - _cpu_t0[2]) * 1000.0
+                lag_watch.note_tick_cpu(
+                    self,
+                    _wall_ms,
+                    _cpu_ms,
+                    user_ms=_user_ms,
+                    sys_ms=_sys_ms,
+                )
             # Stamp after work so a completed heavy tick resets the clock.
             game_heartbeat.touch_heartbeat("post_tick")
             lag_watch.note_post_tick_wall(self)
             from engine import boot_stability
             boot_stability.note_post_tick()
+            try:
+                from engine import public_status as public_status_mod
+
+                public_status_mod.maybe_publish(self)
+            except Exception:
+                pass
             from engine import world_backup
             if world_backup.backup_request_pending():
                 try:
@@ -836,6 +969,11 @@ class Game:
         from engine import game_clock_tuning
         game_clock_tuning.advance_game_time_ticks(self)
         await run_ticks_async(self)
+        try:
+            from engine import disk_health
+            disk_health.maybe_tick_disk_health(self)
+        except Exception:
+            pass
         await self._maybe_autosave_async()
         await self._maybe_flush_deferred_deploy_save()
 
@@ -849,12 +987,233 @@ class Game:
         run_ticks(self)
         self._maybe_autosave()
 
+    def _enqueue_writer_persist_batch(
+        self, handoff, meta_stats, *, reason, save_wall_start, save_wall_budget_ms,
+    ):
+        """Hand world + meta SQL to the background writer (lag P30)."""
+        import time as _save_time
+        from engine import hooks as hooks_mod
+        from engine import persistence
+        from engine.persistence_writer import (
+            PersistWriterBatch,
+            PersistWriterStep,
+            enqueue_persist_batch,
+        )
+
+        meta = handoff["meta"]
+        char_rows = handoff["char_rows"]
+        item_rows = handoff["item_rows"]
+        collect_ms = handoff["collect_ms"]
+        try:
+            import asyncio as _ack_aio
+            ack_loop = _ack_aio.get_running_loop()
+        except RuntimeError:
+            ack_loop = None
+        batch = PersistWriterBatch(
+            world=handoff["world"],
+            checkpoint_reason=str(reason or "autosave"),
+            ack_loop=ack_loop,
+        )
+
+        def _over_budget():
+            return (
+                reason == "autosave"
+                and save_wall_budget_ms > 0
+                and persistence._persist_save_over_wall_budget(
+                    save_wall_start, save_wall_budget_ms,
+                )
+            )
+
+        hs_packet = None
+        tw_packet = None
+        pr_packet = None
+        dm_packet = None
+        if not _over_budget():
+            batch.steps.append(PersistWriterStep(
+                "game_time",
+                lambda conn: persistence.save_game_time(
+                    conn, self.game_time_ticks,
+                ),
+            ))
+            batch.steps.append(PersistWriterStep(
+                "calendar",
+                lambda conn: persistence.save_calendar_epoch_day(
+                    conn, getattr(self, "calendar_epoch_day", 0),
+                ),
+            ))
+            batch.steps.append(PersistWriterStep(
+                "clock",
+                lambda conn: persistence.save_game_clock_tuning(conn, self),
+            ))
+            batch.steps.append(PersistWriterStep(
+                "accounts",
+                lambda conn: persistence.save_accounts(conn, self),
+            ))
+            if _HAS_SUPERS:
+                from supers.persist_meta import save_supers_meta
+                batch.steps.append(PersistWriterStep(
+                    "game_meta",
+                    lambda conn: save_supers_meta(
+                        self, conn, autosave_stagger=True,
+                    ),
+                ))
+                from supers import homestead as homestead_mod
+                from supers import gathering as gathering_mod
+                from supers import player_shops as player_shops_mod
+                from supers import township as township_mod
+                from supers import personal_realm as personal_realm_mod
+                from supers.demesne import persist as demesne_persist_mod
+                from supers import dream_pocket as dream_pocket_mod
+
+                hs_packet = homestead_mod.collect_homestead_persist_packet(
+                    self,
+                )
+                tw_packet = township_mod.collect_township_persist_packet(
+                    self,
+                )
+                pr_packet = (
+                    personal_realm_mod.collect_personal_realm_persist_packet(
+                        self,
+                    )
+                )
+                dm_packet = demesne_persist_mod.collect_demesne_persist_packet(
+                    self,
+                )
+                writer_steps = []
+                if hs_packet is not None:
+                    writer_steps.append(PersistWriterStep(
+                        "homesteads",
+                        lambda conn, pkt=hs_packet: (
+                            homestead_mod.apply_homestead_persist_packet(
+                                conn, self, pkt,
+                            )
+                        ),
+                    ))
+                if tw_packet is not None:
+                    writer_steps.append(PersistWriterStep(
+                        "township",
+                        lambda conn, pkt=tw_packet: (
+                            township_mod.apply_township_persist_packet(
+                                conn, self, pkt,
+                            )
+                        ),
+                    ))
+                writer_steps.extend([
+                    PersistWriterStep(
+                        "gather",
+                        lambda conn: gathering_mod.save_gather_nodes(conn, self),
+                    ),
+                    PersistWriterStep(
+                        "player_shops",
+                        lambda conn: player_shops_mod.save_player_shops(conn, self),
+                    ),
+                ])
+                if pr_packet is not None:
+                    writer_steps.append(PersistWriterStep(
+                        "personal_realms",
+                        lambda conn, pkt=pr_packet: (
+                            personal_realm_mod.apply_personal_realm_persist_packet(
+                                conn, self, pkt,
+                            )
+                        ),
+                    ))
+                if dm_packet is not None:
+                    self._demesne_persist_apply_ok = False
+
+                    def _apply_demesnes(conn, pkt=dm_packet):
+                        self._demesne_persist_apply_ok = (
+                            demesne_persist_mod.apply_demesne_persist_packet(
+                                conn, self, pkt,
+                            )
+                        )
+
+                    writer_steps.append(PersistWriterStep(
+                        "demesnes",
+                        _apply_demesnes,
+                    ))
+                writer_steps.append(PersistWriterStep(
+                    "dream_pockets",
+                    lambda conn: dream_pocket_mod.save_dream_pockets(conn, self),
+                ))
+                batch.steps.extend(writer_steps)
+            else:
+                batch.steps.append(PersistWriterStep(
+                    "game_meta",
+                    lambda conn: hooks_mod.save_game_meta(self, conn),
+                ))
+
+        def _on_done(stats):
+            persistence._persist_ack_world_save(
+                self, meta,
+                apply_ms=stats.get("apply_ms", 0.0),
+                collect_ms=collect_ms,
+                char_rows=char_rows,
+                item_rows=item_rows,
+            )
+            meta_stats["writer_total_ms"] = stats.get("writer_total_ms")
+            meta_stats["writer_steps"] = stats.get("writer_steps")
+            world = getattr(self, "_last_world_save_stats", None) or {}
+            meta_stats["world_ms"] = round(
+                float(world.get("collect_ms") or 0.0)
+                + float(world.get("apply_ms") or 0.0),
+                2,
+            )
+            meta_stats["save_wall_ms"] = round(
+                (_save_time.perf_counter() - save_wall_start) * 1000.0, 2,
+            )
+            self._last_meta_save_stats = meta_stats
+            if _HAS_SUPERS:
+                from supers import homestead as homestead_mod
+                from supers import township as township_mod
+                from supers import personal_realm as personal_realm_mod
+                from supers.demesne import persist as demesne_persist_mod
+
+                if hs_packet is not None:
+                    homestead_mod.ack_homestead_persist_packet(self, hs_packet)
+                if tw_packet is not None:
+                    township_mod.ack_township_persist_packet(self, tw_packet)
+                if pr_packet is not None:
+                    personal_realm_mod.ack_personal_realm_persist_packet(
+                        self, pr_packet,
+                    )
+                if (
+                    dm_packet is not None
+                    and getattr(self, "_demesne_persist_apply_ok", True)
+                ):
+                    demesne_persist_mod.ack_demesne_persist_packet(
+                        self, dm_packet,
+                    )
+            self._note_save_success()
+            self._kick_pending_save_after_writer()
+
+        def _on_error(exc):
+            persistence._persist_restore_deferred_dirty(
+                self,
+                set(meta.get("changed_chars") or ())
+                | set(meta.get("deferred_chars") or ()),
+                set(meta.get("changed_floor_rooms") or ())
+                | set(meta.get("deferred_rooms") or ()),
+            )
+            self._save_pending_after_current = True
+            meta_stats["writer_error"] = repr(exc)
+            self._last_meta_save_stats = meta_stats
+            self._kick_pending_save_after_writer()
+
+        batch.on_done = _on_done
+        batch.on_error = _on_error
+        enqueue_persist_batch(batch)
+        meta_stats["writer_enqueued"] = True
+        self._last_meta_save_stats = meta_stats
+
     async def save_async(self, *, reason="async"):
         """Cooperative world snapshot (yields during blob work + meta slices).
 
         Login and autosave share this path so the asyncio loop can serve
         other sessions while JSON rows are built. Only one save runs at a
-        time -- concurrent callers spin with ``asyncio.sleep(0)``.
+        time. Concurrent callers wait: another collect on this loop
+        yields with ``asyncio.sleep(0)``; a P30 writer apply parks on an
+        Event so the loop does not busy-poll (that pegged a core when the
+        writer flag was on).
 
         Heartbeat-scheduled saves use ``_run_save_task``, which contains
         failures without re-raising. Direct ``await save_async(...)`` from
@@ -870,20 +1229,51 @@ class Game:
         from engine import log_util
         from engine import persistence
 
-        while getattr(self, "_autosave_running", False):
-            await asyncio.sleep(0)
+        lock_wait_start = _save_time.perf_counter()
+        while (
+            persistence.persist_save_busy(self)
+            or persistence.persist_writer_in_flight()
+        ):
+            # Waiting on the writer thread must actually sleep --
+            # ``asyncio.sleep(0)`` only yields to other ready callbacks,
+            # so a follow-up save during apply spun the loop at 100% CPU
+            # until SQLite finished. persist_save_busy no longer includes
+            # writer-in-flight (Cadence must keep running), so this wait
+            # ORs persist_writer_in_flight explicitly.
+            if persistence.persist_writer_in_flight():
+                await persistence.wait_writer_idle_async()
+            else:
+                await persistence.wait_collect_idle_async(self)
+        lock_wait_ms = (_save_time.perf_counter() - lock_wait_start) * 1000.0
+        persistence.note_collect_started(self)
         self._autosave_running = True
-        meta_stats = {}
+        self._save_collecting = True
+        meta_stats = {"lock_wait_ms": round(lock_wait_ms, 2)}
         save_wall_start = _save_time.perf_counter()
         save_wall_budget_ms = persistence.persist_save_wall_budget_ms()
         save_meta_deferred = False
+        # persist_background_writer_ready() (not the raw env flag) -- the
+        # writer thread only exists if boot verified WAL actually took.
+        use_writer = persistence.persist_background_writer_ready()
+        writer_handoff = {} if use_writer else None
         try:
             try:
                 await persistence.save_world_async(
                     self.db, self,
                     wall_start=save_wall_start,
                     wall_budget_ms=save_wall_budget_ms,
+                    writer_handoff=writer_handoff,
                 )
+                self._save_collecting = False
+                if writer_handoff and writer_handoff.get("world"):
+                    self._enqueue_writer_persist_batch(
+                        writer_handoff,
+                        meta_stats,
+                        reason=reason,
+                        save_wall_start=save_wall_start,
+                        save_wall_budget_ms=save_wall_budget_ms,
+                    )
+                    return
 
                 async def _meta_slice(name, fn, *, required=True):
                     nonlocal save_meta_deferred
@@ -931,14 +1321,35 @@ class Game:
                 meta_stats["accounts_changed"] = acct.get("n_changed")
                 meta_stats["accounts_full"] = acct.get("force_full")
                 if _HAS_SUPERS:
+                    meta_wall_start = _save_time.perf_counter()
                     t0_gm = _save_time.perf_counter()
                     try:
                         from supers.persist_meta import save_supers_meta_async
-                        await save_supers_meta_async(self, self.db)
+                        await save_supers_meta_async(
+                            self, self.db,
+                            wall_start=meta_wall_start,
+                            wall_budget_ms=save_wall_budget_ms,
+                            respect_wall_budget=(reason == "autosave"),
+                        )
                     finally:
                         meta_stats["game_meta_ms"] = round(
                             (_save_time.perf_counter() - t0_gm) * 1000.0, 2,
                         )
+                    gm_wall = (
+                        getattr(self, "_last_game_meta_save_stats", None) or {}
+                    )
+                    for tag in gm_wall.get("slices_written") or []:
+                        slice_ms = gm_wall.get(f"{tag}_ms")
+                        if slice_ms is not None:
+                            meta_stats[f"{tag}_ms"] = slice_ms
+                    if gm_wall.get("wall_budget_hit"):
+                        save_meta_deferred = True
+                        meta_stats["game_meta_wall_budget"] = True
+                        deferred = gm_wall.get("slices_deferred") or []
+                        if deferred:
+                            meta_stats["game_meta_deferred"] = ",".join(
+                                deferred,
+                            )
                     await asyncio.sleep(0)
                 else:
                     await _meta_slice(
@@ -1059,9 +1470,12 @@ class Game:
             if save_meta_deferred:
                 self._save_pending_after_current = True
         finally:
+            self._save_collecting = False
             self._autosave_running = False
+            persistence.note_collect_finished(self)
 
     # Save reasons deferred during the post-deploy window (lag P12 / P12.1).
+    # Disconnect/login/shutdown/commerce use their own non-deferrable paths.
     _DEPLOY_DEFERRABLE_SAVE_REASONS = frozenset({
         "autosave",
         "scheduled",
@@ -1123,8 +1537,33 @@ class Game:
         if getattr(self, "_autosave_running", False):
             self._save_pending_after_current = True
             return
+        from engine import persistence as persist_mod
+
+        # Writer still applying: do not start a save_async waiter. The
+        # old path launched a task that busy-looped ``sleep(0)`` for the
+        # whole apply (Cadence dirty + 60s autosave made this permanent).
+        if persist_mod.persist_writer_in_flight():
+            self._save_pending_after_current = True
+            if not persist_mod.persist_writer_in_flight():
+                self._kick_pending_save_after_writer()
+            return
         self._save_task_in_flight = True
         asyncio.create_task(self._run_save_task(reason=reason))
+
+    def _kick_pending_save_after_writer(self):
+        """Start the coalesced follow-up once collect + writer are idle."""
+        if not getattr(self, "_save_pending_after_current", False):
+            return
+        if getattr(self, "_save_task_in_flight", False):
+            return
+        if getattr(self, "_autosave_running", False):
+            return
+        from engine import persistence as persist_mod
+
+        if persist_mod.persist_writer_in_flight():
+            return
+        self._save_pending_after_current = False
+        self._request_save_async(reason="scheduled")
 
     async def _maybe_autosave_async(self):
         """Autosave every AUTOSAVE_INTERVAL_SECONDS of wall-clock time.
@@ -1190,6 +1629,15 @@ class Game:
             "n_changed_rooms": world.get("n_changed_rooms"),
             "n_deferred_chars": world.get("n_deferred_chars"),
             "n_deferred_rooms": world.get("n_deferred_rooms"),
+            "n_dirty_chars_queued": world.get("n_dirty_chars_queued"),
+            "n_dirty_rooms_queued": world.get("n_dirty_rooms_queued"),
+            "echo_coalesce_skipped": world.get("echo_coalesce_skipped"),
+            # Lag P12: name the slow character(s), not just an aggregate
+            # collect_ms -- see docs/plans/lag_p12_collect_profile.md.
+            "slow_chars": world.get("slow_chars"),
+            "char_build_total_ms": world.get("char_build_total_ms"),
+            "char_build_count": world.get("char_build_count"),
+            "char_build_avg_ms": world.get("char_build_avg_ms"),
             "autosave_count": world.get("autosave_count"),
             "full_every": world.get("full_every"),
             "game_time_ticks": self.game_time_ticks,
@@ -1201,6 +1649,10 @@ class Game:
         wal = getattr(self, "_last_wal_checkpoint_stats", None) or {}
         for key, value in wal.items():
             stats[key] = value
+        from engine import autosave_envelope
+        autosave_envelope.enrich_autosave_stats(
+            stats, db_path=getattr(self, "db_path", None),
+        )
         return stats
 
     async def _run_save_task(self, *, reason="autosave"):
@@ -1243,10 +1695,18 @@ class Game:
                     "autosave_ms",
                     stats,
                 )
+                from engine import autosave_envelope
+                if autosave_envelope.should_log_autosave_stall(stats):
+                    stall = dict(stats)
+                    stall["reason"] = reason
+                    diag_export.append_event(
+                        "D",
+                        "server.py:on_tick:autosave",
+                        "autosave_stall",
+                        stall,
+                    )
             self._save_task_in_flight = False
-            if getattr(self, "_save_pending_after_current", False):
-                self._save_pending_after_current = False
-                self._request_save_async(reason="scheduled")
+            self._kick_pending_save_after_writer()
 
     async def _run_autosave_task(self):
         """Backward-compatible alias for autosave background task."""
@@ -1363,6 +1823,7 @@ async def main():
         raise
     game_heartbeat.touch_heartbeat("game_ready")
     from engine.gateway_client import GatewayBridge, gateway_enabled
+    from engine import persistence as persistence_shutdown
 
     if gateway_enabled():
         # Level 3 gateway: do not bind :4000; speak IPC and reattach held clients.
@@ -1390,7 +1851,10 @@ async def main():
         try:
             await bridge.connect_and_run()
         finally:
-            game.save()
+            persistence_shutdown.save_world_before_process_exit(
+                game.db, game, reason="gateway_shutdown",
+            )
+            _shutdown_cadence_planner_if_started()
             game.db.close()
         return
 
@@ -1428,8 +1892,27 @@ async def main():
     finally:
         # Runs even when Ctrl-C cancels us: one last save so nothing typed in
         # the final seconds (since the last tick's autosave) is lost.
-        game.save()
+        persistence_shutdown.save_world_before_process_exit(
+            game.db, game, reason="shutdown",
+        )
+        _shutdown_cadence_planner_if_started()
         game.db.close()
+
+
+def _shutdown_cadence_planner_if_started():
+    """Lag P31.4 Phase 1 -- drain/join the cadence-planner thread if it ran.
+
+    No-op when the feature flag was never on this boot (the common case
+    today). Mirrors ``persistence.save_world_before_process_exit``'s own
+    guarded call to ``shutdown_persistence_writer`` -- kept in server.py
+    rather than engine/persistence.py since the two threads are unrelated
+    engine facilities and persistence.py should not need to know cadence
+    planner exists.
+    """
+    from engine import cadence_planner as cadence_planner_mod
+
+    if cadence_planner_mod.planner_started():
+        cadence_planner_mod.shutdown_cadence_planner()
 
 
 if __name__ == "__main__":

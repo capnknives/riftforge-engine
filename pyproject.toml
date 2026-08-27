@@ -36,3 +36,5 @@ select = ["E9", "F821", "F601"]
 [tool.ruff.lint.per-file-ignores]
 # SUPERS_COMMANDS reuses bare-alias keys that replace earlier help one-liners.
 "supers/verbs/__init__.py" = ["F601"]
+# Optional PyQt tooling — QCompleter only exists when Area Studio deps are installed.
+"tools/area_studio/**/*.py" = ["F821"]

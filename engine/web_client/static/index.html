@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mortals and Monsters — play in browser</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip" href="#cmd">Skip to command</a>
+  <header>
+    <h1>Mortals and Monsters</h1>
+    <p class="meta">
+      Supernatural telnet MUD &middot;
+      <a href="https://play.riftforge.me" target="_blank" rel="noopener noreferrer">site</a>
+      &middot;
+      <a data-discord-invite href="https://discord.com/invite/KZbeRd389" target="_blank" rel="noopener noreferrer">Discord</a>
+      &middot; telnet <code>162.243.50.82 4000</code>
+      &middot; <button type="button" id="help-browser" class="hint">help browser</button>
+      &middot; <button type="button" id="show-shortcuts" class="hint">shortcuts</button>
+      &middot; <button type="button" id="show-display-prefs" class="hint">display</button>
+      &middot; <span id="client-build" class="build-stamp"></span>
+    </p>
+    <p id="status" role="status" aria-live="polite">Connecting…</p>
+  </header>
+
+  <div id="play">
+    <div id="play-main">
+      <section id="comm-pane" aria-label="Communication">
+        <div class="comm-toolbar">
+          <button
+            type="button"
+            class="pane-toggle"
+            id="comm-toggle"
+            aria-expanded="true"
+            aria-controls="comm-body"
+          ><span class="chevron" aria-hidden="true">&#9662;</span> Comm</button>
+          <div class="comm-tabs" role="tablist" aria-label="Communication channels">
+            <button
+              type="button"
+              id="comm-tab-public"
+              role="tab"
+              aria-selected="true"
+              aria-controls="comm-log-public"
+            >Public</button>
+            <button
+              type="button"
+              id="comm-tab-tells"
+              role="tab"
+              aria-selected="false"
+              aria-controls="comm-log-tells"
+            >Tells</button>
+          </div>
+          <label class="comm-gag">
+            <input type="checkbox" id="gag-comms">
+            Hide these in the main window
+          </label>
+        </div>
+        <div id="comm-body">
+          <div
+            id="comm-log-public"
+            class="comm-log"
+            role="log"
+            aria-live="polite"
+            aria-relevant="additions"
+            aria-label="Public channels"
+          ></div>
+          <div
+            id="comm-log-tells"
+            class="comm-log"
+            role="log"
+            aria-live="polite"
+            aria-relevant="additions"
+            aria-label="Tells"
+            hidden
+          ></div>
+        </div>
+      </section>
+      <div
+        id="output"
+        role="log"
+        aria-live="polite"
+        aria-relevant="additions"
+        aria-label="Game output"
+      ></div>
+    </div>
+    <aside id="hud" aria-label="Gauges and atlas">
+      <div id="atlas-panel">
+        <div class="pane-head">
+          <button
+            type="button"
+            class="pane-toggle"
+            id="atlas-toggle"
+            aria-expanded="true"
+            aria-controls="atlas-body"
+          ><span class="chevron" aria-hidden="true">&#9662;</span> <span id="atlas-title">America</span></button>
+          <div class="zoom-controls" aria-label="Atlas zoom">
+            <button type="button" class="zoom-btn" id="atlas-zoom-out" aria-label="Zoom out atlas">&minus;</button>
+            <button type="button" class="zoom-btn" id="atlas-zoom-in" aria-label="Zoom in atlas">&plus;</button>
+          </div>
+        </div>
+        <div id="atlas-body">
+          <div id="atlas-scroll">
+            <canvas id="atlas" width="384" height="240" aria-label="Overland atlas"></canvas>
+          </div>
+          <div id="atlas-caption">Right-click a landmark to travel. Hover to name it.</div>
+        </div>
+      </div>
+      <div id="zone-panel" hidden>
+        <div class="pane-head">
+          <button
+            type="button"
+            class="pane-toggle"
+            id="zone-toggle"
+            aria-expanded="true"
+            aria-controls="zone-body"
+          ><span class="chevron" aria-hidden="true">&#9662;</span> <span id="zone-title">Inside</span></button>
+          <div class="zoom-controls" aria-label="Interior map zoom">
+            <button type="button" class="zoom-btn" id="zone-zoom-out" aria-label="Zoom out interior map">&minus;</button>
+            <button type="button" class="zoom-btn" id="zone-zoom-in" aria-label="Zoom in interior map">&plus;</button>
+          </div>
+        </div>
+        <div id="zone-body">
+          <div id="zone-scroll">
+            <canvas id="zone-map" width="384" height="180" aria-label="Interior map"></canvas>
+          </div>
+          <div id="zone-caption">Streets plus places you have been. Click a room to name it.</div>
+        </div>
+      </div>
+      <div id="status-panel">
+        <button
+          type="button"
+          class="pane-toggle"
+          id="status-toggle"
+          aria-expanded="true"
+          aria-controls="status-body"
+        ><span class="chevron" aria-hidden="true">&#9662;</span> Status</button>
+        <div id="status-body">
+          <div id="compass" aria-label="Exits"></div>
+          <div id="gauges" aria-label="Vitals"></div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <div id="prompt-mirror" aria-hidden="true"></div>
+
+  <form id="input-row" autocomplete="off">
+    <label for="cmd" class="sr-only">Command</label>
+    <input
+      id="cmd"
+      type="text"
+      enterkeyhint="send"
+      autocapitalize="off"
+      autocorrect="off"
+      spellcheck="false"
+      disabled
+      placeholder="Type a command and press Enter"
+    >
+    <button type="submit" id="send" disabled>Send</button>
+  </form>
+
+  <ul id="ctx-menu" hidden role="menu" aria-label="Atlas actions"></ul>
+
+  <div id="shortcuts-dialog" hidden role="dialog" aria-modal="true" aria-labelledby="shortcuts-title">
+    <div id="shortcuts-panel">
+      <h2 id="shortcuts-title">Keyboard &amp; click shortcuts</h2>
+      <dl>
+        <dt>Enter</dt><dd>Send the command</dd>
+        <dt>&uarr; / &darr;</dt><dd>Recall earlier commands (while typing)</dd>
+        <dt>Esc</dt><dd>Close a menu or this dialog</dd>
+        <dt>Right-click atlas</dt><dd>Walk, drive, atlas, or enter a landmark</dd>
+        <dt>Left-click interior map</dt><dd>Name a room (does not move you)</dd>
+        <dt>&minus; / &plus; buttons</dt><dd>Zoom a map pane out or in</dd>
+        <dt>&#9662; chevron</dt><dd>Collapse or expand a pane</dd>
+        <dt>Paste multiple lines</dt><dd>Offers to send them as separate commands</dd>
+      </dl>
+      <button type="button" id="shortcuts-close">Close</button>
+    </div>
+  </div>
+
+  <div id="display-dialog" hidden role="dialog" aria-modal="true" aria-labelledby="display-title">
+    <div id="display-panel">
+      <h2 id="display-title">Display preferences</h2>
+      <label class="display-pref">
+        Text size
+        <select id="pref-fontsize" aria-label="Text size">
+          <option value="small">Small</option>
+          <option value="normal" selected>Normal</option>
+          <option value="large">Large</option>
+          <option value="xlarge">Extra large</option>
+        </select>
+      </label>
+      <label class="display-pref">
+        Theme
+        <select id="pref-theme" aria-label="Color theme">
+          <option value="gothic" selected>Dark gothic</option>
+          <option value="contrast">High contrast</option>
+        </select>
+      </label>
+      <button type="button" id="display-close">Close</button>
+    </div>
+  </div>
+
+  <script src="discord-invite.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

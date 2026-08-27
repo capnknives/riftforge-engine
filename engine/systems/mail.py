@@ -22,6 +22,8 @@ from __future__ import annotations
 MAIL_CAP = 30
 # Hard cap on letter body length (characters).
 MAIL_TEXT_MAX = 2000
+# Optional longer letters via ``mail long`` (same queue, higher cap).
+MAIL_LONG_MAX = 4000
 
 
 def is_mail_room(room):
@@ -56,7 +58,7 @@ def notify_inbox(character, game=None):
     session.send(f"You have {n} {unit}. Type 'mail'.")
 
 
-def send_mail(sender, recipient_name, text, game):
+def send_mail(sender, recipient_name, text, game, *, long=False):
     """Queue a letter on the recipient. Returns (ok, message).
 
     Privacy: missing name and offline-with-no-character look the same.
@@ -67,9 +69,16 @@ def send_mail(sender, recipient_name, text, game):
     name = (recipient_name or "").strip()
     body = (text or "").strip()
     if not name or not body:
-        return False, "Usage: mail send <name> <text>"
-    if len(body) > MAIL_TEXT_MAX:
-        return False, f"Letters are limited to {MAIL_TEXT_MAX} characters."
+        usage = (
+            "Usage: mail long send <name> <text>"
+            if long
+            else "Usage: mail send <name> <text>"
+        )
+        return False, usage
+    cap = MAIL_LONG_MAX if long else MAIL_TEXT_MAX
+    if len(body) > cap:
+        kind = "long letters" if long else "letters"
+        return False, f"{kind.capitalize()} are limited to {cap} characters."
     if name.lower() == sender.key.lower():
         return False, "You can't mail yourself."
     target = game.find_character(name) if game else None

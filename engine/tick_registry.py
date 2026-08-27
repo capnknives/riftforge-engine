@@ -44,11 +44,21 @@ _tick_fail_log_at = {}
 TICK_WARN_MS = 100.0
 # Within a slow tick, also name any single handler above this threshold.
 HANDLER_WARN_MS = 20.0
+# Per-handler process CPU (time.process_time) ops log threshold.
+_HANDLER_CPU_WARN_MS_DEFAULT = 200.0
 # How many recent tick samples GM `tick` keeps (ring buffer).
 TICK_STATS_LEN = 20
 # Soft wall: once handlers have spent this many ms, skip remaining
 # skippable ambient handlers for this heartbeat.
 _TICK_SOFT_BUDGET_MS_DEFAULT = 300.0
+# While SQLite collect/apply is in flight, defer almost all tick handlers so
+# a 4s "handler swarm" heartbeat cannot stack on top of autosave (live 2026-08).
+_TICK_SAVE_BUSY_BUDGET_MS_DEFAULT = 0.0
+# Handlers that still run during save_busy (combat fairness).
+_TICK_SAVE_BUSY_ALLOW = frozenset({
+    "combat",
+    "combat_ko",
+})
 _TICK_FAIL_LOG_SECONDS_DEFAULT = 60.0
 _TICK_DISABLE_THRESHOLD_DEFAULT = 5
 _TICK_DISABLE_WINDOW_SECONDS_DEFAULT = 300.0
@@ -61,6 +71,40 @@ def set_tick_finalize_cadence_clear(fn):
     _tick_finalize_cadence_clear = fn
 
 
+def _handler_cpu_warn_ms():
+    """Per-handler process CPU ops log threshold (0=off)."""
+    raw = (os.environ.get("RIFTFORGE_HANDLER_CPU_WARN_MS") or "").strip()
+    if not raw:
+        return _HANDLER_CPU_WARN_MS_DEFAULT
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _HANDLER_CPU_WARN_MS_DEFAULT
+
+
+def _note_handler_cpu(game, name, wall_ms, cpu_ms):
+    """Log when a tick handler burns process CPU (not just wall stall)."""
+    threshold = _handler_cpu_warn_ms()
+    if threshold <= 0 or cpu_ms < threshold:
+        return
+    from engine import log_util
+
+    extra = ""
+    if name == "cadence":
+        last = getattr(game, "_cadence_last_pass", None) or {}
+        top = last.get("top_phases") or ()
+        if top:
+            extra = " phases=" + ",".join(
+                f"{key}:{val:.0f}" for key, val in top[:6]
+            )
+    log_util.ops(
+        "tick_registry",
+        f"handler_cpu name={name} wall_ms={wall_ms:.1f} "
+        f"cpu_ms={cpu_ms:.1f} "
+        f"ticks={getattr(game, 'game_time_ticks', '?')}{extra}",
+    )
+
+
 def tick_soft_budget_ms():
     """Per-heartbeat soft budget for skipping ambient handlers (0=off)."""
     raw = (os.environ.get("RIFTFORGE_TICK_SOFT_BUDGET_MS") or "").strip()
@@ -70,6 +114,64 @@ def tick_soft_budget_ms():
         return max(0.0, float(raw))
     except ValueError:
         return _TICK_SOFT_BUDGET_MS_DEFAULT
+
+
+def tick_save_busy_budget_ms():
+    """Soft budget cap while ``persist_save_busy`` (0 = skip all but allowlist)."""
+    raw = (os.environ.get("RIFTFORGE_TICK_SAVE_BUSY_BUDGET_MS") or "").strip()
+    if not raw:
+        return _TICK_SAVE_BUSY_BUDGET_MS_DEFAULT
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _TICK_SAVE_BUSY_BUDGET_MS_DEFAULT
+
+
+def _persist_save_busy(game):
+    """True while autosave collect/apply is on the asyncio loop.
+
+    Writer-thread apply is not save-busy -- Cadence keeps running.
+    """
+    try:
+        from engine import persistence
+
+        return persistence.persist_save_busy(game)
+    except Exception:
+        return False
+
+
+def _tick_save_busy_skip(game, name):
+    """Defer non-critical handlers while persistence is busy."""
+    if not _persist_save_busy(game):
+        return False
+    return name not in _TICK_SAVE_BUSY_ALLOW
+
+
+def _effective_tick_soft_budget(game):
+    """Normal soft budget, clamped tighter during save_busy."""
+    budget = tick_soft_budget_ms()
+    if not _persist_save_busy(game):
+        return budget
+    cap = tick_save_busy_budget_ms()
+    if budget <= 0:
+        return cap
+    return min(budget, cap)
+
+
+def _handler_timing_extras(ranked, total_ms):
+    """Sum of all handler wall times vs heartbeat total (diag clarity)."""
+    if not ranked:
+        return {
+            "handlers_n": 0,
+            "handlers_sum_ms": 0.0,
+            "unaccounted_ms": round(float(total_ms), 2),
+        }
+    handlers_sum = sum(float(ms) for _n, ms in ranked)
+    return {
+        "handlers_n": len(ranked),
+        "handlers_sum_ms": round(handlers_sum, 2),
+        "unaccounted_ms": round(max(0.0, float(total_ms) - handlers_sum), 2),
+    }
 
 
 def tick_fail_log_seconds():
@@ -317,6 +419,22 @@ def _unpack_handler(entry):
     return order, name, fn, async_fn, every_n, skippable
 
 
+def _cadence_handler_budget_ms(game, name, h_ms):
+    """Cadence CPU for soft-budget / ambient-skip only (not stall detection)."""
+    if name != "cadence":
+        return h_ms
+    last = getattr(game, "_cadence_last_pass", None) or {}
+    if last.get("skipped_save_busy"):
+        return 0.0
+    cpu = float(last.get("cpu_ms") or 0.0)
+    paused = float(last.get("paused_ms") or 0.0)
+    if cpu > 0.0:
+        return cpu
+    if paused > 0.0:
+        return max(0.0, h_ms - paused)
+    return h_ms
+
+
 def _finalize_tick_run(
     game, t0, slow_handlers, all_handlers, capture, *, skipped=None,
 ):
@@ -347,6 +465,7 @@ def _finalize_tick_run(
             parts.append(f"skipped_ambient={len(skipped)}")
         print(" ".join(parts))
     ranked = sorted(all_handlers or [], key=lambda p: p[1], reverse=True)
+    timing_extras = _handler_timing_extras(ranked, total_ms)
     n_chars = len(getattr(game, "characters", ()) or ())
     n_sessions = len(getattr(game, "sessions", None) or ())
     cadence_meta = getattr(game, "_cadence_budget_meta", None) or {}
@@ -380,7 +499,9 @@ def _finalize_tick_run(
                 for n, ms in slow_handlers[:12]
             ],
             "cadence_budget": cadence_meta,
+            **timing_extras,
         }
+        payload["persist_save_busy"] = _persist_save_busy(game)
         if skipped:
             payload["skipped_ambient"] = list(skipped)[:20]
         payload["autosave_running"] = bool(
@@ -389,6 +510,13 @@ def _finalize_tick_run(
         last_as = getattr(game, "_last_autosave_stats", None) or {}
         if last_as.get("save_ms") is not None:
             payload["last_autosave_save_ms"] = last_as.get("save_ms")
+        last_cad = getattr(game, "_cadence_last_pass", None) or {}
+        if last_cad:
+            payload["cadence_cpu_ms"] = last_cad.get("cpu_ms")
+            payload["cadence_paused_ms"] = last_cad.get("paused_ms")
+            payload["cadence_wall_ms"] = last_cad.get("wall_ms")
+            payload["slow_actor_key"] = last_cad.get("slow_actor_key")
+            payload["slow_actor_ms"] = last_cad.get("slow_actor_ms")
         if diag_export.append_auto_capture_event(
             game, payload, reason=auto_reason,
         ):
@@ -426,17 +554,39 @@ def run_ticks(game):
     slow_handlers = []
     from engine import diag_export
     capture = diag_export.diag_enabled()
-    all_handlers = [] if capture else None
+    all_handlers = []
     skipped = []
-    budget = tick_soft_budget_ms()
+    budget = _effective_tick_soft_budget(game)
+    save_busy = _persist_save_busy(game)
     ticks = getattr(game, "game_time_ticks", 0)
     spent = 0.0
+    _begin_tick_character_snapshot(game)
+    try:
+        _run_ticks_sync_body(
+            game, handlers, slow_handlers, all_handlers, skipped,
+            budget, save_busy, ticks, spent,
+        )
+    finally:
+        _end_tick_character_snapshot(game)
+    _finalize_tick_run(
+        game, t0, slow_handlers, all_handlers, capture, skipped=skipped,
+    )
+
+
+def _run_ticks_sync_body(
+    game, handlers, slow_handlers, all_handlers, skipped,
+    budget, save_busy, ticks, spent,
+):
+    """Handler loop for sync ``run_ticks`` (roster snapshot already set)."""
     for entry in handlers:
         _order, name, fn, _async_fn, every_n, skippable = _unpack_handler(entry)
         if not _handler_due(name, every_n, ticks):
             continue
         if is_tick_handler_disabled(game, name):
             skipped.append(f"{name}:disabled")
+            continue
+        if _tick_save_busy_skip(game, name):
+            skipped.append(f"{name}:save_busy")
             continue
         if (
             skippable
@@ -445,21 +595,20 @@ def run_ticks(game):
         ):
             skipped.append(name)
             continue
+        if skippable and save_busy and budget <= 0:
+            skipped.append(name)
+            continue
         h0 = time.perf_counter()
+        cpu0 = time.process_time()
         _invoke_tick_handler_safe(game, name, fn)
         h_ms = (time.perf_counter() - h0) * 1000.0
-        spent += h_ms
+        cpu_ms = (time.process_time() - cpu0) * 1000.0
+        budget_ms = _cadence_handler_budget_ms(game, name, h_ms)
+        spent += budget_ms
         spent = _cadence_pressure_skip_ambient(
-            game, name, h_ms, spent, budget,
+            game, name, budget_ms, spent, budget,
         )
-        try:
-            from engine import game_heartbeat
-
-            game_heartbeat.touch_heartbeat(f"tick:{name}")
-        except Exception:
-            pass
-        if all_handlers is not None:
-            all_handlers.append((name, h_ms))
+        all_handlers.append((name, h_ms))
         if h_ms >= HANDLER_WARN_MS:
             slow_handlers.append((name, h_ms))
         try:
@@ -467,9 +616,19 @@ def run_ticks(game):
             lag_watch.note_handler_stall(game, name, h_ms)
         except Exception:
             pass
-    _finalize_tick_run(
-        game, t0, slow_handlers, all_handlers, capture, skipped=skipped,
-    )
+        _note_handler_cpu(game, name, h_ms, cpu_ms)
+
+
+def _begin_tick_character_snapshot(game):
+    """One roster tuple for every ``iter_characters`` call this heartbeat."""
+    from engine.char_index import capture_character_snapshot
+
+    game._tick_character_snapshot = capture_character_snapshot(game)
+
+
+def _end_tick_character_snapshot(game):
+    """Drop the heartbeat snapshot so command-path walks stay live."""
+    game._tick_character_snapshot = None
 
 
 async def run_ticks_async(game):
@@ -483,17 +642,39 @@ async def run_ticks_async(game):
     slow_handlers = []
     from engine import diag_export
     capture = diag_export.diag_enabled()
-    all_handlers = [] if capture else None
+    all_handlers = []
     skipped = []
-    budget = tick_soft_budget_ms()
+    budget = _effective_tick_soft_budget(game)
+    save_busy = _persist_save_busy(game)
     ticks = getattr(game, "game_time_ticks", 0)
     spent = 0.0
+    _begin_tick_character_snapshot(game)
+    try:
+        await _run_ticks_async_body(
+            game, handlers, slow_handlers, all_handlers, skipped,
+            budget, save_busy, ticks, spent,
+        )
+    finally:
+        _end_tick_character_snapshot(game)
+    _finalize_tick_run(
+        game, t0, slow_handlers, all_handlers, capture, skipped=skipped,
+    )
+
+
+async def _run_ticks_async_body(
+    game, handlers, slow_handlers, all_handlers, skipped,
+    budget, save_busy, ticks, spent,
+):
+    """Handler loop for async ``run_ticks_async`` (roster snapshot already set)."""
     for entry in handlers:
         _order, name, fn, async_fn, every_n, skippable = _unpack_handler(entry)
         if not _handler_due(name, every_n, ticks):
             continue
         if is_tick_handler_disabled(game, name):
             skipped.append(f"{name}:disabled")
+            continue
+        if _tick_save_busy_skip(game, name):
+            skipped.append(f"{name}:save_busy")
             continue
         if (
             skippable
@@ -502,27 +683,26 @@ async def run_ticks_async(game):
         ):
             skipped.append(name)
             continue
+        if skippable and save_busy and budget <= 0:
+            skipped.append(name)
+            continue
         h0 = time.perf_counter()
+        cpu0 = time.process_time()
         await _invoke_tick_handler_safe_async(game, name, fn, async_fn)
         h_ms = (time.perf_counter() - h0) * 1000.0
+        cpu_ms = (time.process_time() - cpu0) * 1000.0
+        budget_ms = _cadence_handler_budget_ms(game, name, h_ms)
         if async_fn is not None:
-            spent += _async_handler_budget_cost(name, h_ms)
+            spent += _async_handler_budget_cost(name, budget_ms)
             spent = _cadence_pressure_skip_ambient(
-                game, name, h_ms, spent, budget,
+                game, name, budget_ms, spent, budget,
             )
         else:
-            spent += h_ms
+            spent += budget_ms
             spent = _cadence_pressure_skip_ambient(
-                game, name, h_ms, spent, budget,
+                game, name, budget_ms, spent, budget,
             )
-        try:
-            from engine import game_heartbeat
-
-            game_heartbeat.touch_heartbeat(f"tick:{name}")
-        except Exception:
-            pass
-        if all_handlers is not None:
-            all_handlers.append((name, h_ms))
+        all_handlers.append((name, h_ms))
         if h_ms >= HANDLER_WARN_MS:
             slow_handlers.append((name, h_ms))
         try:
@@ -530,9 +710,7 @@ async def run_ticks_async(game):
             lag_watch.note_handler_stall(game, name, h_ms)
         except Exception:
             pass
-    _finalize_tick_run(
-        game, t0, slow_handlers, all_handlers, capture, skipped=skipped,
-    )
+        _note_handler_cpu(game, name, h_ms, cpu_ms)
 
 
 def _record_tick_sample(game, total_ms, slow_handlers, *, skipped=None):
