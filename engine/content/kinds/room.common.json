@@ -40,6 +40,7 @@
         "plains",
         "furnace",
         "highway",
+        "trail",
         "desert",
         "wetland",
         "void"
@@ -136,6 +137,7 @@
         "mountains",
         "lake",
         "highway",
+        "trail",
         "city",
         "mountain_highway"
       ]

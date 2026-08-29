@@ -4,7 +4,9 @@
 `riftforge_core_expansion.md` Phases 1-8 **done**; two-repo purity H1-H10
 extraction track (`docs/plans/two_repo_purity_extractions_plan.md`)
 **done**. Public remote **`capnknives/riftforge-engine`**. Current public tag
-**`v0.6.1`** (2026-08-27: Phase 2 purity restore PR 3266 + ~185 monorepo
+**`v0.6.2`** (2026-08-29: engine liquid-flavor kernels + flavor-neutral
+room/item kind stamps + party-merge companion hook). Prior **`v0.6.1`**
+(2026-08-27: Phase 2 purity restore PR 3266 + ~185 monorepo
 `engine/` commits since **`v0.6.0`**). Prior **`v0.6.0`** (2026-08-21; 103
 monorepo engine commits since **`v0.5.3`**: dispatch/door/
 copyover hooks, universal closable doors, channel speech block + MSSP +
@@ -21,8 +23,8 @@ strangler collapse FSM + robbery peel + fixture_id civic mirror.
    `python tools/classic_smoke.py`.
 3. Tag `vX.Y.Z` (semver; breaking hook API = major)::
 
-       git tag -a v0.6.1 -m "riftforge-engine v0.6.1 — purity restore + engine since v0.6.0"
-       git push origin v0.6.1
+       git tag -a v0.6.2 -m "riftforge-engine v0.6.2 — liquid-flavor kernels + kind stamps"
+       git push origin v0.6.2
 
    Prefer the **latest** tag for new consumers.
    Re-exports via `tools/export_public_engine.py` ignore `__pycache__` /
@@ -49,7 +51,7 @@ strangler collapse FSM + robbery peel + fixture_id civic mirror.
   ``register_sheet_field`` / ``register_sheet_contributor``.
 - Optional env: ``RIFTFORGE_DB`` (SQLite path), ``RIFTFORGE_PORT`` (telnet)
 - Optional WebSocket TLS: ``RIFTFORGE_WSS_CERT`` + ``RIFTFORGE_WSS_KEY`` (pair)
-- Monorepo engine version / current public tag: **v0.6.1**. Export via
+- Monorepo engine version / current public tag: **v0.6.2**. Export via
   ``tools/export_public_engine.py``, then tag ``riftforge-engine`` remote.
 - `tools/engine_smoke.py` / `tools/basegame_smoke.py` /
   `tools/classic_smoke.py` pass

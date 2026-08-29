@@ -317,9 +317,13 @@ def format_tagged_message(tag: str, kind: str | None, body: str) -> str:
     tag_s = str(tag or "signal").strip() or "signal"
     kind_s = str(kind or "").strip()
     body_s = str(body or "").strip()
-    # If the game already stamped a plain header (angel radio / OOC),
-    # keep that line as the whole Discord content -- no double wrap.
-    if body_s.startswith("[") or body_s.startswith("((OOC))"):
+    # If the game already stamped a header (angel radio / OOC / markdown
+    # title such as **Patch notes**), keep that as the whole Discord body.
+    if (
+        body_s.startswith("[")
+        or body_s.startswith("((OOC))")
+        or body_s.startswith("**")
+    ):
         text = body_s
     else:
         if kind_s:
@@ -335,14 +339,16 @@ def format_tagged_message(tag: str, kind: str | None, body: str) -> str:
 def _cooldown_ok(tag: str) -> bool:
     """True if this tag may post now (updates timer only on True).
 
-    Tags ``ooc`` and ``wknz`` skip the tip-line spam brake -- they are
-    player talk / host broadcasts and dropping lines under a 3s gate
-    feels broken. Discord's own webhook rate limits still apply; failed
-    POSTs stay fail-soft. The rare music-flow line uses a separate
-    30-minute gate in ``schedule_wknz_music_flow`` before calling here.
+    Tags ``ooc``, ``wknz``, and ``patch_notes`` skip the tip-line spam
+    brake -- they are player talk / host broadcasts / changelog dumps.
+    Patch notes land as one #news message (newlines) per flush; the skip
+    only matters if a huge batch needs a size-cap continuation post.
+    Discord's own webhook rate limits still apply; failed POSTs stay
+    fail-soft. The rare music-flow line uses a separate 30-minute gate in
+    ``schedule_wknz_music_flow`` before calling here.
     """
     now = time.monotonic()
-    if tag in ("ooc", "wknz", "bug_report", "wiznet"):
+    if tag in ("ooc", "wknz", "bug_report", "wiznet", "patch_notes"):
         _last_sent_mono[tag] = now
         return True
     interval = min_interval_seconds()
@@ -719,8 +725,3 @@ def schedule_wknz_outage_down() -> bool:
 def schedule_wknz_outage_up() -> bool:
     """Discord: game IPC is back after an announced outage. Fail-soft."""
     return schedule_wknz(WKNZ_OUTAGE_UP, kind="outage")
-
-
-def schedule_patch_notes(body: str) -> bool:
-    """Convenience: deploy changelog brief → tag ``patch_notes`` (#patch-notes)."""
-    return schedule_discord("patch_notes", body, kind=None)

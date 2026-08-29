@@ -506,8 +506,10 @@ def _simple_english_plural(noun):
     """Cheap English plural for floor-item stacks (blade -> blades).
 
     Pluralizes the last word of a multi-word name (``angel blade`` ->
-    ``angel blades``). Good enough for catalog keys; not a full
-    inflection library (stdlib-only, learning project).
+    ``angel blades``). Invariant plurals (``sweatpants``, ``sneakers``,
+    ``jeans``, ``shoes``) stay unchanged when already ending in ``s``.
+    Good enough for catalog keys; not a full inflection library
+    (stdlib-only).
     """
     word = (noun or "").strip()
     if not word:
@@ -517,7 +519,9 @@ def _simple_english_plural(noun):
         head, tail = word.rsplit(None, 1)
         return f"{head} {_simple_english_plural(tail)}"
     low = word.lower()
-    if low.endswith(("s", "x", "z", "ch", "sh")):
+    # Singular stems that take -es (kiss, bus, church, box) — not bare -s
+    # endings like pants/sneakers/shoes that are already plural-only.
+    if low.endswith(("ss", "us", "is", "x", "z", "ch", "sh")):
         return word + "es"
     if len(word) > 1 and low.endswith("y") and low[-2] not in "aeiou":
         return word[:-1] + "ies"
@@ -525,6 +529,8 @@ def _simple_english_plural(noun):
         return word[:-2] + "ves"
     if low.endswith("f") and not low.endswith("ff"):
         return word[:-1] + "ves"
+    if low.endswith("s"):
+        return word
     return word + "s"
 
 

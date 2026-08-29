@@ -178,26 +178,27 @@ def _log_task_exception(task):
         print(f"[bug_webhook] background task crashed: {exc}", flush=True)
 
 
-def schedule_open_bugs(directory, *, bug_ids=None, game=None):
+def schedule_open_bugs(directory, *, bug_ids=None, game=None, plan=None):
     """Re-POST open bugs from bug_reports.log to the fixer webhook.
 
     bug_ids=None sends every open entry; otherwise only the listed ids that
     are still open. When ``game`` is passed (GM squashbug path), each payload
     is enriched with a fresh context snapshot when the reporter is still in
-    the world roster. Returns ``(scheduled_count, matched_count,
-    scheduled_ids)`` where ``scheduled_ids`` is the list of bug ids that
-    actually queued.
+    the world roster.
+
+    Pass a pre-built :class:`engine.report_webhook_gate.WebhookPlan` from
+    ``plan_bugs`` to honor skip/reconcile filtering. Returns
+    ``(scheduled_count, matched_count, scheduled_ids)``.
     """
     from engine import bug_report_payload
+    from engine import report_webhook_gate
     from engine import reports
 
-    open_bugs = [
-        entry for entry in reports.recent(reports.BUG, None, directory=directory)
-        if entry.get("status", "open") == "open"
-    ]
-    if bug_ids is not None:
-        wanted = set(bug_ids)
-        open_bugs = [entry for entry in open_bugs if entry.get("id") in wanted]
+    if plan is None:
+        plan = report_webhook_gate.plan_bugs(
+            directory, game, bug_ids=bug_ids, reconcile=False,
+        )
+    open_bugs = list(plan.to_queue)
 
     scheduled = 0
     scheduled_ids = []
@@ -222,7 +223,7 @@ def schedule_open_bugs(directory, *, bug_ids=None, game=None):
                         scheduled_ids.append(int(bid))
                     except (TypeError, ValueError):
                         pass
-    return scheduled, len(open_bugs), scheduled_ids
+    return scheduled, plan.matched_count, scheduled_ids
 
 
 def schedule_bug_report(record_payload, *, url=None):

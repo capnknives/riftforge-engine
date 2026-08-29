@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import json
 import os
+from collections import deque
 
 _MAX_OCCUPANTS = 15
+_OUTPUT_RING_MAX = 8
+_OUTPUT_LINE_MAX = 240
 
 # Report kinds that must not attach the full diagnostic blob.
 _MINIMAL_KINDS = frozenset(("suggest", "help", "typo"))
@@ -48,6 +51,59 @@ def _safe_str(value, fallback="?"):
         return fallback
     text = str(value).strip()
     return text or fallback
+
+
+def _serialize_pos(value):
+    """JSON-friendly macro/micro coord pair."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return str(value)
+
+
+def note_report_output(session, message):
+    """Stamp one client-visible line onto the bug-report output ring.
+
+    Skips blank coalesced lines. Truncates long help/look dumps so a
+    report stays readable. Safe to call from FakeSession.send in smokes.
+    """
+    if session is None:
+        return
+    text = str(message or "").strip()
+    if not text:
+        return
+    if len(text) > _OUTPUT_LINE_MAX:
+        text = text[: _OUTPUT_LINE_MAX - 1] + "…"
+    ring = getattr(session, "_report_output_ring", None)
+    if ring is None:
+        ring = deque(maxlen=_OUTPUT_RING_MAX)
+        session._report_output_ring = ring
+    try:
+        ring.append(text)
+    except Exception:
+        pass
+
+
+def note_verb_gate(character, verb, code, *, detail=None):
+    """Stamp the last dispatch refusal onto the login Session.
+
+    Bug reports read ``session.last_verb_gate`` so triage can see *why* a
+    verb closed without re-deriving asleep/frozen/KO/cage gates from prose.
+    """
+    if character is None or not code:
+        return
+    sess = getattr(character, "session", None)
+    if sess is None:
+        return
+    verb_text = str(verb or getattr(sess, "last_command", None) or "")[:80]
+    entry = {
+        "verb": verb_text,
+        "code": str(code)[:120],
+    }
+    if detail:
+        entry["detail"] = str(detail)[:200]
+    sess._last_verb_gate = entry
 
 
 def _presence_mode(character):
@@ -355,6 +411,55 @@ def build(character, game, *, history=None, description=None, kind=None):
             "deploy_sha": _deploy_sha(report_dir),
         },
     }
+
+    for flag in ("gm_mode", "gm_spirit", "gm_away"):
+        if getattr(character, flag, False):
+            ctx["character"][flag] = True
+
+    if room is not None:
+        if getattr(room, "dark", False):
+            ctx["room"]["dark"] = True
+            try:
+                ctx["room"]["can_see_in_dark"] = bool(
+                    hooks.can_see_in_dark(character, room),
+                )
+            except Exception as exc:
+                _note_context_error(context_errors, "can_see_in_dark", exc)
+        plane = getattr(room, "plane", None)
+        if plane:
+            ctx["room"]["plane"] = str(plane)
+        legacy = getattr(room, "legacy_key", None)
+        if legacy:
+            ctx["room"]["legacy_key"] = str(legacy)
+
+    sess = getattr(character, "session", None)
+    if sess is not None:
+        last_cmd = getattr(sess, "last_command", None)
+        if last_cmd:
+            ctx["session"]["last_command"] = str(last_cmd)[:200]
+        ring = getattr(sess, "_report_output_ring", None)
+        if ring:
+            ctx["session"]["last_output"] = list(ring)[-_OUTPUT_RING_MAX:]
+        gate = getattr(sess, "_last_verb_gate", None)
+        if isinstance(gate, dict) and gate:
+            ctx["session"]["last_verb_gate"] = gate
+
+    pos = {}
+    macro = getattr(character, "macro_pos", None)
+    micro = getattr(character, "micro_pos", None)
+    if macro:
+        pos["macro_pos"] = _serialize_pos(macro)
+    if micro:
+        pos["micro_pos"] = _serialize_pos(micro)
+    if macro or micro:
+        try:
+            from engine.systems.overland import overland_mode
+
+            pos["overland_mode"] = overland_mode(character)
+        except Exception as exc:
+            _note_context_error(context_errors, "overland_mode", exc)
+    if pos:
+        ctx["position"] = pos
 
     combat_aim = getattr(character, "combat_aim", None)
     if combat_aim:

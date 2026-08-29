@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Mortals and Monsters — play in browser</title>
   <link rel="stylesheet" href="style.css">
 </head>
@@ -76,6 +76,10 @@
           ></div>
         </div>
       </section>
+      <div id="room-card" hidden>
+        <div id="room-title"></div>
+        <div id="room-sub"></div>
+      </div>
       <div
         id="output"
         role="log"
@@ -103,7 +107,7 @@
           <div id="atlas-scroll">
             <canvas id="atlas" width="384" height="240" aria-label="Overland atlas"></canvas>
           </div>
-          <div id="atlas-caption">Right-click a landmark to travel. Hover to name it.</div>
+          <div id="atlas-caption">Tap or long-press a landmark to travel. On a computer, right-click. Hover to name it.</div>
         </div>
       </div>
       <div id="zone-panel" hidden>
@@ -143,6 +147,21 @@
     </aside>
   </div>
 
+  <div id="more-sheet" hidden>
+    <h2>Play tools</h2>
+    <p class="more-lead">Same game as telnet. These open prefs or type a command.</p>
+    <button type="button" id="more-help">help browser</button>
+    <button type="button" id="more-shortcuts">shortcuts</button>
+    <button type="button" id="more-display">display</button>
+    <p class="more-meta">
+      <a href="https://play.riftforge.me" target="_blank" rel="noopener noreferrer">site</a>
+      &middot;
+      <a data-discord-invite href="https://discord.com/invite/KZbeRd389" target="_blank" rel="noopener noreferrer">Discord</a>
+      &middot; telnet 162.243.50.82 4000
+    </p>
+    <p id="more-build" class="build-stamp"></p>
+  </div>
+
   <div id="prompt-mirror" aria-hidden="true"></div>
 
   <form id="input-row" autocomplete="off">
@@ -160,6 +179,13 @@
     <button type="submit" id="send" disabled>Send</button>
   </form>
 
+  <nav id="phone-nav" aria-label="Phone layout">
+    <button type="button" data-phone-tab="log" aria-pressed="true">Log</button>
+    <button type="button" data-phone-tab="maps" aria-pressed="false">Maps</button>
+    <button type="button" data-phone-tab="status" aria-pressed="false">Status</button>
+    <button type="button" data-phone-tab="more" aria-pressed="false">More</button>
+  </nav>
+
   <ul id="ctx-menu" hidden role="menu" aria-label="Atlas actions"></ul>
 
   <div id="shortcuts-dialog" hidden role="dialog" aria-modal="true" aria-labelledby="shortcuts-title">
@@ -170,6 +196,8 @@
         <dt>&uarr; / &darr;</dt><dd>Recall earlier commands (while typing)</dd>
         <dt>Esc</dt><dd>Close a menu or this dialog</dd>
         <dt>Right-click atlas</dt><dd>Walk, drive, atlas, or enter a landmark</dd>
+        <dt>Tap or long-press atlas</dt><dd>Same travel list on a phone</dd>
+        <dt>Phone tabs</dt><dd>Log, Maps, Status, More (narrow screens)</dd>
         <dt>Left-click interior map</dt><dd>Name a room (does not move you)</dd>
         <dt>&minus; / &plus; buttons</dt><dd>Zoom a map pane out or in</dd>
         <dt>&#9662; chevron</dt><dd>Collapse or expand a pane</dd>

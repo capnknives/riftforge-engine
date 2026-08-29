@@ -147,17 +147,13 @@ def run_post_overlay_checks(root=None):
     if root is None:
         root = os.getcwd()
     try:
-        import engine.changelog_ids as changelog_ids
-        import engine.changelog_index as changelog_index_mod
+        import engine.changelog_ledger as changelog_ledger_mod
 
-        importlib.reload(changelog_ids)
-        changelog_index_mod = importlib.reload(changelog_index_mod)
-        changelog_index_mod.stamp_pending_and_ensure_index(
-            root, log_prefix="[auto_deploy]",
-        )
+        changelog_ledger_mod = importlib.reload(changelog_ledger_mod)
+        changelog_ledger_mod.assign_new_slugs(root, log_prefix="[auto_deploy]")
     except Exception as exc:
         print(
-            f"[auto_deploy] post-overlay warning: changelog index heal skipped: {exc}",
+            f"[auto_deploy] post-overlay warning: changelog ledger mint skipped: {exc}",
             flush=True,
         )
     for message in check_integrations():

@@ -226,12 +226,17 @@ def _normalize_doc(data):
     return data
 
 
-def save_doc_validated(path, doc):
-    """Atomic write + full maps.load_all_maps() validate; rollback on failure.
+def save_doc_validated(path, doc, *, full_world_reload=True):
+    """Atomic write + optional full maps.load_all_maps() validate.
 
     Validates with ``include_deferred=True`` so exits that target rooms in
     ``autoload: false`` zones (Lebanon, etc.) are resolved. Boot still
     skips those files until ``gm maps load``.
+
+    Player ``remodel`` passes ``full_world_reload=False``: writing the zone
+    JSON is enough, and reloading every deferred map on each restyle is
+    what made remodel hitch for seconds. Staff dig / link keep the full
+    reload so a bad exit still rolls back.
 
     Returns a short ok dict. Does NOT replace the live game.rooms graph.
     """
@@ -257,18 +262,21 @@ def save_doc_validated(path, doc):
             pass
 
     save_json(path, payload)
-    try:
-        rooms, start_room, _ = maps.load_all_maps(include_deferred=True)
-    except Exception as exc:
-        if had_file and old_bytes is not None:
-            with open(path, "wb") as handle:
-                handle.write(old_bytes)
-        elif not had_file and os.path.isfile(path):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-        raise ValueError(str(exc)) from exc
+    rooms = payload.get("rooms") or []
+    start_room = None
+    if full_world_reload:
+        try:
+            rooms, start_room, _ = maps.load_all_maps(include_deferred=True)
+        except Exception as exc:
+            if had_file and old_bytes is not None:
+                with open(path, "wb") as handle:
+                    handle.write(old_bytes)
+            elif not had_file and os.path.isfile(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            raise ValueError(str(exc)) from exc
 
     map_id = maps._map_id_for(os.path.basename(path), payload)
     backup_note = None
@@ -281,11 +289,15 @@ def save_doc_validated(path, doc):
 
     return {
         "ok": True,
-        "room_count": len(rooms),
-        "start_room": start_room.key if start_room else None,
+        "room_count": len(rooms) if not isinstance(rooms, dict) else len(rooms),
+        "start_room": (
+            start_room.key if start_room is not None and hasattr(start_room, "key")
+            else None
+        ),
         "path": path,
         "map_id": map_id,
         "hot_backup_refreshed": backup_note,
+        "full_world_reload": bool(full_world_reload),
     }
 
 
@@ -553,7 +565,7 @@ def _room_owner_hint(game, room_or_key):
 
 
 def dig_room(game, from_room, direction, new_key, *,
-             description=None, title=None, bidirectional=True):
+             description=None, title=None, bidirectional=True, persist=True):
     """Create a new hand room, link it, persist JSON, update live graph.
 
     From a hand room: appends to rooms[] and exits.
@@ -562,6 +574,9 @@ def dig_room(game, from_room, direction, new_key, *,
 
     Builder-typed names are map-qualified (``{map_id}:Name``) so towns can
     reuse the same look name; the short name is stored as ``title``.
+
+    ``persist=False`` updates the live graph only (player remodel garage
+    batches one JSON write at the end). Staff ``room dig`` keeps the default.
 
     Returns a short success message string. Raises ValueError on refusal.
     """
@@ -781,13 +796,14 @@ def dig_room(game, from_room, direction, new_key, *,
             if src_exits.get(direction) == vnum:
                 src_exits.pop(direction, None)
         raise
-    save_doc_validated(path, doc)
+    if persist:
+        save_doc_validated(path, doc)
 
     msg = (
         f"Dug {room_vnum_mod.staff_room_label(live) or vnum} "
         f"{direction} of "
         f"{room_vnum_mod.staff_room_label(from_room) or from_id} "
-        f"(saved)."
+        f"({'saved' if persist else 'live'})."
     )
     msg += f" ROOM NAME: {room_name_face!r}."
     msg += f" VNUM: {vnum}."
@@ -858,12 +874,16 @@ def create_room(game, here, new_key, *, description=None, title=None):
     )
 
 
-def link_rooms(game, from_room, direction, to_query, *, bidirectional=True):
+def link_rooms(game, from_room, direction, to_query, *, bidirectional=True,
+               persist=True):
     """Link from_room toward an existing room; persist both sides as needed.
 
     ``to_query`` is a staff address: **VNUM** or unique **ROOM NAME**
     (internal key still accepted silently until Phase 3). Exit JSON still
     stores the destination's internal key.
+
+    ``persist=False`` updates the live graph only so remodel can batch one
+    JSON write.
     """
     direction = (direction or "").strip().lower()
     to_query = (to_query or "").strip()
@@ -902,86 +922,14 @@ def link_rooms(game, from_room, direction, to_query, *, bidirectional=True):
                 f"the destination first if you really intend to rewire it."
             )
 
-    from_path, _, _, _ = resolve_map_path(game, from_room)
-    from_doc = load_doc(from_path)
+    if persist:
+        from_path, _, _, _ = resolve_map_path(game, from_room)
+        from_doc = load_doc(from_path)
 
-    if is_grid_room(from_room):
-        grid = from_doc.get("grid")
-        if not isinstance(grid, dict):
-            raise ValueError("This map has no grid.")
-        portals = grid.setdefault("portals", [])
-        portals[:] = [
-            p for p in portals
-            if not (
-                int(p.get("x", -1)) == int(from_room.grid_x)
-                and int(p.get("y", -1)) == int(from_room.grid_y)
-                and str(p.get("direction", "")).lower() == direction
-            )
-        ]
-        portals.append({
-            "x": int(from_room.grid_x),
-            "y": int(from_room.grid_y),
-            "direction": direction,
-            "to_room": to_key,
-        })
-    else:
-        src_entry = _ensure_hand_room_entry(from_doc, from_room)
-        src_entry.setdefault("exits", {})[direction] = to_key
-
-    save_doc_validated(from_path, from_doc)
-
-    if back:
-        to_path, _, _, _ = resolve_map_path(game, dest)
-        to_doc = load_doc(to_path)
-        if is_grid_room(dest):
-            grid = to_doc.get("grid")
-            if isinstance(grid, dict):
-                portals = grid.setdefault("portals", [])
-                portals[:] = [
-                    p for p in portals
-                    if not (
-                        int(p.get("x", -1)) == int(dest.grid_x)
-                        and int(p.get("y", -1)) == int(dest.grid_y)
-                        and str(p.get("direction", "")).lower() == back
-                    )
-                ]
-                portals.append({
-                    "x": int(dest.grid_x),
-                    "y": int(dest.grid_y),
-                    "direction": back,
-                    "to_room": from_room.key,
-                })
-        else:
-            dest_entry = _ensure_hand_room_entry(to_doc, dest)
-            dest_entry.setdefault("exits", {})[back] = from_room.key
-        save_doc_validated(to_path, to_doc)
-
-    _live_set_exit(game, from_room.key, direction, to_key)
-    if back:
-        _live_set_exit(game, to_key, back, from_room.key)
-
-    extra = f" (and {back} back)" if back else ""
-    from_label = room_vnum_mod.staff_room_label(from_room) or from_room.key
-    return (
-        f"Linked {from_label} --{direction}--> {dest_label}{extra} (saved)."
-    )
-
-
-def unlink_exit(game, from_room, direction, *, bidirectional=True):
-    """Remove an exit from from_room; optionally clear the reverse."""
-    direction = (direction or "").strip().lower()
-    if not direction:
-        raise ValueError("Usage: room unlink <direction>")
-    dest = (getattr(from_room, "exits", None) or {}).get(direction)
-    dest_key = getattr(dest, "key", None) if dest is not None else None
-    back = opposite_direction(direction) if bidirectional else None
-
-    path, _, _, _ = resolve_map_path(game, from_room)
-    doc = load_doc(path)
-
-    if is_grid_room(from_room):
-        grid = doc.get("grid")
-        if isinstance(grid, dict):
+        if is_grid_room(from_room):
+            grid = from_doc.get("grid")
+            if not isinstance(grid, dict):
+                raise ValueError("This map has no grid.")
             portals = grid.setdefault("portals", [])
             portals[:] = [
                 p for p in portals
@@ -991,41 +939,128 @@ def unlink_exit(game, from_room, direction, *, bidirectional=True):
                     and str(p.get("direction", "")).lower() == direction
                 )
             ]
-    else:
-        entry = find_room_entry(doc, from_room.key)
-        if entry is not None:
-            entry.setdefault("exits", {}).pop(direction, None)
+            portals.append({
+                "x": int(from_room.grid_x),
+                "y": int(from_room.grid_y),
+                "direction": direction,
+                "to_room": to_key,
+            })
+        else:
+            src_entry = _ensure_hand_room_entry(from_doc, from_room)
+            src_entry.setdefault("exits", {})[direction] = to_key
 
-    save_doc_validated(path, doc)
+        save_doc_validated(from_path, from_doc)
 
-    if back and dest_key and dest_key in game.rooms:
-        other = game.rooms[dest_key]
-        rev = (getattr(other, "exits", None) or {}).get(back)
-        if rev is from_room or getattr(rev, "key", None) == from_room.key:
-            other_path, _, _, _ = resolve_map_path(game, other)
-            other_doc = load_doc(other_path)
-            if is_grid_room(other):
-                grid = other_doc.get("grid")
+        if back:
+            to_path, _, _, _ = resolve_map_path(game, dest)
+            to_doc = load_doc(to_path)
+            if is_grid_room(dest):
+                grid = to_doc.get("grid")
                 if isinstance(grid, dict):
                     portals = grid.setdefault("portals", [])
                     portals[:] = [
                         p for p in portals
                         if not (
-                            int(p.get("x", -1)) == int(other.grid_x)
-                            and int(p.get("y", -1)) == int(other.grid_y)
+                            int(p.get("x", -1)) == int(dest.grid_x)
+                            and int(p.get("y", -1)) == int(dest.grid_y)
                             and str(p.get("direction", "")).lower() == back
                         )
                     ]
+                    portals.append({
+                        "x": int(dest.grid_x),
+                        "y": int(dest.grid_y),
+                        "direction": back,
+                        "to_room": from_room.key,
+                    })
             else:
-                oentry = find_room_entry(other_doc, dest_key)
-                if oentry is not None:
-                    oentry.setdefault("exits", {}).pop(back, None)
-            save_doc_validated(other_path, other_doc)
+                dest_entry = _ensure_hand_room_entry(to_doc, dest)
+                dest_entry.setdefault("exits", {})[back] = from_room.key
+            save_doc_validated(to_path, to_doc)
+
+    _live_set_exit(game, from_room.key, direction, to_key)
+    if back:
+        _live_set_exit(game, to_key, back, from_room.key)
+
+    extra = f" (and {back} back)" if back else ""
+    from_label = room_vnum_mod.staff_room_label(from_room) or from_room.key
+    saved = "saved" if persist else "live"
+    return (
+        f"Linked {from_label} --{direction}--> {dest_label}{extra} ({saved})."
+    )
+
+
+def unlink_exit(game, from_room, direction, *, bidirectional=True, persist=True):
+    """Remove an exit from from_room; optionally clear the reverse.
+
+    ``persist=False`` updates the live graph only so remodel can batch one
+    JSON write.
+    """
+    direction = (direction or "").strip().lower()
+    if not direction:
+        raise ValueError("Usage: room unlink <direction>")
+    dest = (getattr(from_room, "exits", None) or {}).get(direction)
+    dest_key = getattr(dest, "key", None) if dest is not None else None
+    if dest_key is None and isinstance(dest, str):
+        dest_key = dest
+    back = opposite_direction(direction) if bidirectional else None
+
+    if persist:
+        path, _, _, _ = resolve_map_path(game, from_room)
+        doc = load_doc(path)
+
+        if is_grid_room(from_room):
+            grid = doc.get("grid")
+            if isinstance(grid, dict):
+                portals = grid.setdefault("portals", [])
+                portals[:] = [
+                    p for p in portals
+                    if not (
+                        int(p.get("x", -1)) == int(from_room.grid_x)
+                        and int(p.get("y", -1)) == int(from_room.grid_y)
+                        and str(p.get("direction", "")).lower() == direction
+                    )
+                ]
+        else:
+            entry = find_room_entry(doc, from_room.key)
+            if entry is not None:
+                entry.setdefault("exits", {}).pop(direction, None)
+
+        save_doc_validated(path, doc)
+
+        if back and dest_key and dest_key in game.rooms:
+            other = game.rooms[dest_key]
+            rev = (getattr(other, "exits", None) or {}).get(back)
+            if rev is from_room or getattr(rev, "key", None) == from_room.key:
+                other_path, _, _, _ = resolve_map_path(game, other)
+                other_doc = load_doc(other_path)
+                if is_grid_room(other):
+                    grid = other_doc.get("grid")
+                    if isinstance(grid, dict):
+                        portals = grid.setdefault("portals", [])
+                        portals[:] = [
+                            p for p in portals
+                            if not (
+                                int(p.get("x", -1)) == int(other.grid_x)
+                                and int(p.get("y", -1)) == int(other.grid_y)
+                                and str(p.get("direction", "")).lower() == back
+                            )
+                        ]
+                else:
+                    oentry = find_room_entry(other_doc, dest_key)
+                    if oentry is not None:
+                        oentry.setdefault("exits", {}).pop(back, None)
+                save_doc_validated(other_path, other_doc)
+                _live_clear_exit(game, dest_key, back)
+    elif back and dest_key and dest_key in game.rooms:
+        other = game.rooms[dest_key]
+        rev = (getattr(other, "exits", None) or {}).get(back)
+        if rev is from_room or getattr(rev, "key", None) == from_room.key:
             _live_clear_exit(game, dest_key, back)
 
     _live_clear_exit(game, from_room.key, direction)
     from_label = room_vnum_mod.staff_room_label(from_room) or from_room.key
-    return f"Unlinked {direction} from {from_label} (saved)."
+    saved = "saved" if persist else "live"
+    return f"Unlinked {direction} from {from_label} ({saved})."
 
 
 def rset_field(game, room, field, value):

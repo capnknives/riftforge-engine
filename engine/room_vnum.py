@@ -513,6 +513,29 @@ def player_room_name(room) -> str:
     return getattr(room, "key", "") or ""
 
 
+def fold_room_needle(text) -> str:
+    """Staff query fold: underscores and hyphens count as spaces.
+
+    ``goto fort_laramie`` must find Fort Laramie rooms. Bare ``-`` / ``_``
+    folds to empty and matches nothing (never ``'' in title``).
+    """
+    raw = str(text or "").strip().lower().replace("_", " ").replace("-", " ")
+    return " ".join(raw.split())
+
+
+def staff_match_label(room) -> str:
+    """Staff disambiguation line: NAME[VNUM] plus map id when stamped.
+
+    Grid mouths often have no VNUM -- the map id is what tells America
+    Overland apart from a second atlas that reused a similar ROOM NAME.
+    """
+    label = staff_room_label(room)
+    map_id = str(getattr(room, "map_id", None) or "").strip()
+    if map_id:
+        return f"{label} ({map_id})"
+    return label
+
+
 def staff_room_label(room) -> str:
     """GM / mapper prose: ``ROOM NAME[VNUM]`` when a hand-room vnum exists.
 
@@ -1363,17 +1386,24 @@ def find_room_by_vnum(game, vnum_text):
 def room_matches_needle(room, needle, *, match_key=False) -> bool:
     """True when *needle* is a substring of ROOM NAME and/or VNUM.
 
-    Staff ``where`` / partial ``goto`` share this matcher. Optional
-    ``match_key`` keeps silent legacy dig-key substring matching for
-    ``where`` discovery until Phase 3 teardown (never teach dig keys).
+    Staff ``where`` / partial ``goto`` share this matcher. Underscores
+    and hyphens in the query fold to spaces so ``fort_laramie`` hits
+    Fort Laramie. Optional ``match_key`` keeps silent legacy dig-key
+    substring matching for ``where`` discovery until Phase 3 teardown
+    (never teach dig keys).
     """
     if room is None or not needle:
         return False
-    want = str(needle).strip().lower()
-    if not want:
+    want_raw = str(needle).strip().lower()
+    if not want_raw:
         return False
-    title = (room_name(room) or "").lower()
-    if want in title:
+    want = fold_room_needle(needle)
+    title_raw = (room_name(room) or "").lower()
+    title_folded = fold_room_needle(room_name(room) or "")
+    # Folded first: fort_laramie ⊂ Fort Laramie Approach.
+    if want and want in title_folded:
+        return True
+    if want_raw in title_raw:
         return True
     raw_v = getattr(room, "vnum", None)
     if raw_v is not None and str(raw_v).strip():
@@ -1381,26 +1411,48 @@ def room_matches_needle(room, needle, *, match_key=False) -> bool:
             code = validate_vnum(raw_v).lower()
         except ValueError:
             code = str(raw_v).strip().lower()
-        if want in code:
+        if want_raw in code:
             return True
     if match_key:
-        key = (getattr(room, "key", "") or "").lower()
-        if want in key:
+        key_raw = (getattr(room, "key", "") or "").lower()
+        if want_raw in key_raw:
+            return True
+        key_folded = fold_room_needle(key_raw)
+        if want and want in key_folded:
             return True
     return False
 
 
-def iter_rooms_matching(game, needle, *, match_key=False):
+def room_on_plane(room, plane) -> bool:
+    """True when *room* is on *plane* (empty plane = any)."""
+    want = str(plane or "").strip().lower()
+    if not want:
+        return True
+    if room is None:
+        return False
+    got = str(getattr(room, "plane", None) or "earth").strip().lower()
+    return got == want
+
+
+def iter_scope_rooms(game, *, plane=None):
+    """Yield live rooms, optionally restricted to one plane."""
+    rooms = getattr(game, "rooms", None) or {}
+    for room in rooms.values():
+        if room_on_plane(room, plane):
+            yield room
+
+
+def iter_rooms_matching(game, needle, *, match_key=False, plane=None):
     """Every live room matching *needle* (ROOM NAME / VNUM substring).
 
     Sorted by ROOM NAME then storage key for stable staff lists.
+    Optional ``plane`` limits the search (staff ``goto 1861 laramie``).
     """
     want = (needle or "").strip()
     if not want or game is None:
         return []
-    rooms = getattr(game, "rooms", None) or {}
     hits = [
-        room for room in rooms.values()
+        room for room in iter_scope_rooms(game, plane=plane)
         if room_matches_needle(room, want, match_key=match_key)
     ]
 
@@ -1414,15 +1466,20 @@ def iter_rooms_matching(game, needle, *, match_key=False):
     return hits
 
 
-def resolve_room(game, query, *, allow_internal_key=True):
+def resolve_room(game, query, *, allow_internal_key=True, plane=None):
     """Resolve a staff/query string to a Room (Phase 1–2 identity bridge).
 
     Order:
       1. Exact VNUM (``CA00001``).
-      2. Exact ROOM NAME (case-insensitive ``look_title`` / title).
+      2. Exact ROOM NAME (case-insensitive ``look_title`` / title;
+         underscores/hyphens fold to spaces). A unique exact title that
+         is also a substring of another ROOM NAME is still ambiguous
+         (``Laramie Approach`` vs ``Fort Laramie Approach``).
       3. Unique partial ROOM NAME / VNUM substring (case-insensitive).
       4. Exact internal key (``room.key``) -- silent compat until Phase 3;
          disable with ``allow_internal_key=False`` to rehearse the cutover.
+
+    Optional ``plane`` scopes every step (staff ``goto 1861 laramie``).
 
     Returns ``(room_or_None, how)`` where ``how`` is
     ``\"vnum\"`` / ``\"room_name\"`` / ``\"partial_name\"`` /
@@ -1437,22 +1494,36 @@ def resolve_room(game, query, *, allow_internal_key=True):
     if not text:
         return None, None
     by_vnum = find_room_by_vnum(game, text)
-    if by_vnum is not None:
+    if by_vnum is not None and room_on_plane(by_vnum, plane):
         return by_vnum, "vnum"
     rooms = getattr(game, "rooms", None) or {}
     lowered = text.lower()
+    folded_query = fold_room_needle(text)
     name_hits = []
-    for room in rooms.values():
-        if room_name(room).lower() == lowered:
-            name_hits.append(room)
+    if folded_query:
+        for room in iter_scope_rooms(game, plane=plane):
+            if fold_room_needle(room_name(room)) == folded_query:
+                name_hits.append(room)
     if len(name_hits) == 1:
+        # Exact unique title still collides when a longer name contains
+        # it -- staff typed "laramie approach" meaning the fort mouth.
+        siblings = [
+            room for room in iter_rooms_matching(
+                game, text, match_key=False, plane=plane,
+            )
+            if room is not name_hits[0]
+        ]
+        if siblings:
+            return None, "ambiguous_name"
         return name_hits[0], "room_name"
     if len(name_hits) > 1:
         # Shared ROOM NAMES must use VNUM -- do not fall through to a
         # coincidental internal-key match and silently pick the wrong room.
         return None, "ambiguous_name"
     # Unique partial ROOM NAME / VNUM substring (goto Town Park, etc.).
-    partial_hits = iter_rooms_matching(game, text, match_key=False)
+    partial_hits = iter_rooms_matching(
+        game, text, match_key=False, plane=plane,
+    )
     if len(partial_hits) == 1:
         return partial_hits[0], "partial_name"
     if len(partial_hits) > 1:
@@ -1460,9 +1531,9 @@ def resolve_room(game, query, *, allow_internal_key=True):
     if allow_internal_key:
         # Direct dict hit (qualified keys, legacy dig targets, RoomMap aliases).
         hit = rooms.get(text)
-        if hit is not None:
+        if hit is not None and room_on_plane(hit, plane):
             return hit, "internal_key"
-        for room in rooms.values():
+        for room in iter_scope_rooms(game, plane=plane):
             if (getattr(room, "key", "") or "").lower() == lowered:
                 return room, "internal_key"
             leg = getattr(room, "legacy_key", None)
@@ -1472,26 +1543,27 @@ def resolve_room(game, query, *, allow_internal_key=True):
         aliases = getattr(game, "room_aliases", None) or {}
         mapped = aliases.get(text)
         if mapped and mapped in rooms:
-            return rooms[mapped], "internal_key"
+            aliased = rooms[mapped]
+            if room_on_plane(aliased, plane):
+                return aliased, "internal_key"
         for aka, vnum in aliases.items():
             if str(aka).lower() == lowered and vnum in rooms:
-                return rooms[vnum], "internal_key"
+                aliased = rooms[vnum]
+                if room_on_plane(aliased, plane):
+                    return aliased, "internal_key"
     return None, None
 
 
-def _ambiguous_name_tip(game, query) -> str:
-    """Staff tip listing VNUMs for rooms matching *query* (exact or partial)."""
+def _ambiguous_name_tip(game, query, *, plane=None) -> str:
+    """Staff tip listing VNUMs / map ids for rooms matching *query*."""
     text = (query or "").strip()
-    lowered = text.lower()
-    rooms = getattr(game, "rooms", None) or {}
-    exact = [
-        room for room in rooms.values()
-        if room_name(room).lower() == lowered
-    ]
-    hits = exact if exact else iter_rooms_matching(game, text, match_key=False)
+    # List every substring hit, not exact-only -- a unique exact title can
+    # still collide with a longer name (Laramie Approach vs Fort Laramie
+    # Approach). Exact-only would hide the longer mouth.
+    hits = iter_rooms_matching(game, text, match_key=False, plane=plane)
     labels = []
     for room in hits[:12]:
-        label = staff_room_label(room)
+        label = staff_match_label(room)
         if label:
             labels.append(label)
     more = ""
@@ -1504,24 +1576,25 @@ def _ambiguous_name_tip(game, query) -> str:
     )
 
 
-def resolve_room_or_error(game, query, *, allow_internal_key=True):
+def resolve_room_or_error(game, query, *, allow_internal_key=True, plane=None):
     """Resolve for staff verbs -- returns ``(room, None)`` or ``(None, err)``.
 
     Staff addressing is **ROOM NAME** and **VNUM** (partial name OK when
     unique). Internal key remains silent compat when
     ``allow_internal_key`` is True. Prefer this over bare
     :func:`resolve_room` when the caller sends a tip to a GM.
+    Optional ``plane`` scopes the search like :func:`resolve_room`.
     """
     text = (query or "").strip()
     if not text:
         return None, "Name a room by VNUM (e.g. MT00002) or unique ROOM NAME."
     room, how = resolve_room(
-        game, text, allow_internal_key=allow_internal_key,
+        game, text, allow_internal_key=allow_internal_key, plane=plane,
     )
     if room is not None:
         return room, None
     if how == "ambiguous_name":
-        return None, _ambiguous_name_tip(game, text)
+        return None, _ambiguous_name_tip(game, text, plane=plane)
     return None, (
         f"No room matching VNUM or ROOM NAME {text!r}. "
         "Try `gm where room <text>` or `gm goto <vnum>`."

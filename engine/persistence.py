@@ -2207,6 +2207,16 @@ def save_winchester_pursuit(conn, game):
     _save_meta_dict(conn, "winchester_pursuit", game, "winchester_pursuit")
 
 
+def load_winchester_road(conn):
+    """Load Winchester board-tour circuit toggle from meta (default {})."""
+    return _load_meta_dict(conn, "winchester_road")
+
+
+def save_winchester_road(conn, game):
+    """Persist game.winchester_road (enabled) to meta."""
+    _save_meta_dict(conn, "winchester_road", game, "winchester_road")
+
+
 def load_cadence_airport(conn):
     """Load GM Cadence airport travel toggle from meta (default off)."""
     return _load_meta_dict(conn, "cadence_airport")
@@ -2355,6 +2365,43 @@ def _restore_herb_fields(item, state):
             pass
 
 
+def _persist_text_is_corrupt_repr(text):
+    if not isinstance(text, str):
+        return True
+    value = text.strip()
+    if not value:
+        return True
+    return value.startswith("<") and " object at 0x" in value
+
+
+def _persist_item_field(item, attr, *, fallback="item"):
+    """SQLite-safe plain key/description for held-item rows."""
+    from engine import hooks
+
+    raw = getattr(item, attr, None)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text and not _persist_text_is_corrupt_repr(text):
+            return text
+    if attr == "key":
+        painted = hooks.item_display_key(item, None)
+        from engine.style import strip_ansi
+
+        text = strip_ansi(painted).strip() if painted else ""
+        if text and not _persist_text_is_corrupt_repr(text):
+            return text
+    if attr == "description":
+        desc = getattr(item, "description", None)
+        if isinstance(desc, str):
+            text = desc.strip()
+            if text and not _persist_text_is_corrupt_repr(text):
+                return text
+        key_text = _persist_item_field(item, "key", fallback=fallback)
+        if key_text and not _persist_text_is_corrupt_repr(key_text):
+            return key_text
+    return fallback
+
+
 def _bag_contents_for_json(item):
     """Serialize nested bag rows for the container blob."""
     contents = getattr(item, "bag_contents", None) or []
@@ -2363,8 +2410,10 @@ def _bag_contents_for_json(item):
         if not isinstance(sub, Item):
             continue
         out.append({
-            "key": sub.key,
-            "description": sub.description,
+            "key": _persist_item_field(sub, "key"),
+            "description": _persist_item_field(
+                sub, "description", fallback=_persist_item_field(sub, "key"),
+            ),
             "container": json.loads(_item_container_blob(sub)),
         })
     return out
@@ -2378,8 +2427,10 @@ def _wallet_contents_for_json(item):
         if not isinstance(sub, Item):
             continue
         out.append({
-            "key": sub.key,
-            "description": sub.description,
+            "key": _persist_item_field(sub, "key"),
+            "description": _persist_item_field(
+                sub, "description", fallback=_persist_item_field(sub, "key"),
+            ),
             "container": json.loads(_item_container_blob(sub)),
         })
     return out
@@ -2451,6 +2502,8 @@ def _restore_body_harvest_fields(item, state):
     """Re-apply corpse harvest flags + Origin stamps from a container blob."""
     if state.get("body_harvested_meat"):
         item.body_harvested_meat = True
+    if state.get("body_harvested_hide"):
+        item.body_harvested_hide = True
     if state.get("body_drained"):
         item.body_drained = True
     if state.get("body_siphoned"):
@@ -2461,6 +2514,71 @@ def _restore_body_harvest_fields(item, state):
         item.body_origin = str(state["body_origin"]).strip().lower()
     if state.get("body_path"):
         item.body_path = str(state["body_path"]).strip().lower()
+    if state.get("body_type"):
+        item.body_type = str(state["body_type"]).strip().lower()
+    if state.get("body_no_blood"):
+        item.body_no_blood = True
+    if "body_yields_meat" in state and state.get("body_yields_meat") is not None:
+        item.body_yields_meat = bool(state["body_yields_meat"])
+    if "body_yields_hide" in state and state.get("body_yields_hide") is not None:
+        item.body_yields_hide = bool(state["body_yields_hide"])
+    if state.get("body_creature_id"):
+        item.body_creature_id = str(state["body_creature_id"]).strip()
+    listed = state.get("body_butcher_yields")
+    if isinstance(listed, list):
+        item.body_butcher_yields = [
+            str(x).strip() for x in listed if str(x).strip()
+        ]
+    custody = state.get("custody")
+    if custody:
+        item.custody = str(custody).strip().lower()
+    if state.get("morgue_drawer") is not None:
+        try:
+            item.morgue_drawer = int(state["morgue_drawer"])
+        except (TypeError, ValueError):
+            pass
+    if state.get("morgue_tray_in_at_tick") is not None:
+        try:
+            item.morgue_tray_in_at_tick = int(state["morgue_tray_in_at_tick"])
+        except (TypeError, ValueError):
+            pass
+    stored_in = state.get("stored_in_receptacle_key")
+    if stored_in:
+        item.stored_in_receptacle_key = str(stored_in).strip()
+    if state.get("body_receptacle"):
+        item.body_receptacle = True
+    fam = state.get("receptacle_family")
+    if fam:
+        item.receptacle_family = str(fam).strip().lower()
+    if state.get("receptacle_slot") is not None:
+        try:
+            item.receptacle_slot = int(state["receptacle_slot"])
+        except (TypeError, ValueError):
+            pass
+    stored_body_key = state.get("stored_body_key")
+    if stored_body_key:
+        item.stored_body_key = str(stored_body_key).strip()
+    stone_label = state.get("plot_stone_label")
+    if stone_label:
+        item.plot_stone_label = str(stone_label).strip()
+    stone_identity = state.get("plot_stone_identity")
+    if stone_identity:
+        item.plot_stone_identity = str(stone_identity).strip()
+    for field_name in ("custom_look_in_empty_lines", "custom_look_in_lines"):
+        custom_lines = state.get(field_name)
+        if isinstance(custom_lines, list) and custom_lines:
+            setattr(
+                item,
+                field_name,
+                [str(line).strip() for line in custom_lines if str(line).strip()],
+            )
+    death_record = state.get("death_record")
+    if isinstance(death_record, dict):
+        item.death_record = dict(death_record)
+    if state.get("forensic_autopsied"):
+        item.forensic_autopsied = True
+    if state.get("evidence_tampered"):
+        item.evidence_tampered = True
 
 
 def _item_container_blob(item):
@@ -2485,6 +2603,12 @@ def _item_container_blob(item):
             else None
         ),
         "furniture": getattr(item, "furniture", False),
+        # Civic shop curb fixtures (supers/player_shops.py) -- must round-trip
+        # or save/load drops civic_fixture and boot stacks duplicates.
+        "civic_fixture": bool(getattr(item, "civic_fixture", False)),
+        "fixture_id": getattr(item, "fixture_id", None),
+        "shop_id": getattr(item, "shop_id", None),
+        "player_shop_fixture": bool(getattr(item, "player_shop_fixture", False)),
         "owner_key": getattr(item, "owner_key", None),
         "need": getattr(item, "need", None),
         "provides_light": bool(getattr(item, "provides_light", False)),
@@ -2502,6 +2626,15 @@ def _item_container_blob(item):
         "god_forge_blessed_tier": (
             int(item.god_forge_blessed_tier)
             if getattr(item, "god_forge_blessed_tier", None) else None
+        ),
+        "god_forge_infused_until": int(
+            getattr(item, "god_forge_infused_until", 0) or 0
+        ),
+        "god_forge_infuse_damage_bonus": getattr(
+            item, "god_forge_infuse_damage_bonus", None,
+        ),
+        "god_forge_infuse_accuracy_bonus": getattr(
+            item, "god_forge_infuse_accuracy_bonus", None,
         ),
         "god_war_manifest": bool(getattr(item, "god_war_manifest", False)),
         "god_war_owner_key": getattr(item, "god_war_owner_key", None),
@@ -2548,11 +2681,34 @@ def _item_container_blob(item):
         "body_dropped_tick": getattr(item, "body_dropped_tick", None),
         # Corpse harvest flags (supers/scavenge.py) -- one take each.
         "body_harvested_meat": bool(getattr(item, "body_harvested_meat", False)),
+        "body_harvested_hide": bool(getattr(item, "body_harvested_hide", False)),
         "body_drained": bool(getattr(item, "body_drained", False)),
         "body_siphoned": bool(getattr(item, "body_siphoned", False)),
         "body_dmb_drawn": bool(getattr(item, "body_dmb_drawn", False)),
         "body_origin": getattr(item, "body_origin", None),
         "body_path": getattr(item, "body_path", None),
+        "body_type": getattr(item, "body_type", None),
+        "body_no_blood": bool(getattr(item, "body_no_blood", False)),
+        "body_yields_meat": getattr(item, "body_yields_meat", None),
+        "body_yields_hide": getattr(item, "body_yields_hide", None),
+        "body_creature_id": getattr(item, "body_creature_id", None),
+        "body_butcher_yields": getattr(item, "body_butcher_yields", None),
+        # Death forensics custody (supers/death_forensics.py) -- scene -> tray -> plot.
+        "custody": getattr(item, "custody", None),
+        "morgue_drawer": getattr(item, "morgue_drawer", None),
+        "morgue_tray_in_at_tick": getattr(item, "morgue_tray_in_at_tick", None),
+        "stored_in_receptacle_key": getattr(item, "stored_in_receptacle_key", None),
+        "death_record": getattr(item, "death_record", None),
+        "forensic_autopsied": bool(getattr(item, "forensic_autopsied", False)),
+        "evidence_tampered": bool(getattr(item, "evidence_tampered", False)),
+        "body_receptacle": bool(getattr(item, "body_receptacle", False)),
+        "receptacle_family": getattr(item, "receptacle_family", None),
+        "receptacle_slot": getattr(item, "receptacle_slot", None),
+        "stored_body_key": getattr(item, "stored_body_key", None),
+        "plot_stone_label": getattr(item, "plot_stone_label", None),
+        "plot_stone_identity": getattr(item, "plot_stone_identity", None),
+        "custom_look_in_empty_lines": getattr(item, "custom_look_in_empty_lines", None),
+        "custom_look_in_lines": getattr(item, "custom_look_in_lines", None),
         # Abandoned floor loot grace (Cadence scavengers); absent = legacy pile.
         "floor_dropped_tick": getattr(item, "floor_dropped_tick", None),
         # Beneath Lucifer's Cage TTL; absent = stamp on next vault decay tick.
@@ -2724,15 +2880,25 @@ def _reseat_account_linked_if_unroomed(obj, game):
     ``location is None`` (or on a Room object that was replaced in
     ``game.rooms``). The next full snapshot then ``DELETE FROM characters``.
     Home / start is enough to survive until deferred unstick runs.
+
+    Virtual overland cells live in ``game.overland_rooms``, not
+    ``game.rooms`` (bug report 907). Live clients are never silently moved.
     """
+    from engine.session_attach import has_live_player_session
+    from engine.systems.overland import resolve_virtual_overland_room_key
+
     loc = getattr(obj, "location", None)
     rooms = getattr(game, "rooms", None) or {}
     dest = None
     if loc is not None:
-        live = rooms.get(getattr(loc, "key", None))
+        key = getattr(loc, "key", None)
+        live = rooms.get(key)
         if live is loc:
             return loc
-        dest = live
+        virt = resolve_virtual_overland_room_key(game, key)
+        if virt is loc:
+            return loc
+        dest = live if live is not None else virt
     if not _persistable_reseat_body(obj):
         return loc
     if dest is None:
@@ -2740,6 +2906,13 @@ def _reseat_account_linked_if_unroomed(obj, game):
     if dest is None:
         dest = getattr(game, "start_room", None)
     if dest is None or dest is loc:
+        return loc
+    if has_live_player_session(obj, game):
+        name = getattr(obj, "key", None) or getattr(obj, "name", None) or "?"
+        print(
+            f"[persistence] anomaly: skipping live-player reseat for {name!r}",
+            flush=True,
+        )
         return loc
     mover = getattr(obj, "move_to", None)
     if callable(mover) and mover(dest):
@@ -2882,12 +3055,20 @@ def _character_save_rows(game, obj, seen_names):
     item_rows = []
     for item in obj.inventory:
         item_rows.append((
-            item.key, item.description, "character", obj.key,
+            _persist_item_field(item, "key"),
+            _persist_item_field(
+                item, "description", fallback=_persist_item_field(item, "key"),
+            ),
+            "character", obj.key,
             _item_container_blob(item),
         ))
     for item in list(getattr(obj, "gear_bag", None) or []):
         item_rows.append((
-            item.key, item.description, "gear", obj.key,
+            _persist_item_field(item, "key"),
+            _persist_item_field(
+                item, "description", fallback=_persist_item_field(item, "key"),
+            ),
+            "gear", obj.key,
             _item_container_blob(item),
         ))
     return char_row, item_rows
@@ -4419,6 +4600,16 @@ def load_world(conn, game):
             except (TypeError, ValueError):
                 pass
         note_item_created_seq(getattr(item, "created_seq", 0))
+        from engine.systems import civic_fixture as civic_fixture_mod
+        if state.get("civic_fixture") or state.get("fixture_id") or state.get("shop_id"):
+            fid = state.get("fixture_id") or state.get("shop_id")
+            civic_fixture_mod.restore_fixture_item(
+                item, str(fid).strip() if fid else None
+            )
+            if state.get("player_shop_fixture"):
+                item.player_shop_fixture = True
+        elif str(key or "").startswith(civic_fixture_mod.FIXTURE_KEY_PREFIX):
+            civic_fixture_mod.restore_fixture_item(item)
         if state.get("owner_key"):
             item.owner_key = state["owner_key"]
         if state.get("need"):
@@ -4440,6 +4631,19 @@ def load_world(conn, game):
                 item.god_forge_blessed_tier = int(state["god_forge_blessed_tier"])
             except (TypeError, ValueError):
                 pass
+        if state.get("god_forge_infused_until"):
+            try:
+                item.god_forge_infused_until = int(state["god_forge_infused_until"])
+            except (TypeError, ValueError):
+                pass
+        if state.get("god_forge_infuse_damage_bonus") is not None:
+            item.god_forge_infuse_damage_bonus = state[
+                "god_forge_infuse_damage_bonus"
+            ]
+        if state.get("god_forge_infuse_accuracy_bonus") is not None:
+            item.god_forge_infuse_accuracy_bonus = state[
+                "god_forge_infuse_accuracy_bonus"
+            ]
         if state.get("god_war_manifest"):
             item.god_war_manifest = True
         if state.get("god_war_owner_key"):
@@ -4861,6 +5065,19 @@ def item_from_saved_container(key, description, container):
             item.god_forge_blessed_tier = int(state["god_forge_blessed_tier"])
         except (TypeError, ValueError):
             pass
+    if state.get("god_forge_infused_until"):
+        try:
+            item.god_forge_infused_until = int(state["god_forge_infused_until"])
+        except (TypeError, ValueError):
+            pass
+    if state.get("god_forge_infuse_damage_bonus") is not None:
+        item.god_forge_infuse_damage_bonus = state[
+            "god_forge_infuse_damage_bonus"
+        ]
+    if state.get("god_forge_infuse_accuracy_bonus") is not None:
+        item.god_forge_infuse_accuracy_bonus = state[
+            "god_forge_infuse_accuracy_bonus"
+        ]
     if state.get("god_war_manifest"):
         item.god_war_manifest = True
     if state.get("god_war_owner_key"):
@@ -4984,15 +5201,19 @@ def snapshot_held_items(character):
     for item in list(getattr(character, "inventory", None) or []):
         rows.append({
             "holder_type": "character",
-            "key": item.key,
-            "description": item.description,
+            "key": _persist_item_field(item, "key"),
+            "description": _persist_item_field(
+                item, "description", fallback=_persist_item_field(item, "key"),
+            ),
             "container": json.loads(_item_container_blob(item)),
         })
     for item in list(getattr(character, "gear_bag", None) or []):
         rows.append({
             "holder_type": "gear",
-            "key": item.key,
-            "description": item.description,
+            "key": _persist_item_field(item, "key"),
+            "description": _persist_item_field(
+                item, "description", fallback=_persist_item_field(item, "key"),
+            ),
             "container": json.loads(_item_container_blob(item)),
         })
     return rows

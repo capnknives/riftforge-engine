@@ -21,6 +21,7 @@ _PRONOUN_TABLE = {
     "he": {"subj": "he", "obj": "him", "poss": "his"},
     "she": {"subj": "she", "obj": "her", "poss": "her"},
     "they": {"subj": "they", "obj": "them", "poss": "their"},
+    "it": {"subj": "it", "obj": "it", "poss": "its"},
 }
 
 _SMOTE_I_PREFIXES = ("i ", "i'm ", "i am ")

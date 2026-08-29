@@ -15,6 +15,7 @@
       "default": "earth",
       "values": [
         "earth",
+        "earth_frontierland_1861",
         "prime",
         "pocket"
       ]

@@ -93,10 +93,11 @@ COLORS = {
     "combat_in": "\x1b[31m",
     "combat_other": "\x1b[37m",
     "combat_mitigate": "\x1b[90m",
-    # OOC / questions *body* (parens + letters are layered separately).
-    # White at 16-color so gold OOC letters pop; not dim grey (90) that
-    # vanished into room chrome.
-    "ooc": "\x1b[37m",
+    # OOC is a channel interrupt, not gothic body prose: bright cyan at
+    # 16-color (closest to the player Mudlet RGB 0,255,200). Tells stay
+    # dark cyan (36m) so the two cannot merge. Questions body uses
+    # ``exit`` (parchment) via layered chrome -- not this role.
+    "ooc": "\x1b[96m",
     "say": "\x1b[37m",
     "emote": "\x1b[35m",
     "tell": "\x1b[36m",
@@ -149,9 +150,9 @@ COLORS_XTERM256 = {
     "combat_in": "\x1b[38;5;174m",
     "combat_other": "\x1b[38;5;250m",
     "combat_mitigate": "\x1b[38;5;242m",
-    # Warm parchment -- distinct from room prose grey (250) so global
-    # OOC does not blend into look text (player report 2026-08-26).
-    "ooc": "\x1b[38;5;187m",
+    # Exact Mudlet ``setFgColor(0, 255, 200)`` (truecolor). xterm 50 is
+    # close (#00ffd7); this matches the trigger the player shipped.
+    "ooc": "\x1b[38;2;0;255;200m",
     "say": "\x1b[38;5;111m",
     "emote": "\x1b[38;5;97m",
     "tell": "\x1b[38;5;110m",
@@ -1166,6 +1167,64 @@ def format_help_start_here(*, screenreader=False):
     return lines
 
 
+def format_help_alphabetical_index(
+    entries,
+    *,
+    title="Help Index",
+    width=TOME_WIDTH,
+    screenreader=False,
+):
+    """Flat A-Z help catalog -- ``help topics`` / ``help gmtopics``.
+
+    ``entries`` is ``[(name, blurb), ...]`` already sorted. No category
+    headers -- one long list so staff can skim letter-by-letter.
+    """
+    if screenreader:
+        lines = [
+            "",
+            _tts_period(title),
+            _tts_period(
+                "Warning: long listen -- this is the full topic catalog sorted "
+                "A through Z"
+            ),
+            _tts_period(
+                "Type help for Start Here. Type help followed by a name for one page"
+            ),
+            _tts_period("Type commands for verbs"),
+            "",
+        ]
+        for name, blurb in entries:
+            if blurb:
+                lines.append(f"  {name} -- {blurb}.")
+            else:
+                lines.append(f"  {name}.")
+        lines.append("")
+        return lines
+
+    w = max(40, int(width))
+    heavy = paint("dark_red", rule_equals(w))
+    lines = [
+        heavy,
+        render(f"<gold> TOME: <dark_magenta>{title}"),
+        heavy,
+        paint(
+            "dark_grey",
+            " A-Z catalog.  Type 'help <name>' for a page.  'commands' for verbs.",
+        ),
+        "",
+    ]
+    for name, blurb in entries:
+        if blurb:
+            lines.append(
+                render(f"<silver>  {name} <dark_grey>-- <slate_grey>{blurb}")
+            )
+        else:
+            lines.append(render(f"<silver>  {name}"))
+    lines.append("")
+    lines.append(heavy)
+    return lines
+
+
 def format_help_index(categories, *, width=TOME_WIDTH, screenreader=False):
     """Bare `help` grimoire index: category tomes with topic blurbs.
 
@@ -1173,7 +1232,8 @@ def format_help_index(categories, *, width=TOME_WIDTH, screenreader=False):
 
     ``screenreader=True`` skips equals rules; vertical ``name -- blurb`` lists.
     Screenreader bare ``help`` uses :func:`format_help_start_here` instead;
-    this full index is what ``help topics`` / ``help index`` emit.
+    categorized index stays on bare ``help``; ``help topics`` uses
+    :func:`format_help_alphabetical_index` instead.
     """
     if screenreader:
         lines = [
@@ -1418,14 +1478,17 @@ def format_commands_compact(entry_labels, *, gm_labels=None, width=TOME_WIDTH,
         return rows
 
     footer_sr = (
-        "Type commands <verb> for a one-line tip, or commands detail "
-        "for the full list. System topics: help."
+        "Type commands <verb> for a one-line tip, commands here for this "
+        "room, commands travel, combat, work, or social for a domain list, "
+        "or commands detail for the full list. System topics: help."
     )
     footer_sighted = paint(
         "muted",
         " Type commands "
         + literal_angle_syntax("<verb>")
-        + " for a one-line tip, or commands detail for the full list. "
+        + " for a one-line tip, commands here for this room, "
+        "commands travel|combat|work|social for a domain list, "
+        "or commands detail for the full list. "
         + "System topics: help.",
     )
 

@@ -73,6 +73,13 @@ def save_entry(
         alias = alias.strip().lower()
         if not alias or alias == keyword or alias in seen:
             continue
+        # A GM may have claimed this name as its own help page via hedit;
+        # do not stomp it back into an alias on boot heal / hrefresh.
+        if conn.execute(
+            "SELECT 1 FROM helpfiles WHERE primary_keyword = ?",
+            (alias,),
+        ).fetchone():
+            continue
         seen.add(alias)
         conn.execute(
             "INSERT OR REPLACE INTO help_aliases (alias, primary_keyword) "
@@ -94,6 +101,49 @@ def delete_entry(conn, keyword):
     conn.commit()
 
 
+def get_primary_entry(conn, keyword, *, is_gm=True):
+    """Return a helpfiles row only when ``keyword`` is the primary key.
+
+    Unlike ``get_entry``, this does **not** follow ``help_aliases`` -- used
+    by ``hedit`` so staff can claim an alias-only name as its own page.
+    """
+    keyword = (keyword or "").strip().lower()
+    if not keyword:
+        return None
+    columns_sql = ", ".join(_COLUMNS)
+    row = conn.execute(
+        f"SELECT {columns_sql} FROM helpfiles WHERE primary_keyword = ?",
+        (keyword,),
+    ).fetchone()
+    if row is None:
+        return None
+    entry = _row_to_dict(row)
+    if entry["gm_only"] and not is_gm:
+        return None
+    return entry
+
+
+def get_alias_target(conn, alias):
+    """Primary keyword an alias points at, or ``None`` when not an alias."""
+    alias = (alias or "").strip().lower()
+    if not alias:
+        return None
+    row = conn.execute(
+        "SELECT primary_keyword FROM help_aliases WHERE alias = ?",
+        (alias,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def remove_alias(conn, alias):
+    """Drop one alias row (the primary page and other aliases stay put)."""
+    alias = (alias or "").strip().lower()
+    if not alias:
+        return
+    conn.execute("DELETE FROM help_aliases WHERE alias = ?", (alias,))
+    conn.commit()
+
+
 def get_entry(conn, keyword, *, is_gm=True):
     """Layer 1: exact ``primary_keyword`` or alias match (case-insensitive).
 
@@ -105,28 +155,13 @@ def get_entry(conn, keyword, *, is_gm=True):
     keyword = (keyword or "").strip().lower()
     if not keyword:
         return None
-    columns_sql = ", ".join(_COLUMNS)
-    row = conn.execute(
-        f"SELECT {columns_sql} FROM helpfiles WHERE primary_keyword = ?",
-        (keyword,),
-    ).fetchone()
-    if row is None:
-        alias_row = conn.execute(
-            "SELECT primary_keyword FROM help_aliases WHERE alias = ?",
-            (keyword,),
-        ).fetchone()
-        if alias_row is None:
-            return None
-        row = conn.execute(
-            f"SELECT {columns_sql} FROM helpfiles WHERE primary_keyword = ?",
-            (alias_row[0],),
-        ).fetchone()
-        if row is None:
-            return None
-    entry = _row_to_dict(row)
-    if entry["gm_only"] and not is_gm:
+    entry = get_primary_entry(conn, keyword, is_gm=is_gm)
+    if entry is not None:
+        return entry
+    alias_target = get_alias_target(conn, keyword)
+    if alias_target is None:
         return None
-    return entry
+    return get_primary_entry(conn, alias_target, is_gm=is_gm)
 
 
 def list_aliases(conn, keyword):

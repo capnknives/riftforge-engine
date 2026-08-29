@@ -248,13 +248,55 @@ def stamp_hub_layout(host, hub, offset):
 # Fixture Item identification + collection
 # ---------------------------------------------------------------------------
 
+FIXTURE_KEY_PREFIX = "fixture:"
+
+
+def _item_storage_key(obj):
+    """Item.key (GameObject) with legacy name fallback."""
+    return str(getattr(obj, "key", None) or getattr(obj, "name", None) or "")
+
+
+def fixture_id_from_item(obj):
+    """Return fixture_id from markers or a ``fixture:<id>`` Item key."""
+    fid = getattr(obj, "fixture_id", None)
+    if fid:
+        return str(fid).strip()
+    key = _item_storage_key(obj)
+    if key.startswith(FIXTURE_KEY_PREFIX):
+        return key[len(FIXTURE_KEY_PREFIX) :].strip()
+    return ""
+
+
+def restore_fixture_item(obj, fixture_id=None):
+    """Re-stamp civic fixture markers after save/load dropped them."""
+    fid = str(fixture_id or fixture_id_from_item(obj) or "").strip()
+    if not fid:
+        return False
+    obj.civic_fixture = True
+    obj.fixture_id = fid
+    if not getattr(obj, "shop_id", None):
+        obj.shop_id = fid
+    return True
+
+
 def is_fixture_item(obj):
     """True when ``obj`` is a civic-fixture Item stamped by this module."""
-    return (
-        obj is not None
-        and isinstance(obj, Item)
-        and bool(getattr(obj, "civic_fixture", False))
-    )
+    if obj is None or not isinstance(obj, Item):
+        return False
+    if bool(getattr(obj, "civic_fixture", False)):
+        return True
+    # Legacy floor copies keep the key but lose civic_fixture on reload.
+    return _item_storage_key(obj).startswith(FIXTURE_KEY_PREFIX)
+
+
+def is_fixture_key_for(obj, fixture_id):
+    """True when ``obj`` is (or looks like) the fixture for ``fixture_id``."""
+    fid = str(fixture_id or "").strip()
+    if not fid:
+        return False
+    if is_fixture_item(obj) and fixture_id_from_item(obj) == fid:
+        return True
+    return _item_storage_key(obj) == f"{FIXTURE_KEY_PREFIX}{fid}"
 
 
 def fixtures_on_room(room):
@@ -270,8 +312,14 @@ def fixture_for_id(room, fixture_id):
     """Find the fixture Item for ``fixture_id`` in a host room, if any."""
     if room is None or not fixture_id:
         return None
+    fid = str(fixture_id).strip()
+    target_key = f"{FIXTURE_KEY_PREFIX}{fid}"
     for obj in list(getattr(room, "contents", None) or []):
-        if is_fixture_item(obj) and getattr(obj, "fixture_id", None) == fixture_id:
+        if is_fixture_item(obj) and fixture_id_from_item(obj) == fid:
+            restore_fixture_item(obj, fid)
+            return obj
+        if _item_storage_key(obj) == target_key:
+            restore_fixture_item(obj, fid)
             return obj
     return None
 
@@ -318,12 +366,13 @@ def place_fixture(host, item):
 
 
 def remove_fixture(host, fixture_id):
-    """Remove the fixture matching ``fixture_id`` from ``host``, if present."""
-    if host is None:
+    """Remove every fixture copy matching ``fixture_id`` from ``host``."""
+    if host is None or not fixture_id:
         return
-    item = fixture_for_id(host, fixture_id)
-    if item is not None:
-        host.remove(item)
+    fid = str(fixture_id).strip()
+    for obj in list(getattr(host, "contents", None) or []):
+        if is_fixture_key_for(obj, fid):
+            host.remove(obj)
 
 
 # ---------------------------------------------------------------------------

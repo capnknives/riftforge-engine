@@ -95,26 +95,56 @@ def refuse_carry_message():
 
 
 def find_carried_item(character, needle):
-    """Find first inventory item matching needle substring in key."""
+    """Find a carried item by name fragment (inventory, worn bags, gear bag).
+
+    Uses the same search surface as ``inventory`` / ``get … from backpack``.
+    """
+    from engine.command_support import _collect_item_matches
+    from engine.systems import containers as containers_mod
+
     needle = (needle or "").strip().lower()
-    for item in getattr(character, "inventory", None) or []:
-        key = (getattr(item, "key", "") or "").lower()
-        if not needle or needle in key:
-            return item
-    return None
+    items = list(containers_mod.iter_carried_items(character))
+    if not needle:
+        for item in items:
+            cid = (getattr(item, "catalog_id", None) or "").lower()
+            if getattr(item, "material_id", None) and (
+                cid.startswith("ore_") or "ore" in (getattr(item, "key", "") or "").lower()
+            ):
+                return item
+        return None
+    matches = _collect_item_matches(needle, items)
+    if not matches:
+        for item in items:
+            mat = (getattr(item, "material_id", None) or "").lower()
+            cid = (getattr(item, "catalog_id", None) or "").lower()
+            if needle == mat or needle == cid.replace("ore_", ""):
+                return item
+        return None
+    if needle == "ore":
+        typed = [it for it in matches if getattr(it, "material_id", None)]
+        if typed:
+            return typed[0]
+    return matches[0]
 
 
 def iter_carried_items(character):
-    """Yield open inventory items."""
-    yield from getattr(character, "inventory", None) or []
+    """Yield open inventory, worn bag contents, and virtual gear-bag rows."""
+    from engine.systems import containers as containers_mod
+
+    yield from containers_mod.iter_carried_items(character)
 
 
 def remove_from_inventory(character, item):
-    inv = getattr(character, "inventory", None) or []
-    if item in inv:
-        inv.remove(item)
-        return True
-    return False
+    """Remove ``item`` from inventory, a worn bag, or the gear kit bag."""
+    from engine.systems import containers as containers_mod
+
+    if character is None or item is None:
+        return False
+    before = list(containers_mod.iter_carried_items(character))
+    if item not in before:
+        return False
+    containers_mod._remove_carried_item(character, item)
+    return True
 
 
 def try_give_item(character, item):

@@ -1945,7 +1945,7 @@ def _reset_hard_to(root, sha):
             "(skipping reset --hard + protect restore)",
             flush=True,
         )
-        _ensure_changelog_index_after_sync(root)
+        _ensure_changelog_ledger_after_sync(root)
         return True
     previous_head = head
     n_files = _diff_file_count(root, previous_head, sha)
@@ -1979,7 +1979,7 @@ def _reset_hard_to(root, sha):
             )
     except Exception as exc:
         print(f"[auto_deploy] map heal skipped: {exc}", flush=True)
-    _ensure_changelog_index_after_sync(root)
+    _ensure_changelog_ledger_after_sync(root)
     if not _verify_boot_probe_or_rollback(root, previous_head):
         return False
     _emit_deploy_diag(
@@ -1991,45 +1991,41 @@ def _reset_hard_to(root, sha):
     return True
 
 
-def _fresh_changelog_index():
-    """Reload changelog id modules from disk (watcher is long-lived).
+def _fresh_changelog_ledger():
+    """Reload the changelog ledger module from disk (watcher is long-lived).
 
     ``watch_and_run`` reloads ``auto_deploy`` each poll, but used to keep a
-    stale ``engine.changelog_index`` in ``sys.modules``. Live then logged
-    ``has no attribute 'stamp_pending_and_ensure_index'`` every idle poll
-    and newest ships stayed unnumbered. Same class as ``_fresh_deploy_notify``.
+    stale ``engine.changelog_index`` in ``sys.modules``, which then logged
+    ``has no attribute 'stamp_pending_and_ensure_index'`` every idle poll and
+    left the newest ships unnumbered. Same class as ``_fresh_deploy_notify``.
     """
-    import engine.changelog_ids as changelog_ids
-    import engine.changelog_index as changelog_index_mod
+    import engine.changelog_ledger as changelog_ledger_mod
 
-    importlib.reload(changelog_ids)
-    return importlib.reload(changelog_index_mod)
+    return importlib.reload(changelog_ledger_mod)
 
 
-def _ensure_changelog_index_after_sync(root):
-    """Stamp pending changelog #N ids, then rebuild the compiled index.
+def _ensure_changelog_ledger_after_sync(root):
+    """Mint any pending changelog ``#N`` ids in the ledger.
 
-    GitHub Actions is not the writer (billing often never starts that job).
-    Fill-only assignment here is deterministic: already-stamped ids stay
-    put, unstamped **player** bullets get that sequence's ``max+1``
-    oldest-first, and unstamped **staff** bullets get a separate ops
-    ``max+1``. Discord patch notes run after this so the post can include
-    ``changes N`` without skipping for ``[ops]`` ships.
-
-    Also called on idle polls (no origin advance) so a missed first stamp
-    or a later ``reset --hard`` back to timestamp-only git still heals.
+    ``assign_new_slugs`` is idempotent per slug — a fragment that already
+    has a ledger row is a no-op, so calling this on every sync **and** every
+    idle poll is safe. There is nothing left to "rebuild" here: ``changes``
+    and Discord both query the ledger directly, so there is no compiled
+    JSON cache that can fall behind.
 
     Copyover / ``Game()`` boot is the guaranteed mint (fresh interpreter).
     This watcher path is the Discord / idle-poll companion — it must reload
-    ``changelog_index`` from disk or it no-ops on a stale module.
+    ``changelog_ledger`` from disk or it no-ops on a stale module.
     """
     try:
-        changelog_index_mod = _fresh_changelog_index()
-        changelog_index_mod.stamp_pending_and_ensure_index(
+        changelog_ledger_mod = _fresh_changelog_ledger()
+        minted = changelog_ledger_mod.assign_new_slugs(
             root, log_prefix="[auto_deploy]",
         )
+        if minted:
+            print(f"[auto_deploy] changelog ledger minted {minted} id(s)", flush=True)
     except Exception as exc:
-        print(f"[auto_deploy] changelog index heal skipped: {exc}", flush=True)
+        print(f"[auto_deploy] changelog ledger mint skipped: {exc}", flush=True)
 
 
 _GITHUB_SSH_ORIGIN = "git@github.com:capnknives/RiftForge.git"
@@ -2541,31 +2537,72 @@ def parse_deploy_metadata(
 ) -> tuple[list[int], list[int], str]:
     """Extract bug/suggestion ids + short summary from deploy text.
 
-    Scans the commit subject, body lines, and (when ``pr_fallback``) the
-    linked GitHub PR title/body when the squash subject ends with
-    ``(#NNNN)``. Mixed Fix + Ship bundles collect both id lists.
+    ``ops/deploy_pr_ticket_map.json`` (written by ``tools/open_pr.py`` at
+    PR-open time) is the **primary** source when the squash subject carries
+    a merged PR number: it is a structured row an agent wrote deliberately,
+    not free text regex has to guess at. Regex-parsing the commit
+    subject/body/PR-title text is a **fallback** for pushes with no PR
+    number (direct-to-main hotfixes) or a PR that predates the manifest —
+    every time that fallback actually contributes an id the manifest did
+    not already have, it prints a loud one-line warning so a missing
+    manifest row is visible instead of silently rotting into a
+    never-auto-closed ticket.
 
-    Recognized headers include ``Fix bug #N:``, ``Fix in-game bug N:``,
-    and agent PR prose ``Fixes bug report N`` / ``Ships suggestion report N``
-    (no ``#``).
+    Mixed Fix + Ship bundles collect both id lists. Recognized regex
+    headers include ``Fix bug #N:``, ``Fix in-game bug N:``, and agent PR
+    prose ``Fixes bug report N`` / ``Ships suggestion report N`` (no ``#``).
 
     Returns ``(bug_ids, suggestion_ids, summary)``.
     """
     subject_line = _first_subject_line(text)
     bug_ids, suggestion_ids, summary = _parse_deploy_text_lines(text)
+    regex_found_any = bool(bug_ids or suggestion_ids)
 
-    if pr_fallback and (not bug_ids or not suggestion_ids):
-        pr_number = _merged_pr_number_from_subject(subject_line)
-        if pr_number:
-            pr_text = _fetch_merged_pr_text(pr_number, allow_network=pr_network)
-            if pr_text:
-                pr_bugs, pr_sugs, pr_summary = _parse_deploy_text_lines(
-                    pr_text,
-                )
-                _merge_ticket_ids(bug_ids, pr_bugs)
-                _merge_ticket_ids(suggestion_ids, pr_sugs)
-                if not summary:
-                    summary = pr_summary
+    pr_number = _merged_pr_number_from_subject(subject_line) if pr_fallback else None
+    if pr_number:
+        from engine import deploy_pr_ticket_map
+
+        manifest_row = deploy_pr_ticket_map.lookup(pr_number, root=_repo_root())
+        if manifest_row:
+            manifest_bugs = [
+                int(x) for x in (manifest_row.get("bug_ids") or []) if str(x).isdigit()
+            ]
+            manifest_sugs = [
+                int(x) for x in (manifest_row.get("suggestion_ids") or [])
+                if str(x).isdigit()
+            ]
+            _merge_ticket_ids(bug_ids, manifest_bugs)
+            _merge_ticket_ids(suggestion_ids, manifest_sugs)
+            if not summary:
+                summary = (manifest_row.get("summary") or "").strip()
+        elif not regex_found_any:
+            print(
+                f"[auto_deploy] no ops/deploy_pr_ticket_map.json row for merged "
+                f"PR #{pr_number} — falling back to regex/GitHub text parsing "
+                f"for ticket close (this ticket may not auto-close; run "
+                f"'py -3.13 tools/stale_ticket_report.py' to catch stragglers)",
+                flush=True,
+            )
+
+    if pr_fallback and (not bug_ids or not suggestion_ids) and pr_number:
+        pr_text = _fetch_merged_pr_text(pr_number, allow_network=pr_network)
+        if pr_text:
+            pr_bugs, pr_sugs, pr_summary = _parse_deploy_text_lines(
+                pr_text,
+            )
+            if pr_bugs or pr_sugs:
+                if not manifest_row:
+                    print(
+                        f"[auto_deploy] regex fallback found ticket ids for PR "
+                        f"#{pr_number} that the manifest was missing "
+                        f"(bugs={pr_bugs} suggestions={pr_sugs}) — consider "
+                        f"backfilling ops/deploy_pr_ticket_map.json",
+                        flush=True,
+                    )
+            _merge_ticket_ids(bug_ids, pr_bugs)
+            _merge_ticket_ids(suggestion_ids, pr_sugs)
+            if not summary:
+                summary = pr_summary
 
     if len(summary) > 120:
         summary = summary[:117] + "..."
@@ -2633,12 +2670,12 @@ def _maybe_schedule_deploy_patch_notes(root, from_sha, to_sha):
     """Fail-soft Discord #patch-notes mirror for CHANGELOG.d in this deploy."""
     # Stamp before posting so Discord never teaches a blank ``changes`` footer
     # while the in-game list already has #N (GitHub assign job is retired).
-    _ensure_changelog_index_after_sync(root)
+    _ensure_changelog_ledger_after_sync(root)
     try:
         import engine.discord_patch_notes as discord_patch_notes
 
         # Watcher keeps a stale discord_patch_notes the same way it kept a
-        # stale changelog_index — reload so "wait then retry" actually runs.
+        # stale changelog_ledger — reload so "wait then retry" actually runs.
         discord_patch_notes = importlib.reload(discord_patch_notes)
         discord_patch_notes.schedule_for_deploy(root, from_sha, to_sha)
     except Exception as exc:

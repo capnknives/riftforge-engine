@@ -31,6 +31,8 @@ PACE_HOPS_PER_ADVANCE = {
 WALK_STEP_EVERY = PACE_STEP_EVERY["walk"]
 
 _COORD_RE = re.compile(r"^(-?\d+)\s*[, ]\s*(-?\d+)$")
+# Four space-separated ints: macro tile + foot micro (drive placement).
+_COORD_FOUR_RE = re.compile(r"^(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)$")
 
 _RESOURCE_HINTS = {
     "clinic": ("clinic",),
@@ -127,13 +129,36 @@ def normalize_query(raw):
 
 
 def parse_coordinates(raw):
-    """Return (x, y) ints from ``20 20`` / ``20,20``, or None.
+    """Return a coordinate tuple parsed from ``raw``, or ``None`` on no match.
 
-    Two numbers with a space (or one comma) -- no parentheses -- so
-    screenreader players can type walk 20 5 / drive 35 10 the same way
-    sighted players do. Three-token strings like ``1 2 3`` do not match.
+    Discrimination uses ``len`` on the returned tuple:
+
+    * ``len == 2`` -- macro atlas tile ``(mx, my)`` from ``20 20``,
+      ``20,20``, or ``20 5`` (comma or single space between the pair).
+    * ``len == 4`` -- macro tile plus foot micro ``(mx, my, ux, uy)``
+      from exactly four space-separated integers (e.g. ``44 32 3 7``).
+      Micro ``ux`` / ``uy`` must lie in ``0`` through ``9`` (the 10-by-10
+      foot grid inside each atlas tile); out-of-range micro values are a
+      parse failure (``None``), same as unmatched text.
+
+    No parentheses. Three-token strings like ``1 2 3`` do not match.
     """
-    match = _COORD_RE.match((raw or "").strip())
+    text = (raw or "").strip()
+    if not text:
+        return None
+    four = _COORD_FOUR_RE.match(text)
+    if four is not None:
+        mx = int(four.group(1))
+        my = int(four.group(2))
+        ux = int(four.group(3))
+        uy = int(four.group(4))
+        # MICRO_SIZE is 10 on the America dual-layer atlas (0..9 cells).
+        from engine.systems.overland import MICRO_SIZE
+
+        if not (0 <= ux < MICRO_SIZE and 0 <= uy < MICRO_SIZE):
+            return None
+        return (mx, my, ux, uy)
+    match = _COORD_RE.match(text)
     if not match:
         return None
     return int(match.group(1)), int(match.group(2))

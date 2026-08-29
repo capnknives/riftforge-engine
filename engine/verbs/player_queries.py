@@ -33,7 +33,7 @@ def cmd_query(character, args, game):
     if not text:
         character.session.send(
             "Usage: query <your question>  -- opens a helper ticket "
-            "(see help query). For live chat try questions <message>."
+            "(see help query). For live chat try question <message>."
         )
         return
     directory = _directory(game)
@@ -74,7 +74,7 @@ def cmd_query(character, args, game):
 def cmd_querylist(character, args, game):
     """List open helper tickets (helpers and staff)."""
     if not is_player_helper(game, character):
-        character.session.send("Helpers only. Try questions <message> for live help.")
+        character.session.send("Helpers only. Try question <message> for live help.")
         return
     entries = pq_mod.recent(_directory(game), open_only=True)
     if not entries:

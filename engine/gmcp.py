@@ -677,6 +677,12 @@ def push_map_view(character, payload):
         return
     session.send_gmcp("RiftForge.Map.View", payload)
     # Compact here-packet so a mapper can skip redrawing the whole window.
+    # Optional ``route`` (drive-preview overlay) stays on View only: Here
+    # is a position ping (``you`` / ``origin``) so clients can skip a
+    # glyph redraw. The trail is a full-window glyph change (and a HUD
+    # polyline) that belongs with ``rows`` on View. Forwarding it here
+    # would either spam the path on every step or leave compact-only
+    # clients without the matching glyph grid.
     session.send_gmcp(
         "RiftForge.Map.Here",
         {

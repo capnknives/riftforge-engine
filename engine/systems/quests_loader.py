@@ -31,6 +31,9 @@ BASE_COMPLETE_WHEN_TYPES = frozenset({
     "item",
     "buy",
     "help_topic",
+    "quest_flag",
+    "character_flag",
+    "dialogue_done",
 })
 
 _EXTRA_COMPLETE_WHEN_TYPES: set[str] = set()
@@ -83,6 +86,29 @@ def validate_quest(data, *, where="quest"):
         raise AssertionError(f"{where}: id must be a non-empty string")
     if not data.get("title"):
         raise AssertionError(f"{where}: title required")
+    chain_id = data.get("chain_id")
+    if chain_id is not None and not isinstance(chain_id, str):
+        raise AssertionError(f"{where}: chain_id must be a string when set")
+    chapter = data.get("chapter")
+    if chapter is not None and not isinstance(chapter, int):
+        raise AssertionError(f"{where}: chapter must be an int when set")
+    chain_title = data.get("chain_title")
+    if chain_title is not None and not isinstance(chain_title, str):
+        raise AssertionError(f"{where}: chain_title must be a string when set")
+    requires_quest = data.get("requires_quest")
+    if requires_quest is not None:
+        if not isinstance(requires_quest, list):
+            raise AssertionError(f"{where}: requires_quest must be a list when set")
+        for i, req_id in enumerate(requires_quest):
+            if not req_id or not isinstance(req_id, str):
+                raise AssertionError(
+                    f"{where}: requires_quest[{i}] must be a non-empty string"
+                )
+    requires = data.get("requires")
+    if requires is not None:
+        if not isinstance(requires, dict):
+            raise AssertionError(f"{where}: requires must be a dict when set")
+        _validate_when(requires, where=f"{where} requires")
     steps = data.get("steps")
     if not isinstance(steps, list) or not steps:
         raise AssertionError(f"{where}: steps must be a non-empty list")
@@ -101,6 +127,51 @@ def validate_quest(data, *, where="quest"):
         if not isinstance(when, dict):
             raise AssertionError(f"{sw}: complete_when must be a dict")
         _validate_when(when, where=sw)
+        nxt = step.get("next")
+        if nxt is not None and not isinstance(nxt, str):
+            raise AssertionError(f"{sw}: next must be a string when set")
+        dialogue_tree = step.get("dialogue_tree")
+        if dialogue_tree is not None and not isinstance(dialogue_tree, str):
+            raise AssertionError(f"{sw}: dialogue_tree must be a string when set")
+        grant = step.get("grant")
+        if grant is not None:
+            if isinstance(grant, list):
+                for gi, g in enumerate(grant):
+                    if not isinstance(g, dict):
+                        raise AssertionError(
+                            f"{sw}: grant[{gi}] must be a dict"
+                        )
+            elif not isinstance(grant, dict):
+                raise AssertionError(f"{sw}: grant must be a dict or list")
+        branches = step.get("branches")
+        if branches is not None:
+            if not isinstance(branches, list):
+                raise AssertionError(f"{sw}: branches must be a list when set")
+            for bi, branch in enumerate(branches):
+                bw = f"{sw} branches[{bi}]"
+                if not isinstance(branch, dict):
+                    raise AssertionError(f"{bw}: must be a dict")
+                branch_next = branch.get("next")
+                if not branch_next or not isinstance(branch_next, str):
+                    raise AssertionError(f"{bw}: next must be a non-empty string")
+                branch_when = branch.get("when") or {}
+                if not isinstance(branch_when, dict):
+                    raise AssertionError(f"{bw}: when must be a dict")
+                _validate_when(branch_when, where=bw)
+    # Dangling next / branch targets fail after all step ids are known.
+    step_ids = seen
+    for i, step in enumerate(steps):
+        sw = f"{where} steps[{i}]"
+        nxt = step.get("next")
+        if nxt and nxt not in step_ids:
+            raise AssertionError(f"{sw}: next references unknown step id {nxt!r}")
+        for bi, branch in enumerate(step.get("branches") or []):
+            branch_next = branch.get("next")
+            if branch_next and branch_next not in step_ids:
+                raise AssertionError(
+                    f"{sw} branches[{bi}]: next references unknown step id "
+                    f"{branch_next!r}"
+                )
     return data
 
 

@@ -13,6 +13,26 @@ from __future__ import annotations
 # Ring buffer size for per-character cash audit (wallet + bank moves).
 WALLET_LEDGER_MAX = 40
 
+# Optional listeners: ``register_wallet_ledger_listener(fn)`` where
+# ``fn(character, row)`` runs after each appended ledger row. Keeps the
+# engine free of game imports (SUPERS Echo journal hooks from bootstrap).
+_wallet_ledger_listeners = []
+
+
+def register_wallet_ledger_listener(fn):
+    """Register ``fn(character, row)`` to run after each ledger append."""
+    if fn is not None and fn not in _wallet_ledger_listeners:
+        _wallet_ledger_listeners.append(fn)
+
+
+def _notify_wallet_ledger_listeners(character, row):
+    """Fan out a fresh ledger row; listener errors never break wallet ops."""
+    for fn in list(_wallet_ledger_listeners):
+        try:
+            fn(character, row)
+        except Exception:
+            pass
+
 
 def _carry_cents(dollars, cents):
     """Normalize (dollars, cents) so cents is always 0--99."""
@@ -173,6 +193,7 @@ def record_wallet_ledger(
     ledger.append(row)
     if len(ledger) > WALLET_LEDGER_MAX:
         del ledger[: len(ledger) - WALLET_LEDGER_MAX]
+    _notify_wallet_ledger_listeners(character, row)
 
 
 def _ledger_int(value, default=0):

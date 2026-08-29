@@ -10,6 +10,29 @@
       "doc": "Gravity multiplier (default 1.0).",
       "default": 1.0
     },
+    "evil_ward": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp: bars entrants the game layer classifies as malevolent (which categories count is entirely game-defined).",
+      "default": false
+    },
+    "iron_ward": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp: bars entrants the game layer classifies as vulnerable to this ward's material (meaning is entirely game-defined).",
+      "default": false
+    },
+    "god_ward": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp: a high-tier intrusion barrier is active on this room (compared against a caller-supplied intrusion power, e.g. via god_ward_strength below).",
+      "default": false
+    },
+    "god_ward_strength": {
+      "type": "float",
+      "required": false,
+      "doc": "Minimum intrusion power needed to cross this room's high-tier ward; the game layer defines what \"power\" means and how it is compared."
+    },
     "wilderness": {
       "type": "bool",
       "required": false,
@@ -49,6 +72,282 @@
       "type": "bool",
       "required": false,
       "doc": "Smelter/forge station (room_has_smelter); map JSON foundry_amenity."
+    },
+    "is_house": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (is_house).",
+      "default": false
+    },
+    "is_home": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (is_home).",
+      "default": false
+    },
+    "is_hotel_room": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (is_hotel_room).",
+      "default": false
+    },
+    "is_cell": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (is_cell).",
+      "default": false
+    },
+    "is_prison_cell": {
+      "type": "bool",
+      "required": false,
+      "doc": "Federal prison cell.",
+      "default": false
+    },
+    "is_grave": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (is_grave).",
+      "default": false
+    },
+    "morgue": {
+      "type": "bool",
+      "required": false,
+      "doc": "Hospital or custody intake; drawer custody/records verbs.",
+      "default": false
+    },
+    "private_home": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (private_home).",
+      "default": false
+    },
+    "build_lot": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (build_lot).",
+      "default": false
+    },
+    "main_homeroom": {
+      "type": "string",
+      "required": false,
+      "doc": "Multi-room house hub room key."
+    },
+    "doors": {
+      "type": "list",
+      "required": false,
+      "doc": "Optional exit directions that are closable doors (list of dir names, or dict dir->bool). Omit to use topology heuristics.",
+      "default": null
+    },
+    "door_keys": {
+      "type": "object",
+      "required": false,
+      "doc": "Map exit direction to item catalog id for the key that unlocks that door.",
+      "default": null
+    },
+    "no_door": {
+      "type": "list",
+      "required": false,
+      "doc": "Exit directions that must NOT be treated as doors (open archway).",
+      "default": null
+    },
+    "boat_ramp": {
+      "type": "bool",
+      "required": false,
+      "doc": "Gravel boat ramp for trailer-backed launches (launch boat).",
+      "default": false
+    },
+    "lake_underwater": {
+      "type": "bool",
+      "required": false,
+      "doc": "Underwater lake cell (layout z=-1); pair with surface tile and dive.",
+      "default": false
+    },
+    "no_park": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (no_park). -- municipal no-park plaza.",
+      "default": false
+    },
+    "vehicle_berth": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (vehicle_berth). -- drive/board parking bay.",
+      "default": false
+    },
+    "no_loiter": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (no_loiter).",
+      "default": false
+    },
+    "robable": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (robable).",
+      "default": false
+    },
+    "floor_sleep": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (floor_sleep).",
+      "default": false
+    },
+    "has_bunks": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (has_bunks).",
+      "default": false
+    },
+    "boss_room": {
+      "type": "bool",
+      "required": false,
+      "doc": "Dungeon apex room (boss chamber).",
+      "default": false
+    },
+    "enter_hazard": {
+      "type": "string",
+      "required": false,
+      "doc": "Optional enter-room hazard id (e.g. finesse_unbalanced).",
+      "default": null
+    },
+    "hospital": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (hospital).",
+      "default": false
+    },
+    "gym": {
+      "type": "bool",
+      "required": false,
+      "doc": "Gym hub -- boot seeds a pinned training dummy (gym_fixture).",
+      "default": false
+    },
+    "mechanic": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (mechanic).",
+      "default": false
+    },
+    "gas_station": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (gas_station).",
+      "default": false
+    },
+    "town_worksite": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp (town_worksite).",
+      "default": false
+    },
+    "courthouse": {
+      "type": "bool",
+      "required": false,
+      "doc": "Courthouse civic block (justice identity).",
+      "default": false
+    },
+    "id_registry": {
+      "type": "bool",
+      "required": false,
+      "doc": "Clerk window for ID registry / payfine.",
+      "default": false
+    },
+    "federal_check": {
+      "type": "bool",
+      "required": false,
+      "doc": "Federal database ID check room.",
+      "default": false
+    },
+    "prison": {
+      "type": "bool",
+      "required": false,
+      "doc": "Prison zone room stamp.",
+      "default": false
+    },
+    "prison_yard": {
+      "type": "bool",
+      "required": false,
+      "doc": "Prison yard (combat allowed).",
+      "default": false
+    },
+    "visitation": {
+      "type": "bool",
+      "required": false,
+      "doc": "Prison visitation room.",
+      "default": false
+    },
+    "breakout_surface": {
+      "type": "bool",
+      "required": false,
+      "doc": "Prison perimeter escape surface.",
+      "default": false
+    },
+    "online_terminal": {
+      "type": "bool",
+      "required": false,
+      "doc": "Public records / cafe Wi-Fi terminal (history OSINT).",
+      "default": false
+    },
+    "vendor_stock": {
+      "type": "list",
+      "required": false,
+      "doc": "Settlement shop catalog item refs."
+    },
+    "shop_amenity": {
+      "type": "string",
+      "required": false,
+      "doc": "Civic shop amenity type (player_shop_types.json key); auto-stocks tagged catalog SKUs."
+    },
+    "shop_tags": {
+      "type": "list",
+      "required": false,
+      "doc": "Optional extra shop subscription tags for auto-stock filtering."
+    },
+    "vendor_stock_mode": {
+      "type": "enum",
+      "required": false,
+      "values": [
+        "merge",
+        "explicit"
+      ],
+      "default": "merge",
+      "doc": "merge = union auto-catalog with vendor_stock; explicit = authored list only."
+    },
+    "zoning": {
+      "type": "string",
+      "required": false,
+      "doc": "TownForge zoning stamp (commercial, residential, …)."
+    },
+    "player_shop_hub": {
+      "type": "bool",
+      "required": false,
+      "doc": "Pocket hub room with jobs[] + shop resources (TownForge spine).",
+      "default": false
+    },
+    "homestead_owner": {
+      "type": "string",
+      "required": false,
+      "doc": "Homestead plot owner character key."
+    },
+    "leisure_drip_mult": {
+      "type": "float",
+      "required": false,
+      "doc": "Leisure need drip multiplier (e.g. sanctuary deck)."
+    },
+    "no_combat_flavor": {
+      "type": "string",
+      "required": false,
+      "doc": "Custom prose when no_combat blocks fighting in this room."
+    },
+    "remodel_type": {
+      "type": "string",
+      "required": false,
+      "doc": "House remodel stamp (kitchen, garage, …)."
+    },
+    "remodel_inbound_exit": {
+      "type": "string",
+      "required": false,
+      "doc": "Named inbound exit for remodel shells."
     }
   }
 }

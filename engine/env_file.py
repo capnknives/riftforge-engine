@@ -5,6 +5,13 @@ often tune lag knobs (``RIFTFORGE_SQLITE_JOURNAL``, deploy coalesce, …) and
 then want a **game-only restart** (hard rule 19) without recreating the
 gateway container. The watcher calls :func:`apply_repo_env` before each game
 child spawn so those edits take effect on the next copyover/restart.
+
+The **game child** also calls this from ``server.py`` ``main()`` (and the
+Ash viewport starter) because the watcher process can cache an old
+``engine.env_file`` for days — new whitelist keys such as
+``RIFTFORGE_VIEWPORT`` would otherwise stay unset until a compose recreate
+(forbidden by default). ``docker compose exec printenv`` is the container's
+create-time env, not the game process.
 """
 
 from __future__ import annotations
@@ -84,4 +91,10 @@ DEFAULT_REPO_ENV_KEYS = (
     # Cursor fixer webhook (GM squashbug / Discord !squashbug).
     "CURSOR_BUG_WEBHOOK_URL",
     "CURSOR_BUG_WEBHOOK_AUTH",
+    # Ash viewport (agent play harness). Loopback JSON; game-only restart
+    # picks this up without compose recreate (hard rule 19).
+    "RIFTFORGE_VIEWPORT",
+    "RIFTFORGE_VIEWPORT_BIND",
+    "RIFTFORGE_VIEWPORT_ALLOW_NONLOCAL",
+    "RIFTFORGE_VIEWPORT_STAFF_ACCOUNT",
 )

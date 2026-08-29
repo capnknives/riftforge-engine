@@ -133,23 +133,21 @@ def _log_task_exception(task):
         print(f"[suggestion_webhook] background task crashed: {exc}", flush=True)
 
 
-def schedule_open_suggestions(directory, *, suggestion_ids=None):
+def schedule_open_suggestions(directory, *, suggestion_ids=None, plan=None):
     """Re-POST open suggestions from suggestions.log to the implementer webhook.
 
     suggestion_ids=None sends every open entry; otherwise only listed ids that
-    are still open. Returns ``(scheduled_count, matched_count, scheduled_ids)``.
+    are still open. Pass a pre-built
+    :class:`engine.report_webhook_gate.WebhookPlan` from ``plan_suggestions``.
+    Returns ``(scheduled_count, matched_count, scheduled_ids)``.
     """
-    from engine import reports
+    from engine import report_webhook_gate
 
-    open_suggestions = [
-        entry for entry in reports.recent(reports.SUGGEST, None, directory=directory)
-        if entry.get("status", "open") == "open"
-    ]
-    if suggestion_ids is not None:
-        wanted = set(suggestion_ids)
-        open_suggestions = [
-            entry for entry in open_suggestions if entry.get("id") in wanted
-        ]
+    if plan is None:
+        plan = report_webhook_gate.plan_suggestions(
+            directory, suggestion_ids=suggestion_ids, reconcile=False,
+        )
+    open_suggestions = list(plan.to_queue)
 
     scheduled = 0
     scheduled_ids = []
@@ -172,7 +170,7 @@ def schedule_open_suggestions(directory, *, suggestion_ids=None):
                             scheduled_ids.append(int(sid))
                         except (TypeError, ValueError):
                             pass
-    return scheduled, len(open_suggestions), scheduled_ids
+    return scheduled, plan.matched_count, scheduled_ids
 
 
 def schedule_suggestion_report(record_payload, *, url=None):

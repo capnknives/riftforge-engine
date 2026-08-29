@@ -343,6 +343,9 @@ class Session:
         self.history = collections.deque(maxlen=RECENT_HISTORY_SIZE)
         # Last dispatched play-loop line for bare ``!`` repeat (suggestion 263).
         self.last_command = None
+        # Last non-empty client lines for bug-report triage (see
+        # engine.report_context.note_report_output).
+        self._report_output_ring = collections.deque(maxlen=8)
         # Multi-line bug/suggest capture (a live report: pasting a multi-
         # line message into 'suggest' split across several 'Unknown
         # command' lines instead of landing as one report -- a raw telnet
@@ -600,6 +603,9 @@ class Session:
                 from engine import snoop
                 snoop.mirror_output(self.character, message)
             self._last_output_empty = is_empty
+            if not is_empty:
+                from engine.report_context import note_report_output
+                note_report_output(self, message)
 
     def send_gmcp(self, package, payload, force=False):
         """Send one GMCP package as a telnet subnegotiation frame.
@@ -820,7 +826,15 @@ class Session:
                     self.game, reattach
                 ):
                     char = hooks.try_restore_folded_login(self.game, reattach)
-            if char is not None and not getattr(char, "is_npc", False):
+            from engine.accounts import is_staff_login_cast
+            if char is None:
+                raw = self.game.find_character(reattach)
+                if is_staff_login_cast(raw):
+                    char = raw
+            if char is not None and (
+                not getattr(char, "is_npc", False)
+                or is_staff_login_cast(char)
+            ):
                 self._gateway_reattach_name = None
                 char.session = self
                 # Do not stamp last_input_tick when already idle -- autoidle
@@ -1609,7 +1623,23 @@ class Session:
         """
         char = self.character
         if char is not None and getattr(char, "session", None) is self:
-            char.session = None
+            if (
+                getattr(char, "gm_mode", False)
+                or getattr(char, "gm_spirit", False)
+            ):
+                from engine import hooks
+                body = hooks.resolve_gm_body(char, self.game)
+                if body is not None:
+                    body.gm_away = True
+                    body.gm_staff_form = True
+                    body.gm_spirit_key = getattr(char, "key", None)
+                    watch = getattr(char, "location", None)
+                    if watch is not None and getattr(watch, "key", None):
+                        body.gm_spirit_room_key = watch.key
+                char.session = None
+                hooks.park_gm_spirit_on_disconnect(char, self.game)
+            else:
+                char.session = None
         self.character = None
         self.alive = False
         sessions = getattr(self.game, "sessions", None)

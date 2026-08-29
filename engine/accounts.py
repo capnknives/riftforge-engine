@@ -21,6 +21,7 @@ the two sides honest.
 
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from engine import auth
@@ -81,15 +82,19 @@ class Account:
         self.wizinvis = True
         # Playtester diagnostic tools (``playtest`` / ``playtester add``).
         self.playtester = False
+        # One-time MUD basics orientation completed on any linked character.
+        self.mud_basics_seen = False
         # Volunteer player helper (``gm set … helper on``).
         self.player_helper = False
         # Visit-ceiling for in-game ``changes`` (new since last acknowledgment).
         # Legacy ``last_seen_changelog_id`` is uplifted once on read.
         self.last_seen_changelog_sort_ts = ""
         self.changelog_visit_migrated = False
-        # Partial ``changes unread`` paging cursor (oldest ship on the last
-        # unread page). Empty = read from the visit ceiling downward.
+        # Partial ``changes unread`` paging window: cursor is the low lookup
+        # ``#N`` already listed, high-water is the high ``#N``. Empty = no
+        # paging in progress (read from the visit ceiling downward).
         self.last_seen_changelog_unread_cursor = ""
+        self.last_seen_changelog_unread_high_water = ""
         # Legacy numeric watermark (pre Aug 2026 timestamp-only feed).
         self.last_seen_changelog_id = 0
         # Phase 5: storage key of a body mid create-flow chargen (resume draft).
@@ -99,6 +104,10 @@ class Account:
         # Catalog bodies on loan for RPC tenure (Gabriel, Dean, …).
         # Never ``character_keys`` / ``.account`` -- see Assigned Characters menu.
         self.assigned_characters = []
+        # Wall-clock UNIX time when this account was minted. 0.0 on
+        # pre-feature saves -- boot heal ``heal_account_created_at_stamps``
+        # fills these on first boot after the ledger ships.
+        self.created_at = 0.0
 
     def to_blob(self):
         """JSON-serializable extras for the accounts.data column."""
@@ -121,6 +130,7 @@ class Account:
             "gm_see_accounts": bool(self.gm_see_accounts),
             "wizinvis": bool(self.wizinvis),
             "playtester": bool(self.playtester),
+            "mud_basics_seen": bool(getattr(self, "mud_basics_seen", False)),
             "player_helper": bool(self.player_helper),
             "last_seen_changelog_id": int(
                 getattr(self, "last_seen_changelog_id", 0) or 0
@@ -134,6 +144,9 @@ class Account:
             "last_seen_changelog_unread_cursor": str(
                 getattr(self, "last_seen_changelog_unread_cursor", "") or ""
             ),
+            "last_seen_changelog_unread_high_water": str(
+                getattr(self, "last_seen_changelog_unread_high_water", "") or ""
+            ),
             "chargen_draft_key": str(
                 getattr(self, "chargen_draft_key", "") or ""
             ),
@@ -143,6 +156,7 @@ class Account:
             "assigned_characters": list(
                 getattr(self, "assigned_characters", None) or []
             ),
+            "created_at": float(getattr(self, "created_at", 0.0) or 0.0),
         }
 
     def apply_blob(self, data):
@@ -185,6 +199,7 @@ class Account:
         # Missing key = default staff-invisible (old saves keep prior behavior).
         self.wizinvis = bool(data.get("wizinvis", True))
         self.playtester = bool(data.get("playtester", False))
+        self.mud_basics_seen = bool(data.get("mud_basics_seen", False))
         self.player_helper = bool(data.get("player_helper", False))
         self.last_seen_changelog_id = int(
             data.get("last_seen_changelog_id", 0) or 0
@@ -197,6 +212,9 @@ class Account:
         )
         self.last_seen_changelog_unread_cursor = str(
             data.get("last_seen_changelog_unread_cursor", "") or ""
+        )
+        self.last_seen_changelog_unread_high_water = str(
+            data.get("last_seen_changelog_unread_high_water", "") or ""
         )
         self.chargen_draft_key = str(data.get("chargen_draft_key", "") or "")
         blocked = data.get("ooc_blocked_accounts") or []
@@ -225,6 +243,10 @@ class Account:
                 seen_grants.add(k.lower())
                 cleaned_grants.append(k)
         self.assigned_characters = cleaned_grants
+        try:
+            self.created_at = float(data.get("created_at", 0) or 0)
+        except (TypeError, ValueError):
+            self.created_at = 0.0
 
 
 def normalize_account_name(raw):
@@ -375,6 +397,7 @@ def create_account(game, name, password, *, display_name=None):
         password_hash=auth.hash_password(password),
         display_name=display_name or cleaned,
     )
+    account.created_at = time.time()
     register_account(game, account)
     return account, None
 
@@ -1085,6 +1108,41 @@ def heal_empty_account_passwords(game):
     return {"healed": healed}
 
 
+def heal_account_created_at_stamps(game):
+    """Boot heal: stamp ``created_at`` on accounts that predate the field.
+
+    Legacy rows minted before the gm accounts ledger shipped carry
+    ``created_at=0``.  The first boot after that ship stamps them with
+    the current wall time so ``gm accounts`` oldest/newest lines are real
+    instead of "unstamped".  Idempotent -- already-stamped accounts are
+    left alone.
+    """
+    accounts = ensure_accounts_dict(game)
+    now = time.time()
+    stamped = 0
+    for account in accounts.values():
+        try:
+            created = float(getattr(account, "created_at", 0) or 0)
+        except (TypeError, ValueError):
+            created = 0.0
+        if created > 0:
+            continue
+        account.created_at = now
+        stamped += 1
+        try:
+            from engine.persistence import mark_account_dirty
+
+            mark_account_dirty(game, account)
+        except Exception:
+            pass
+    if stamped:
+        print(
+            f"[accounts] boot-heal stamped created_at on {stamped} account(s)",
+            flush=True,
+        )
+    return {"stamped": stamped}
+
+
 def migrate_legacy_gm_ranks(game):
     """Move per-character ``gm_rank`` onto linked (or auto-made) accounts.
 
@@ -1166,17 +1224,41 @@ def playable_link_target(game, character):
     return body, None
 
 
-def list_immersion_cast(game):
-    """Live immersion-cast bodies (non-NPC) for staff account secondary roster.
+def is_staff_login_cast(char):
+    """True when catalog opted this fixture into the staff-only occupy path.
 
-    Same gate as ``castpass``: ``immersion=True``, not ``is_npc``. Sorted by
-    presence face / key for stable menus.
+    Idle ``npc_until_assigned`` bodies stay ``is_npc`` until a live Session
+    rides them, so the ordinary Cast filter would hide them. ``staff_login``
+    is the staff backdoor (Ash): type the name at the account menu or
+    ``gm off``. Players never see the Cast roster.
+    """
+    if char is None:
+        return False
+    if not getattr(char, "immersion", False):
+        return False
+    key_low = (getattr(char, "key", None) or "").lower()
+    if key_low.startswith("husk:") or key_low.startswith("gmspirit:"):
+        return False
+    if getattr(char, "staff_login", False):
+        return True
+    # Catalog hook -- copyover skip-deferred leaves old blobs unstamped.
+    from engine import hooks as hooks_mod
+
+    return key_low in hooks_mod.staff_login_cast_keys()
+
+
+def list_immersion_cast(game):
+    """Live immersion-cast bodies for staff account secondary roster.
+
+    Playable cast: ``immersion=True`` and not ``is_npc``. Staff-login
+    fixtures (Ash) stay in the list even while idle NPCs so typing the
+    name occupies them. Sorted by key for stable menus.
     """
     found = []
     if game is None:
         return found
     for char in list(getattr(game, "characters", None) or []):
-        if getattr(char, "is_npc", False):
+        if getattr(char, "is_npc", False) and not is_staff_login_cast(char):
             continue
         if not getattr(char, "immersion", False):
             continue
@@ -1188,6 +1270,53 @@ def list_immersion_cast(game):
         return (getattr(ch, "key", None) or "").lower()
     found.sort(key=_sort_key)
     return found
+
+
+def list_essential_fixture_cast(game):
+    """Idle ``npc_until_assigned`` essential cast (Ash, desk fixtures, …).
+
+    ``list_immersion_cast`` skips ordinary ``is_npc`` bodies; staff login
+    menus still need them pickable by name for crash-gate telnet.
+    """
+    found = []
+    if game is None:
+        return found
+    for char in list(getattr(game, "characters", None) or []):
+        if not getattr(char, "immersion", False):
+            continue
+        if not getattr(char, "is_npc", False):
+            continue
+        if not getattr(char, "essential", False):
+            continue
+        key_low = (getattr(char, "key", None) or "").lower()
+        if key_low.startswith("husk:") or key_low.startswith("gmspirit:"):
+            continue
+        found.append(char)
+    found.sort(key=lambda ch: (getattr(ch, "key", None) or "").lower())
+    return found
+
+
+def resolve_staff_login_cast(game, raw):
+    """Exact-name backdoor onto a ``staff_login`` fixture (even if is_npc).
+
+    Used when a staff account types the cast key at the character menu and
+    the row was missing from the painted list. Players never reach this.
+    """
+    needle = (raw or "").strip()
+    if not needle or game is None:
+        return None
+    low = needle.lower()
+    exact = []
+    for char in list(getattr(game, "characters", None) or []):
+        if not is_staff_login_cast(char):
+            continue
+        key = (getattr(char, "key", None) or "")
+        given = (getattr(char, "given_name", None) or "").lower()
+        if key.lower() == low or (given and given == low):
+            exact.append(char)
+    if len(exact) == 1:
+        return exact[0]
+    return None
 
 
 def _resolve_immersion_cast_by_name(game, raw):
@@ -1212,6 +1341,16 @@ def _resolve_immersion_cast_by_name(game, raw):
         return None
     if len(loose) == 1:
         return loose[0]
+    # Fixture cast (npc_until_assigned) stay is_npc while idle and are
+    # omitted from list_immersion_cast -- still resolve by storage key.
+    if game is not None:
+        direct = game.find_character(needle)
+        if (
+            direct is not None
+            and getattr(direct, "immersion", False)
+            and (getattr(direct, "key", None) or "").lower() == low
+        ):
+            return direct
     return None
 
 
@@ -1273,6 +1412,11 @@ def assign_character_to_account(game, account, character_name, *, quiet=False):
     key = getattr(cast, "key", None) or ""
     if not key:
         return False, "That character has no storage key."
+    if is_staff_login_cast(cast):
+        return False, (
+            f"{key} is staff-login only -- occupy from the Cast menu "
+            "(type the name). Not an Assigned Character loan."
+        )
     if account_has_assigned_character(account, key):
         if quiet:
             return True, f"{key} is already on Assigned Characters."
@@ -1432,6 +1576,12 @@ def account_login_choices(game, account):
             if low in seen:
                 continue
             # Cast linked as a PC stays in Characters only.
+            seen.add(low)
+            choices.append(("cast", cast))
+        for cast in list_essential_fixture_cast(game):
+            low = (getattr(cast, "key", None) or "").lower()
+            if low in seen:
+                continue
             seen.add(low)
             choices.append(("cast", cast))
     else:

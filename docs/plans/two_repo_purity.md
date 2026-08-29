@@ -10,8 +10,9 @@ hook API details grow in [`../ENGINE_CONSUMER.md`](../ENGINE_CONSUMER.md).
 **complete** — Stages **1–10**, A1/A2, Plan B, Stage G, and public tags
 `v0.2.0`–`v0.5.0`. Public
 [`riftforge-engine`](https://github.com/capnknives/riftforge-engine) Latest
-**`v0.6.1`** (2026-08-27, purity restore + monorepo engine since **`v0.6.0`**
-2026-08-21); private `capnknives/RiftForge` (SUPERS) pins **`@v0.6.1`**.
+**`v0.6.2`** (2026-08-29, liquid-flavor kernels + kind stamps; prior **`v0.6.1`**
+2026-08-27 purity restore + monorepo engine since **`v0.6.0`**
+2026-08-21); private `capnknives/RiftForge` (SUPERS) pins **`@v0.6.2`**.
 **Post–`v0.4.0` hygiene track (H1–H10)** **complete** (2026-08-05) —
 execution SoT: [`two_repo_purity_extractions_plan.md`](two_repo_purity_extractions_plan.md);
 closeout inventory: [`two_repo_purity_audit_2026-08-05.md`](two_repo_purity_audit_2026-08-05.md).

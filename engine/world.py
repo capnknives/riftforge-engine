@@ -111,11 +111,12 @@ class Item(GameObject):
         # skips it instead of re-exhuming and re-burying the same corpse. Only
         # ever meaningful when is_body is True.
         self.is_buried = is_buried
-        # Scavenger harvest flags (supers/scavenge.py): meat/blood/DMB can
-        # each be taken once from an unburied body without destroying it --
-        # Moss can still bury, spirits can still anchor. Only meaningful
-        # when is_body.
+        # Scavenger harvest flags (supers/scavenge.py): meat/blood/DMB/hide
+        # can each be taken once from an unburied body without destroying
+        # it -- Moss can still bury, spirits can still anchor. Only
+        # meaningful when is_body (hunt carcasses reuse the meat/hide flags).
         self.body_harvested_meat = False
+        self.body_harvested_hide = False
         self.body_drained = False
         self.body_siphoned = False
         self.body_dmb_drawn = False
@@ -123,6 +124,13 @@ class Item(GameObject):
         # Hunters use this to refuse vampire corpses for dead man's blood.
         self.body_origin = None
         self.body_path = None
+        # Opaque harvest profile copied at make_body (morphology + flags).
+        self.body_type = None
+        self.body_no_blood = False
+        self.body_yields_meat = None
+        self.body_yields_hide = None
+        self.body_creature_id = None
+        self.body_butcher_yields = None
         # Divine relic id (supers.faith.DIVINE_RELICS) or None. Carried
         # relics keep a Divine congregation happier -- see faith.py.
         self.relic = relic
@@ -598,7 +606,8 @@ class Character(GameObject):
         # Melee vs ranged engagement preference (FIN paces close/retreat).
         # Distinct from combat_stance. None = auto from style / weapon.
         self.engagement_stance = None     # None | melee | ranged
-        # Fight-ephemeral engagement band state (cleared on disengage).
+        # In-room pair distance (close/reach/far). Progress flags clear on
+        # disengage; the pair band can persist until someone leaves the room.
         self.engagement_vs = {}           # foe_key -> close|reach|far
         self.engagement_progress = {}     # pair_key -> float
         self.engagement_pressed = False
@@ -851,7 +860,13 @@ class Character(GameObject):
             if session is not None and hasattr(session, "send"):
                 session.send(block)
             return False
-        old_key = getattr(self.location, "key", None) if self.location else None
+        old_room = self.location
+        old_key = getattr(old_room, "key", None) if old_room else None
+        if old_room is not None and old_room is not room:
+            try:
+                hooks_mod.character_relocated(self, old_room, room, game)
+            except Exception:
+                pass
         if self.location:
             # Bypass Room.remove so we do NOT drop out of game.characters
             # mid-move (remove unregisters for true despawns). The
@@ -898,6 +913,22 @@ def make_body(character):
         body.body_origin = str(origin).strip().lower()
     if path:
         body.body_path = str(path).strip().lower()
+    body_type = getattr(character, "body_type", None)
+    if body_type:
+        body.body_type = str(body_type).strip().lower()
+    body.body_no_blood = bool(getattr(character, "no_blood", False))
+    if getattr(character, "yields_meat", None) is not None:
+        body.body_yields_meat = bool(character.yields_meat)
+    if getattr(character, "yields_hide", None) is not None:
+        body.body_yields_hide = bool(character.yields_hide)
+    creature_id = getattr(character, "creature_id", None)
+    if creature_id:
+        body.body_creature_id = str(creature_id).strip()
+    raw_yields = getattr(character, "butcher_yields", None)
+    if isinstance(raw_yields, (list, tuple)):
+        listed = [str(x).strip() for x in raw_yields if str(x).strip()]
+        if listed:
+            body.body_butcher_yields = listed
     return body
 
 

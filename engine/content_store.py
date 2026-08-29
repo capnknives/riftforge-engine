@@ -60,7 +60,14 @@ def save_json(path, data):
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(data, handle, indent=4)
+            # ensure_ascii=False: the file is opened utf-8, so keep real
+            # unicode (em dashes, accents, ...) as literal UTF-8 bytes
+            # instead of \uXXXX escapes. The escaped form is functionally
+            # equivalent but rewrites every non-ASCII character in the whole
+            # catalog into noisy escapes on every GM `olc` save, which
+            # produces huge diffs unrelated to the actual edit and makes the
+            # file unreadable to a human reviewer.
+            json.dump(data, handle, indent=4, ensure_ascii=False)
             handle.write("\n")
         # Retry replace: Windows AV / indexer can briefly lock `path`.
         last_err = None

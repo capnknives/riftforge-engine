@@ -90,6 +90,10 @@ AMERICA_PREFIX = "America Overland"
 # Legacy room keys / help text sometimes used a "The " prefix.
 _AMERICA_PREFIXES = frozenset({AMERICA_PREFIX, "The America Overland"})
 EARTH_AMERICA_ID = "earth_america"
+# Secret 1861 atlas — never adopt onto the live America dual-layer.
+FRONTIERLAND_PREFIX = "Frontierland Overland"
+FRONTIERLAND_MAP_ID = "earth_frontierland_1861"
+FRONTIERLAND_PLANE = "earth_frontierland_1861"
 
 # Cardinal deltas: +y north, +x east (same as maps.py grids).
 _DIR_DELTA = {
@@ -134,6 +138,12 @@ _TERRAIN_BLURBS = {
 
 # Water / lake / off-CONUS void block Impala travel (v1 road fantasy).
 _VEHICLE_BLOCKED = frozenset({"ocean", "lake", "void", "water"})
+
+# area_type / map_layer strings that count as paved or settled road for
+# ``offroad_fraction`` when callers do not override ``road_areas``.
+_DEFAULT_ROAD_AREAS = frozenset(
+    {"highway", "mountain_highway", "city", "road"},
+)
 
 
 def _content_maps_dir():
@@ -199,13 +209,32 @@ def _is_foreign_overland_grid(room):
     (purity), so this checks the plain ``demesne_id`` attribute those
     rooms stamp on themselves rather than importing the demesne module.
 
+    The 1861 Frontierland atlas is a second CONUS grid on another plane.
+    Its numeric cells must never be mistaken for live America Overland.
+
     Any function here that reads a room's overland coords to look up
     real atlas terrain/cities, or that calls :func:`place_on_overland`
     with coords borrowed from a room, must skip these rooms first --
     otherwise a God standing in their demesne gets silently relocated
     onto the real America atlas at the same numeric coordinates.
     """
-    return bool(getattr(room, "demesne_id", None))
+    if room is None:
+        return False
+    if bool(getattr(room, "demesne_id", None)):
+        return True
+    plane = str(getattr(room, "plane", None) or "").strip().lower()
+    if plane == FRONTIERLAND_PLANE:
+        return True
+    map_id = str(getattr(room, "map_id", None) or "").strip().lower()
+    if map_id == FRONTIERLAND_MAP_ID:
+        return True
+    prefix = str(getattr(room, "grid_prefix", None) or "").strip()
+    if prefix == FRONTIERLAND_PREFIX:
+        return True
+    parsed = map_ui.parse_grid_key(getattr(room, "key", "") or "")
+    if parsed and parsed[0] == FRONTIERLAND_PREFIX:
+        return True
+    return False
 
 
 def is_real_overland_room(room):
@@ -1105,13 +1134,32 @@ def _vehicle_can_enter(atlas, mx, my):
     return area not in _VEHICLE_BLOCKED
 
 
-def pathfind_vehicle_macro(atlas, start, goal, *, max_steps=4000):
-    """BFS a driveable America-macro path from ``start`` to ``goal``.
+def pathfind_vehicle_macro(atlas, start, goal, *, cost_fn=None, max_steps=4000):
+    """Find a driveable America-macro path from ``start`` to ``goal``.
 
-    Cardinal steps only (n/s/e/w). Skips ocean/lake. Returns a list of
-    ``(x, y)`` tiles **after** start through and including goal, or
-    ``None`` when unreachable / inputs invalid. Used by scenic / slow
-    atlas cruises (You are what you drive C+).
+    Cardinal steps only (n/s/e/w). Skips ocean/lake/void/water via
+    ``_vehicle_can_enter``. Returns a list of ``(x, y)`` tiles **after**
+    start through and including goal, or ``None`` when unreachable /
+    inputs invalid.
+
+    When ``cost_fn`` is ``None`` (default), uses unweighted BFS — fewest
+    hops, identical to the original v1 behavior so existing callers
+    (dispatch, taxi, charter legs, vehicle kit smokes) stay stable.
+
+    When ``cost_fn`` is provided, uses Dijkstra's algorithm (``heapq`` min-
+    heap) so each cardinal step onto neighbor ``(nx, ny)`` adds
+    ``cost_fn(atlas.terrain_at(nx, ny))`` to the path total. BFS always
+    treats every hop as equal cost; Dijkstra is needed when terrain types
+    have different weights (highway cheap, forest expensive, etc.).
+
+    ``cost_fn`` contract: receives the **area_type string** returned by
+    ``atlas.terrain_at(x, y)`` (e.g. ``"highway"``, ``"forest"``,
+    ``"city"`` — not the full terrain cell dict). Must return a numeric
+    step cost (typically ``>= 0``). Games supply their own policy via a
+    lambda; this engine module stays game-agnostic.
+
+    ``max_steps`` caps how many cells the search may **pop** from its
+    frontier (BFS deque or Dijkstra heap) before giving up.
     """
     start = _parse_pos_pair(start)
     goal = _parse_pos_pair(goal)
@@ -1125,30 +1173,67 @@ def pathfind_vehicle_macro(atlas, start, goal, *, max_steps=4000):
         return None
     if start == goal:
         return []
-    # Standard BFS: queue of positions; came_from rebuilds the path.
-    from collections import deque
 
-    came_from = {start: None}
-    queue = deque([start])
-    steps = 0
     cardinals = ((0, 1), (0, -1), (1, 0), (-1, 0))
-    while queue and steps < max_steps:
-        steps += 1
-        cur = queue.popleft()
-        if cur == goal:
-            break
-        cx, cy = cur
-        for dx, dy in cardinals:
-            nx, ny = cx + dx, cy + dy
-            nxt = (nx, ny)
-            if nxt in came_from:
+    came_from = {start: None}
+
+    if cost_fn is None:
+        # Standard BFS: queue of positions; came_from rebuilds the path.
+        from collections import deque
+
+        queue = deque([start])
+        steps = 0
+        while queue and steps < max_steps:
+            steps += 1
+            cur = queue.popleft()
+            if cur == goal:
+                break
+            cx, cy = cur
+            for dx, dy in cardinals:
+                nx, ny = cx + dx, cy + dy
+                nxt = (nx, ny)
+                if nxt in came_from:
+                    continue
+                if not clamp_macro(nx, ny):
+                    continue
+                if not _vehicle_can_enter(atlas, nx, ny):
+                    continue
+                came_from[nxt] = cur
+                queue.append(nxt)
+    else:
+        # Weighted shortest path: heapq.heappop always returns the lowest-
+        # cost frontier cell first (like a priority queue). Stale heap
+        # entries — pushed before we found a cheaper route — are skipped
+        # when their stored cost exceeds cost_so_far[cur].
+        import heapq
+
+        cost_so_far = {start: 0}
+        # Tuple order matters: heapq compares element[0] first (total cost).
+        heap = [(0, start)]
+        steps = 0
+        while heap and steps < max_steps:
+            steps += 1
+            cur_cost, cur = heapq.heappop(heap)
+            if cur_cost > cost_so_far.get(cur, float("inf")):
                 continue
-            if not clamp_macro(nx, ny):
-                continue
-            if not _vehicle_can_enter(atlas, nx, ny):
-                continue
-            came_from[nxt] = cur
-            queue.append(nxt)
+            if cur == goal:
+                break
+            cx, cy = cur
+            for dx, dy in cardinals:
+                nx, ny = cx + dx, cy + dy
+                nxt = (nx, ny)
+                if not clamp_macro(nx, ny):
+                    continue
+                if not _vehicle_can_enter(atlas, nx, ny):
+                    continue
+                # Charge for entering the destination cell's terrain.
+                step_cost = cost_fn(atlas.terrain_at(nx, ny))
+                new_cost = cur_cost + step_cost
+                if new_cost < cost_so_far.get(nxt, float("inf")):
+                    cost_so_far[nxt] = new_cost
+                    came_from[nxt] = cur
+                    heapq.heappush(heap, (new_cost, nxt))
+
     if goal not in came_from:
         return None
     # Rebuild goal -> start, then reverse to start-exclusive path.
@@ -1159,6 +1244,41 @@ def pathfind_vehicle_macro(atlas, start, goal, *, max_steps=4000):
         node = came_from.get(node)
     path.reverse()
     return path
+
+
+def offroad_fraction(atlas, path, road_areas=None):
+    """Measure how much of a macro vehicle path is off-road.
+
+    ``path`` is the same ``[(x, y), ...]`` list ``pathfind_vehicle_macro``
+    returns (tiles after start through goal). For each cell, we read
+    ``atlas.terrain_at(x, y)`` (area_type string) and, when present,
+    ``atlas.terrain[(x, y)]["map_layer"]`` — matching how games already
+    classify highway vs wilderness without importing game code here.
+
+    A cell counts as **on-road** when its area_type **or** map_layer is in
+    ``road_areas``. Default ``road_areas`` is ``_DEFAULT_ROAD_AREAS``
+    (highway, mountain_highway, city, road).
+
+    Returns ``(offroad_steps, total_steps, fraction)`` where
+    ``fraction = offroad_steps / total_steps``. Empty paths return
+    ``(0, 0, 0.0)`` to avoid division by zero.
+    """
+    if road_areas is None:
+        road_areas = _DEFAULT_ROAD_AREAS
+    total_steps = len(path or [])
+    if total_steps == 0:
+        return (0, 0, 0.0)
+
+    offroad_steps = 0
+    for x, y in path:
+        area = atlas.terrain_at(x, y)
+        cell = atlas.terrain.get((x, y)) or {}
+        layer = str(cell.get("map_layer") or "").lower()
+        on_road = area in road_areas or layer in road_areas
+        if not on_road:
+            offroad_steps += 1
+    fraction = offroad_steps / total_steps
+    return (offroad_steps, total_steps, fraction)
 
 
 def mission_pocket_blocks_overland_move(character):
@@ -1614,6 +1734,7 @@ WILD_ROAM_MACRO_RADIUS = 2
 _SETTLEMENT_HOME_ZONES = frozenset({
     "lebanon-town",
     "men-of-letters",
+    "harvelles-roadhouse",
 })
 
 
@@ -1647,6 +1768,11 @@ def home_return_room_key(actor, game):
         ):
             if key in rooms:
                 return key
+    if zone == "harvelles-roadhouse":
+        for key in ("HX00003", "HX00001"):
+            room = rooms.get(key)
+            if room is not None:
+                return room.key
     if zone == "lebanon-town" or not zone:
         if plaza_key in rooms:
             return plaza_key
@@ -1768,6 +1894,9 @@ def cadence_homeward_from_overland(game, actor, dest_room_key=None):
     Returns True when the turn was consumed.
     """
     if game is None or actor is None:
+        return False
+    from engine.session_attach import has_live_player_session
+    if has_live_player_session(actor, game):
         return False
     if overland_mode(actor) != "on_foot":
         return False
@@ -1924,6 +2053,7 @@ def heal_stranded_overland_cadence(game):
         or rooms.get("Bunker Library Stacks")
     )
     lebanon_mouth = rooms.get(hub_key)
+    harvelles_lot = rooms.get("HX00001")
     bunker_mouth = None
     for room in rooms.values():
         if (
@@ -1937,6 +2067,9 @@ def heal_stranded_overland_cadence(game):
     for char in cast:
         if not isinstance(char, Character):
             continue
+        from engine.session_attach import has_live_player_session
+        if has_live_player_session(char, game):
+            continue
         ensure_overland_defaults(char)
         if overland_mode(char) != "on_foot":
             continue
@@ -1948,6 +2081,9 @@ def heal_stranded_overland_cadence(game):
         if zone == "men-of-letters":
             dest = bunker or plaza
             mouth = bunker_mouth
+        elif zone == "harvelles-roadhouse":
+            dest = harvelles_lot or plaza
+            mouth = harvelles_lot
         else:
             dest = plaza or bunker
             mouth = lebanon_mouth

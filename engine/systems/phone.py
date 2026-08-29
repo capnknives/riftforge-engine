@@ -10,6 +10,7 @@ Zero ``supers`` imports.
 
 from __future__ import annotations
 
+import difflib
 import re
 
 from engine.char_index import iter_characters
@@ -306,6 +307,210 @@ def _next_number(game):
     return f"555-{n:04d}"
 
 
+META_KEY = "phone_number_pool"
+
+
+def ensure_phone_pool(game):
+    """``game.retired_phone_numbers`` + ``game.claimed_phone_numbers``.
+
+    Retired rows wait ``free_after_ticks`` (one game-day at stock 1x) before
+    ``next_assignable_number`` reuses them. Claimed numbers stay out of the
+    recycle pool even after that deadline.
+    """
+    if game is None:
+        return
+    blob = getattr(game, "retired_phone_numbers", None)
+    if not isinstance(blob, list):
+        game.retired_phone_numbers = []
+    claimed = getattr(game, "claimed_phone_numbers", None)
+    if not isinstance(claimed, set):
+        if isinstance(claimed, (list, tuple)):
+            game.claimed_phone_numbers = set(
+                str(x).strip() for x in claimed if str(x).strip()
+            )
+        else:
+            game.claimed_phone_numbers = set()
+
+
+def export_meta(game):
+    """Persist blob for ``save_meta_json`` (retired pool + claimed numbers)."""
+    ensure_phone_pool(game)
+    retired = []
+    for row in list(getattr(game, "retired_phone_numbers", None) or []):
+        if not isinstance(row, dict):
+            continue
+        num = normalize_number(row.get("number"))
+        if not num:
+            continue
+        try:
+            free_at = int(row.get("free_after_ticks", 0) or 0)
+        except (TypeError, ValueError):
+            free_at = 0
+        retired.append({"number": num, "free_after_ticks": free_at})
+    claimed = sorted(
+        normalize_number(x) or str(x).strip()
+        for x in (getattr(game, "claimed_phone_numbers", None) or set())
+        if x
+    )
+    return {"retired": retired, "claimed": [c for c in claimed if c]}
+
+
+def import_meta(game, blob):
+    """Restore retired/claimed phone numbers from meta JSON."""
+    ensure_phone_pool(game)
+    if not isinstance(blob, dict):
+        return
+    retired = []
+    for row in blob.get("retired") or []:
+        if not isinstance(row, dict):
+            continue
+        num = normalize_number(row.get("number"))
+        if not num:
+            continue
+        try:
+            free_at = int(row.get("free_after_ticks", 0) or 0)
+        except (TypeError, ValueError):
+            free_at = 0
+        retired.append({"number": num, "free_after_ticks": free_at})
+    game.retired_phone_numbers = retired
+    claimed = set()
+    for raw in blob.get("claimed") or []:
+        num = normalize_number(raw)
+        if num:
+            claimed.add(num)
+    game.claimed_phone_numbers = claimed
+
+
+def _retired_row(game, number):
+    """Return the retired-pool dict for ``number``, or None."""
+    ensure_phone_pool(game)
+    want = normalize_number(number)
+    if not want:
+        return None
+    for row in list(getattr(game, "retired_phone_numbers", None) or []):
+        if not isinstance(row, dict):
+            continue
+        if normalize_number(row.get("number")) == want:
+            return row
+    return None
+
+
+def retire_number(game, number, *, free_after_ticks: int):
+    """Disable ``number`` until ``free_after_ticks``, then it may recycle.
+
+    A live handset may still carry the stamp (corpse loot); ``number_is_live``
+    treats a retired number as disconnected until it is reclaimed or a
+    player ``claim_number``s it. Essential / immersion faces should not
+    call this -- they keep the number across Chuck remake (Slice 6).
+    """
+    if game is None:
+        return
+    want = normalize_number(number)
+    if not want:
+        return
+    ensure_phone_pool(game)
+    try:
+        free_at = int(free_after_ticks)
+    except (TypeError, ValueError):
+        free_at = 0
+    # Refresh the deadline if this number is retired twice (re-death).
+    kept = [
+        row for row in game.retired_phone_numbers
+        if isinstance(row, dict)
+        and normalize_number(row.get("number")) != want
+    ]
+    kept.append({"number": want, "free_after_ticks": free_at})
+    game.retired_phone_numbers = kept
+
+
+def number_is_live(game, number) -> bool:
+    """True when ``number`` is assigned and has not been retired.
+
+    Retired-and-not-yet-reclaimed numbers return False so dialers hear
+    disconnected prose even if the corpse still holds the handset.
+    """
+    want = normalize_number(number)
+    if not want or game is None:
+        return False
+    if _retired_row(game, want) is not None:
+        return False
+    item, _holder, _room = find_item_by_number(game, want)
+    if item is not None:
+        return True
+    claimed = getattr(game, "claimed_phone_numbers", None) or set()
+    return want in claimed
+
+
+def next_assignable_number(game) -> str:
+    """Prefer a retired-and-due number from the pool, else ``_next_number``."""
+    if game is None:
+        return _next_number(game)
+    ensure_phone_pool(game)
+    now = int(getattr(game, "game_time_ticks", 0) or 0)
+    claimed = getattr(game, "claimed_phone_numbers", None) or set()
+    still = []
+    reuse = None
+    for row in list(game.retired_phone_numbers):
+        if not isinstance(row, dict):
+            continue
+        num = normalize_number(row.get("number"))
+        if not num:
+            continue
+        try:
+            free_at = int(row.get("free_after_ticks", 0) or 0)
+        except (TypeError, ValueError):
+            free_at = 0
+        # Claimed numbers never return to the pool.
+        if num in claimed:
+            continue
+        if free_at > now:
+            still.append({"number": num, "free_after_ticks": free_at})
+            continue
+        if reuse is None:
+            reuse = num
+        else:
+            still.append({"number": num, "free_after_ticks": free_at})
+    game.retired_phone_numbers = still
+    if reuse:
+        return reuse
+    return _next_number(game)
+
+
+def claim_number(character, number, game) -> tuple[bool, str]:
+    """Lock ``number`` onto the caller's flip phone and out of the recycle pool.
+
+    Nested hub: ``phone claim <number>``. Fails if the number is still live
+    on someone else's handset (not retired).
+    """
+    want = normalize_number(number)
+    if not want:
+        return False, "That does not look like a phone number."
+    if is_special_dial(want):
+        return False, "Special lines cannot be claimed."
+    phone = primary_handset(character)
+    if phone is None:
+        return False, "You need a flip phone in hand to claim a number."
+    if game is None:
+        return False, "No exchange is open to claim that number."
+    ensure_phone_pool(game)
+    # Live = assigned and not retired. A retired corpse number is claimable.
+    if number_is_live(game, want):
+        existing = normalize_number(getattr(phone, "phone_number", None))
+        if existing != want:
+            return False, "That number is already in service."
+        game.claimed_phone_numbers.add(want)
+        return True, f"Your handset is already {want} -- claimed, it will not recycle."
+    # Drop from the retired pool so next_assignable cannot reuse it.
+    game.retired_phone_numbers = [
+        row for row in game.retired_phone_numbers
+        if isinstance(row, dict)
+        and normalize_number(row.get("number")) != want
+    ]
+    game.claimed_phone_numbers.add(want)
+    phone.phone_number = want
+    return True, f"Your handset is now {want}. That number will not recycle."
+
+
 def ensure_phone_number(item, game=None):
     """Stamp a unique ``phone_number`` on a phone Item if missing."""
     if not is_phone_item(item):
@@ -315,7 +520,7 @@ def ensure_phone_number(item, game=None):
         return normalize_number(existing) or existing.strip().upper()
     if game is None:
         return None
-    number = _next_number(game)
+    number = next_assignable_number(game)
     item.phone_number = number
     return number
 
@@ -406,6 +611,38 @@ def find_item_by_number(game, number):
     return None, None, None
 
 
+def _phonebook_fuzzy_match(alias_key, contacts):
+    """Resolve a typed label to one saved alias (prefix or close spelling).
+
+    ``phone save alie 555-1575`` then ``phone text alice …`` should still
+    hit the saved row when the name is a unique near-match.
+    """
+    if not alias_key or not contacts:
+        return None
+    hits = []
+    for saved_alias, number in contacts.items():
+        if alias_key == saved_alias:
+            return (saved_alias, number)
+        if len(saved_alias) >= 3 and len(alias_key) >= 3:
+            if alias_key.startswith(saved_alias) or saved_alias.startswith(alias_key):
+                hits.append((saved_alias, number))
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        names = ", ".join(sorted(a for a, _n in hits))
+        return ("__ambiguous__", names)
+    close = difflib.get_close_matches(
+        alias_key, list(contacts.keys()), n=2, cutoff=0.84,
+    )
+    if len(close) == 1:
+        saved_alias = close[0]
+        return (saved_alias, contacts[saved_alias])
+    if len(close) > 1:
+        names = ", ".join(sorted(close))
+        return ("__ambiguous__", names)
+    return None
+
+
 def resolve_dial_target(character, raw, game):
     """Resolve dial args to a number string."""
     text = (raw or "").strip()
@@ -415,13 +652,34 @@ def resolve_dial_target(character, raw, game):
     contacts = getattr(character, "phone_contacts", None) or {}
     if isinstance(contacts, dict) and alias_key in contacts:
         return normalize_number(contacts[alias_key]), None
-    if " " not in text and alias_key in (contacts or {}):
-        return normalize_number(contacts[alias_key]), None
+    if isinstance(contacts, dict) and contacts:
+        fuzzy_hit = _phonebook_fuzzy_match(alias_key, contacts)
+        if fuzzy_hit is not None:
+            saved_alias, number = fuzzy_hit
+            if saved_alias == "__ambiguous__":
+                return None, f"Which contact? Saved aliases match: {number}."
+            return normalize_number(number), None
     head = text.split(None, 1)[0]
+    try:
+        from engine import hooks as hooks_mod
+
+        hooked = hooks_mod.phone_dial_alias_resolver(head, character, game)
+        if hooked:
+            return normalize_number(hooked), None
+    except Exception:
+        pass
     if is_special_dial(head):
         return head.upper(), None
     num = normalize_number(head)
     if not num:
+        return None, "That does not look like a phone number or saved alias."
+    # Names like Alice normalize to letter-only pseudo-numbers — do not dial.
+    if num.isalpha() and not is_special_dial(num):
+        if contacts:
+            return None, (
+                f"No saved alias '{alias_key}'. "
+                "Try 'phone contacts' or phone save <alias> <number>."
+            )
         return None, "That does not look like a phone number or saved alias."
     return num, None
 
@@ -445,6 +703,7 @@ def save_contact(character, alias, number):
         )
     if label in (
         "wknz", "save", "forget", "contacts", "number", "ask", "text",
+        "claim",
     ):
         return False, "That alias is reserved."
     num = normalize_number(number)
@@ -811,6 +1070,14 @@ def dial(character, game, raw_args):
         if msg is not None:
             return msg
 
+    # Retired numbers ring disconnected even if a corpse still holds the
+    # handset. Missing numbers keep the existing "not in service" line.
+    if not is_special_dial(number) and _retired_row(game, number) is not None:
+        return (
+            f"{tag_phone(character)} Disconnected — that number is "
+            "out of service."
+        )
+
     item, holder, _room = find_item_by_number(game, number)
     if item is None:
         return f"{tag_phone(character)} No answer — number not in service."
@@ -946,6 +1213,6 @@ def status_text(character, game):
         "  Try: dial/call <number|alias> | answer | hangup | "
         "phone text <alias|number> <msg> | phone say <text> | "
         "phone ask group|food|water|help | phone request <song> | "
-        "phone save|forget|contacts"
+        "phone save|forget|contacts | phone claim <number>"
     )
     return "\r\n".join(lines)

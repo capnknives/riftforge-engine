@@ -57,6 +57,7 @@ def _cheat_sheet():
         "",
         "Kinds refuse incomplete saves and undeclared fields on new rows.",
         "Same rules as tools/content_new.py and Area Studio.",
+        "Body trays/plots: olc new item.body_receptacle <id> (gm spawn item <id>).",
         "Detail: help olc | help build-kinds",
     ])
 
@@ -178,6 +179,7 @@ def cmd_olc(character, args, game):
             "kind": kind_id,
             "entity_id": entity_id,
             "obj": dict(obj),
+            "editing": True,
         })
         character.session.send(
             f"OLC edit: {kind_id} id={entity_id}. "
@@ -231,7 +233,12 @@ def cmd_olc(character, args, game):
             return
         try:
             validate_kind(kind_id, obj, reject_unknown=True)
-            msg = hooks.content_kind_save_entity(kind_id, entity_id, obj)
+            msg = hooks.content_kind_save_entity(
+                kind_id,
+                entity_id,
+                obj,
+                update=bool(sess.get("editing")),
+            )
         except Exception as err:
             character.session.send(f"OLC save refused: {err}")
             missing = diff_missing(kind_id, obj)

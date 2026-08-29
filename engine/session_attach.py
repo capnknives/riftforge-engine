@@ -87,6 +87,37 @@ def find_session_for_character(character, game):
     return None
 
 
+def _session_counts_as_live_player(sess, character):
+    """True when *sess* is a real client bound to *character* (not SilentSession)."""
+    if sess is None or character is None:
+        return False
+    try:
+        from engine.npc_act import SilentSession
+        if isinstance(sess, SilentSession):
+            return False
+    except ImportError:
+        pass
+    if not getattr(sess, "alive", False):
+        return False
+    return getattr(sess, "character", None) is character
+
+
+def has_live_player_session(character, game):
+    """True when *character* has a live client Session (direct or via game.sessions).
+
+    Covers half-cleared attach where ``character.session`` is None but
+    ``game.sessions`` still holds an alive Session for this body — OOC and
+    room broadcasts work, but Cadence-lite must not calendar-snap them home.
+    """
+    if character is None:
+        return False
+    cur = getattr(character, "session", None)
+    if _session_counts_as_live_player(cur, character):
+        return True
+    found = find_session_for_character(character, game)
+    return _session_counts_as_live_player(found, character)
+
+
 def heal_character_session(character, game, *, preferred_session=None):
     """Reattach *character.session* when the reverse link on Session still holds.
 

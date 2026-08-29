@@ -71,9 +71,19 @@
         "plains",
         "furnace",
         "highway",
+        "trail",
         "desert",
         "wetland",
         "void"
+      ]
+    },
+    "route_kind": {
+      "type": "enum",
+      "required": false,
+      "doc": "How road_rows paint: interstate gold (default) or wagon ruts.",
+      "values": [
+        "highway",
+        "trail"
       ]
     },
     "bestiary_categories": {
@@ -94,7 +104,7 @@
     "road_rows": {
       "type": "list",
       "required": false,
-      "doc": "Compact atlas: matching interstate overlay (= | / \\ + or space). City letters still win via cell_overrides map_glyph."
+      "doc": "Compact atlas: matching route overlay (= | / \\ + or space). grid.route_kind trail paints wagon ruts (not interstate gold). City letters still win via cell_overrides map_glyph."
     },
     "cell_overrides": {
       "type": "object",

@@ -14,10 +14,9 @@
       "doc": "Look / examine prose."
     },
     "need": {
-      "type": "enum",
+      "type": "string",
       "required": false,
-      "values": ["food", "water"],
-      "doc": "Consumable need tag (food/water only at engine tier)."
+      "doc": "Consumable need-meter id this item satisfies (engine ships food/water/sleep as common ids; games register additional meter ids via engine.systems.needs.register_meter, e.g. a game's own hunger-adjacent resources)."
     },
     "locked": {
       "type": "bool",
@@ -51,10 +50,27 @@
       "type": "enum",
       "required": false,
       "values": [
-        "weapon", "offhand", "shield", "head", "body", "arms", "hands",
-        "legs", "feet", "about", "neck", "finger", "ring_left", "ring_right",
-        "earring_left", "earring_right", "bracelet_left", "bracelet_right",
-        "waist", "belt", "light_belt"
+        "weapon",
+        "offhand",
+        "shield",
+        "head",
+        "body",
+        "arms",
+        "hands",
+        "legs",
+        "feet",
+        "about",
+        "neck",
+        "finger",
+        "ring_left",
+        "ring_right",
+        "earring_left",
+        "earring_right",
+        "bracelet_left",
+        "bracelet_right",
+        "waist",
+        "belt",
+        "light_belt"
       ],
       "doc": "Combat equip slot (legacy armor/accessory normalize at load)."
     },
@@ -71,7 +87,10 @@
     "grip": {
       "type": "enum",
       "required": false,
-      "values": ["one_hand", "two_hand"],
+      "values": [
+        "one_hand",
+        "two_hand"
+      ],
       "doc": "Weapon grip for dual-wield rules."
     },
     "two_hand": {

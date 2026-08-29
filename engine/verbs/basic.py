@@ -1540,8 +1540,36 @@ def cmd_group(character, args, game):
             f"You shift to the {group_mod.ROW_LABELS[group_mod.ROW_BACK]}."
         )
         return
+    if choice == "merge":
+        from engine import party_invite as party_mod
+
+        if len(parts) < 2:
+            character.session.send(
+                "Usage: group merge <name>  -- merge your group into theirs."
+            )
+            return
+        name = " ".join(parts[1:]).strip()
+        target = game.find_character(name) if game is not None else None
+        if target is None:
+            character.session.send(f"No one here named {name!r}.")
+            return
+        ok, msg, moved = party_mod.invite_merge(character, target, game)
+        character.session.send(msg)
+        if ok and not moved:
+            dest_leader = group_mod.resolve_leader(target)
+            if (
+                dest_leader is not None
+                and getattr(dest_leader, "session", None) is not None
+                and dest_leader is not character
+            ):
+                dest_leader.session.send(
+                    f"{character.key} wants to merge their group into yours. "
+                    "Type 'party accept' or 'party decline'."
+                )
+        return
     character.session.send(
         "Usage: group  |  group front  |  group back  |  "
+        "group merge <name>  |  "
         "group leave confirm  |  group disband confirm\r\n"
         "(Front/Back Row is display-only for now -- see 'help group'.)"
     )
@@ -2178,11 +2206,11 @@ def cmd_ooc(character, args, game):
 
     Usage:
       ooc <message>   speak on the global OOC channel
-      ooc             show the last 20 OOC lines (server-wide ring buffer)
+      ooc             show the last 20 OOC lines, numbered
+      replay ooc 12   replay one numbered line
 
-    Prefs #23 / #26: double-bracket prefix with layered sighted chrome
-    (crimson parens, gold OOC letters, parchment body) unless the player
-    set channel_colors['ooc'] to another role. Same plain text for
+    Prefs #23 / #26: whole-line bright aqua (role ``ooc``) unless the
+    player set channel_colors['ooc'] to another role. Same plain text for
     everyone::
 
         ((OOC)) [Name]: message text
@@ -2190,7 +2218,8 @@ def cmd_ooc(character, args, game):
     Offline Echoes have no Session and do not receive OOC. The history
     buffer lives on ``game.ooc_history`` and is saved in meta on every
     ``game.save()`` (so copyover / restart keep the last 20 lines). Still
-    a short ring — not a forever chat log.
+    a short ring — not a forever chat log. Staff mining also appends
+    ``ooc.log`` beside the save DB.
     """
     from engine import display_prefs
     from engine import channels
@@ -2215,8 +2244,9 @@ def cmd_questions(character, args, game):
     """Global player-help questions channel (OOC-adjacent).
 
     Usage:
-      questions <message>   ask everyone online
-      questions             replay the last 20 lines
+      question <message>    ask everyone online (questions is the same verb)
+      questions             replay the last 20 lines, numbered
+      replay questions 12   replay one numbered line
 
   Use this for how-do-I-play tutoring. For code bugs use bug; for ideas use
   suggest; for async tickets when nobody is online use query (help query).
@@ -2255,11 +2285,44 @@ def cmd_answers(character, args, game):
     if not text:
         channels.replay_global(character, game, "answers")
         return
-    from command_support import _presence_face
-    face = _presence_face(character)
-    channels.speak_custom_global(
-        game, spec, character, text, speaker_face=face,
+    from engine import answers_channel
+
+    answers_channel.broadcast_answers(
+        game, character, text, speaker_session=session,
     )
+
+
+def cmd_replay(character, args, game):
+    """Replay one numbered global-channel line without speaking.
+
+    Usage:
+      replay ooc 12
+      replay questions 12
+      replay ooc            same numbered dump as bare ooc
+    """
+    from engine import channels
+
+    session = getattr(character, "session", None)
+    if session is None:
+        return
+    text = (args or "").strip()
+    if not text:
+        session.send("Usage: replay ooc 12  or  replay questions 12")
+        return
+    parts = text.split(None, 1)
+    token = parts[0]
+    rest = parts[1] if len(parts) > 1 else ""
+    spec = channels.resolve_global_channel(token)
+    if spec is None:
+        session.send(
+            f"No channel named '{token}'. Try replay ooc 12 or replay questions 12."
+        )
+        return
+    index = channels.parse_replay_index(rest) if rest else None
+    if rest and index is None:
+        session.send("Usage: replay ooc 12  or  replay questions 12")
+        return
+    channels.replay_global(character, game, spec.name, index=index)
 
 
 def cmd_who(character, args, game):
@@ -3174,6 +3237,7 @@ def cmd_config(character, args, game):
         # config channel ooc|say|emote|tell|questions <role>
         bits = rest.split(None, 2)
         channel_names = ("ooc", "say", "emote", "tell", "questions")
+        channel_aliases = {"question": "questions"}
         if not bits:
             character.session.send(
                 "OOC channel role is "
@@ -3200,7 +3264,7 @@ def cmd_config(character, args, game):
                 "(roles: muted, ooc, say, emote, tell, alert, teal, gold, …)"
             )
             return
-        sub = bits[0].lower()
+        sub = channel_aliases.get(bits[0].lower(), bits[0].lower())
         if sub not in channel_names:
             character.session.send(
                 "Configurable channels: ooc, say, emote, tell, questions. "
@@ -3271,6 +3335,7 @@ def cmd_config(character, args, game):
         "autoidle": "autoidle",
         "idlemode": "idlemode",
         "idle": "idle",
+        "afk": "afk",
     }
     if key in _FORWARD:
         dispatch = hooks.get_dispatch()
@@ -3345,14 +3410,15 @@ def _config_category_index():
         "(alias: compact)",
         "  combat    -- gag, tags, hints, numbers, diag, fightlog, autokill",
         "  autoloot  -- kill scoop, dungeon/relics, autosplit",
-        "  chat      -- channels, plaincomms, tips, surname reminder",
+        "  chat      -- config channel ooc|say|emote|tell|questions, "
+        "plaincomms, tips, surname reminder",
         "  account   -- OOC name, staff seeaccounts",
         "  who       -- whofull, whohide, autoidle, idle",
         "  macros    -- prompt + aliases",
         "  full      -- every setting at once",
         "",
-        "Examples: config brief | config combat | config compact on | "
-        "config vehicles compact on",
+        "Examples: config brief | config combat | config channel | "
+        "config compact on | config vehicles compact on",
         "See also: help config | help formatting | help alias | help prompt",
     ]
 
@@ -3474,6 +3540,8 @@ def _config_section_autoloot(character):
         "-- config autoloot relics on|off",
         "  autoloot categories: bare autoloot lists weapons/armor/coins/… "
         "-- config autoloot <category> on|off",
+        "  autoloot ignore: bare autoloot ignore lists types left on the floor "
+        "-- config autoloot ignore <name> | unignore <name> | ignore clear",
         f"  autosplit: "
         f"{'on' if getattr(character, 'autosplit', True) else 'off'}  "
         "-- config autosplit on|off (party coin/salvage split)",
@@ -4083,18 +4151,21 @@ def cmd_date(character, args, game):
 
 
 # Undated Unreleased bullets keep a sentinel date for display only.
-# Which ships make the page is still newest ``sort_ts`` first (visit
-# ceiling / ``changes new``). Lines on that page are then arranged by
-# lookup ``#N`` (see ``_changelog_arrange_display``).
+# The player ``changes`` page is lookup-number order (highest ``#N`` first)
+# once the ledger has overlaid ids. Visit ceiling / ``changes new`` still
+# key off ``sort_ts``. After chronological minting those two agree.
 # Legacy bullets may still carry an optional hidden ``#N`` id for old
 # ``changes detail <n>`` bookmarks; new ships omit ``#N`` entirely.
 # Visit-ceiling model (``changes`` UX lock, Aug 2026 — see
 # ``docs/plans/changes_ux_lock.md``): ``last_seen_changelog_sort_ts`` stores
-# the newest ship timestamp this account has acknowledged. Ships with
-# ``sort_ts`` strictly above that ceiling are *new* (``*`` on lists, login
-# MOTD, ``changes new``). Bare ``changes`` always shows the global recent
-# feed; it does not page an unread backlog. ``changes catchup`` raises the
-# ceiling to the newest visible ship. Legacy floor watermarks migrate once via
+# the newest ship timestamp this account has **fully** acknowledged
+# (catchup, opening one ship, or finishing the whole unread pile). Stars on
+# bare ``changes`` still use that ceiling. ``changes new`` paging does **not**
+# raise it on a partial page (bug 678) — it walks a closed lookup-# window
+# (``unread_cursor`` .. ``unread_high_water``). Login ``[NEWS]`` counts the
+# remaining pool, so a copyover that lands one new ship while you are mid-page
+# adds 1 instead of replaying the whole backlog. Bare ``changes`` always
+# shows the global recent feed. Legacy floor watermarks migrate once via
 # ``changelog_visit_migrated``.
 _CHANGELOG_UNDATED = "0001-01-01"
 _CHANGELOG_WM_MIN = "0000-00-00T00:00:00Z"
@@ -4196,9 +4267,17 @@ def _changelog_sort_key(entry):
 
 
 def _changelog_unread_cursor_token(entry):
-    """Encode ``shown[-1]`` so same-second ships do not collapse (bug 835)."""
+    """Encode the last row of an unread page for the next ``changes unread``.
+
+    Player lists scroll ``#N`` high-to-low (``_changelog_display_order_key``),
+    not ``sort_ts`` + slug. A composite sort-key cursor could mark the whole
+    same-second wave read or replay page one (bug reports 835 / 935).
+    """
+    change_id = int(entry.get("id") or 0)
+    if change_id > 0:
+        return f"id\t{change_id}"
     sort_ts, slug, file_index = _changelog_sort_key(entry)
-    return f"{sort_ts}\t{slug}\t{file_index}"
+    return f"unstamped\t{sort_ts}\t{slug}\t{file_index}"
 
 
 def _changelog_unread_cursor_key(cursor):
@@ -4206,24 +4285,59 @@ def _changelog_unread_cursor_key(cursor):
     cur = str(cursor or "").strip()
     if not cur:
         return None
-    if "\t" in cur:
-        parts = cur.split("\t")
-        sort_ts = parts[0]
-        slug = (parts[1] if len(parts) > 1 else "").lower()
+    if "\t" not in cur:
+        return ("legacy_ts", cur)
+    parts = cur.split("\t")
+    kind = parts[0]
+    if kind == "id" and len(parts) >= 2:
         try:
-            file_index = int(parts[2]) if len(parts) > 2 else 0
+            return ("id", int(parts[1]))
+        except ValueError:
+            return None
+    if kind == "unstamped":
+        sort_ts = parts[1] if len(parts) > 1 else ""
+        slug = (parts[2] if len(parts) > 2 else "").lower()
+        try:
+            file_index = int(parts[3]) if len(parts) > 3 else 0
         except ValueError:
             file_index = 0
-        return (sort_ts, slug, file_index)
-    return (cur, "", 0)
+        return ("unstamped", sort_ts, slug, file_index)
+    # Legacy composite sort_ts/slug/file_index (pre id-cursor saves).
+    sort_ts = parts[0]
+    slug = (parts[1] if len(parts) > 1 else "").lower()
+    try:
+        file_index = int(parts[2]) if len(parts) > 2 else 0
+    except ValueError:
+        file_index = 0
+    return ("legacy_composite", sort_ts, slug, file_index)
+
+
+def _changes_entry_unread_after_cursor(entry, cur_key):
+    """True when *entry* belongs on the next unread page after *cur_key*."""
+    if cur_key is None:
+        return True
+    kind = cur_key[0]
+    if kind == "legacy_ts":
+        return str(entry.get("sort_ts") or "") < cur_key[1]
+    if kind == "id":
+        return int(entry.get("id") or 0) < cur_key[1]
+    if kind == "unstamped":
+        entry_key = _changelog_sort_key(entry)
+        cursor_key = (cur_key[1], cur_key[2], cur_key[3])
+        return entry_key < cursor_key
+    if kind == "legacy_composite":
+        entry_key = _changelog_sort_key(entry)
+        cursor_key = (cur_key[1], cur_key[2], cur_key[3])
+        return entry_key < cursor_key
+    return True
 
 
 def _changelog_display_order_key(entry):
     """List-line key: unstamped newest-first, then ``#N`` high-to-low.
 
-    Stamp waves can mint a low id on a later clock (or the reverse). Adjacent
-    time-sorted lines then jump ``#3676`` / ``#3665`` / ``#3672``. Display
-    order is numeric so the column is readable; ids themselves never move.
+    Lookup numbers are minted oldest-ship-first, so high-to-low ``#N`` is
+    also newest-first. Unstamped rows (id 0) stay at the top until boot
+    mints them.
     """
     cid = int(entry.get("id") or 0)
     date = entry.get("date") or _CHANGELOG_UNDATED
@@ -4236,9 +4350,8 @@ def _changelog_display_order_key(entry):
 
 
 def _changelog_arrange_display(entries):
-    """Arrange an already-chosen ``changes`` window for the player list.
+    """Arrange a ``changes`` window for the player list (``#N`` high-to-low).
 
-    Does not pick which ships are in the window (that stays newest-by-time).
     Unstamped rows stay at the top of the page until copyover mints ``#N``.
     """
     return sorted(entries, key=_changelog_display_order_key, reverse=True)
@@ -4547,7 +4660,7 @@ def _changes_visit_ts_bump(game, character, sort_ts):
     if current and target <= current:
         return
     holder.last_seen_changelog_sort_ts = target
-    _changes_unread_cursor_clear(game, character)
+    _changes_unread_window_clear(game, character)
     _changes_watermark_persist(game, character)
 
 
@@ -4557,13 +4670,116 @@ def _changes_watermark_bump(game, character, sort_ts):
 
 
 def _changes_unread_cursor_get(game, character):
-    """Return the unread paging cursor (oldest ship on the last unread page)."""
+    """Return the unread paging cursor (low end of the already-listed window)."""
     holder = _changes_watermark_holder(game, character)
     if holder is None:
         return ""
     return str(
         getattr(holder, "last_seen_changelog_unread_cursor", "") or ""
     ).strip()
+
+
+def _changes_unread_high_water_get(game, character):
+    """Return the unread high-water (high end of the already-listed window)."""
+    holder = _changes_watermark_holder(game, character)
+    if holder is None:
+        return ""
+    return str(
+        getattr(holder, "last_seen_changelog_unread_high_water", "") or ""
+    ).strip()
+
+
+def _unread_token_id(token):
+    """Lookup ``#N`` encoded in an ``id\\tN`` paging token, or None."""
+    key = _changelog_unread_cursor_key(token)
+    if key and key[0] == "id":
+        return key[1]
+    return None
+
+
+def _changes_unread_id_window(cursor_ts, high_water_ts):
+    """Closed lookup-# interval when both bounds are ``id`` tokens, else None."""
+    hw_id = _unread_token_id(high_water_ts)
+    cur_id = _unread_token_id(cursor_ts)
+    if hw_id is None or cur_id is None:
+        return None
+    if cur_id <= hw_id:
+        return (cur_id, hw_id)
+    return (hw_id, cur_id)
+
+
+def _changes_entry_already_paged(entry, cursor_ts, high_water_ts=""):
+    """True when *entry* sits inside the already-listed unread window.
+
+    With both ``id`` bounds, a ship whose lookup number is **above** the
+    high-water (a copyover that minted a new ``#N`` while you were paging)
+    stays unread. Cursor-only legacy saves keep ``id < cursor`` (bug 935).
+    Unstamped rows (id 0) are never inside a numbered window.
+    """
+    window = _changes_unread_id_window(cursor_ts, high_water_ts)
+    if window is not None:
+        eid = int(entry.get("id") or 0)
+        if eid <= 0:
+            return False
+        lo_id, hi_id = window
+        return lo_id <= eid <= hi_id
+    cur_key = _changelog_unread_cursor_key(cursor_ts)
+    return not _changes_entry_unread_after_cursor(entry, cur_key)
+
+
+def _changes_unread_window_from_shown(shown, old_cursor="", old_hw=""):
+    """Extend the paged ``#N`` window across *shown* without shrinking it."""
+    numbered = [
+        entry for entry in shown
+        if int(entry.get("id") or 0) > 0
+    ]
+    if numbered:
+        ids = [int(entry.get("id") or 0) for entry in numbered]
+        shown_lo, shown_hi = min(ids), max(ids)
+        old_lo = _unread_token_id(old_cursor)
+        old_hi = _unread_token_id(old_hw)
+        lo_id = shown_lo if old_lo is None else min(old_lo, shown_lo)
+        hi_id = shown_hi if old_hi is None else max(old_hi, shown_hi)
+        return f"id\t{lo_id}", f"id\t{hi_id}"
+    arranged = _changelog_arrange_display(shown)
+    if not arranged:
+        return old_cursor, old_hw
+    if _unread_token_id(old_cursor) is not None:
+        # Mixed leftover: keep the numbered window; unstamped-only pages
+        # do not move lookup-# bounds.
+        return old_cursor, old_hw or old_cursor
+    return (
+        _changelog_unread_cursor_token(arranged[-1]),
+        _changelog_unread_cursor_token(arranged[0]),
+    )
+
+
+def _changes_unread_window_set(game, character, cursor, high_water):
+    """Persist both unread-window ends in one account/character flush."""
+    holder = _changes_watermark_holder(game, character)
+    if holder is None:
+        return
+    holder.last_seen_changelog_unread_cursor = str(cursor or "").strip()
+    holder.last_seen_changelog_unread_high_water = str(high_water or "").strip()
+    _changes_watermark_persist(game, character)
+
+
+def _changes_unread_window_clear(game, character):
+    """Drop both unread-window ends (full catch-up or visit ceiling advance)."""
+    holder = _changes_watermark_holder(game, character)
+    if holder is None:
+        return
+    cur = str(
+        getattr(holder, "last_seen_changelog_unread_cursor", "") or ""
+    ).strip()
+    hw = str(
+        getattr(holder, "last_seen_changelog_unread_high_water", "") or ""
+    ).strip()
+    if not cur and not hw:
+        return
+    holder.last_seen_changelog_unread_cursor = ""
+    holder.last_seen_changelog_unread_high_water = ""
+    _changes_watermark_persist(game, character)
 
 
 def _changes_unread_cursor_set(game, character, sort_ts):
@@ -4577,51 +4793,51 @@ def _changes_unread_cursor_set(game, character, sort_ts):
 
 
 def _changes_unread_cursor_clear(game, character):
-    """Drop a partial unread cursor (full catch-up or visit ceiling advance)."""
-    holder = _changes_watermark_holder(game, character)
-    if holder is None:
-        return
-    if not str(getattr(holder, "last_seen_changelog_unread_cursor", "") or "").strip():
-        return
-    holder.last_seen_changelog_unread_cursor = ""
-    _changes_watermark_persist(game, character)
+    """Drop paging cursor and high-water (full catch-up or visit advance)."""
+    _changes_unread_window_clear(game, character)
 
 
-def _changes_unread_pool(entries, visit_ts, cursor_ts):
-    """Ships newer than the visit ceiling and below an unread paging cursor."""
+def _changes_unread_pool(entries, visit_ts, cursor_ts, high_water_ts=""):
+    """Ships still unread: above the visit ceiling, outside the paged window."""
     vt = str(visit_ts or "").strip()
-    cur_raw = str(cursor_ts or "").strip()
-    cur_key = _changelog_unread_cursor_key(cursor_ts)
-    legacy_ts = bool(cur_raw) and "\t" not in cur_raw
     pool = []
     for entry in entries:
         ts = str(entry.get("sort_ts") or "")
         if vt and ts <= vt:
             continue
-        if cur_key is not None:
-            if legacy_ts:
-                if ts >= cur_key[0]:
-                    continue
-            elif _changelog_sort_key(entry) >= cur_key:
-                continue
+        if _changes_entry_already_paged(entry, cursor_ts, high_water_ts):
+            continue
         pool.append(entry)
     return pool
 
 
-def _changes_unread_ack_page(game, character, shown, pool):
-    """Advance unread paging: cursor on partial pages, ceiling when finished."""
+def _changes_unread_ack_page(game, character, shown, pool, catalog=None):
+    """Advance unread paging: window on partial pages, ceiling when finished."""
     if not shown:
         return
     if len(pool) > len(shown):
-        # Last row of this newest-first page -- composite, not min(sort_ts).
-        token = _changelog_unread_cursor_token(shown[-1])
-        _changes_unread_cursor_set(game, character, token)
+        old_cur = _changes_unread_cursor_get(game, character)
+        old_hw = _changes_unread_high_water_get(game, character)
+        new_cur, new_hw = _changes_unread_window_from_shown(
+            shown, old_cur, old_hw,
+        )
+        _changes_unread_window_set(game, character, new_cur, new_hw)
         return
-    ceiling = max(
-        (entry.get("sort_ts") or _CHANGELOG_WM_MIN for entry in pool),
-        default=_CHANGELOG_WM_MIN,
+    ts_candidates = [
+        entry.get("sort_ts") or _CHANGELOG_WM_MIN for entry in pool
+    ]
+    window = _changes_unread_id_window(
+        _changes_unread_cursor_get(game, character),
+        _changes_unread_high_water_get(game, character),
     )
-    _changes_unread_cursor_clear(game, character)
+    if window is not None:
+        lo_id, hi_id = window
+        for entry in catalog or shown:
+            eid = int(entry.get("id") or 0)
+            if eid and lo_id <= eid <= hi_id:
+                ts_candidates.append(entry.get("sort_ts") or _CHANGELOG_WM_MIN)
+    ceiling = max(ts_candidates) if ts_candidates else _CHANGELOG_WM_MIN
+    _changes_unread_window_clear(game, character)
     _changes_visit_ts_bump(game, character, ceiling)
 
 
@@ -4810,81 +5026,129 @@ def _read_changelog_text(path):
 _CHANGELOG_CACHE = None  # (cache_key_tuple, entries_list)
 
 
-def _changelog_headlines_missing_ids(entries, *, limit=25):
-    """True when a recent ``changes`` headline still has no stable ``#N``."""
-    for entry in (entries or [])[:limit]:
-        if int(entry.get("id") or 0) <= 0:
-            return True
-    return False
+def _changelog_cache_key(root):
+    """Cheap staleness signature for the in-memory entry cache.
 
-
-def _changelog_index_cache_key(root):
-    """Cache key for compiled index + live source file count.
-
-    ``stat`` on the index alone is not enough: auto-deploy can overlay new
-    ``CHANGELOG.d`` fragments without rebuilding ``changelog_index.json``,
-    leaving index mtime/size unchanged while ships go missing from ``changes``.
-    A cheap ``listdir`` count busts that case without parsing 1600+ files.
+    Does not ``stat`` every ``CHANGELOG.d`` fragment (that full per-file scan
+    is reserved for ``tools/`` — see ``_changelog_signature``). A directory's
+    own mtime changes whenever a file is added/removed/renamed inside it, and
+    the ledger file's mtime changes whenever a new slug is minted (or an
+    existing row is touched) — together those cover every case that changes
+    what ``changes`` should show. The fragment *count* used to come from a
+    fresh ``os.listdir`` on every tap; that walk is now memoized behind the
+    same two-stat directory probe (plus a short TTL) in
+    ``changelog_ledger.changelog_fragment_names``. In-place edits to an
+    existing fragment's prose (rare — old ships are frozen) are not caught
+    here; that trade-off matches the listing memo's behavior.
     """
-    from engine import changelog_index as changelog_index_mod
+    from engine import changelog_ledger
 
-    path = changelog_index_mod.index_path(root)
-    try:
-        st = os.stat(path)
-        index_key = ("index", st.st_mtime_ns, st.st_size)
-    except OSError:
-        index_key = ("none",)
-    source_count = changelog_index_mod.changelog_source_file_count(root)
-    return index_key + (source_count,)
+    def _stat(path):
+        try:
+            st = os.stat(path)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return (0, 0)
+
+    probe = changelog_ledger.sources_dir_probe(root)
+    # probe is (frag_dir_stat, changelog_md_stat)
+    dir_key, main_key = probe[0], probe[1]
+    ledger_key = _stat(changelog_ledger.db_path(root))
+    count = changelog_ledger.changelog_source_file_count(root, probe=probe)
+    return (main_key, dir_key, ledger_key, count)
+
+
+def _changelog_cache_sources_unchanged(old_key, new_key):
+    """True when markdown sources look the same and only the ledger mtime moved.
+
+    Opening the ledger SQLite file (or minting a new slug) changes
+    ``changelog.db`` mtime without any new fragment. Re-parsing several
+    thousand markdown files for that case is wasted work — overlay ids onto
+    the already-cached entries instead.
+    """
+    if not isinstance(old_key, tuple) or not isinstance(new_key, tuple):
+        return False
+    if len(old_key) < 4 or len(new_key) < 4:
+        return False
+    # (main_key, dir_key, ledger_key, count) — ignore ledger_key.
+    return (
+        old_key[0] == new_key[0]
+        and old_key[1] == new_key[1]
+        and old_key[3] == new_key[3]
+    )
+
+
+def _apply_ledger_ids(entries, root):
+    """Overlay each fragment entry's id with the ledger's permanent id.
+
+    The ledger (``engine/changelog_ledger.py``) is the single source of
+    truth for ``#N`` going forward — this replaces the old "regex-parse a
+    stamp someone wrote into the markdown text" approach that produced
+    duplicate/never-numbered ids. Monolith rows (no fragment ``slug`` —
+    frozen ``CHANGELOG.md`` history that never grows again) keep whatever
+    id is already embedded in their own text; only ``CHANGELOG.d`` fragment
+    rows, which is where new ships actually happen, get their id from the
+    ledger. A slug with no ledger row yet (boot has not minted it) shows
+    ``id: 0`` — the existing display logic already treats that as
+    "unstamped, list at the top until minted," which self-heals on the next
+    boot/idle poll without any special-casing here.
+    """
+    from engine import changelog_ledger
+
+    slug_map = changelog_ledger.slug_id_map(root)
+    for entry in entries:
+        slug = changelog_ledger.canonical_fragment_slug(entry.get("slug") or "")
+        if not slug:
+            continue
+        # Canonicalize in place so Discord mark_posted and later lookups
+        # hit the lowercase ledger key even if the filename kept T/Z.
+        entry["slug"] = slug
+        hit = slug_map.get(slug)
+        entry["id"] = hit[1] if hit else 0
+    return entries
 
 
 def _load_unreleased_entries(repo_root=None):
     """Load Unreleased entries for in-game ``changes``.
 
-    Fast path: read ``content/changelog_index.json`` when its baked-in source
-    file count matches live ``CHANGELOG`` sources. Slow path: parse markdown
-    when the index is missing or stale, then self-heal by rewriting the index
-    when the tree is writable (live bind-mount / local dev).
+    Parses ``CHANGELOG.md`` + ``CHANGELOG.d/*.md`` for prose/category/date,
+    then overlays each fragment's ``#N`` from the changelog ledger — the
+    ledger is the only place an id is ever minted, so there is nothing left
+    to "rebuild" or "stamp" here. Cached per-process until the cheap
+    staleness signature changes.
 
-    In-place ``#N`` stamps do not change the file count. If recent headlines
-    still have ``id: 0`` and fragment mtimes beat the index, rebuild so
-    ``changes`` shows the numbers without waiting for copyover. This path
-    never mints ids (``Game()`` smokes share the real tree).
+    Opening ``changelog.db`` (first tap in a process, or a freshly minted
+    slug) changes the ledger file's mtime. That used to bust the markdown
+    cache and re-walk every fragment; if only the ledger half of the key
+    moved, we overlay ids onto the already-parsed entries instead.
+    After a load we re-probe the key so a db file created mid-call does not
+    force a second miss on the very next tap.
     """
     global _CHANGELOG_CACHE
     root = repo_root or _changelog_repo_root()
-    from engine import changelog_index as changelog_index_mod
 
-    cache_key = _changelog_index_cache_key(root)
+    cache_key = _changelog_cache_key(root)
     if _CHANGELOG_CACHE is not None and _CHANGELOG_CACHE[0] == cache_key:
-        cached = _CHANGELOG_CACHE[1]
-        if not (
-            _changelog_headlines_missing_ids(cached)
-            and changelog_index_mod.sources_newer_than_index(root)
-        ):
-            return cached
-        # Fall through: host stamper wrote #N after this process compiled.
+        return _CHANGELOG_CACHE[1]
 
-    entries = None
-    index_path = changelog_index_mod.index_path(root)
-    count_ok = (
-        cache_key[0] == "index"
-        and not changelog_index_mod.index_likely_stale(root)
-    )
-    if count_ok:
-        entries = changelog_index_mod.load_index_file(index_path)
-        if entries is not None and _changelog_headlines_missing_ids(entries):
-            if changelog_index_mod.sources_newer_than_index(root):
-                entries = None
+    if (
+        _CHANGELOG_CACHE is not None
+        and _changelog_cache_sources_unchanged(_CHANGELOG_CACHE[0], cache_key)
+    ):
+        entries = _CHANGELOG_CACHE[1]
+        _apply_ledger_ids(entries, root)
+        entries.sort(key=_changelog_display_order_key, reverse=True)
+        _CHANGELOG_CACHE = (_changelog_cache_key(root), entries)
+        return entries
 
-    if entries is None:
-        changelog_index_mod.ensure_compiled_index(root)
-        entries = changelog_index_mod.load_index_file(index_path)
-        if entries is None:
-            entries = _load_changelog_entries_from_sources(root)
-        cache_key = _changelog_index_cache_key(root)
-
-    _CHANGELOG_CACHE = (cache_key, entries)
+    entries = _load_changelog_entries_from_sources(root)
+    _enrich_changelog_entries(entries)
+    _apply_ledger_ids(entries, root)
+    # After ids are overlaid, the player feed is lookup-number order so
+    # ``changes`` / ``changes all`` scroll #N, #(N-1), … with no jumps.
+    entries.sort(key=_changelog_display_order_key, reverse=True)
+    # Re-probe: ``connect()`` may have just created ``changelog.db``.
+    _CHANGELOG_CACHE = (_changelog_cache_key(root), entries)
     return entries
 
 
@@ -4906,42 +5170,79 @@ def _changelog_signature(root):
     return tuple(sig)
 
 
+# fragment filename -> parsed entries. Fragments accumulate forever (one
+# file per ship, never merged/archived); re-parsing every one of them from
+# scratch whenever a *single* new fragment lands is what brought the
+# in-game command lag back -- the single-threaded asyncio loop (hard rule
+# 3) blocks for the whole regex pass over the multi-thousand-file backlog,
+# on every deploy, for whichever player types ``changes`` first.
+#
+# Keyed by filename only, with no ``os.stat`` staleness check: an already
+# shipped ``CHANGELOG.d`` fragment is frozen prose (old ships are never
+# edited in place) -- ``_changelog_cache_key``'s docstring already accepts
+# that exact trade-off for the outer cache, and it matters even more here
+# because Docker's overlay2 storage driver makes a per-path ``stat()``
+# call expensive; stat-ing the whole backlog on every cache miss undid
+# most of the win from skipping the re-parse. A rename/delete still
+# invalidates correctly because it changes the ``os.listdir`` name set.
+_FRAGMENT_PARSE_CACHE: dict[str, list[dict]] = {}
+
+
+def _parse_fragment_file(path, slug):
+    """Parse one ``CHANGELOG.d`` fragment (cache miss only — see caller).
+
+    ``file_index`` on the returned entries is local to this file (0, 1, …)
+    instead of a running count across the whole backlog. That is at least
+    as correct as the old cross-file counter: every sort/tie-break here
+    already keys on ``slug`` first (unique per fragment), and the one
+    lookup that re-derives ``file_index``
+    (``_changelog_entry_full_lines``) re-parses this same file in
+    isolation anyway, so it never depended on a global count either.
+    """
+    try:
+        text = _read_changelog_text(path)
+    except OSError:
+        return []
+    return _parse_unreleased_entries(
+        text.splitlines(keepends=True), fragment=True, slug=slug,
+    )
+
+
 def _load_changelog_entries_from_sources(repo_root=None):
     """Parse CHANGELOG.md + CHANGELOG.d/*.md (slow path; used by index builder)."""
     root = repo_root or _changelog_repo_root()
     entries = []
-    file_index = 0
     main_path = os.path.join(root, "CHANGELOG.md")
     try:
         main_entries = _parse_unreleased_entries(
             _read_changelog_text(main_path).splitlines(keepends=True),
-            file_index_start=file_index,
         )
         entries.extend(main_entries)
-        file_index += len(main_entries)
     except OSError:
         pass
 
     frag_dir = os.path.join(root, "CHANGELOG.d")
-    if os.path.isdir(frag_dir):
-        names = sorted(
-            n for n in os.listdir(frag_dir)
-            if n.endswith(".md") and n.lower() != "readme.md"
-        )
-        for name in names:
-            path = os.path.join(frag_dir, name)
-            slug = os.path.splitext(name)[0]
-            try:
-                frag_entries = _parse_unreleased_entries(
-                    _read_changelog_text(path).splitlines(keepends=True),
-                    fragment=True,
-                    file_index_start=file_index,
-                    slug=slug,
-                )
-            except OSError:
-                continue
-            entries.extend(frag_entries)
-            file_index += len(frag_entries)
+    from engine import changelog_ledger
+
+    names = changelog_ledger.changelog_fragment_names(root)
+    for name in names:
+        cached = _FRAGMENT_PARSE_CACHE.get(name)
+        if cached is not None:
+            entries.extend(cached)
+            continue
+        # Only the (rare) new/uncached fragment pays for path-building
+        # and an actual parse -- everything already cached skips both.
+        path = os.path.join(frag_dir, name)
+        slug = changelog_ledger.canonical_fragment_slug(name)
+        parsed = _parse_fragment_file(path, slug)
+        _FRAGMENT_PARSE_CACHE[name] = parsed
+        entries.extend(parsed)
+    # Drop cache rows for fragments that no longer exist (renamed /
+    # removed) so this dict does not grow unbounded in a long-lived
+    # process.
+    live_names = set(names)
+    for stale_name in [n for n in _FRAGMENT_PARSE_CACHE if n not in live_names]:
+        _FRAGMENT_PARSE_CACHE.pop(stale_name, None)
 
     entries.sort(key=_changelog_sort_key, reverse=True)
     return _dedupe_changelog_entries_by_slug(entries)
@@ -4950,9 +5251,28 @@ def _load_changelog_entries_from_sources(repo_root=None):
 from engine.changelog_audience import (
     audience_tag_labels as _changelog_audience_tag_labels,
     display_summary as _changelog_display_summary,
+    entry_audience as _changelog_entry_audience,
+    entry_is_staff_only as _changelog_entry_is_staff_only,
     strip_leading_tags as _changelog_strip_leading_tags,
     visible_to_viewer as _changelog_visible_to_viewer,
 )
+
+
+def _enrich_changelog_entries(entries):
+    """Precompute audience/staff flags once at load (not per ``changes`` tap).
+
+    The old compiled JSON index baked these fields at build time. Markdown
+    loads skipped that step, so every ``changes`` tap ran three full passes of
+    ``entry_is_staff_only`` (heavy regex over summary + body) across the
+    entire backlog — seconds of asyncio-loop blocking per tap.
+    """
+    for entry in entries:
+        if entry.get("audience") is not None and "staff_only" in entry:
+            continue
+        tags, _ = _changelog_strip_leading_tags(entry.get("summary") or "")
+        entry["audience"] = sorted(_changelog_entry_audience(tags))
+        entry["staff_only"] = bool(_changelog_entry_is_staff_only(entry))
+    return entries
 
 
 def _changes_active_game():
@@ -5004,17 +5324,21 @@ def _filter_changelog_entries_for_viewer(entries, character, *, mode="player"):
 
 
 def changes_unread_player_entries(character, game):
-    """Player-visible ships newer than this viewer's visit ceiling."""
+    """Player-visible ships still unread (visit ceiling + paging window)."""
     all_entries = _load_unreleased_entries()
     player_entries = _filter_changelog_entries_for_viewer(
         all_entries, character, mode="player",
     )
     visit_ts = _changes_visit_ts_get(game, character, player_entries)
-    return _changes_new_entries(player_entries, visit_ts)
+    cursor_ts = _changes_unread_cursor_get(game, character)
+    high_water_ts = _changes_unread_high_water_get(game, character)
+    return _changes_unread_pool(
+        player_entries, visit_ts, cursor_ts, high_water_ts,
+    )
 
 
 def deliver_changes_unread_on_login(character, game):
-    """One-line MOTD-style nudge when ships landed since the last visit (Phase C)."""
+    """One-line nudge for remaining unread ships (not the raw visit ceiling)."""
     session = getattr(character, "session", None)
     if session is None:
         return
@@ -5107,10 +5431,11 @@ def cmd_changes(character, args, game):
     should feed into an in-game 'changes' command like traditional MUDs,"
     instead of players having to go read CHANGELOG.md by hand.
 
-    Reads ``content/changelog_index.json`` when its source file count matches
-    live ``CHANGELOG`` sources; otherwise parses markdown and rewrites the
-    index when writable. Watermark updates use incremental account/character
-    dirty flags — not a full world save.
+    Parses ``CHANGELOG.md`` + ``CHANGELOG.d/*.md`` for prose and overlays
+    each fragment's permanent ``#N`` from the changelog ledger
+    (``engine/changelog_ledger.py`` — the only place an id is ever minted).
+    Watermark updates use incremental account/character dirty flags — not a
+    full world save.
 
     Bare ``changes`` always lists the **10 most recent** player ships (global
     feed). Lines newer than your last visit show a ``*`` before the timestamp.
@@ -5359,9 +5684,19 @@ def cmd_changes(character, args, game):
     n = _CHANGES_DEFAULT_LIMIT
     if unread_mode:
         cursor_ts = _changes_unread_cursor_get(game, character)
-        pool = _changes_unread_pool(entries, visit_ts, cursor_ts)
+        high_water_ts = _changes_unread_high_water_get(game, character)
+        pool = _changes_unread_pool(
+            entries, visit_ts, cursor_ts, high_water_ts,
+        )
+        if not pool and (
+            cursor_ts or high_water_ts
+        ) and _changes_new_entries(entries, visit_ts):
+            # Stale legacy cursors could empty the pool while ships remain
+            # unread, trapping players in a read/caught-up loop (bug 935).
+            _changes_unread_window_clear(game, character)
+            pool = _changes_unread_pool(entries, visit_ts, "", "")
         if not pool:
-            _changes_unread_cursor_clear(game, character)
+            _changes_unread_window_clear(game, character)
             character.session.send(
                 "No new changes since your last visit — you are caught up. "
                 "(Type changes for the recent list.)"
@@ -5398,7 +5733,9 @@ def cmd_changes(character, args, game):
             )
         lines_out.append(_changes_list_footer(ops_mode=ops_mode))
         character.session.send("\n".join(lines_out))
-        _changes_unread_ack_page(game, character, shown, pool)
+        _changes_unread_ack_page(
+            game, character, shown, pool, catalog=entries,
+        )
         return
 
     if raw and not ops_mode:
@@ -5566,9 +5903,36 @@ def cmd_help(character, args, game):
     # Full categorized catalog -- screenreader bare help is Start Here only,
     # so these verbs recover the complete index for TTS users who want it.
     if verb in ("topics", "index", "catalog", "all"):
+        from engine import help_audience as help_audience_mod
+        alpha = help_audience_mod.sort_help_entries(
+            help_audience_mod.flatten_help_categories(visible_categories)
+        )
         lines = [""]
-        lines.extend(style.format_help_index(
-            visible_categories,
+        lines.extend(style.format_help_alphabetical_index(
+            alpha,
+            title="Help Index",
+            width=help_w,
+            screenreader=sr,
+        ))
+        character.session.send("\r\n".join(lines).rstrip("\n"))
+        return
+
+    if verb == "gmtopics":
+        if not is_gm_viewer:
+            character.session.send(
+                "No such command or topic: 'gmtopics'. "
+                "Try 'help' for topics, or 'commands' for the verb list."
+            )
+            return
+        from engine import help_audience as help_audience_mod
+        gm_rows = help_audience_mod.category_help_entries(categories, "GM")
+        alpha = help_audience_mod.sort_help_entries(
+            help_audience_mod.flatten_help_categories([("GM", gm_rows)])
+        )
+        lines = [""]
+        lines.extend(style.format_help_alphabetical_index(
+            alpha,
+            title="GM Help Index",
             width=help_w,
             screenreader=sr,
         ))
@@ -5697,9 +6061,14 @@ def cmd_help(character, args, game):
             character.session.send("\r\n".join(framed))
             return
         # DB full-text search -- only when the word is not a live command.
+        # Onboarding hubs skip FTS: paths catalog bodies mention "help newbie"
+        # and would steal ``help newbie`` when static/DB exact pages are missing.
         if db is not None:
             from engine import help_db
-            fts_entry = help_db.search_fts(db, verb, is_gm=is_gm_viewer)
+            from engine import hooks as hooks_mod
+            fts_entry = None
+            if verb not in hooks_mod.get_help_fts_blocklist():
+                fts_entry = help_db.search_fts(db, verb, is_gm=is_gm_viewer)
             if fts_entry:
                 character.session.send(
                     "\r\n".join(_format_help_db_entry(character, fts_entry))
@@ -5758,12 +6127,49 @@ def cmd_help(character, args, game):
     character.session.send("\r\n".join(lines).rstrip("\n"))
 
 
+_COMMAND_DOMAIN_BUCKETS = {
+    "travel": frozenset({
+        "walk", "drive", "taxi", "travel", "fly", "ticket", "depart",
+        "hitch", "atlas", "map", "seek", "enter", "leave", "follow",
+        "charter", "flights", "overland", "boardflight", "takeoff",
+        "exit", "exits",
+    }),
+    "combat": frozenset({
+        "attack", "kill", "shoot", "aim", "fire", "flee", "rest",
+        "guard", "unleash", "rescue", "protect", "wield", "wear",
+        "draw", "sheathe", "reload", "load",
+    }),
+    "work": frozenset({
+        "job", "shop", "missions", "cases", "casework", "contracts", "dungeons",
+        "quests", "homestead", "bounty", "chaseboard", "storyboard",
+        "fireboard", "funeralboard", "rideboard", "work", "commute",
+        "dream", "court", "dominion", "pit", "marches",
+    }),
+    "social": frozenset({
+        "say", "tell", "ooc", "replay", "emote", "talk", "whisper", "introduce",
+        "relate", "favorite", "who", "look", "consider", "kiss", "hug",
+        "radio", "phone",
+    }),
+}
+
+
+def _commands_label_in_bucket(label, bucket):
+    """True when any slash-grouped verb's first word is in ``bucket``."""
+    for part in str(label or "").split("/"):
+        token = part.strip().split()[0].lower() if part.strip() else ""
+        if token in bucket:
+            return True
+    return False
+
+
 def cmd_commands(character, args, game):
     """List commands: compact index, per-verb tip, or full detail dump.
 
     bare ``commands``              compact verb names (aliases grouped;
                                    glued ``alias:`` flats hidden -- Wave 2d)
     ``commands detail`` / ``all``  full one-line tips including alias rows
+    ``commands travel|combat|work|social``  Wave 1.5 domain buckets
+    ``commands here``              hubs/verbs for the current room
     ``commands <verb>``            one handler group's tip (alias verbs ok)
 
     GM commands stay in a separate block (GMs only). Magic/Occultist/Mount
@@ -5786,6 +6192,47 @@ def cmd_commands(character, args, game):
             screenreader=sr,
         )
         character.session.send("\r\n".join(framed) + style.RESET)
+        return
+
+    if mode in _COMMAND_DOMAIN_BUCKETS:
+        bucket = _COMMAND_DOMAIN_BUCKETS[mode]
+        compact_normal, compact_gm = _commands_compact_triples(
+            normal_triples, gm_triples,
+        )
+        compact_normal = [
+            t for t in compact_normal if _commands_label_in_bucket(t[1], bucket)
+        ]
+        compact_gm = [
+            t for t in compact_gm if _commands_label_in_bucket(t[1], bucket)
+        ]
+        if not compact_normal and not compact_gm:
+            character.session.send(
+                f"No {mode} commands in the compact index. "
+                "Try commands or commands detail."
+            )
+            return
+        normal_labels = [label for _k, label, _ht in compact_normal]
+        gm_labels = [label for _k, label, _ht in compact_gm]
+        framed = style.format_commands_compact(
+            normal_labels,
+            gm_labels=gm_labels if _is_gm(character) and gm_labels else None,
+            width=width,
+            screenreader=sr,
+        )
+        character.session.send("\r\n".join(framed) + style.RESET)
+        return
+
+    if mode == "here":
+        from engine import hooks
+
+        hints = list(hooks.room_command_hints(character, game) or [])
+        if not hints:
+            hints = ["Nothing board-specific here."]
+        hints.append(
+            "Type commands for the compact index, or commands travel, "
+            "combat, work, or social."
+        )
+        character.session.send("\r\n".join(hints))
         return
 
     if mode:
@@ -5867,6 +6314,26 @@ def _commands_grouped_triples(character):
     return normal_triples, gm_triples
 
 
+def _commands_listing_alias_text(help_text):
+    """Lowercased tip with optional Origin / GM tag stripped for alias checks."""
+    text = (help_text or "").strip().lower()
+    for prefix in (
+        "gm:",
+        "head gm:",
+        "magic:",
+        "occultist:",
+        "mount:",
+        "angel/demon:",
+        "angel:",
+        "demon:",
+        "human:",
+    ):
+        if text.startswith(prefix):
+            text = text[len(prefix):].lstrip()
+            break
+    return text
+
+
 def _is_commands_listing_alias(help_text):
     """True when this COMMANDS one-liner is a compact-hidden alias.
 
@@ -5875,14 +6342,22 @@ def _is_commands_listing_alias(help_text):
     ``COMMANDS`` so Cadence / ``npc_do`` still dispatch them, and
     ``commands detail`` / ``commands takechase`` still show the tip.
 
-    Recognized prefixes (already in the catalog): ``alias:``,
-    ``alias for``, ``alias of``.
+    Recognized markers: ``alias:``, ``alias for``, ``alias of`` (after
+    optional Origin / GM tag strip), plus embedded ``alias of`` on
+    separate-handler tips (``build``, ``zone``, …).
     """
-    text = (help_text or "").strip().lower()
-    return (
+    text = _commands_listing_alias_text(help_text)
+    if (
         text.startswith("alias:")
         or text.startswith("alias for ")
         or text.startswith("alias of ")
+    ):
+        return True
+    # Separate-handler rows that document the hub in the same tip.
+    return (
+        "; alias of " in text
+        or " … alias of " in text
+        or "(alias of " in text
     )
 
 
@@ -7020,15 +7495,29 @@ def _static_help_category(keyword):
     return ""
 
 
+def _hedit_blank_draft(session, keyword):
+    """Start a fresh hedit session with an empty body buffer."""
+    session.help_edit = {
+        "keyword": keyword,
+        "body": [],
+        "syntax": [],
+        "category": "",
+        "aliases": [],
+        "gm_only": False,
+        "is_ic": False,
+    }
+
+
 def cmd_hedit(character, args, game):
     """GM: open the modal helpfile editor for <keyword> (docs/plans/
     helpfile_editing_system.md). Loads an existing DB-overlay page to
-    revise; otherwise seeds a new draft from the static help_topics.py page
-    of the same name if one exists (so hot-patching a typo doesn't mean
-    retyping the whole page from scratch), or starts blank for a brand-new
-    keyword. Overlay pages win over the static page at lookup time -- this
-    is for hot-patching or drafting live, not for editing the git-tracked
-    canon file itself, which the static page still is until /save.
+    revise when ``keyword`` is the page's primary key; otherwise seeds a
+    new draft from the static help_topics.py page of that name if one
+    exists (and is not alias-only), or starts blank. Alias-only names
+    (DB or static redirects) drop the alias and open a blank draft so
+    staff can claim the keyword as its own page. Overlay pages win over
+    the static page at lookup time -- this is for hot-patching or drafting
+    live, not for editing the git-tracked canon file itself.
 
     While editing, plain text appends a body line; '/list /i /d /clear /r
     /syntax /category /alias /gm /ic /preview /save /cancel' are the modal
@@ -7051,7 +7540,11 @@ def cmd_hedit(character, args, game):
 
     db = getattr(game, "db", None)
     from engine import help_db
-    existing = help_db.get_entry(db, keyword) if db is not None else None
+    from engine import hooks as hooks_mod
+
+    existing = (
+        help_db.get_primary_entry(db, keyword) if db is not None else None
+    )
     if existing:
         session.help_edit = {
             "keyword": keyword,
@@ -7067,6 +7560,24 @@ def cmd_hedit(character, args, game):
             f"({len(session.help_edit['body'])} body lines loaded). "
             "Type text to append, or /list /i /d /clear /r /syntax "
             "/category /alias /gm /ic /preview /save /cancel."
+        )
+        return
+
+    dropped_hub = None
+    if db is not None:
+        dropped_hub = help_db.get_alias_target(db, keyword)
+        if dropped_hub:
+            help_db.remove_alias(db, keyword)
+    if dropped_hub is None:
+        dropped_hub = hooks_mod.get_help_alias_target(keyword)
+
+    if dropped_hub:
+        _hedit_blank_draft(session, keyword)
+        session.send(
+            f"'{keyword}' was only an alias for '{dropped_hub}' -- "
+            f"alias dropped; drafting a new '{keyword}' page. "
+            "Type text to append lines, then /save when ready (or /cancel). "
+            "See /list /i /d /clear /r /syntax /category /alias /gm /ic /preview."
         )
         return
 
@@ -7091,15 +7602,7 @@ def cmd_hedit(character, args, game):
         )
         return
 
-    session.help_edit = {
-        "keyword": keyword,
-        "body": [],
-        "syntax": [],
-        "category": "",
-        "aliases": [],
-        "gm_only": False,
-        "is_ic": False,
-    }
+    _hedit_blank_draft(session, keyword)
     session.send(
         f"New overlay page '{keyword}'. Type text to append lines, "
         "then /save when ready (or /cancel to abort). "
@@ -7489,11 +7992,14 @@ def cmd_reports(character, args, game):
     - reports comment <kind> <id> <text> -- staff note on the thread
       (does not resolve; players use bugs comment / ideas comment).
 
-    Non-GMs are rejected with nothing shown.
+    Non-GMs get a distinct hint (not the death-scene or hunt-turn-in verbs).
     """
     from engine import reports
     if not _is_gm(character):
-        character.session.send("You aren't a GM.")
+        character.session.send(
+            "Staff tickets are gm reports. File a ticket with bug. "
+            "Death on scene is report death. Hunt turn-in is missions report."
+        )
         return
 
     raw = (args or "").strip()

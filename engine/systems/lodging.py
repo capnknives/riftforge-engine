@@ -61,6 +61,44 @@ def ensure_home_basics(game):
             stamp_home_basics(room)
 
 
+def _resolve_exit_room(dest, game=None):
+    """Return a live Room from an exits{} value (Room or key string)."""
+    if dest is None:
+        return None
+    if not isinstance(dest, str):
+        return dest
+    rooms = getattr(game, "rooms", None) or {}
+    return rooms.get(dest)
+
+
+def is_house_satellite_chamber(room):
+    """True when this interior is an attached bay/yard, not the claim hub.
+
+    Garage and backyard remodeled chambers carry a named inbound door on
+    the living room (and a ``living`` return). They must never win
+    ``pick_main_homeroom`` or look treats them as a separate unclaimed
+    house (buyhome on look).
+    """
+    if room is None:
+        return False
+    label = (getattr(room, "remodel_inbound_exit", None) or "").strip().lower()
+    if label:
+        return True
+    rtype = (getattr(room, "remodel_type", None) or "").strip().lower()
+    if rtype in ("garage", "backyard"):
+        return True
+    exits = getattr(room, "exits", None) or {}
+    # Attached garage bay: named return to living plus street/porch out.
+    if "living" in exits and (
+        "out" in exits or getattr(room, "vehicle_berth", False)
+    ):
+        return True
+    # Fenced backyard pocket: named living return, outdoor.
+    if "living" in exits and getattr(room, "outdoor", False):
+        return True
+    return False
+
+
 def house_interior_cluster(seed, game):
     """Every ``is_house`` room in the same interior compound as ``seed``."""
     if seed is None or game is None:
@@ -71,7 +109,8 @@ def house_interior_cluster(seed, game):
     stack = [seed]
     while stack:
         room = stack.pop()
-        for neighbor in (room.exits or {}).values():
+        for dest in (room.exits or {}).values():
+            neighbor = _resolve_exit_room(dest, game)
             if neighbor is None:
                 continue
             if not getattr(neighbor, "is_house", False):
@@ -84,32 +123,37 @@ def house_interior_cluster(seed, game):
     return list(seen.values())
 
 
-def pick_main_homeroom(rooms):
+def pick_main_homeroom(rooms, game=None):
     """Choose the claim-hub Room for a house interior cluster."""
     interiors = [r for r in (rooms or ()) if r is not None]
     if not interiors:
         return None
-    by_key = {r.key: r for r in interiors if getattr(r, "key", None)}
+    # Attached garage/backyard bays are never the deed hub.
+    hubs = [r for r in interiors if not is_house_satellite_chamber(r)]
+    if not hubs:
+        # Do not elect a garage/backyard as the deed hub (bug report 863).
+        return None
+    by_key = {r.key: r for r in hubs if getattr(r, "key", None)}
     for key, room in by_key.items():
         if key.endswith(" Living"):
             return room
-    for room in interiors:
-        outbound = (room.exits or {}).get("out")
+    for room in hubs:
+        outbound = _resolve_exit_room((room.exits or {}).get("out"), game)
         if outbound is not None and getattr(outbound, "private_home", False):
             return room
-    for room in interiors:
+    for room in hubs:
         main = getattr(room, "main_homeroom", None)
         if main and main == getattr(room, "key", None):
             return room
-    return sorted(interiors, key=lambda r: r.key)[0]
+    return sorted(hubs, key=lambda r: r.key)[0]
 
 
-def stamp_house_home_links(rooms, main_room=None):
+def stamp_house_home_links(rooms, main_room=None, game=None):
     """Stamp ``is_home`` + ``main_homeroom`` on every room in the cluster."""
     interiors = [r for r in (rooms or ()) if r is not None]
     if not interiors:
         return None
-    main = main_room or pick_main_homeroom(interiors)
+    main = main_room or pick_main_homeroom(interiors, game=game)
     if main is None:
         return None
     main_key = main.key
@@ -138,7 +182,7 @@ def ensure_house_home_links(game):
             continue
         for member in cluster:
             seen.add(member.key)
-        main_guess = pick_main_homeroom(cluster)
+        main_guess = pick_main_homeroom(cluster, game=game)
         main_key = main_guess.key if main_guess else None
         already = True
         for member in cluster:
@@ -150,7 +194,7 @@ def ensure_house_home_links(game):
                 break
         if already and main_key:
             continue
-        if stamp_house_home_links(cluster, main_guess):
+        if stamp_house_home_links(cluster, main_guess, game=game):
             stamped += 1
     return stamped
 
@@ -500,6 +544,77 @@ def clear_room_bed_owners(room):
             bed.owner_key = None
             cleared += 1
     return cleared
+
+
+def is_lodging_corridor(room):
+    """True for hotel, motel, or apartment floor corridors."""
+    if room is None:
+        return False
+    from engine.systems.procedural_build import (
+        is_apartment_floor,
+        is_hotel_floor,
+        is_motel_floor,
+    )
+
+    return (
+        is_hotel_floor(room)
+        or is_motel_floor(room)
+        or is_apartment_floor(room)
+    )
+
+
+def _lodging_unit_on_crossing(from_room, direction, dest):
+    """Return the guest unit room when this hop is corridor <-> unit."""
+    if from_room is None or dest is None:
+        return None
+    d = str(direction or "").strip().lower()
+    if is_lodging_corridor(from_room):
+        if is_hotel_guest_room(dest):
+            return dest
+        if getattr(dest, "is_house", False) and (
+            getattr(dest, "private_home", False)
+            or getattr(dest, "main_homeroom", None) == getattr(dest, "key", None)
+        ):
+            return dest
+    if d == "out" and is_lodging_corridor(dest):
+        if is_hotel_guest_room(from_room):
+            return from_room
+        if getattr(from_room, "is_house", False):
+            return from_room
+    return None
+
+
+def is_lodging_unit_door(from_room, direction, dest):
+    """True when crossing a numbered hotel/motel/apartment unit threshold."""
+    return _lodging_unit_on_crossing(from_room, direction, dest) is not None
+
+
+def lodging_unit_move_phrase(direction, from_room, dest):
+    """Return a player-facing phrase like ``into room 2d``, or None."""
+    if from_room is None or dest is None:
+        return None
+    d = str(direction or "").strip().lower()
+    if _lodging_unit_on_crossing(from_room, direction, dest) is None:
+        return None
+    if d == "out":
+        return "out into the hall"
+    if is_lodging_corridor(from_room):
+        return f"into room {d}"
+    return None
+
+
+def lodging_unit_arrive_phrase(dest_room):
+    """Arrive suffix when someone enters a guest unit from the corridor."""
+    if dest_room is None:
+        return None
+    if is_hotel_guest_room(dest_room):
+        return "from the hall"
+    if getattr(dest_room, "is_house", False) and (
+        getattr(dest_room, "private_home", False)
+        or getattr(dest_room, "main_homeroom", None) == getattr(dest_room, "key", None)
+    ):
+        return "from the hall"
+    return None
 
 
 def iter_hotel_guest_rooms(game):

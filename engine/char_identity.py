@@ -891,16 +891,66 @@ def heal_all_character_identities(game) -> dict:
     return stats
 
 
-def _sheriff_office_identity_match(label) -> bool:
-    """True when a room key or legacy_key names the sheriff desk lobby."""
+def _sheriff_office_bare_label(label) -> str:
+    """Strip instance / map prefixes from a room identity string.
+
+    Djinn mirage clones store ``djinn:<id>:<source_key>``. Map-qualified
+    keys are ``lebanon:Sheriff's Office``. One ``split(':', 1)`` leaves
+    ``<id>:SE00008`` on clones, so peel the instance prefix first.
+    """
     if not label or not isinstance(label, str):
+        return ""
+    text = label.strip()
+    if not text:
+        return ""
+    low = text.lower()
+    # ``djinn:<12-hex>:<source_key>`` -- keep the source key intact
+    # (it may itself be map-qualified or a VNUM).
+    if low.startswith("djinn:") and text.count(":") >= 2:
+        text = text.split(":", 2)[2].strip()
+    if ":" in text:
+        text = text.split(":", 1)[-1].strip()
+    return text
+
+
+def _sheriff_office_name_match(bare) -> bool:
+    """True for the lobby name itself, not a lot / cell / street near it."""
+    low = str(bare or "").strip().lower()
+    if not low:
         return False
-    # Bare label after optional map qualify (``lebanon:Sheriff's Office``).
-    bare = label.split(":", 1)[-1].strip()
-    low = bare.lower()
     if "cell" in low or "lot" in low:
         return False
     return low in ("sheriff's office", "sherrif's office")
+
+
+def _sheriff_office_identity_match(label) -> bool:
+    """True when a room key or legacy_key names the sheriff desk lobby."""
+    return _sheriff_office_name_match(_sheriff_office_bare_label(label))
+
+
+def _sheriff_office_title_match(label) -> bool:
+    """True for authored lobby titles (not lot, cell, or 'near the office').
+
+    ``Lebanon - Sheriff's Office - Lobby`` and ``Lebanon - Sheriff's Office``
+    count. ``… - Cell A``, ``… - Lot``, and ``Near the Sheriff's Office``
+    do not. Used when VNUM / instance keys have no legacy_key (Djinn clones
+    copy title but used to omit legacy_key).
+    """
+    if not label or not isinstance(label, str):
+        return False
+    parts = [
+        part.strip()
+        for part in label.replace("–", "-").split(" - ")
+        if part.strip()
+    ]
+    if not parts:
+        return False
+    last = parts[-1].lower()
+    if last in ("lobby",):
+        room = parts[-2].lower() if len(parts) >= 2 else ""
+    else:
+        room = last
+    return _sheriff_office_name_match(room)
 
 
 def is_sheriff_office_room(room) -> bool:
@@ -910,11 +960,19 @@ def is_sheriff_office_room(room) -> bool:
     (and legacy dig typo ``Sherrif's Office``) without Cell / Lot suffixes.
     After VNUM rekey the live ``room.key`` may be ``SE00008`` while
     ``legacy_key`` stays ``lebanon:Sheriff's Office`` -- check both.
+    Instance clones (``djinn:<id>:SE00008``) and title-only lobbies also
+    match so desk verbs do not tell you to walk to a desk you are on.
     """
     if room is None:
         return False
-    for attr in ("key", "legacy_key"):
+    for attr in ("key", "legacy_key", "vnum"):
         if _sheriff_office_identity_match(getattr(room, attr, None)):
+            return True
+    for attr in ("title", "look_key"):
+        label = getattr(room, attr, None)
+        if _sheriff_office_title_match(label):
+            return True
+        if _sheriff_office_identity_match(label):
             return True
     return False
 

@@ -117,18 +117,6 @@ How you play (desk)
   3. research                 log regional normals for small dollars
   4. radar                    list watches and live tornado tracks
 
-
-
-
-
-
-
-
-
-
-
-
-
 How you play (chase)
   1. chaseboard take         accept a live funnel or storm-cell probe (also: takechase)
   2. track chase              soft lead toward the target atlas cell
@@ -149,18 +137,6 @@ How you play (field)
   1. photograph       shoot fights, crowds, crime scenes, or sky drama (may tag [PHOTO] hunter tells on stills -- not masquerade heat)
   2. photos           list held shots on your roll
   3. sellphoto        cash a print at the Lebanon Gazette (west of the Library)
-
-
-
-
-
-
-
-
-
-
-
-
 
 How you play (stories)
   1. storyboard       read tips at the Gazette news desk
@@ -403,8 +379,8 @@ How the town AI uses tags
   When social need is high, it prefers your favorite person. Closer tags beat weaker ones for auto-pick (lover, then family, then friend, …). rival stays competitive without murder. enemy and worse can lead to hunt attempts when you share a zone.
   Offline Echoes use close ties for hunt / rest buddies (never Enemy-tier).
 
-Beckon (help beckon) can pull close Echo / idle ties along as companions. Mutual siblings can die into the afterlife so a sibling may attempt a rescue (help death).
-See also: help ashkin | help beckon | help personality | help echo
+Beckon (help beckon) can pull close Echo / idle ties along as companions. recruit dean, or ask dean to help -- Dean or Sam ride along even without a close tag (help recruit). Mutual siblings can die into the afterlife so a sibling may attempt a rescue (help death).
+See also: help ashkin | help beckon | help recruit | help personality
 """,
     "personas": """Notbigville -- persona traits demo
 

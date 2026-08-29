@@ -360,6 +360,9 @@ def load_parking_state(game):
                     info["micro"] = [int(micro[0]), int(micro[1])]
                 except (TypeError, ValueError):
                     pass
+            extra = entry.get("extra")
+            if isinstance(extra, dict) and extra:
+                info["extra"] = dict(extra)
             if info:
                 out[vid] = info
     return out
@@ -379,7 +382,9 @@ def tick_scrub_invalid_vehicle_parks(game):
     game._parking_save_scrubbing = True
     try:
         rooms = getattr(game, "rooms", None) or {}
-        for veh in game.vehicles.values():
+        # Snapshot -- rehoming a nested park below can call back into
+        # kit/park helpers that touch ``game.vehicles`` mid-scrub.
+        for veh in list(game.vehicles.values()):
             if not isinstance(veh, dict):
                 continue
             park_key = veh.get("parked_room")
@@ -481,7 +486,12 @@ def save_parking_state(game):
     if not isinstance(prior, dict):
         prior = {}
     payload = dict(prior)
-    for vid, veh in game.vehicles.items():
+    # Snapshot before iterating -- a hook callback (trunk extra fields,
+    # park-scrub exemptions) or a kit ensure still in flight elsewhere in
+    # the same tick can add/remove a vehicle id while this walks the
+    # roster, which raises "dictionary changed size during iteration" on
+    # the live ``game.vehicles`` dict (bug report -- makecar crash).
+    for vid, veh in list(game.vehicles.items()):
         entry = {}
         room_key = veh.get("parked_room")
         interior_key = veh.get("interior_key")
@@ -500,6 +510,9 @@ def save_parking_state(game):
             entry["micro"] = None
         elif isinstance(micro, (list, tuple)) and len(micro) == 2:
             entry["micro"] = [int(micro[0]), int(micro[1])]
+        extra = hooks_mod.vehicle_extra_persist_fields(veh)
+        if extra:
+            entry["extra"] = extra
         if entry:
             payload[vid] = entry
         elif vid in payload:
@@ -622,6 +635,9 @@ def ensure_game_vehicles(game, *, pre_character_load=False):
             "scenic_mode": False,
             "scenic_last_step": 0,
         }
+        extra = saved.get("extra")
+        if isinstance(extra, dict) and extra:
+            hooks_mod.vehicle_extra_persist_apply(game.vehicles[vid], extra)
     _stamp_catalog_vehicle_interior_vnums(game)
     game._vehicles_ready = True
     if not os.path.isfile(parking_path(game)):
@@ -967,7 +983,10 @@ def find_vehicle_at(game, room, query, character=None):
     if not needle:
         return None
     matches = []
-    for veh in game.vehicles.values():
+    # Snapshot -- ``ensure_game_vehicles`` / ``ensure_character_vehicles``
+    # can stamp a brand-new vehicle into ``game.vehicles`` from a nested
+    # call triggered while this scan is mid-roster.
+    for veh in list(game.vehicles.values()):
         if not _vehicle_parked_in_room(game, veh, room):
             continue
         aliases = set(veh.get("aliases") or []) | {
@@ -1815,7 +1834,9 @@ def tick_drives(game, *, finish_drive_fn=None):
     if not getattr(game, "_vehicles_ready", False):
         return
     now = game.game_time_ticks
-    for veh in game.vehicles.values():
+    # Snapshot -- ``finish_drive_fn`` arrival prose (road encounters,
+    # impound/tow, carvana sale) can add/remove a vehicle mid-heartbeat.
+    for veh in list(game.vehicles.values()):
         path = veh.get("scenic_path")
         if not (veh.get("scenic_mode") and isinstance(path, list)):
             if veh.get("drive_until"):

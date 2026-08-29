@@ -36,7 +36,8 @@ body.theme-contrast {
 html,
 body {
   margin: 0;
-  height: 100%;
+  height: var(--app-height, 100dvh);
+  max-height: var(--app-height, 100dvh);
   background: var(--bg);
   color: var(--silver);
   font-family: Consolas, "Courier New", Courier, monospace;
@@ -311,6 +312,44 @@ header button.hint {
   font-style: italic;
 }
 
+/* Complete telnet lines are block boxes -- same idea as .comm-line.
+   Inline unstyled spans plus leftover \\r made consecutive rooms smear
+   over each other in the story log. */
+#output .out-line {
+  display: block;
+}
+
+#output .out-line:empty::before {
+  content: "\00a0";
+}
+
+#output .out-partial {
+  display: inline;
+}
+
+#room-card {
+  flex: 0 0 auto;
+  padding: 0.4rem 1rem 0.45rem;
+  border-bottom: 1px solid var(--rule);
+  background: #0c0e10;
+}
+
+#room-title {
+  color: var(--gold);
+  font-size: 0.95rem;
+  letter-spacing: 0.02em;
+}
+
+#room-sub {
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-transform: lowercase;
+}
+
+#room-sub:empty {
+  display: none;
+}
+
 #output {
   flex: 1 1 auto;
   margin: 0;
@@ -345,6 +384,8 @@ header button.hint {
   background: #080a0e;
   border: 1px solid var(--rule);
   cursor: crosshair;
+  touch-action: manipulation;
+  user-select: none;
 }
 
 #atlas-caption {
@@ -365,6 +406,8 @@ header button.hint {
   background: #080a0e;
   border: 1px solid var(--rule);
   cursor: pointer;
+  touch-action: manipulation;
+  user-select: none;
 }
 
 #zone-caption {
@@ -509,6 +552,53 @@ header button.hint {
 #send:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+#phone-nav {
+  display: none;
+}
+
+#more-sheet {
+  display: none;
+  padding: 1rem 1.1rem 1.25rem;
+  overflow: auto;
+}
+
+#more-sheet h2 {
+  margin: 0 0 0.35rem;
+  font-size: 1rem;
+  color: var(--gold);
+}
+
+.more-lead,
+.more-meta {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin: 0 0 0.85rem;
+}
+
+.more-meta a {
+  color: var(--teal);
+}
+
+#more-sheet button {
+  display: block;
+  width: 100%;
+  margin: 0 0 0.45rem;
+  background: #1a1a1a;
+  color: var(--silver);
+  border: 1px solid var(--input-border);
+  border-radius: 3px;
+  padding: 0.7rem 0.85rem;
+  font: inherit;
+  cursor: pointer;
+  min-height: 44px;
+}
+
+#more-sheet button:hover,
+#more-sheet button:focus {
+  border-color: var(--teal);
+  color: var(--teal);
 }
 
 #ctx-menu {
@@ -663,14 +753,95 @@ body[data-fontsize="xlarge"] { --ui-font-size: 22px; }
 }
 
 @media (max-width: 720px) {
+  header {
+    padding: 0.4rem 0.75rem;
+  }
+  header .meta {
+    display: none;
+  }
+  #status {
+    margin-left: 0;
+  }
   #play {
     flex-direction: column;
   }
   #hud {
-    flex: 0 0 auto;
+    flex: 1 1 auto;
     width: 100%;
     border-left: 0;
     border-top: 1px solid var(--rule);
-    max-height: 42vh;
+    max-height: none;
+  }
+  #phone-nav {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 0;
+    border-top: 1px solid var(--rule);
+    background: #080808;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  #phone-nav button {
+    flex: 1 1 0;
+    min-height: 44px;
+    background: transparent;
+    color: var(--muted);
+    border: 0;
+    border-top: 2px solid transparent;
+    font: inherit;
+    font-size: 0.78rem;
+    cursor: pointer;
+    padding: 0.35rem 0.2rem;
+  }
+  #phone-nav button[aria-pressed="true"] {
+    color: var(--silver);
+    border-top-color: var(--gold);
+  }
+  #input-row {
+    padding: 0.5rem 0.75rem;
+  }
+  #cmd,
+  #send {
+    min-height: 44px;
+  }
+  #compass button,
+  .zoom-btn,
+  .pane-toggle,
+  .comm-tabs button {
+    min-height: 44px;
+  }
+  #play[data-phone-tab="log"] #hud {
+    display: none;
+  }
+  #play[data-phone-tab="maps"] #play-main,
+  #play[data-phone-tab="status"] #play-main {
+    display: none;
+  }
+  #play[data-phone-tab="maps"] #status-panel {
+    display: none;
+  }
+  #play[data-phone-tab="status"] #atlas-panel,
+  #play[data-phone-tab="status"] #zone-panel {
+    display: none;
+  }
+  #play[data-phone-tab="more"] {
+    display: none;
+  }
+  body[data-phone-tab="more"] #more-sheet {
+    display: block;
+    flex: 1 1 auto;
+  }
+  #ctx-menu.ctx-sheet {
+    left: 0 !important;
+    right: 0;
+    top: auto !important;
+    bottom: 0;
+    width: 100%;
+    min-width: 0;
+    border-left: 0;
+    border-right: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0.5rem);
+  }
+  #ctx-menu.ctx-sheet button {
+    min-height: 44px;
   }
 }

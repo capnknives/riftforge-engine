@@ -68,14 +68,14 @@ briefs, body parts, content kinds, travel, economy, …). Game-specific lore,
 catalogs, and prose live in a **separate** consumer repo and pin **tagged
 releases** of this package.
 
-**Current release: [`v0.6.1`](https://github.com/capnknives/riftforge-engine/releases/tag/v0.6.1)** — Phase 2 purity restore (engine never lazy-imports a game package) plus monorepo `engine/` since `v0.6.0`. Pin `@v0.6.1` until the next semver tag ships from `main`.
+**Current release: [`v0.6.2`](https://github.com/capnknives/riftforge-engine/releases/tag/v0.6.2)** — engine liquid-flavor kernels (skill ranks, gather nodes, vendor stock, claim boards, wage curves, status conditions, prose-pool loader) plus flavor-neutral room/item kind stamps. Pin `@v0.6.2` until the next semver tag ships from `main`.
 
 ## Install
 
 ```bash
 pip install -e .
 # or pin from another project:
-#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.6.1
+#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.6.2
 ```
 
 Requires **Python 3.11+**.
@@ -124,6 +124,14 @@ python tools/scaffold_game_mode.py --slug mygame --label "My Game"
 ```
 
 See [`docs/GAME_MODE_SCHEMA_CHECKLIST.md`](docs/GAME_MODE_SCHEMA_CHECKLIST.md).
+
+## What's new in v0.6.2
+
+- **Lifestyle kernels** — `engine/systems/skill_ranks.py` (craft/skill chance curves and spoken odds bands) and `engine/systems/gather_nodes.py` (depleting harvest nodes + SQLite round-trip). Games keep catalogs, affinities, and terrain glue.
+- **Civic kernels** — `engine/systems/vendor_stock.py` (ware rows), `engine/systems/claim_board.py` (posted → claimed → assist), `engine/systems/wage_curve.py` (hourly/career pay and shift exhaustion math).
+- **Combat framework kernels** — `engine/systems/status_conditions.py` (id → rounds ledger + catalog multipliers) and `engine/systems/prose_pool_loader.py` (JSON pool directory + test override + hot reload). Games still own condition catalogs and prose files.
+- **Kind stamps** — `item.generic` `need` is an open string (games register meter ids); room ward stamps (`evil_ward`, `iron_ward`, `god_ward`, `god_ward_strength`) live on `room.engine` with flavor-neutral docs. Game-specific trap names stay on the child kind.
+- **Party-merge purity** — `engine.party_invite` no longer lazy-imports a game package; games register `hooks.set_can_auto_companion`.
 
 ## What's new in v0.6.1
 
@@ -189,7 +197,9 @@ Reusable opt-in systems another MUD can adopt through hooks and registration:
 | **Spawn** | `spawn/` | Bestiary tables + nest-AI dispatch |
 | **Instances** | `instance_rooms` | Tear down pocket/instance rooms when empty |
 | **Social & gear** | `mail`, `social_catalog`, `wearables`, `containers`, `floor_loot` | Letters, emote catalog, clothing slots, containers |
-| **Civic** | `clinic`, `justice`, `player_site` | Injury intake, crime case shell, player-owned site hooks |
+| **Civic** | `clinic`, `justice`, `player_site`, `claim_board`, `vendor_stock`, `wage_curve` | Injury intake, crime case shell, player-owned site hooks; posted-job board kit; ware-row helpers; gig-work pay curves |
+| **Lifestyle** | `skill_ranks`, `gather_nodes` | Craft/skill chance curves + spoken odds; depleting harvest nodes |
+| **Combat status / prose** | `status_conditions`, `prose_pool_loader` | Catalog-driven condition ledger; JSON pool directory loader |
 | **Quests** | `quests`, `quests_loader` | Quest state machine + JSON loader |
 | **Map authoring** | `map_store` | OLC dig/link/room-field helpers; games register field catalogs + seed-item placement via hooks |
 | **Phone** | `phone` | Numbers, contacts, ring/answer/hangup, plane-local dial, payphone fee hook |
@@ -255,7 +265,7 @@ CI runs all three on every push.
 
 ## Building your own game
 
-1. `pip install -e .` (or pin `@v0.6.1`).
+1. `pip install -e .` (or pin `@v0.6.2`).
 2. Read [`docs/ENGINE_CONSUMER.md`](docs/ENGINE_CONSUMER.md) — hooks for chargen, persist, help, `register_all_hooks()`.
 3. Copy `basegame/` or `classic/` as a skeleton, or register your package via `RIFTFORGE_GAME=yourgame`.
 4. Put catalogs in your repo (`content/kinds/`, maps, NPCs); register kind dirs with `set_content_kinds_dirs`. Run `tools/scaffold_game_mode.py` for a fresh tree.

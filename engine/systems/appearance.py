@@ -28,12 +28,18 @@ EXTENDED_SLOTS = (
 SLOTS = CORE_SLOTS + EXTENDED_SLOTS
 CUSTOM_MAX_LEN = 40
 SHORT_DESC_MAX_LEN = 60
-PRONOUNS = ("he", "she", "they")
+PRONOUNS = ("he", "she", "they", "it")
+
+# Possessive / object spellings players may type at the pronoun verb.
+PRONOUN_ALIASES = {
+    "its": "it",
+}
 
 _PERSON_WORD = {
     "he": "man",
     "she": "woman",
     "they": "person",
+    "it": "figure",
 }
 
 _APPEARANCE_KITS: dict = {}
@@ -61,6 +67,28 @@ def set_appearance_age_phrase(fn):
     """Register fn(age:int) -> optional decade phrase for look prose."""
     global _age_phrase_fn
     _age_phrase_fn = fn
+
+
+def resolve_apparent_age(character, viewer=None):
+    """Return the apparent age (in years) to show for ``character``.
+
+    Today this is a thin pass-through -- it just returns the character's
+    real stored ``age`` attribute, the same value every past call site read
+    directly. The function exists as a **documented extension seam**: a
+    future age-band-concealment feature (a cosmetic "makeup" appearance
+    slot, a Hexcraft glamour spell that locks a perceived age band, or a
+    mirror/reflection tell that pierces a disguise) can later make the
+    apparent age depend on who is looking, without having to hunt down and
+    change every place in the codebase that currently calls
+    ``getattr(character, "age", None)``.
+
+    ``viewer`` is accepted but intentionally unused for now -- it is not
+    dead code by accident, it is reserved for that future branch (e.g.
+    "does ``viewer`` have True Sight, or did they cast Discern on
+    ``character``?"). See ``docs/plans/age_band_concealment.md`` (parked --
+    not implemented) for the design pointer.
+    """
+    return getattr(character, "age", None)
 
 
 def register_appearance_kit(
@@ -173,6 +201,18 @@ def display(slot, option_id, *, kit=None):
 def list_options(slot, kit=None):
     """Return the list of {id, name} dicts for `slot` in ``kit``."""
     return list(catalog_for(kit).get(slot, []))
+
+
+def normalize_pronoun(raw):
+    """Map a typed pronoun (he / she / they / it, or its) onto PRONOUNS.
+
+    Returns the canonical id, or None when the token is unknown.
+    """
+    text = str(raw or "").strip().lower()
+    text = PRONOUN_ALIASES.get(text, text)
+    if text in PRONOUNS:
+        return text
+    return None
 
 
 def person_word_for(pronoun, kit=None):
@@ -423,7 +463,7 @@ def apply_appearance(character):
     """Rewrite character.description from slots when complete and allowed."""
     if getattr(character, "desc_override", False):
         return
-    age = getattr(character, "age", None)
+    age = resolve_apparent_age(character)
     kit = kit_for_character(character)
     text = build_description(
         character.appearance, character.pronoun, age=age, kit=kit

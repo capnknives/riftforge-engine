@@ -88,11 +88,13 @@ def _highlight_author_nudge_verbs(message: str) -> str:
 def render_ooc_line(character, face: str, message: str, *, kind: str = OOC_KIND_NORMAL) -> str:
     """Paint one OOC line for *character* (or plain when SR / color off).
 
-    Default sighted chrome is layered: crimson ``((`` ``))``, gold ``OOC``
-    letters, parchment/white body -- so the line does not blend into room
-    prose grey. Player text is never run through ``paint_layered`` (no
-    ``<tag>`` injection). ``config channel ooc <role>`` still paints the
-    whole line one color. Author nudges stay gold with silver verb pops.
+    Default sighted color is the whole line bright aqua (role ``ooc``,
+    RGB 0,255,200) so the channel cannot hide in room prose. Player text
+    is never run through ``paint_layered`` (URLs stay clickable via
+    ``paint_preserving_urls``). ``config channel ooc <role>`` still paints
+    the whole line a different color. Author nudges stay gold with silver
+    verb pops. The official Mudlet package also recolors ``((OOC))`` lines
+    to the same RGB in the main window.
     """
     from engine import display_prefs
     from engine import style
@@ -107,16 +109,9 @@ def render_ooc_line(character, face: str, message: str, *, kind: str = OOC_KIND_
         body = _highlight_author_nudge_verbs(message)
         template = format_ooc_line(face, body, kind=kind)
         return style.paint_layered_for(character, "gold", template)
-    if display_prefs.wants_plain_comms(character):
-        return display_prefs.paint_plaincomms_channel_lead(
-            character, plain, "OOC.", body_role="ooc",
-        )
-    prefix = "((OOC))"
-    if not plain.startswith(prefix):
-        return style.paint_for(character, "ooc", plain)
-    return display_prefs.paint_double_bracket_channel_line(
-        character, "OOC", plain[len(prefix):], channel="ooc",
-    )
+    role = display_prefs.channel_role(character, "ooc", default="ooc")
+    depth = display_prefs.color_depth(character)
+    return style.paint_preserving_urls(role, plain, depth=depth)
 
 
 def make_ooc_history_entry(
@@ -189,6 +184,19 @@ def broadcast_ooc(
     channel_history.append(
         game, "ooc", entry, gateway_plain=public_plain,
     )
+    try:
+        from engine import channel_transcript
+
+        channel_transcript.record(
+            "ooc",
+            face=public_face,
+            message=message,
+            game=game,
+            speaker=str(getattr(speaker, "key", "") or ""),
+            extra={"kind": kind} if kind != OOC_KIND_NORMAL else None,
+        )
+    except Exception:
+        pass
     delivered = False
     from engine.accounts import ooc_should_hide_from_viewer
     for session in list(getattr(game, "sessions", None) or []):
@@ -248,6 +256,18 @@ def broadcast_ooc_from_face(
     channel_history.append(
         game, "ooc", entry, gateway_plain=public_plain,
     )
+    try:
+        from engine import channel_transcript
+
+        channel_transcript.record(
+            "ooc",
+            face=face,
+            message=message,
+            game=game,
+            extra={"from_discord": True} if from_discord else None,
+        )
+    except Exception:
+        pass
     delivered = False
     from engine.accounts import find_account, ooc_is_blocked, account_for_character
     for session in list(getattr(game, "sessions", None) or []):

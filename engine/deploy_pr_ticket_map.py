@@ -2,9 +2,10 @@
 
 When a squash-merge subject ends with ``(#NNNN)`` but omits ``Fix bug #N``,
 auto-deploy falls back to PR title/body via GitHub. Live often lacks API auth
-or hits rate limits. Agents record ticket ids in ``ops/deploy_pr_ticket_map.json``
-when opening PRs (``tools/open_pr.py``); deploy + boot reconcile read that file
-first.
+or hits rate limits. Agents record ticket ids when opening PRs
+(``tools/open_pr.py``) under ``ops/deploy_tickets/<pr>.json`` — one file per
+PR so parallel bug-fix branches do not fight over a shared JSON tail. Legacy
+rows in ``ops/deploy_pr_ticket_map.json`` are still read.
 
 Map keys are GitHub PR numbers (strings). Values hold bug_ids, suggestion_ids,
 and an optional short summary for announce copy.
@@ -17,6 +18,7 @@ import os
 import time
 
 _MAP_BASENAME = "deploy_pr_ticket_map.json"
+_TICKETS_DIRNAME = "deploy_tickets"
 
 
 def _repo_root() -> str:
@@ -24,33 +26,78 @@ def _repo_root() -> str:
 
 
 def map_path(root: str | None = None) -> str:
-    """Absolute path to the committed ticket map under ``ops/``."""
+    """Absolute path to the legacy monolithic ticket map under ``ops/``."""
     base = root or _repo_root()
     return os.path.join(base, "ops", _MAP_BASENAME)
 
 
-def load(root: str | None = None) -> dict[str, dict]:
-    """Return ``{pr_number_str: row_dict}``; empty when missing or invalid."""
-    path = map_path(root)
+def tickets_dir(root: str | None = None) -> str:
+    """Directory holding one JSON row per GitHub PR number."""
+    base = root or _repo_root()
+    return os.path.join(base, "ops", _TICKETS_DIRNAME)
+
+
+def ticket_path(pr_number: int, root: str | None = None) -> str:
+    """Absolute path to ``ops/deploy_tickets/<pr>.json``."""
+    return os.path.join(tickets_dir(root), f"{int(pr_number)}.json")
+
+
+def _read_json(path: str) -> dict | None:
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _load_monolithic(root: str | None = None) -> dict[str, dict]:
+    """Rows from the legacy shared ``deploy_pr_ticket_map.json`` file."""
+    data = _read_json(map_path(root))
+    if not data:
         return {}
-    rows = data.get("pulls") if isinstance(data, dict) else None
+    rows = data.get("pulls")
     if not isinstance(rows, dict):
         return {}
+    return {str(k): dict(v) for k, v in rows.items() if isinstance(v, dict)}
+
+
+def _load_ticket_files(root: str | None = None) -> dict[str, dict]:
+    """Rows from ``ops/deploy_tickets/<pr>.json`` (parallel-PR safe)."""
+    directory = tickets_dir(root)
+    if not os.path.isdir(directory):
+        return {}
+    rows: dict[str, dict] = {}
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".json"):
+            continue
+        key = name[:-5]
+        if not key.isdigit():
+            continue
+        row = _read_json(os.path.join(directory, name))
+        if row:
+            rows[key] = row
+    return rows
+
+
+def load(root: str | None = None) -> dict[str, dict]:
+    """Return ``{pr_number_str: row_dict}`` from legacy map + per-PR files."""
+    rows = _load_monolithic(root)
+    rows.update(_load_ticket_files(root))
     return rows
 
 
 def save(rows: dict[str, dict], root: str | None = None) -> None:
-    """Write the map atomically (pretty JSON for human review in PRs)."""
+    """Write the legacy monolithic map (tests / one-off migrations only).
+
+    New PR rows should use ``record_pull`` → ``ops/deploy_tickets/<pr>.json``.
+    """
     path = map_path(root)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
         "_doc": (
             "GitHub PR → in-game bug_reports.log / suggestions.log ids. "
-            "Written by tools/open_pr.py; read by auto_deploy PR fallback."
+            "Legacy monolithic map; new PRs use ops/deploy_tickets/<pr>.json."
         ),
         "pulls": rows,
     }
@@ -61,9 +108,27 @@ def save(rows: dict[str, dict], root: str | None = None) -> None:
     os.replace(tmp, path)
 
 
+def save_ticket_row(pr_number: int, row: dict, root: str | None = None) -> str:
+    """Write one PR row to ``ops/deploy_tickets/<pr>.json``; return rel path."""
+    directory = tickets_dir(root)
+    os.makedirs(directory, exist_ok=True)
+    path = ticket_path(pr_number, root=root)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(row, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+    rel = os.path.relpath(path, root or _repo_root()).replace("\\", "/")
+    return rel
+
+
 def lookup(pr_number: int, root: str | None = None) -> dict | None:
     """Return a row dict for ``pr_number``, or None."""
-    row = load(root).get(str(int(pr_number)))
+    key = str(int(pr_number))
+    row = _read_json(ticket_path(pr_number, root=root))
+    if row:
+        return row
+    row = _load_monolithic(root).get(key)
     return row if isinstance(row, dict) else None
 
 
@@ -103,11 +168,10 @@ def record_pull(
     summary: str = "",
     squash_subject: str = "",
     root: str | None = None,
-) -> None:
-    """Upsert one PR row (idempotent — safe to call again with same data)."""
+) -> str:
+    """Upsert one PR row (idempotent). Returns the committed relative path."""
     key = str(int(pr_number))
-    rows = load(root)
-    row = dict(rows.get(key) or {})
+    row = dict(lookup(pr_number, root=root) or {})
     if bug_ids:
         row["bug_ids"] = sorted({int(x) for x in bug_ids})
     if suggestion_ids:
@@ -117,5 +181,4 @@ def record_pull(
     if squash_subject:
         row["squash_subject"] = squash_subject.strip()
     row["recorded_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    rows[key] = row
-    save(rows, root)
+    return save_ticket_row(pr_number, row, root=root)

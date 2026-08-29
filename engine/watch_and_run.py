@@ -123,14 +123,13 @@ _COPYOVER_SKIP_PREFIXES = (
     "tools",
 )
 
-# Compiled / boot-rewritten JSON at content/ (not a live catalog). Boot and
-# auto-deploy rewrite changelog_index.json whenever CHANGELOG sources are
-# ahead; watching it copyover-stormed Azure playtest (Veil loop + mixed
-# imports like ``witch_veilform``). Same class as map_backups: artifact, not
-# a reason to SIGUSR1 the game.
-_COPYOVER_SKIP_FILES = (
-    "content/changelog_index.json",
-)
+# Individual files (beyond the prefix list above) that should never trigger
+# a copyover on their own — same class as map_backups: generated artifact,
+# not a reason to SIGUSR1 the game. The changelog ledger
+# (``content/changelog.db``) never lived here: it is a ``.db`` file, and
+# this watcher only globs ``*.py`` plus JSON under ``content/`` /
+# ``supers/content/`` in the first place.
+_COPYOVER_SKIP_FILES = ()
 
 
 def _repo_root():
@@ -208,17 +207,16 @@ def reload_auto_deploy():
     Reloads ``tools.apply_pr_fix`` first (protect lists), then
     ``engine.deploy_notify`` and ``engine.hooks`` (batch ``bug_ids`` /
     ``queue_catchup_resolves`` / map heal must match disk), then
-    ``engine.changelog_ids`` / ``engine.changelog_index`` (fill-stamp
-    ``#N``), then ``engine.discord_patch_notes`` (numbered Discord
-    footer), then ``engine.auto_deploy``. Call on every deploy poll.
+    ``engine.changelog_ledger`` (mint any new ``#N``), then
+    ``engine.discord_patch_notes`` (posts from the ledger's unposted rows),
+    then ``engine.auto_deploy``. Call on every deploy poll.
 
     Without reloading ``deploy_notify``, a tip-only ``auto_deploy`` reload
     can call ``queue_deploy(..., bug_ids=...)`` against a stale module and
     error-loop every poll (reset --hard + protect restore → copyover churn).
     """
     import engine.auto_deploy as auto_deploy
-    import engine.changelog_ids as changelog_ids
-    import engine.changelog_index as changelog_index
+    import engine.changelog_ledger as changelog_ledger
     import engine.deploy_notify as deploy_notify
     import engine.discord_patch_notes as discord_patch_notes
     import engine.hooks as hooks
@@ -227,8 +225,7 @@ def reload_auto_deploy():
     importlib.reload(apply_pr_fix)
     importlib.reload(deploy_notify)
     importlib.reload(hooks)
-    importlib.reload(changelog_ids)
-    importlib.reload(changelog_index)
+    importlib.reload(changelog_ledger)
     importlib.reload(discord_patch_notes)
     # Watcher is not the game child — bootstrap never re-registers map
     # heal after this hooks reload. Late-bind so the next reset --hard
@@ -321,7 +318,6 @@ def _skip_copyover_path(path):
     - ``content/maps`` / ``content/zones`` (dig + Studio live-edit)
     - ``content/map_backups`` / ``content/map_archives`` snapshot churn from
       validated map saves (backups + daily archive nag state)
-    - ``content/changelog_index.json`` (boot/deploy compiled ``changes`` feed)
     - Repo-root ad-hoc ``_*.py`` probes (``live_ssh.run_remote_script`` uses
       ``/tmp`` instead -- dropping ``_remote_probe*.py`` in the bind-mount
       used to SIGUSR1 mid-chargen in a tight loop)
@@ -374,8 +370,9 @@ def _snapshot():
 
     Watches ``*.py`` (except pruned trees / root ``_*.py`` probes) plus
     JSON under ``content/`` and ``supers/content/``. Map/zone JSON stays
-    off the copyover list (dig + Studio live-edit), as does the compiled
-    ``content/changelog_index.json`` feed (boot/deploy rewrite).
+    off the copyover list (dig + Studio live-edit). The changelog ledger
+    (``content/changelog.db``) is a ``.db`` file, so it was never in this
+    JSON glob to begin with.
 
     Updates ``_LAST_SNAPSHOT_METRICS`` (see ``RIFTFORGE_WATCH_SNAP_*``).
     """
@@ -489,10 +486,16 @@ def _spawn_game(env=None, *, cold=False):
     from engine import copyover as copyover_mod
     from engine import crash_recovery
     from engine import env_file
+    import importlib
 
     root = _repo_root()
     crash_recovery.clear_gateway_ipc_down(root=root)
     copyover_mod.clear_copyover_ready(root=root)
+    # Reload from disk so new DEFAULT_REPO_ENV_KEYS (viewport, lag knobs)
+    # apply even if this watcher process imported env_file days ago.
+    # The game child *also* applies in server.py main() — that is what
+    # actually saves a stale watcher without a compose recreate.
+    importlib.reload(env_file)
     env_file.apply_repo_env(root)
     boot_stability.reset_post_tick_counter()
     if cold or not _gateway_mode():

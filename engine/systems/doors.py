@@ -36,8 +36,9 @@ def normalize_loaded(blob):
             continue
         room_key, direction = raw_key.rsplit("|", 1)
         direction = direction.strip().lower()
-        if not room_key or direction not in _CARDINAL_DIRS:
+        if not room_key or not direction or "|" in direction:
             continue
+        direction = direction.strip().lower()
         out[_pair_key(room_key, direction)] = bool(locked)
     return out
 
@@ -179,6 +180,10 @@ def _exit_defaults_closed(from_room, direction, dest):
         and _same_home_compound(from_room, dest)
     ):
         return True
+    from engine.systems.lodging import is_lodging_unit_door
+
+    if is_lodging_unit_door(from_room, direction, dest):
+        return True
     return False
 
 
@@ -186,6 +191,10 @@ def exit_is_door(from_room, direction, dest):
     """True when this step crosses a closable door (not zone travel)."""
     if from_room is None or dest is None:
         return False
+    from engine.systems.lodging import is_lodging_unit_door
+
+    if is_lodging_unit_door(from_room, direction, dest):
+        return True
     d = str(direction or "").strip().lower()
     if d not in _CARDINAL_DIRS:
         return False
@@ -254,8 +263,6 @@ def set_exit_open(game, from_room, direction, open_):
     if not room_key:
         return False
     d = str(direction or "").strip().lower()
-    if d not in _CARDINAL_DIRS:
-        return False
     dest = (from_room.exits or {}).get(d)
     if dest is None:
         dest = (from_room.exits or {}).get(direction)
@@ -331,8 +338,6 @@ def set_exit_locked(game, from_room, direction, locked):
     if not room_key:
         return False
     d = str(direction or "").strip().lower()
-    if d not in _CARDINAL_DIRS:
-        return False
     dest = (from_room.exits or {}).get(d)
     if dest is None:
         dest = (from_room.exits or {}).get(direction)

@@ -726,6 +726,40 @@ def format_group_names(character):
     return ", ".join(names)
 
 
+def _format_prompt_energy_value(energy, energy_max=""):
+    """Format Focus / energy for %En and legacy %e without float noise.
+
+    Char.Vitals (SUPERS gmcp) normally stamps percent strings. When hooks
+    are missing or the legacy ``Character.energy`` exhaustion field (0..1)
+    leaks through, still render a short integer percent bar.
+    """
+    if energy in (None, ""):
+        return "0"
+    try:
+        num = float(energy)
+    except (TypeError, ValueError):
+        text = str(energy).strip()
+        return text if text else "0"
+    if num == int(num):
+        return str(int(num))
+    max_text = str(energy_max or "").strip()
+    if max_text:
+        try:
+            cap = float(max_text)
+        except (TypeError, ValueError):
+            cap = 100.0
+        if 0.0 < cap <= 100.0 and num <= cap + 0.001:
+            return str(int(round(num)))
+        return str(round(num, 1))
+    # Legacy fallback: Character.energy is exhaustion (0 rested .. 1 spent).
+    if 0.0 <= num <= 1.0:
+        pct = int(round(num * 100.0))
+        return str(max(0, min(100, pct)))
+    if num <= 100.0:
+        return str(int(round(num)))
+    return str(int(round(num)))
+
+
 def _prompt_momentum_value(character, vitals):
     """Integer Momentum for prompt tokens (-100..100; 0 when unset).
 
@@ -825,6 +859,22 @@ def _prompt_vitals(character, game=None):
         name = _display_name(character)
     except Exception:
         name = getattr(character, "key", "?")
+    try:
+        legacy = float(energy)
+    except (TypeError, ValueError):
+        legacy = None
+    if legacy is not None and 0.0 < legacy < 1.0 and not energy_max:
+        try:
+            from engine import hooks
+            vitals_retry = hooks.gmcp_char_vitals(character) or {}
+            stamped = vitals_retry.get("energy")
+            if stamped not in (None, ""):
+                energy = stamped
+                if vitals_retry.get("energymax"):
+                    energy_max = str(vitals_retry["energymax"])
+        except Exception:
+            pass
+    energy = _format_prompt_energy_value(energy, energy_max)
     bands = {
         "hp": hp,
         "max_hp": max_hp,
@@ -1118,9 +1168,11 @@ def paint_channel_line(character, channel, text, *, default="muted"):
 def _explicit_channel_color(character, channel):
     """Return a player-chosen channel role, or None for default layered chrome.
 
-    ``config channel ooc gold`` (and the same for questions) paints the
-    whole line one color. The catalog default ``ooc`` still means the
-    layered crimson-parens / gold-letters treatment.
+    ``config channel questions gold`` paints the whole line one color.
+    The catalog default ``ooc`` (or unset) still means layered dark-grey
+    parens / gold letters for the questions net. OOC itself no longer
+    uses this helper -- it is always whole-line aqua unless the player
+    picked another role.
     """
     ensure_display_defaults(character)
     custom = (character.channel_colors or {}).get(channel)
@@ -1135,7 +1187,7 @@ def _explicit_channel_color(character, channel):
 def paint_double_bracket_channel_line(
     character, mark, rest, *, channel="ooc", body_role="ooc",
 ):
-    """Sighted ``((MARK))`` chrome: crimson parens, gold letters, body on rest.
+    """Sighted ``((MARK))`` chrome: dark-grey parens, gold letters, body on rest.
 
     *rest* is never parsed as ``paint_layered`` markup -- player text can
     contain ``<gold>`` or URLs without eating the line. An explicit
@@ -1153,8 +1205,8 @@ def paint_double_bracket_channel_line(
     # Layered prefix only -- mark is a fixed catalog word (OOC / QUESTIONS).
     prefix = style.paint_layered_for(
         character,
-        "dark_red",
-        f"<dark_red>((<gold>{mark}<dark_red>))",
+        "dark_grey",
+        f"<dark_grey>((<gold>{mark}<dark_grey>))",
     )
     if not rest:
         return prefix
@@ -1162,7 +1214,7 @@ def paint_double_bracket_channel_line(
 
 
 def paint_plaincomms_channel_lead(character, plain, lead, *, body_role="ooc"):
-    """Gold the leading ``OOC.`` / ``Questions.`` word; body stays parchment."""
+    """Gold the leading ``Questions.`` word; body stays parchment (``exit``)."""
     from engine import style
 
     ensure_display_defaults(character)

@@ -91,12 +91,18 @@ def expand_grid_cell(grid, x, y):
     road_ch = layer_char(grid.get("road_rows"), x, y)
     if road_ch and road_ch in ROAD_GLYPHS:
         under = out.get("area_type") or grid.get("area_type")
-        out["area_type"] = "highway"
-        out["map_glyph"] = road_ch
-        out["map_layer"] = (
-            "mountain_highway" if under == "mountains" else "highway"
-        )
-        out["title"] = "Highway"
+        if str(grid.get("route_kind") or "").strip().lower() == "trail":
+            out["area_type"] = "trail"
+            out["map_glyph"] = road_ch
+            out["map_layer"] = "trail"
+            out["title"] = "Wagon trail"
+        else:
+            out["area_type"] = "highway"
+            out["map_glyph"] = road_ch
+            out["map_layer"] = (
+                "mountain_highway" if under == "mountains" else "highway"
+            )
+            out["title"] = "Highway"
     key = f"{x},{y}"
     override = (grid.get("cell_overrides") or {}).get(key) or {}
     if isinstance(override, dict):

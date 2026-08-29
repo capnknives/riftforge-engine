@@ -32,6 +32,7 @@
   const zoneCaption = document.getElementById("zone-caption");
   const zoneTitle = document.getElementById("zone-title");
   const clientBuildEl = document.getElementById("client-build");
+  const moreBuildEl = document.getElementById("more-build");
   const prefFontSize = document.getElementById("pref-fontsize");
   const prefTheme = document.getElementById("pref-theme");
   const shortcutsBtn = document.getElementById("show-shortcuts");
@@ -40,6 +41,12 @@
   const displayBtn = document.getElementById("show-display-prefs");
   const displayDialog = document.getElementById("display-dialog");
   const displayClose = document.getElementById("display-close");
+  const playRoot = document.getElementById("play");
+  const roomCard = document.getElementById("room-card");
+  const roomTitle = document.getElementById("room-title");
+  const roomSub = document.getElementById("room-sub");
+  const moreSheet = document.getElementById("more-sheet");
+  const phoneNav = document.getElementById("phone-nav");
 
   const SGR16 = {
     0: null,
@@ -64,7 +71,7 @@
   // Bump this string with each shipped client change so bug reports about
   // "the web client" can be matched to a build (help/ops QoL, not a version
   // negotiation -- GMCP Core.Hello version above is the protocol number).
-  const CLIENT_BUILD = "2026-08-25a";
+  const CLIENT_BUILD = "2026-08-28d";
 
   const MAX_LINES = 8000;
   const MAX_COMM_LINES = 500;
@@ -75,7 +82,10 @@
   const THEME_KEY = "riftforge-theme";
   const PANE_COLLAPSE_KEY = "riftforge-pane-collapsed";
   const ZOOM_KEY = "riftforge-map-zoom";
+  const PHONE_TAB_KEY = "riftforge-phone-tab";
   const PASTE_LINES_CONFIRM = 3;
+  const LONG_PRESS_MS = 480;
+  const PRESS_MOVE_CANCEL_PX = 12;
   const ZOOM_MIN = 100;
   const ZOOM_MAX = 200;
   const ZOOM_STEP = 25;
@@ -97,6 +107,16 @@
   let socket = null;
   let passwordMode = false;
   let rawTail = "";
+  // Incomplete telnet line (no trailing newline yet). Re-painted as
+  // .out-partial so a WebSocket split never becomes two stacked rows.
+  let lineBuf = "";
+  let partialEl = null;
+  // SGR color carries across chunks so a split mid-line does not snap
+  // back to silver. Committed only when a complete line is flushed.
+  let sgrColor = "#e8e8e8";
+  // Game-only restart keeps this WebSocket. Arm after MSG_AFTER (reattach)
+  // so handshakeHud can run once the game child is actually back.
+  let hudResumeArmed = false;
   let history = [];
   let historyIdx = -1;
   let reconnectTimer = null;
@@ -415,6 +435,9 @@
   if (clientBuildEl) {
     clientBuildEl.textContent = "build " + CLIENT_BUILD;
   }
+  if (moreBuildEl) {
+    moreBuildEl.textContent = "build " + CLIENT_BUILD;
+  }
 
   function syncGagToServer() {
     let on = !!(gagCheckbox && gagCheckbox.checked);
@@ -539,10 +562,55 @@
       .replace(/>/g, "&gt;");
   }
 
-  function ansiToHtml(text) {
+  function consumeCsi(text, i) {
+    // CSI is ESC [ … final-byte (0x40–0x7E). Looking for the letter "m"
+    // used to swallow the rest of a room when the sequence was not SGR
+    // (erase, cursor) or when "m" appeared later in the prose.
+    if (text.charCodeAt(i) !== 27 || text.charAt(i + 1) !== "[") {
+      return null;
+    }
+    let j = i + 2;
+    while (j < text.length) {
+      const code = text.charCodeAt(j);
+      if (code >= 0x40 && code <= 0x7E) {
+        return {
+          next: j + 1,
+          final: text.charAt(j),
+          body: text.slice(i + 2, j),
+        };
+      }
+      j += 1;
+    }
+    return { next: text.length, final: "", body: "" };
+  }
+
+  function applySgrCodes(codes, color, closeSpan, openSpan) {
+    let next = color;
+    if (!codes.length) {
+      closeSpan();
+      return "#e8e8e8";
+    }
+    for (let c = 0; c < codes.length; c++) {
+      const code = parseInt(codes[c], 10);
+      if (code === 0) {
+        next = "#e8e8e8";
+        closeSpan();
+      } else if (code === 38 && codes[c + 1] === "5") {
+        next = xterm256ToCss(codes[c + 2]);
+        c += 2;
+        openSpan(next);
+      } else if (SGR16[code]) {
+        next = SGR16[code];
+        openSpan(next);
+      }
+    }
+    return next;
+  }
+
+  function ansiToHtml(text, commit) {
     const parts = [];
     let i = 0;
-    let color = "#e8e8e8";
+    let color = sgrColor;
     let open = false;
 
     function closeSpan() {
@@ -560,37 +628,23 @@
     }
 
     while (i < text.length) {
-      if (text.charCodeAt(i) === 27 && text[i + 1] === "[") {
-        const end = text.indexOf("m", i);
-        if (end === -1) {
-          break;
-        }
-        const seq = text.slice(i + 2, end);
-        i = end + 1;
-        const codes = seq.split(";").filter(Boolean);
-        if (!codes.length) {
-          color = "#e8e8e8";
-          closeSpan();
+      const cc = text.charCodeAt(i);
+      if (cc === 27) {
+        const csi = consumeCsi(text, i);
+        if (csi) {
+          i = csi.next;
+          if (csi.final === "m") {
+            const codes = csi.body.split(";").filter(Boolean);
+            color = applySgrCodes(codes, color, closeSpan, openSpan);
+          }
           continue;
         }
-        for (let c = 0; c < codes.length; c++) {
-          const code = parseInt(codes[c], 10);
-          if (code === 0) {
-            color = "#e8e8e8";
-            closeSpan();
-          } else if (code === 38 && codes[c + 1] === "5") {
-            color = xterm256ToCss(codes[c + 2]);
-            c += 2;
-            openSpan(color);
-          } else if (SGR16[code]) {
-            color = SGR16[code];
-            openSpan(color);
-          }
-        }
+        i += 1;
         continue;
       }
-      const next = text.indexOf("\x1b", i);
-      const chunk = next === -1 ? text.slice(i) : text.slice(i, next);
+      const nextEsc = text.indexOf("\x1b", i);
+      let chunk = nextEsc === -1 ? text.slice(i) : text.slice(i, nextEsc);
+      chunk = chunk.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
       if (chunk) {
         if (color && color !== "#e8e8e8") {
           if (!open) {
@@ -602,45 +656,120 @@
           parts.push(escapeHtml(chunk));
         }
       }
-      i = next === -1 ? text.length : next;
+      i = nextEsc === -1 ? text.length : nextEsc;
     }
     closeSpan();
+    if (commit) {
+      sgrColor = color;
+    }
     return parts.join("");
   }
 
   function trimOutput() {
+    if (!output) {
+      return;
+    }
     while (output.childNodes.length > MAX_LINES) {
       output.removeChild(output.firstChild);
     }
+    if (partialEl && !partialEl.parentNode) {
+      partialEl = null;
+    }
+  }
+
+  function lastNonEmptyLine(text) {
+    const bits = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+    for (let i = bits.length - 1; i >= 0; i--) {
+      const t = bits[i].trim().toLowerCase();
+      if (t) {
+        return t;
+      }
+    }
+    return "";
+  }
+
+  function looksLikePasswordPrompt(line) {
+    return (
+      line.endsWith("password:") ||
+      line.indexOf("new password:") !== -1 ||
+      line.indexOf("password for ") !== -1
+    );
+  }
+
+  function flushCompleteLine(piece) {
+    const line = document.createElement("div");
+    line.className = "out-line";
+    line.innerHTML = ansiToHtml(piece, true);
+    output.appendChild(line);
+  }
+
+  function renderPartial() {
+    if (partialEl && partialEl.parentNode) {
+      partialEl.parentNode.removeChild(partialEl);
+    }
+    partialEl = null;
+    if (!lineBuf) {
+      return;
+    }
+    partialEl = document.createElement("span");
+    partialEl.className = "out-partial";
+    partialEl.innerHTML = ansiToHtml(lineBuf, false);
+    output.appendChild(partialEl);
   }
 
   function appendOutput(text) {
-    if (!text) {
+    if (!text || !output) {
       return;
     }
     rawTail = (rawTail + text).slice(-4000);
-    const line = document.createElement("span");
-    line.innerHTML = ansiToHtml(text);
-    output.appendChild(line);
+    const normalized = String(text).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    lineBuf += normalized;
+    const parts = lineBuf.split("\n");
+    lineBuf = parts.pop();
+    parts.forEach(function (piece) {
+      flushCompleteLine(piece);
+    });
+    renderPartial();
     trimOutput();
     output.scrollTop = output.scrollHeight;
 
-    const lower = rawTail.toLowerCase();
-    if (
-      lower.includes("password:") ||
-      lower.includes("password for") ||
-      lower.includes("new password:")
-    ) {
+    const lastLine = lastNonEmptyLine(rawTail);
+    if (looksLikePasswordPrompt(lastLine)) {
       passwordMode = true;
       cmd.type = "password";
-    } else if (passwordMode && text.indexOf("\n") !== -1) {
-      if (!lower.endsWith("password:") && !lower.endsWith("password for")) {
-        passwordMode = false;
-        cmd.type = "text";
-      }
+    } else if (passwordMode && lastLine) {
+      passwordMode = false;
+      cmd.type = "text";
     }
-    if (text.indexOf("[WAIT]") !== -1) {
+    noteHoldOrResume(text);
+  }
+
+  function noteHoldOrResume(text) {
+    // [WAIT] is hold music or MSG_AFTER — never the handshake trigger.
+    // Hello / Core.* envelopes drop while the game child is down.
+    const raw = String(text || "");
+    if (!raw) {
+      return;
+    }
+    if (raw.indexOf("[WAIT]") !== -1) {
       setStatus("World restarting — stay connected", "wait");
+      // MSG_AFTER: socket stayed up, new Session exists, commands still wait.
+      // Arm only — handshake on the next real game line (look / rewrite done).
+      if (raw.indexOf("You are still here") !== -1) {
+        hudResumeArmed = true;
+      }
+      return;
+    }
+    const lower = raw.toLowerCase();
+    const rewriteDone = lower.indexOf("rewrite is complete") !== -1;
+    // Login splash after a hold: unbound sockets skip MSG_AFTER, but the
+    // new Session is already painting the connect card (IPC is up).
+    const held = statusEl.className === "wait";
+    const loginSplash = held && raw.indexOf("Hunters work the cases") !== -1;
+    if (hudResumeArmed || rewriteDone || loginSplash) {
+      hudResumeArmed = false;
+      setStatus("Connected", "connected");
+      handshakeHud();
     }
   }
 
@@ -660,87 +789,174 @@
   }
 
   function handshakeHud() {
+    // Also re-fired after a game-only restart (see noteHoldOrResume).
+    // Inbound GMCP SB sets session.gmcp_enabled without a second IAC DO
+    // (gateway already sent DO once on this held socket).
     sendEnvelope({ op: "hello", client: "riftforge-web", version: "2" });
     sendGmcp("Core.Hello", { client: "riftforge-web", version: "2" });
     sendGmcp("Core.Supports.Set", GMCP_SUPPORTS);
     syncGagToServer();
   }
 
-  function pct(value) {
+  function numericVital(value) {
+    // Missing / blank / NaN must not become 0% — that looks like a wipe.
+    if (value == null || value === "") {
+      return null;
+    }
     const n = parseFloat(value);
     if (Number.isNaN(n)) {
-      return 0;
+      return null;
     }
     return Math.max(0, Math.min(100, n));
   }
 
-  function renderGauge(id, label, value, klass) {
-    const n = pct(value);
-    return (
-      '<div class="gauge" id="g-' +
-      id +
-      '">' +
-      '<div class="gauge-label"><span>' +
-      escapeHtml(label) +
-      "</span><strong>" +
-      escapeHtml(String(Math.round(n))) +
-      "%</strong></div>" +
-      '<div class="gauge-track" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' +
-      Math.round(n) +
-      '" aria-label="' +
-      escapeHtml(label) +
-      '">' +
-      '<div class="gauge-fill ' +
-      klass +
-      '" style="width:' +
-      n +
-      '%"></div></div></div>'
-    );
+  function upsertGauge(id, label, value, klass) {
+    const n = numericVital(value);
+    if (n == null || !gaugesEl) {
+      return false;
+    }
+    let el = document.getElementById("g-" + id);
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "gauge";
+      el.id = "g-" + id;
+      const lab = document.createElement("div");
+      lab.className = "gauge-label";
+      const span = document.createElement("span");
+      const strong = document.createElement("strong");
+      lab.appendChild(span);
+      lab.appendChild(strong);
+      const track = document.createElement("div");
+      track.className = "gauge-track";
+      track.setAttribute("role", "meter");
+      track.setAttribute("aria-valuemin", "0");
+      track.setAttribute("aria-valuemax", "100");
+      const fill = document.createElement("div");
+      fill.className = "gauge-fill";
+      track.appendChild(fill);
+      el.appendChild(lab);
+      el.appendChild(track);
+      gaugesEl.appendChild(el);
+    }
+    const span = el.querySelector(".gauge-label span");
+    const strong = el.querySelector(".gauge-label strong");
+    const track = el.querySelector(".gauge-track");
+    const fill = el.querySelector(".gauge-fill");
+    if (span) {
+      span.textContent = label;
+    }
+    if (strong) {
+      strong.textContent = String(Math.round(n)) + "%";
+    }
+    if (track) {
+      track.setAttribute("aria-valuenow", String(Math.round(n)));
+      track.setAttribute("aria-label", label);
+    }
+    if (fill) {
+      fill.className = "gauge-fill " + klass;
+      fill.style.width = n + "%";
+    }
+    return true;
   }
 
   function applyVitals(v) {
-    if (!v || typeof v !== "object") {
+    if (!v || typeof v !== "object" || !gaugesEl) {
       return;
     }
-    const bits = [];
-    bits.push(renderGauge("hp", "Lifeforce", v.hp, "hp"));
-    bits.push(renderGauge("st", "Stamina", v.stamina, "stamina"));
-    bits.push(renderGauge("en", "Focus", v.energy, "energy"));
+    // Empty / pre-attach payloads must leave the existing HUD alone.
+    // Never wipe #gauges (no innerHTML = "").
+    const painted = [];
+    if (upsertGauge("hp", "Lifeforce", v.hp, "hp")) {
+      painted.push("hp");
+    }
+    if (upsertGauge("st", "Stamina", v.stamina, "stamina")) {
+      painted.push("st");
+    }
+    if (upsertGauge("en", "Focus", v.energy, "energy")) {
+      painted.push("en");
+    }
     if (v.mana != null) {
-      bits.push(renderGauge("mn", "Mana", v.mana, "mana"));
+      if (upsertGauge("mn", "Mana", v.mana, "mana")) {
+        painted.push("mn");
+      }
     }
     if (v.fuel != null) {
       const fl = v.fuel_label ? String(v.fuel_label) : "Fuel";
-      bits.push(renderGauge("fu", fl.charAt(0).toUpperCase() + fl.slice(1), v.fuel, "fuel"));
+      const fuelLabel = fl.charAt(0).toUpperCase() + fl.slice(1);
+      if (upsertGauge("fu", fuelLabel, v.fuel, "fuel")) {
+        painted.push("fu");
+      }
     }
     const mom = parseFloat(v.momentum);
     if (!Number.isNaN(mom) && mom !== 0) {
-      const shown = ((mom + 100) / 2);
-      bits.push(renderGauge("mo", "Momentum", shown, "momentum"));
+      const shown = (mom + 100) / 2;
+      if (upsertGauge("mo", "Momentum", shown, "momentum")) {
+        painted.push("mo");
+      }
     }
     if (v.cash) {
-      bits.push(
-        '<div class="gauge-label"><span>Cash</span><strong>' +
-          escapeHtml(String(v.cash)) +
-          "</strong></div>"
-      );
+      let cashEl = document.getElementById("g-cash");
+      if (!cashEl) {
+        cashEl = document.createElement("div");
+        cashEl.className = "gauge-label";
+        cashEl.id = "g-cash";
+        const span = document.createElement("span");
+        span.textContent = "Cash";
+        const strong = document.createElement("strong");
+        cashEl.appendChild(span);
+        cashEl.appendChild(strong);
+        gaugesEl.appendChild(cashEl);
+      }
+      const strong = cashEl.querySelector("strong");
+      if (strong) {
+        strong.textContent = String(v.cash);
+      }
+      painted.push("cash");
     }
-    gaugesEl.innerHTML = bits.join("");
+    if (!painted.length) {
+      return;
+    }
     const mirror = [];
-    if (v.hp != null) {
-      mirror.push("H " + Math.round(pct(v.hp)) + "%");
+    const hp = numericVital(v.hp);
+    const st = numericVital(v.stamina);
+    if (hp != null) {
+      mirror.push("H " + Math.round(hp) + "%");
     }
-    if (v.stamina != null) {
-      mirror.push("S " + Math.round(pct(v.stamina)) + "%");
+    if (st != null) {
+      mirror.push("S " + Math.round(st) + "%");
     }
     if (!Number.isNaN(mom) && mom !== 0) {
       mirror.push("Mo " + mom);
     }
-    promptEl.textContent = mirror.join("  ");
+    if (mirror.length) {
+      promptEl.textContent = mirror.join("  ");
+    }
+  }
+
+  function paintRoomCard(info) {
+    // Player-facing title only -- never Room.Info id / num / map keys.
+    if (!roomCard || !roomTitle || !info) {
+      return;
+    }
+    const name = String(info.name || "").trim();
+    if (!name) {
+      return;
+    }
+    roomTitle.textContent = name;
+    if (roomSub) {
+      const env = String(info.environment || "").trim().replace(/_/g, " ");
+      const skip = !env || env === "plains" || /earth |map id/i.test(env);
+      roomSub.textContent = skip ? "" : env;
+    }
+    roomCard.hidden = false;
   }
 
   function applyRoom(info) {
     if (!info || typeof info !== "object") {
+      return;
+    }
+    paintRoomCard(info);
+    if (!compassEl) {
       return;
     }
     const exits = info.exits || {};
@@ -791,7 +1007,12 @@
 
   function hideMenu() {
     ctxMenu.hidden = true;
+    ctxMenu.classList.remove("ctx-sheet");
     ctxMenu.innerHTML = "";
+  }
+
+  function phoneShell() {
+    return window.matchMedia("(max-width: 720px)").matches;
   }
 
   function showMenu(x, y, verbs) {
@@ -816,8 +1037,15 @@
       ctxMenu.appendChild(li);
     });
     ctxMenu.hidden = false;
-    ctxMenu.style.left = x + "px";
-    ctxMenu.style.top = y + "px";
+    if (phoneShell()) {
+      ctxMenu.classList.add("ctx-sheet");
+      ctxMenu.style.left = "";
+      ctxMenu.style.top = "";
+    } else {
+      ctxMenu.classList.remove("ctx-sheet");
+      ctxMenu.style.left = x + "px";
+      ctxMenu.style.top = y + "px";
+    }
     const first = ctxMenu.querySelector("button");
     if (first) {
       first.focus();
@@ -875,9 +1103,9 @@
     const st = atlasState;
     if (st && st.mark && st.you && st.you.length === 2) {
       atlasCaption.textContent =
-        "You are at (" + st.you[0] + ", " + st.you[1] + "). Right-click a landmark.";
+        "You are at (" + st.you[0] + ", " + st.you[1] + "). Tap or right-click a landmark.";
     } else {
-      atlasCaption.textContent = "Right-click a landmark to walk, drive, or enter.";
+      atlasCaption.textContent = "Tap or right-click a landmark to walk, drive, or enter.";
     }
   }
 
@@ -1309,6 +1537,9 @@
       handshakeHud();
     });
     socket.addEventListener("message", function (ev) {
+      if (typeof ev.data !== "string") {
+        return;
+      }
       handleFrame(ev.data);
     });
     socket.addEventListener("close", function () {
@@ -1474,7 +1705,90 @@
     setCaptionDefault();
   });
 
-  atlasCanvas.addEventListener("click", hideMenu);
+  let atlasPress = null;
+
+  function cancelAtlasPress() {
+    if (atlasPress && atlasPress.timer) {
+      clearTimeout(atlasPress.timer);
+    }
+    atlasPress = null;
+  }
+
+  function openAtlasTravel(clientX, clientY, cell) {
+    if (!cell) {
+      hideMenu();
+      return false;
+    }
+    const verbs = verbsForCell(cell.x, cell.y);
+    if (!verbs.length) {
+      hideMenu();
+      if (atlasCaption) {
+        atlasCaption.textContent =
+          "Nothing to travel from (" + cell.x + ", " + cell.y + ").";
+      }
+      return false;
+    }
+    showMenu(clientX, clientY, verbs);
+    return true;
+  }
+
+  atlasCanvas.addEventListener("pointerdown", function (ev) {
+    if (ev.pointerType === "mouse") {
+      return;
+    }
+    if (ev.button !== 0 && ev.button !== -1) {
+      return;
+    }
+    const cell = cellAtEvent(ev);
+    cancelAtlasPress();
+    atlasPress = {
+      x: ev.clientX,
+      y: ev.clientY,
+      cell: cell,
+      opened: false,
+    };
+    atlasPress.timer = setTimeout(function () {
+      if (!atlasPress) {
+        return;
+      }
+      atlasPress.opened = true;
+      openAtlasTravel(atlasPress.x, atlasPress.y, atlasPress.cell);
+    }, LONG_PRESS_MS);
+  });
+  atlasCanvas.addEventListener("pointermove", function (ev) {
+    if (!atlasPress) {
+      return;
+    }
+    const dx = ev.clientX - atlasPress.x;
+    const dy = ev.clientY - atlasPress.y;
+    if (dx * dx + dy * dy > PRESS_MOVE_CANCEL_PX * PRESS_MOVE_CANCEL_PX) {
+      cancelAtlasPress();
+    }
+  });
+  atlasCanvas.addEventListener("pointerup", function (ev) {
+    if (!atlasPress) {
+      return;
+    }
+    const opened = atlasPress.opened;
+    const cell = atlasPress.cell;
+    const x = atlasPress.x;
+    const y = atlasPress.y;
+    cancelAtlasPress();
+    if (opened) {
+      ev.preventDefault();
+      return;
+    }
+    if (phoneShell()) {
+      openAtlasTravel(x, y, cell);
+    }
+  });
+  atlasCanvas.addEventListener("pointercancel", cancelAtlasPress);
+  atlasCanvas.addEventListener("click", function () {
+    if (phoneShell()) {
+      return;
+    }
+    hideMenu();
+  });
   document.addEventListener("click", function (ev) {
     if (ctxMenu.hidden) {
       return;
@@ -1504,6 +1818,56 @@
     drawAtlas();
     drawZone();
   });
+
+  function syncVisualViewport() {
+    const vv = window.visualViewport;
+    const height = vv ? vv.height : window.innerHeight;
+    document.documentElement.style.setProperty("--app-height", height + "px");
+  }
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", syncVisualViewport);
+    window.visualViewport.addEventListener("scroll", syncVisualViewport);
+  }
+  window.addEventListener("orientationchange", syncVisualViewport);
+  syncVisualViewport();
+
+  function applyPhoneTab(name, persist) {
+    const tab = name === "maps" || name === "status" || name === "more" ? name : "log";
+    if (playRoot) {
+      playRoot.setAttribute("data-phone-tab", tab);
+    }
+    document.body.setAttribute("data-phone-tab", tab);
+    if (moreSheet) {
+      moreSheet.hidden = tab !== "more";
+    }
+    if (phoneNav) {
+      const buttons = phoneNav.querySelectorAll("[data-phone-tab]");
+      for (let i = 0; i < buttons.length; i++) {
+        const on = buttons[i].getAttribute("data-phone-tab") === tab;
+        buttons[i].setAttribute("aria-pressed", on ? "true" : "false");
+      }
+    }
+    if (persist !== false) {
+      writeStoredString(PHONE_TAB_KEY, tab);
+    }
+    if (tab === "maps" || tab === "status") {
+      window.requestAnimationFrame(function () {
+        drawAtlas();
+        drawZone();
+      });
+    }
+  }
+
+  if (phoneNav) {
+    phoneNav.addEventListener("click", function (ev) {
+      const btn = ev.target.closest("[data-phone-tab]");
+      if (!btn) {
+        return;
+      }
+      applyPhoneTab(btn.getAttribute("data-phone-tab"), true);
+    });
+  }
+  applyPhoneTab(readStoredString(PHONE_TAB_KEY, "log"), false);
 
   document.addEventListener("keydown", function (ev) {
     if (ev.key !== "Escape") {
@@ -1575,12 +1939,27 @@
   }
 
   const helpBrowser = document.getElementById("help-browser");
-  if (helpBrowser) {
-    helpBrowser.addEventListener("click", function (ev) {
+  function typeHelpBrowser(ev) {
+    if (ev) {
       ev.preventDefault();
-      sendCmd("help browser");
-      cmd.focus();
-    });
+    }
+    sendCmd("help browser");
+    cmd.focus();
+  }
+  if (helpBrowser) {
+    helpBrowser.addEventListener("click", typeHelpBrowser);
+  }
+  const moreHelp = document.getElementById("more-help");
+  const moreShortcuts = document.getElementById("more-shortcuts");
+  const moreDisplay = document.getElementById("more-display");
+  if (moreHelp) {
+    moreHelp.addEventListener("click", typeHelpBrowser);
+  }
+  if (moreShortcuts) {
+    moreShortcuts.addEventListener("click", openShortcuts);
+  }
+  if (moreDisplay) {
+    moreDisplay.addEventListener("click", openDisplayPrefs);
   }
 
   try {

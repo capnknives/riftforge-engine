@@ -7,33 +7,183 @@ engine/bug_webhook.py's register_after_record hook on reports.record().
 """
 
 
+def _history_for_bug_subject(reporter):
+    """Recent session commands for subject disambiguation (no current bug line)."""
+    history = getattr(getattr(reporter, "session", None), "history", None)
+    if not history:
+        return []
+    entries = list(history)
+    if entries:
+        last_line = entries[-1][0].strip().lower()
+        if last_line.startswith("bug ") or last_line in ("bug",):
+            entries = entries[:-1]
+    from engine.connection import history_line_for_storage
+
+    cleaned = []
+    for line, tb in entries:
+        cleaned.append([history_line_for_storage(line), tb])
+    return cleaned
+
+
+def _bug_subject_candidates(reporter, game, history=None):
+    """Priority-ordered bodies for ``bug <name>`` resolution (bug report 925).
+
+    Global ``game.find_character`` can grab the wrong homonym across the
+    atlas (peaceful desk NPC vs nest crook both answering to ``max``).
+    Prefer combat focus, co-located bodies, then recent command targets.
+    """
+    if reporter is None:
+        return []
+
+    from engine.command_support import (
+        _collect_character_matches,
+        _find_character,
+        split_shell_args,
+    )
+
+    seen = set()
+    ordered = []
+
+    def add(ch):
+        if ch is None or ch is reporter:
+            return
+        oid = id(ch)
+        if oid in seen:
+            return
+        seen.add(oid)
+        ordered.append(ch)
+
+    room = getattr(reporter, "location", None)
+
+    target = getattr(reporter, "target", None)
+    add(target)
+    if target is not None and getattr(target, "target", None) is reporter:
+        add(target)
+
+    if room is not None:
+        try:
+            occupants = list(room.characters())
+        except Exception:
+            occupants = []
+        for ch in occupants:
+            add(ch)
+            if getattr(ch, "target", None) is reporter:
+                add(ch)
+
+    pool_so_far = list(ordered)
+    for line, _tb in history or []:
+        text = (line or "").strip()
+        if not text:
+            continue
+        tokens = split_shell_args(text)
+        if len(tokens) < 2:
+            continue
+        verb = tokens[0].lower()
+        if verb in ("bug", "suggest", "typo", "ooc", "say", "tell", "emote"):
+            continue
+        target_text = " ".join(tokens[1:])
+        hit = _find_character(target_text, pool_so_far, self_character=reporter)
+        if hit is None and pool_so_far:
+            hit = _find_character(target_text, ordered, self_character=reporter)
+        add(hit)
+        for frag in tokens[1:]:
+            for match in _collect_character_matches(
+                frag, pool_so_far, self_character=reporter,
+            ):
+                add(match)
+
+    return ordered
+
+
+def resolve_bug_subject_character(reporter, query, game, history=None):
+    """Resolve a ``bug <name>`` subject with local context before world scan."""
+    if reporter is None or game is None:
+        return None
+
+    from engine.command_support import (
+        _collect_character_matches,
+        _find_character,
+        sort_character_target_matches,
+    )
+
+    if history is None:
+        history = _history_for_bug_subject(reporter)
+
+    pool = _bug_subject_candidates(reporter, game, history)
+    if pool:
+        hit = _find_character(query, pool, self_character=reporter)
+        if hit is not None:
+            return hit
+
+    finder = getattr(game, "find_character", None)
+    if not callable(finder):
+        return None
+    world_hit = finder(query)
+    if world_hit is None:
+        return None
+
+    if not pool:
+        return world_hit
+
+    pool_matches = _collect_character_matches(
+        query, pool, self_character=reporter,
+    )
+    if not pool_matches:
+        return world_hit
+    if world_hit in pool_matches:
+        return world_hit
+    if len(pool_matches) == 1:
+        return pool_matches[0]
+    return sort_character_target_matches(pool_matches)[0]
+
+
 def parse_bug_subject(reporter, args, game):
     """Split ``bug`` args into ``(subject_character, description)``.
 
-    When the first token resolves to another character in the world, the
-    report is *about* that body (their diagnostic context is snapshotted).
-    Otherwise the full args string is a self-report description -- e.g.
-    ``bug the sword vanished`` stays about the reporter even when ``the``
-    is not a character name (bug report 203).
+    When a leading name resolves to another character, the report is *about*
+    that body (their diagnostic context is snapshotted). Otherwise the full
+    args string is a self-report description -- e.g. ``bug the sword vanished``
+    stays about the reporter even when ``the`` is not a character name
+    (bug report 203).
+
+    Multi-word names and local context win over bare global lookup (bug
+    reports 816, 925): ``bug Max Booth was collared…`` prefers the crook
+  Pierre just ``collar``ed in-room over a homonym NPC across town.
     """
     text = (args or "").strip()
     if not text:
         return None, ""
 
-    from engine.command_support import (
-        is_self_name,
-        peel_shell_arg,
-        resolve_named_character,
-    )
+    from engine.command_support import is_self_name, split_shell_args
 
-    first, rest = peel_shell_arg(text)
-
-    if is_self_name(first):
+    tokens = split_shell_args(text)
+    if not tokens:
         return None, text
 
-    subject = resolve_named_character(reporter, first, game=game)
-    if subject is not None and subject is not reporter:
-        return subject, rest
+    if is_self_name(tokens[0]) and len(tokens) == 1:
+        return None, text
+
+    history = _history_for_bug_subject(reporter)
+    pool = _bug_subject_candidates(reporter, game, history)
+    world_fallback = None
+
+    for i in range(len(tokens), 0, -1):
+        prefix = " ".join(tokens[:i])
+        if is_self_name(prefix):
+            return None, text
+        subject = resolve_bug_subject_character(
+            reporter, prefix, game, history=history,
+        )
+        if subject is None or subject is reporter:
+            continue
+        rest = " ".join(tokens[i:])
+        if subject in pool:
+            return subject, rest
+        if world_fallback is None:
+            world_fallback = (subject, rest)
+
+    if world_fallback is not None:
+        return world_fallback
 
     return None, text
 

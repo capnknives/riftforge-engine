@@ -803,6 +803,93 @@ def heal_separated_groups(game):
         maintain_group_colocation(leader, game)
 
 
+def merge_source_root(caller):
+    """Who moves when ``caller`` initiates a group merge.
+
+    Leaders (including solo) drag their whole follow subtree; followers
+    in someone else's party only move themselves.
+    """
+    if caller is None:
+        return None
+    if is_leader(caller):
+        return resolve_leader(caller)
+    return caller
+
+
+def members_to_merge(source_root):
+    """Characters that ``merge_groups`` will re-parent (source_root first)."""
+    if source_root is None:
+        return []
+    if is_leader(source_root):
+        return members_of(source_root)
+    return [source_root]
+
+
+def merge_groups(source_root, dest_target, game):
+    """Merge ``source_root``'s subtree into ``dest_target``'s party.
+
+    Resolves ``dest_target`` to its follow-tree leader, then re-parents
+    every member from ``members_to_merge(source_root)`` onto that leader.
+    Each member's ``companion_leader_key`` is retargeted only when it
+    already pointed at the old subtree leader; unrelated companion bonds
+    are left alone.
+
+    Returns the list of characters that actually changed follow bonds
+    (empty when nothing moved or args invalid).
+    """
+    from engine.command_support import start_following
+
+    if source_root is None or dest_target is None:
+        return []
+    dest_leader = resolve_leader(dest_target)
+    if dest_leader is None:
+        return []
+    actual_source = merge_source_root(source_root)
+    if actual_source is None:
+        return []
+    if same_group(actual_source, dest_leader):
+        return []
+    to_move = members_to_merge(actual_source)
+    if not to_move:
+        return []
+    # Destination leader must sit outside the moving subtree.
+    dest_id = id(dest_leader)
+    for member in to_move:
+        if member is None:
+            continue
+        if id(member) == dest_id:
+            return []
+    old_leader = resolve_leader(actual_source)
+    old_leader_key = getattr(old_leader, "key", None) if old_leader else None
+    new_leader_key = getattr(dest_leader, "key", None)
+    moved = []
+    # Re-parent deepest followers first so transitive members are not
+    # skipped once the leader moves onto dest_leader.
+    ordered = list(to_move)
+    if len(ordered) > 1:
+        ordered.sort(
+            key=lambda m: len(members_of(m)) if is_leader(m) else 1,
+            reverse=True,
+        )
+    for member in ordered:
+        if member is None:
+            continue
+        if member is dest_leader:
+            continue
+        old_companion = getattr(member, "companion_leader_key", None)
+        retarget_companion = (
+            old_companion
+            and old_leader_key
+            and str(old_companion).strip() == str(old_leader_key).strip()
+        )
+        if not start_following(member, dest_leader):
+            continue
+        if retarget_companion and new_leader_key:
+            member.companion_leader_key = new_leader_key
+        moved.append(member)
+    return moved
+
+
 def cadence_may_step(character, *, group_pulled=False):
     """True when Cadence may move this body on its own initiative.
 

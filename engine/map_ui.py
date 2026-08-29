@@ -353,6 +353,7 @@ AREA_TYPE_GLYPH = {
     "plains": "P",
     "furnace": "H",
     "highway": "=",
+    "trail": "-",
     "desert": "D",
     "wetland": "W",
     "void": ".",
@@ -374,6 +375,7 @@ ATLAS_AREA_GLYPH = {
     "plains": ".",
     "furnace": "H",
     "highway": "=",
+    "trail": "-",
     "desert": ",",
     "wetland": "'",
     "void": " ",
@@ -391,7 +393,10 @@ MAP_LAYER_COLOR = {
     "forest": "\x1b[32m",
     "highway": "\x1b[33m",         # yellow asphalt / Impala road
     "mountain_highway": "\x1b[33m",  # yellow pass through Rockies
+    "trail": "\x1b[33m",           # dim tan wagon ruts (not interstate gold)
     "city": "\x1b[97m",            # bright white hub letter
+    "route": "\x1b[95m",          # bright magenta -- on-road drive overlay
+    "offroad": "\x1b[91m",        # bright red -- off-road segment of overlay
 }
 
 # --- Filled "Forgotten Kingdoms" atlas palette ------------------------
@@ -416,6 +421,7 @@ ATLAS_BG = {                        # background fill per terrain
     "wetland": "42",                # green bayou (glyph distinguishes)
     "highway": "43",                # yellow-tan asphalt (browser HUD + filled atlas)
     "road": "43",
+    "trail": "43",                  # dusty tan ruts
 }
 ATLAS_TOPO_FG = {                   # glyph color when the cell is bare topo
     "ocean": "96",                  # bright-cyan ripples on blue
@@ -432,8 +438,22 @@ ATLAS_TOPO_FG = {                   # glyph color when the cell is bare topo
 ATLAS_LAYER_FG = {                  # glyph color for a bright overlay layer
     "highway": "93",                # bright-yellow asphalt on the terrain
     "mountain_highway": "93",       # yellow pass over grey rock
+    "trail": "90",                  # dark-grey ruts on tan (not bright I-80)
     "city": "97",                   # bright-white hub letter on red
+    # Calculated-drive preview (not a JSON map_layer). Bright magenta /
+    # bright red are unused by highway (93), city (97), and trail (90)
+    # so the accent stays distinguishable on green / tan / grey / blue fills.
+    "route": "95",                 # bright-magenta on-road trail marker
+    "offroad": "91",               # bright-red dirt-segment of that trail
 }
+
+# Route-preview overlay glyphs. These REPLACE the terrain glyph so the
+# trail is visible with ``config color off`` (section 8 a11y -- never
+# color alone). ``*`` is already the atlas city token, ``@`` is you,
+# ``=``/``-``/``|``/``+`` are highway stamps -- ``#`` / ``x`` are unused
+# in AREA_TYPE_GLYPH / ATLAS_AREA_GLYPH and stay 1-col ASCII.
+ROUTE_GLYPH_ONROAD = "#"
+ROUTE_GLYPH_OFFROAD = "x"
 
 # ANSI 16-color escapes (stdlib only -- no third-party color libs).
 # Reset with ANSI_RESET after every colored cell so a color never leaks
@@ -450,6 +470,7 @@ AREA_TYPE_COLOR = {
     "plains": "\x1b[92m",       # bright green
     "furnace": "\x1b[91m",      # bright red -- Heart Furnace heat
     "highway": "\x1b[33m",
+    "trail": "\x1b[90m",
     "desert": "\x1b[33m",
     "wetland": "\x1b[32m",
     "void": "\x1b[90m",
@@ -1053,6 +1074,45 @@ def _room_display_color(room):
     )
 
 
+def _normalize_macro_coords(cells):
+    """Turn an iterable of (x, y) into a list of [int, int] pairs.
+
+    Accepts tuples or lists (JSON / GMCP callers often send lists). A
+    malformed row is skipped so one bad point cannot crash the map
+    render. Empty / None input yields an empty list.
+    """
+    if not cells:
+        return []
+    out = []
+    for pair in cells:
+        try:
+            # pair[0]/pair[1] works for tuple, list, and other sequences.
+            x, y = pair[0], pair[1]
+            out.append([int(x), int(y)])
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def _route_display_color(room, *, offroad=False):
+    """ANSI prefix for one calculated-route overlay cell.
+
+    Atlas maps keep the terrain background fill (so the trail still sits
+    on green plains / yellow asphalt / blue water) and swap only the
+    glyph foreground to ATLAS_LAYER_FG ``route`` / ``offroad``. Non-atlas
+    maps use the matching MAP_LAYER_COLOR foreground-only escape. The
+    glyph (``#`` / ``x``) is the primary signal; color is the accent
+    (section 8 a11y).
+    """
+    role = "offroad" if offroad else "route"
+    if room is not None and getattr(room, "glyph_set", None) == "atlas":
+        area = getattr(room, "area_type", "plains") or "plains"
+        bg = ATLAS_BG.get(area, "40")
+        fg = ATLAS_LAYER_FG.get(role, "95")
+        return f"\x1b[{fg};{bg}m"
+    return MAP_LAYER_COLOR.get(role, "")
+
+
 def _map_legend_for(rooms_sample):
     """Legend line: atlas symbols when any cell uses them, else letters."""
     # If any room in the window uses map_glyph / atlas set, show atlas key.
@@ -1643,6 +1703,8 @@ def render_viewport_grid(
     mark_you=True,
     character=None,
     game=None,
+    route_cells=None,
+    offroad_cells=None,
 ):
     """ASCII camera window -- never wider/taller than view_w x view_h cells.
 
@@ -1650,6 +1712,16 @@ def render_viewport_grid(
     wrap the silhouette. Off-atlas cells are spaces (not ocean, not wrap).
     Returns (text, payload) where payload is the GMCP-friendly dict, or
     (None, None) if the center is not a stamped grid cell.
+
+    ``route_cells`` / ``offroad_cells`` are optional iterables of atlas
+    (world) ``(x, y)`` pairs -- not viewport-relative. When ``route_cells``
+    is passed, those cells swap their terrain glyph for a trail marker
+    (``#`` on-road, ``x`` off-road) so the path is visible even with color
+    off. ``offroad_cells`` is the dirt subset; everything else in
+    ``route_cells`` is treated as highway. ``@`` (you) still wins if the
+    character stands on a route cell. The payload grows a ``route`` key
+    only when ``route_cells`` is not None (omit, don't send ``[]``, for
+    ordinary map renders).
     """
     prefix = getattr(center_room, "grid_prefix", None)
     cx = getattr(center_room, "grid_x", None)
@@ -1674,6 +1746,19 @@ def render_viewport_grid(
         cx, cy, width, height, view_w, view_h,
     )
 
+    # Membership sets are viewport-loop (x, y) lookups in atlas coords --
+    # the same integers the nested range() already walks. Payload lists
+    # keep caller order so a HUD can stroke the polyline.
+    route_path = None
+    route_offroad = []
+    route_set = set()
+    offroad_set = set()
+    if route_cells is not None:
+        route_path = _normalize_macro_coords(route_cells)
+        route_offroad = _normalize_macro_coords(offroad_cells)
+        route_set = {(p[0], p[1]) for p in route_path}
+        offroad_set = {(p[0], p[1]) for p in route_offroad}
+
     glyph_rows = []
     color_rows = []
     seen_rooms = []
@@ -1691,15 +1776,30 @@ def render_viewport_grid(
                 paint_cells.append(" ")
                 continue
             neighbor = rooms.get(f"{prefix} ({x}, {y})")
-            if neighbor is None:
+            on_route = (x, y) in route_set
+            is_offroad = on_route and (x, y) in offroad_set
+            if neighbor is None and not on_route:
                 raw_cells.append(" ")
                 paint_cells.append(" ")
                 continue
-            seen_rooms.append(neighbor)
-            glyph = _room_display_glyph(neighbor)
+            if neighbor is not None:
+                seen_rooms.append(neighbor)
+            if on_route:
+                glyph = (
+                    ROUTE_GLYPH_OFFROAD if is_offroad else ROUTE_GLYPH_ONROAD
+                )
+            else:
+                glyph = _room_display_glyph(neighbor)
             raw_cells.append(glyph)
             if use_color:
-                color = _room_display_color(neighbor)
+                if on_route:
+                    color = _route_display_color(
+                        neighbor, offroad=is_offroad,
+                    )
+                elif neighbor is not None:
+                    color = _room_display_color(neighbor)
+                else:
+                    color = ""
                 if color:
                     glyph = f"{color}{glyph}{ANSI_RESET}"
             paint_cells.append(glyph)
@@ -1711,6 +1811,14 @@ def render_viewport_grid(
         f"{view_w}x{view_h}/{width}x{height} @=you"
     )
     legend = _fit_legend(_map_legend_for(seen_rooms or [center_room]), view_w)
+    if route_path:
+        # Glyph key for the overlay -- sighted color-off and SR clients
+        # both need the characters named, not just the ANSI accent.
+        route_key = (
+            f"{ROUTE_GLYPH_ONROAD}=route "
+            f"{ROUTE_GLYPH_OFFROAD}=off-road"
+        )
+        legend = _fit_legend(f"{legend} {route_key}", view_w)
     text = "\n".join([header, *color_rows, legend])
     text = append_mapzone_overlay(
         text, center_room, game, character=character,
@@ -1725,6 +1833,11 @@ def render_viewport_grid(
         "view_height": view_h,
         "rows": glyph_rows,
     }
+    if route_path is not None:
+        payload["route"] = {
+            "path": route_path,
+            "offroad": route_offroad,
+        }
     return text, payload
 
 

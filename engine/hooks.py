@@ -105,6 +105,9 @@ _eclipse_ambient_line = None
 # Per-room look extras (e.g. planar influence note). fn(room, game) -> list[str].
 _room_look_extras = None
 
+# Room-scoped command hints for ``commands here``. fn(character, game) -> list[str].
+_room_command_hints = None
+
 # Virtual Paths not stored on ``Room.exits`` (pit descent after boss kill).
 # fn(room, character, game) -> list[(direction, dest_label)].
 _room_look_virtual_exits = None
@@ -270,6 +273,11 @@ _can_perceive_reaper = None
 # True means "refuse new chargen for this name".
 _reserved_login_name = None
 
+# Staff-login fixture keys (lowercase). fn() -> iterable of keys.
+# Copyover skips deferred ensure, so Character.staff_login may still be
+# False on old blobs -- login consults the catalog through this hook.
+_staff_login_cast_keys = None
+
 # Pre-move cancel (e.g. stop an in-progress training montage). Called
 # before a single-character move actually happens.
 # fn(character) -> player message str, or None if nothing to say.
@@ -279,6 +287,10 @@ _before_relocate = None
 # drag a carried body along, lodging owner-walks-in-on-squatter check, ...).
 # fn(character, dest, game, was_working) -> None (side-effecting only).
 _after_arrive = None
+# After Character.move_to actually leaves a room (GM goto, walk, teleport).
+# fn(character, old_room, new_room, game) -> None. SUPERS drops in-room
+# approach/retreat pair bands so a new room starts at default reach.
+_character_relocated = None
 # Optional fn(character, direction, dest, game) after a successful room step
 # (combat-pit pose feed). Kept separate from after_arrive so direction is known.
 _after_move_step = None
@@ -833,6 +845,7 @@ _DEFAULT_MAP_AREA_TYPES = {
     "plains": [],
     "furnace": [],
     "highway": [],
+    "trail": [],
     "desert": [],
     "wetland": [],
     "void": [],
@@ -1477,6 +1490,24 @@ def room_look_extras(room, game, character=None):
         return list(_room_look_extras(room, game) or [])
 
 
+def set_room_command_hints(fn):
+    """Register fn(character, game) -> list[str] for ``commands here``.
+
+    Pass None to restore the empty default. Games list hubs and verbs
+    relevant to the viewer's current room (boards, desks, cabins).
+    Engine never invents game-specific board copy.
+    """
+    global _room_command_hints
+    _room_command_hints = fn
+
+
+def room_command_hints(character, game):
+    """Return room-scoped command hint lines, or []."""
+    if _room_command_hints is None:
+        return []
+    return list(_room_command_hints(character, game) or [])
+
+
 def set_room_look_virtual_exits(fn):
     """Register fn(room, character, game) -> list[(direction, label)].
 
@@ -1573,6 +1604,13 @@ def register_sheet_contributor(section_id, fn, *, priority=100):
     from engine.systems import sheet as sheet_mod
 
     sheet_mod.register_contributor(section_id, fn, priority=priority)
+
+
+def register_wallet_ledger_listener(fn):
+    """Register ``fn(character, row)`` after each wallet ledger append."""
+    from engine.systems import economy as economy_mod
+
+    economy_mod.register_wallet_ledger_listener(fn)
 
 
 def set_look_quirk(fn):
@@ -2661,6 +2699,22 @@ def after_arrive(character, dest, game, was_working):
         _after_arrive(character, dest, game, was_working)
 
 
+def set_character_relocated(fn):
+    """Register fn(character, old_room, new_room, game) after a room change.
+
+    Called from ``Character.move_to`` while the actor is still listed in
+    ``old_room`` so pair proximity can be dropped. Pass None to clear.
+    """
+    global _character_relocated
+    _character_relocated = fn
+
+
+def character_relocated(character, old_room, new_room, game=None):
+    """Run the registered relocate hook, or do nothing if none is set."""
+    if _character_relocated is not None:
+        _character_relocated(character, old_room, new_room, game)
+
+
 def set_after_move_step(fn):
     """Register fn(character, direction, dest, game) after a successful step.
 
@@ -3040,6 +3094,29 @@ def is_reserved_login_name(name):
     return bool(_reserved_login_name(name))
 
 
+def set_staff_login_cast_keys(fn):
+    """Register fn() -> iterable of lowercase immersion keys staff may occupy.
+
+    Idle fixture NPCs (Ash) stay ``is_npc`` until ridden. Pass None to clear.
+    """
+    global _staff_login_cast_keys
+    _staff_login_cast_keys = fn
+
+
+def staff_login_cast_keys():
+    """Lowercase catalog keys with ``staff_login`` (empty when unset)."""
+    if _staff_login_cast_keys is None:
+        return frozenset()
+    try:
+        return frozenset(
+            (k or "").strip().lower()
+            for k in (_staff_login_cast_keys() or ())
+            if k
+        )
+    except Exception:
+        return frozenset()
+
+
 # Hard gm fold: restore a vaulted pfile when login name is not in memory.
 # fn(game, name) -> Character | None
 _try_restore_folded_login = None
@@ -3371,6 +3448,9 @@ _try_exit_zone = None
 # fn(character, topic, game)
 _after_help_topic = None
 _refresh_help_overlay = None
+# Verbs that must never FTS-fallback into the paths catalog (body mentions
+# "help newbie" and would hijack onboarding queries).
+_help_fts_blocklist = frozenset()
 
 
 def set_map_center_room(fn):
@@ -3546,6 +3626,54 @@ def vehicle_park_scrub_exempt(game, veh, park_room, owner):
     return False
 
 
+_vehicle_extra_persist_fields = None
+
+
+def set_vehicle_extra_persist_fields(fn):
+    """Register fn(veh) -> dict of JSON-safe fields for parking persistence.
+
+    Pass None to clear.
+    """
+    global _vehicle_extra_persist_fields
+    _vehicle_extra_persist_fields = fn
+
+
+def vehicle_extra_persist_fields(veh):
+    """Return extra vehicle fields to persist, or {}."""
+    if _vehicle_extra_persist_fields is not None:
+        try:
+            extra = _vehicle_extra_persist_fields(veh)
+            if isinstance(extra, dict) and extra:
+                return dict(extra)
+        except Exception:
+            return {}
+    return {}
+
+
+_vehicle_extra_persist_apply = None
+
+
+def set_vehicle_extra_persist_apply(fn):
+    """Register fn(veh, extra) to restore persisted extra fields.
+
+    Pass None to clear.
+    """
+    global _vehicle_extra_persist_apply
+    _vehicle_extra_persist_apply = fn
+
+
+def vehicle_extra_persist_apply(veh, extra):
+    """Apply a loaded extra dict onto a live vehicle dict."""
+    if _vehicle_extra_persist_apply is None:
+        return
+    if not isinstance(veh, dict) or not isinstance(extra, dict) or not extra:
+        return
+    try:
+        _vehicle_extra_persist_apply(veh, extra)
+    except Exception:
+        return
+
+
 _vehicle_invalid_park_rehome = None
 
 
@@ -3632,6 +3760,45 @@ def after_help_topic(character, topic, game):
     """Run the registered post-help-topic hook, or do nothing."""
     if _after_help_topic is not None:
         _after_help_topic(character, topic, game)
+
+
+def set_help_fts_blocklist(keys):
+    """Register help queries that must skip DB FTS (game registers onboarding hubs)."""
+    global _help_fts_blocklist
+    if not keys:
+        _help_fts_blocklist = frozenset()
+        return
+    _help_fts_blocklist = frozenset(
+        str(k).strip().lower() for k in keys if str(k).strip()
+    )
+
+
+def get_help_fts_blocklist():
+    """Help verbs that skip FTS when no static/DB exact page matched."""
+    return _help_fts_blocklist
+
+
+_help_alias_target_resolver = None
+
+
+def set_help_alias_target_resolver(fn):
+    """Register fn(keyword) -> hub keyword when ``keyword`` is alias-only.
+
+    Used by ``hedit`` so staff can claim a redirect name as a real page.
+    Pass ``None`` to restore the lean-engine default (no static aliases).
+    """
+    global _help_alias_target_resolver
+    _help_alias_target_resolver = fn
+
+
+def get_help_alias_target(keyword):
+    """Hub keyword when ``keyword`` is a static alias-only name, else ``None``."""
+    if _help_alias_target_resolver is None:
+        return None
+    keyword = (keyword or "").strip().lower()
+    if not keyword:
+        return None
+    return _help_alias_target_resolver(keyword)
 
 
 def set_refresh_help_overlay(fn):
@@ -5761,6 +5928,35 @@ def channel_speech_blocked(character, game):
     if _channel_speech_blocked is not None:
         return bool(_channel_speech_blocked(character, game))
     return False
+
+
+# Party-merge auto-accept (Echo / idlemode close-tie). Default True so a
+# lean engine still auto-accepts merges the way the old ImportError path
+# did; games register a stricter predicate (SUPERS: companion.can_auto_companion).
+_can_auto_companion = None
+
+
+def set_can_auto_companion(fn):
+    """Register fn(leader, target, game=None, *, require_close_tie=True) -> bool.
+
+    Pass None to restore the default (always True). SUPERS registers
+    ``supers.companion.can_auto_companion`` from bootstrap.
+    """
+    global _can_auto_companion
+    _can_auto_companion = fn
+
+
+def can_auto_companion(leader, target, game=None, *, require_close_tie=True):
+    """Run the game-owned party-merge auto-accept hook, if any.
+
+    Default True matches the pre-hook ImportError path (no game package
+    means Echo/idlemode merges still go through).
+    """
+    if _can_auto_companion is not None:
+        return bool(_can_auto_companion(
+            leader, target, game, require_close_tie=require_close_tie,
+        ))
+    return True
 
 
 _default_mssp_description = None

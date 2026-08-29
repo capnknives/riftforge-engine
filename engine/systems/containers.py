@@ -829,6 +829,33 @@ def _remove_carried_item(character, item):
         gear.remove(item)
 
 
+def _plain_carried_item_text(item, attr, fallback):
+    """Return a safe plain string for stack peels and persistence."""
+    from engine import hooks as hooks_mod
+
+    val = getattr(item, attr, None)
+    if isinstance(val, str):
+        text = val.strip()
+        if text and not (
+            text.startswith("<") and " object at 0x" in text
+        ):
+            return text
+    if attr == "key":
+        painted = hooks_mod.item_display_key(item, None)
+        text = strip_ansi(painted).strip() if painted else ""
+        if text and not (text.startswith("<") and " object at 0x" in text):
+            return text
+    if attr == "description":
+        desc = getattr(item, "description", None)
+        if isinstance(desc, str):
+            text = desc.strip()
+            if text and not (
+                text.startswith("<") and " object at 0x" in text
+            ):
+                return text
+    return fallback
+
+
 def _spawn_single_stack_unit(item):
     """Fresh one-unit Item cloned from a stacked row (sell/drop peel)."""
     catalog_id = getattr(item, "catalog_id", None)
@@ -843,7 +870,11 @@ def _spawn_single_stack_unit(item):
         return unit
     from world import Item
 
-    unit = Item(item.key, getattr(item, "description", item.key))
+    plain_key = _plain_carried_item_text(item, "key", "an unknown scrap")
+    plain_desc = _plain_carried_item_text(
+        item, "description", plain_key,
+    )
+    unit = Item(plain_key, plain_desc)
     for attr in (
         "catalog_id",
         "slot",
@@ -1222,6 +1253,12 @@ def heal_character_kit_bag(character):
         migrate_virtual_gear_bag(character)
     collapse_duplicate_kit_bags(character)
     rebind_containers_from_inventory(character)
+    bag_item = designated_gear_bag(character)
+    if bag_item is not None:
+        for piece in list(bag_contents(bag_item)):
+            hooks_mod.enrich_loaded_item(piece)
+    for piece in list(getattr(character, "gear_bag", None) or []):
+        hooks_mod.enrich_loaded_item(piece)
     return True
 
 

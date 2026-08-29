@@ -138,6 +138,7 @@ _LEGACY_AREA_TYPE_ALIASES = {
 # always wins regardless (e.g. a hand-placed safehouse inside a forest).
 WILD_AREA_TYPES = frozenset({
     "forest", "lake", "mountains", "ocean", "plains", "desert", "wetland",
+    "trail",
 })
 
 # Radiant / NEEDS resource tags allowed on Room.resources (and capacity keys).
@@ -194,6 +195,7 @@ PLANES = frozenset({
     "coalescence",
     "riftcrash",
     "stellar", "umbral", "empty",
+    "earth_frontierland_1861",
 })
 
 # plane -> realm family. Cosmic Favor's elemental/eldritch tether is a
@@ -212,6 +214,7 @@ REALM_FOR_PLANE = {
     "dream": "spirit",
     "coalescence": "spirit",
     "riftcrash": "pocket",
+    "earth_frontierland_1861": "prime",
     "stellar": "void",
     "umbral": "void",
     "empty": "void",

@@ -342,6 +342,12 @@ async def _prompt_character_menu(session, game, account):
             return None
         idx = _parse_menu_choice(pick, tagged)
         if idx is None:
+            # Staff-only backdoor: type Ash even when the idle fixture
+            # row is missing from the painted Cast list (is_npc until ridden).
+            if accounts_mod.account_is_staff(account):
+                backdoor = accounts_mod.resolve_staff_login_cast(game, pick)
+                if backdoor is not None:
+                    return backdoor
             session.send(
                 "Pick the menu number, a character name, or type create or link."
             )

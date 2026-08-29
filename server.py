@@ -130,31 +130,46 @@ class Game:
             print(f"[boot] map heal skipped: {exc}", flush=True)
         boot_profile_mod.mark("map_heal")
         try:
-            from engine import changelog_index as changelog_index_mod
+            from engine import changelog_ledger
 
             # Copyover / game-child boot is a fresh interpreter — this is
-            # the guaranteed #N mint. The long-lived watcher can still be
-            # holding a stale changelog_index without stamp_pending_*.
-            changelog_index_mod.stamp_pending_and_ensure_index(
-                os.getcwd(),
-                log_prefix="[boot]",
-                mint_ids=changelog_index_mod.should_mint_ids_on_boot(),
+            # the guaranteed mint point. ``assign_id`` is idempotent per
+            # slug, so calling this every boot (and from the watcher's idle
+            # poll) is safe against churn; it never reassigns an id once
+            # minted.
+            minted = changelog_ledger.assign_new_slugs(
+                os.getcwd(), log_prefix="[boot]",
             )
         except Exception as exc:
-            print(f"[boot] changelog index heal skipped: {exc}", flush=True)
+            print(f"[boot] changelog ledger mint skipped: {exc}", flush=True)
         else:
-            # Discord may have deferred this SHA until #N existed. Retry
-            # here so the post lands with ``changes N`` after copyover.
+            if minted:
+                print(f"[boot] changelog ledger minted {minted} id(s)", flush=True)
+            # Discord may have deferred a batch until every player bullet
+            # in it had #N. Retry here so the post lands with a real
+            # ``changes N`` number after copyover.
             try:
-                if changelog_index_mod.should_mint_ids_on_boot():
-                    from engine import discord_patch_notes as discord_patch_notes_mod
+                from engine import discord_patch_notes as discord_patch_notes_mod
 
-                    discord_patch_notes_mod.retry_deferred_patch_notes(
-                        os.getcwd(),
-                    )
+                discord_patch_notes_mod.retry_deferred_patch_notes(os.getcwd())
             except Exception as exc:
                 print(f"[boot] patch notes retry skipped: {exc}", flush=True)
-        boot_profile_mod.mark("changelog_index")
+        boot_profile_mod.mark("changelog_ledger")
+        # Pre-warm the in-memory ``changes`` cache here, before any player
+        # can connect. ``_load_unreleased_entries`` parses every
+        # CHANGELOG.d fragment on its first call in a fresh process
+        # (~a few hundred ms with today's fragment count); without this,
+        # whoever types ``changes`` or logs in first after a copyover /
+        # game-only restart pays that cost inline, blocking the single
+        # asyncio loop for everyone. Paying it once during boot instead
+        # costs nothing players notice.
+        try:
+            from engine.verbs import basic as basic_verbs_mod
+
+            basic_verbs_mod._load_unreleased_entries(os.getcwd())
+        except Exception as exc:
+            print(f"[boot] changelog pre-warm skipped: {exc}", flush=True)
+        boot_profile_mod.mark("changelog_prewarm")
         # Live Character roster (engine/char_index.py). RoomMap stamps
         # room.game on every insert so Room.add/remove keep the set
         # truthful (including procedural dungeons and smoke ad-hoc rooms).
@@ -500,6 +515,7 @@ class Game:
             # legacy body ranks onto accounts after the first migrate.
             accounts_mod.migrate_legacy_gm_ranks(self)
             accounts_mod.heal_empty_account_passwords(self)
+            accounts_mod.heal_account_created_at_stamps(self)
         except Exception:
             print("[server] account reconcile/migrate failed:", flush=True)
             traceback.print_exc()
@@ -672,6 +688,7 @@ class Game:
             is_login_player_body,
         )
         from engine.command_support import strip_ephemeral_storage_prefix
+        from engine.accounts import is_staff_login_cast
 
         needle = strip_ephemeral_storage_prefix(name or "").strip().lower()
         if not needle or needle == "?":
@@ -679,7 +696,7 @@ class Game:
         key_hit = None
         given_hits = []
         for obj in self.characters:
-            if not is_login_player_body(obj):
+            if not is_login_player_body(obj) and not is_staff_login_cast(obj):
                 continue
             key = (getattr(obj, "key", None) or "")
             key_low = key.lower()
@@ -1807,9 +1824,18 @@ async def handle_client(reader, writer, game):
 async def main():
     # Prove the child is alive during long Game() / world load so the
     # watcher boot-grace clock has a fresh stamp once import finishes.
+    from engine import env_file
     from engine import game_heartbeat
 
     game_heartbeat.touch_heartbeat("main_enter")
+    # The game child applies whitelisted `.env` keys itself. The watcher
+    # process can live for days with a cached `engine.env_file` that
+    # predates new whitelist rows (Ash viewport, lag knobs). Reloading
+    # in `_spawn_game` does not help until *that* watcher restarts —
+    # and restarting the watcher means a compose recreate (hard rule 19).
+    # `docker compose exec printenv` is container create-time, not this
+    # process. Do not compose-recreate to pick up RIFTFORGE_VIEWPORT.
+    env_file.apply_repo_env(os.path.dirname(os.path.abspath(__file__)))
     try:
         game = Game(db_path=db_path_from_env())
     except Exception as exc:
@@ -1824,6 +1850,9 @@ async def main():
     game_heartbeat.touch_heartbeat("game_ready")
     from engine.gateway_client import GatewayBridge, gateway_enabled
     from engine import persistence as persistence_shutdown
+
+    from engine import viewport as viewport_mod
+    viewport_mod.start_viewport_task(game)
 
     if gateway_enabled():
         # Level 3 gateway: do not bind :4000; speak IPC and reattach held clients.

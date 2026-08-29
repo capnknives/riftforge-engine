@@ -53,7 +53,10 @@ Call these **before** constructing `Character`s or loading a save:
 | Chargen | `set_chargen(async_fn)` | skip (return True) | `chargen.run` |
 | Help topics | `set_help(topics, categories)` | empty | `help_topics` maps |
 | Command dispatch | `set_dispatch(fn)` | `None` (npc_do no-ops) | `commands.dispatch` |
+| Party-merge auto-accept | `set_can_auto_companion(fn)` | `True` (lean auto-accept) | `supers.companion.can_auto_companion` |
 | Eclipse ambient line | `set_eclipse_ambient_line(fn)` | `""` | `supers.balance.eclipse_ambient_line` |
+| Room look extras | `set_room_look_extras(fn)` | `[]` | `supers.bootstrap._room_look_extras` (planar, haunt, vehicles, boards, …) |
+| Room command hints | `set_room_command_hints(fn)` | `[]` | `supers.command_hints.commands_here_lines` (`commands here`) |
 | Vampire fear message | `set_vampire_fear_message(fn)` | `None` | `supers.slayer.fear_message_for_vampire` |
 | Look/examine quirk | `set_look_quirk(fn)` | `None` | `supers.relationships.maybe_look_quirk` |
 | Extra target match needles | `set_extra_target_match_needles(fn)` | `[]` | `supers.target_kinds.kind_match_needles` (Origin/Path/kind room targeting) |
@@ -378,6 +381,8 @@ table above is unchanged.
 | **Cadence** | — | **Deferred** — no generic kernel to peel (Phase 4 finding) |
 | **SUPERS narrative combat** | `supers/combat.py` → `supers/combat_prose.py` | Stays in SUPERS (not swing/active backends) |
 | **Civic shops** | `engine/systems/civic_shop.py` (ware shell) | Shell shipped; deep `player_shops` → `civic_shop` wiring **deferred** (Phase 6b / H-track) |
+| **Lifestyle / civic kernels** | `skill_ranks`, `gather_nodes`, `vendor_stock`, `claim_board`, `wage_curve` | Shipped **v0.6.2** — games keep catalogs and job titles |
+| **Combat status / prose loader** | `status_conditions`, `prose_pool_loader` | Shipped **v0.6.2** — catalog + JSON pools stay in the game |
 | **Clinic** | `engine/systems/clinic.py` | Framework shipped + wired (H4); Town Clinic room keys stay SUPERS-branded |
 | **Justice** | `engine/systems/justice.py` | Framework shipped + wired (H4); crime catalog stays SUPERS |
 | **Missions** | partial | Board shell deferred; quest content in SUPERS |
@@ -392,8 +397,8 @@ Phases **H1–H7** landed on `feature/purity-h-track-remaining` (see
 `engine/map_ui.py`, `engine/systems/{vehicles,lodging,paced_travel,phone,appearance,persona_registry,relationships}`,
 `engine/map_store.py`, plus **H4** wiring (`hospital`→`clinic`, `crime`→`justice`).
 **Deep `player_shops` → `civic_shop`** remains DEFERRED. **H8** (kind
-grandparents) and **H9** (`v0.5.0` tag) **landed**; SUPERS pin is **`@v0.6.1`**
-(2026-08-27; **`v0.6.0`** was 2026-08-21).
+grandparents) and **H9** (`v0.5.0` tag) **landed**; SUPERS pin is **`@v0.6.2`**
+(2026-08-29; liquid-flavor kernels. Prior **`v0.6.1`** 2026-08-27; **`v0.6.0`** 2026-08-21).
 
 
 ## Hook bundles (engine mudlib unification)

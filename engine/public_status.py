@@ -14,7 +14,6 @@ import json
 import os
 from datetime import datetime, timezone
 
-from engine import changelog_index
 from engine import mssp
 from engine.changelog_audience import display_summary, visible_to_viewer
 
@@ -39,18 +38,23 @@ def public_status_json_path(root=None):
 
 
 def _repo_root():
-    """Directory that holds ``content/changelog_index.json``."""
+    """Directory that holds ``CHANGELOG.d/`` and the changelog ledger."""
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def latest_player_change(root=None):
     """Newest player-visible SUPERS ``changes`` bullet, or None.
 
-    Uses the compiled changelog index (same feed as in-game ``changes``).
-    Missing or unreadable index is fail-soft -- the splash keeps static copy.
+    Uses the same ledger-backed entry loader as in-game ``changes``. Missing
+    or unreadable sources are fail-soft -- the splash keeps static copy.
     """
+    from engine.verbs.basic import _load_unreleased_entries
+
     repo = root if root is not None else _repo_root()
-    entries = changelog_index.load_index_file(changelog_index.index_path(repo))
+    try:
+        entries = _load_unreleased_entries(repo)
+    except Exception:
+        entries = None
     if not entries:
         return None
     ranked = sorted(

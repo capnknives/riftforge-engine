@@ -5,7 +5,7 @@ State shape per quest id::
 
     {
       "status": "active" | "done" | "abandoned",
-      "step": 0,
+      "step": "<step_id>",  # legacy int index accepted on load
       "flags": {},
     }
 
@@ -65,6 +65,8 @@ _quest_step_stamp_handler = None
 _quest_npc_done_line_skip = None
 _quest_empty_log_hint = None
 _quest_no_offers_hint = None
+_quest_giver_needles_handler = None
+_quest_office_match_handler = None
 _quest_predicates: dict = {}
 
 
@@ -174,6 +176,69 @@ def set_quest_no_offers_hint(fn):
     _quest_no_offers_hint = fn
 
 
+def set_quest_giver_needles_handler(fn):
+    """Register fn(npc) -> iterable[str] of extra lowercase match labels.
+
+    Civic offices (job id / title aliases) go here so ``talk_npc``
+    payloads can exact-match ``sheriff`` / ``coroner`` / ``doctor``
+    against whoever currently holds the desk. Bare engine: no extra
+    needles.
+    """
+    global _quest_giver_needles_handler
+    _quest_giver_needles_handler = fn
+
+
+def set_quest_office_match_handler(fn):
+    """Register fn(npc, giver_name, *, quest_data, game) -> True|False|None.
+
+    True = this body currently holds the civic office named by
+    ``giver_name``. False = it is an office token but this body does not
+    hold it (retired name leftover, wrong town, corpse). None = not an
+    office token; fall through to named-NPC matching. Bare engine: None.
+    """
+    global _quest_office_match_handler
+    _quest_office_match_handler = fn
+
+
+def fold_giver_token(raw):
+    """Fold a giver / office token for exact compare (spaces to underscore)."""
+    text = str(raw or "").strip().lower()
+    for mark in ("'", "'", "`"):
+        text = text.replace(mark, "")
+    chars = []
+    for ch in text:
+        if ch.isalnum():
+            chars.append(ch)
+        else:
+            chars.append("_")
+    folded = "".join(chars)
+    while "__" in folded:
+        folded = folded.replace("__", "_")
+    return folded.strip("_")
+
+
+def giver_needles_for(npc):
+    """Extra lowercase match labels for ``npc`` from the registered handler."""
+    if npc is None or _quest_giver_needles_handler is None:
+        return []
+    try:
+        return [str(label).lower() for label in (_quest_giver_needles_handler(npc) or ())]
+    except Exception:
+        return []
+
+
+def office_match_for(npc, giver_name, *, quest_data=None, game=None):
+    """True/False/None from the registered civic-office handler."""
+    if _quest_office_match_handler is None:
+        return None
+    try:
+        return _quest_office_match_handler(
+            npc, giver_name, quest_data=quest_data, game=game,
+        )
+    except Exception:
+        return None
+
+
 def register_quest_predicate(type_name, fn):
     """Register fn(character, when, event, payload) -> bool for custom types."""
     if type_name and fn is not None:
@@ -238,16 +303,103 @@ def active_quest_ids(character):
     ]
 
 
+def _build_step_id_index(steps):
+    """Map step id -> list index for one quest's ``steps`` array."""
+    out = {}
+    for i, step in enumerate(steps or []):
+        sid = (step or {}).get("id")
+        if sid:
+            out[str(sid)] = i
+    return out
+
+
 def _parse_step_index(entry):
-    """Return a non-negative step index from quest progress, or 0 on bad data."""
+    """Return a non-negative step index from legacy int progress, or 0."""
     if not entry:
         return 0
     raw = entry.get("step", 0)
+    if isinstance(raw, str):
+        return 0
     try:
         idx = int(raw if raw is not None else 0)
     except (TypeError, ValueError):
         return 0
     return max(0, idx)
+
+
+def _resolve_step_index(data, entry):
+    """Resolve persisted step (id string or legacy int) to a list index."""
+    steps = (data or {}).get("steps") or []
+    if not steps:
+        return 0
+    raw = (entry or {}).get("step", 0)
+    id_to_idx = _build_step_id_index(steps)
+    if isinstance(raw, str) and raw:
+        if raw in id_to_idx:
+            return id_to_idx[raw]
+        return len(steps)
+    idx = _parse_step_index(entry)
+    return min(max(0, idx), len(steps) - 1) if steps else 0
+
+
+def _resolve_step_id(data, entry):
+    """Return the current step id for a quest progress entry."""
+    steps = (data or {}).get("steps") or []
+    if not steps:
+        return None
+    raw = (entry or {}).get("step", 0)
+    id_to_idx = _build_step_id_index(steps)
+    if isinstance(raw, str) and raw:
+        if raw in id_to_idx:
+            return raw
+        return None
+    idx = _resolve_step_index(data, entry)
+    if 0 <= idx < len(steps):
+        return steps[idx].get("id")
+    return None
+
+
+def _write_step_id(entry, step_id):
+    """Persist the current step as a string id going forward."""
+    if entry is not None and step_id:
+        entry["step"] = str(step_id)
+
+
+def normalize_quest_progress_step(quest_id, entry, *, get_quest=None):
+    """Load-time heal: coerce legacy int ``step`` to the step id string.
+
+    ``get_quest`` defaults to the loader catalog. Returns True when the
+    entry was rewritten.
+    """
+    if not entry or not isinstance(entry, dict):
+        return False
+    raw = entry.get("step", 0)
+    if isinstance(raw, str) and raw:
+        return False
+    loader = get_quest or loader_mod.get_quest
+    data = loader(quest_id)
+    if not data:
+        return False
+    steps = data.get("steps") or []
+    if not steps:
+        return False
+    idx = _parse_step_index(entry)
+    idx = min(max(0, idx), len(steps) - 1)
+    sid = steps[idx].get("id")
+    if sid:
+        entry["step"] = sid
+        return True
+    return False
+
+
+def normalize_all_quest_progress(character, *, get_quest=None):
+    """Normalize every quest progress entry on ``character``."""
+    prog = _progress(character)
+    changed = False
+    for qid, entry in list(prog.items()):
+        if normalize_quest_progress_step(qid, entry, get_quest=get_quest):
+            changed = True
+    return changed
 
 
 def _complete_quest(character, quest_id, game=None, *, announce=True):
@@ -288,7 +440,7 @@ def _heal_stale_quest_entry(character, quest_id, game=None, *, silent=False):
     steps = data.get("steps") or []
     if not steps:
         return False
-    idx = _parse_step_index(entry)
+    idx = _resolve_step_index(data, entry)
     if idx < len(steps):
         return False
     return _complete_quest(
@@ -307,14 +459,27 @@ def stale_active_quest_ids(character):
         steps = data.get("steps") or []
         if not steps:
             continue
-        if _parse_step_index(entry) >= len(steps):
+        if _resolve_step_index(data, entry) >= len(steps):
             ids.append(qid)
     return ids
 
 
-def _npc_matches_giver(npc, giver_name):
-    """True when ``npc`` is the authored quest giver (substring match)."""
+def _npc_matches_giver(npc, giver_name, *, quest_data=None, game=None):
+    """True when ``npc`` is the authored quest giver.
+
+    Civic office tokens (``sheriff``, ``coroner``, a jobs.json id, …)
+    match whoever currently holds that title in the quest's town --
+    leftover names on a retired body do not. Named givers still use
+    substring / identity match (Bobby / Bobby Singer).
+    """
     if npc is None or not giver_name:
+        return False
+    office = office_match_for(
+        npc, giver_name, quest_data=quest_data, game=game,
+    )
+    if office is True:
+        return True
+    if office is False:
         return False
     npc_key = (getattr(npc, "key", None) or "").lower()
     giver = str(giver_name).lower().strip()
@@ -343,15 +508,17 @@ def _npc_matches_giver(npc, giver_name):
     return False
 
 
-def _npc_lines_for(npc, npc_lines):
-    """Return the ``npc_lines`` bucket for ``npc`` (short or full key)."""
+def _npc_lines_for(npc, npc_lines, *, quest_data=None, game=None):
+    """Return the ``npc_lines`` bucket for ``npc`` (short, full key, or office)."""
     if not npc_lines or npc is None:
         return {}
     npc_key = getattr(npc, "key", None) or ""
     if npc_key in npc_lines:
         return npc_lines.get(npc_key) or {}
     for key, lines in npc_lines.items():
-        if _npc_matches_giver(npc, key):
+        if _npc_matches_giver(
+            npc, key, quest_data=quest_data, game=game,
+        ):
             return lines or {}
     return {}
 
@@ -359,8 +526,9 @@ def _npc_lines_for(npc, npc_lines):
 def close_stale_quest_with_giver(character, quest_id, game, npc, room):
     """Finalize a past-end quest with giver ``done`` room text when present."""
     data = loader_mod.get_quest(quest_id) or {}
-    giver = data.get("giver_npc") or ""
-    lines = (data.get("npc_lines") or {}).get(giver) or {}
+    lines = _npc_lines_for(
+        npc, data.get("npc_lines"), quest_data=data, game=game,
+    )
     done_line = lines.get("done")
     if done_line and room is not None:
         room.broadcast(done_line, exclude=())
@@ -403,7 +571,7 @@ def current_step(character, quest_id=None):
     if data is None:
         return None
     steps = data.get("steps") or []
-    idx = _parse_step_index(entry)
+    idx = _resolve_step_index(data, entry)
     if idx < 0 or idx >= len(steps):
         game = _game_from_character(character)
         if idx >= len(steps):
@@ -416,18 +584,14 @@ def current_step(character, quest_id=None):
     return steps[idx]
 
 
-def _giver_present(room, giver_key):
-    """True when an NPC whose key matches ``giver_key`` is in ``room``.
-
-    Matches either way as a substring so ``Bobby`` still finds
-    ``Bobby Singer`` and a short key still matches a longer giver id.
-    """
-    want = (giver_key or "").lower()
-    if not want or room is None:
+def _giver_present(room, giver_key, *, quest_data=None, game=None):
+    """True when the live giver (name or civic office) is in ``room``."""
+    if not giver_key or room is None:
         return False
     for obj in getattr(room, "contents", None) or []:
-        key = (getattr(obj, "key", None) or "").lower()
-        if want in key or key in want:
+        if _npc_matches_giver(
+            obj, giver_key, quest_data=quest_data, game=game,
+        ):
             return True
     return False
 
@@ -488,7 +652,9 @@ def list_offers_in_room(character, room):
         offer_rooms = data.get("offer_rooms") or []
         giver = data.get("giver_npc") or ""
         in_offer_room = _offer_room_matches(room, offer_rooms, game=game)
-        giver_here = _giver_present(room, giver)
+        giver_here = _giver_present(
+            room, giver, quest_data=data, game=game,
+        )
         if offer_rooms:
             if not in_offer_room:
                 continue
@@ -538,6 +704,9 @@ def format_log_lines(character):
     Sighted path keeps compact ``[ACTIVE]`` tags. Screenreader path uses
     flat ``Label: value.`` lines with terminal punctuation for TTS
     (never meaning by layout alone).
+
+    When ``chain_id`` is set on a quest, entries group under that saga and
+  show ``Chapter N of M: chain_title``. Standalone quests render unchanged.
     """
     sr = bool(getattr(character, "screenreader", False))
     prog = _progress(character)
@@ -558,10 +727,30 @@ def format_log_lines(character):
     for qid in list(prog.keys()):
         if qid in stale_active_quest_ids(character):
             _complete_quest(character, qid, game=game, announce=announce)
-    lines = ["Quest log."] if sr else ["Quest log:"]
-    for qid in sorted(prog.keys()):
+    catalog = loader_mod.load_quests()
+
+    def _chain_chapter_count(chain_id):
+        chapters = [
+            q for q in catalog.values()
+            if (q or {}).get("chain_id") == chain_id
+        ]
+        return len(chapters)
+
+    # Group quest ids: chained sagas first (by chain_id, chapter), then standalone.
+    chained = {}
+    standalone = []
+    for qid in prog.keys():
+        data = catalog.get(qid) or loader_mod.get_quest(qid) or {}
+        chain_id = data.get("chain_id")
+        if chain_id:
+            chained.setdefault(chain_id, []).append(qid)
+        else:
+            standalone.append(qid)
+
+    def _render_quest_line(qid):
+        out = []
         entry = prog[qid] or {}
-        data = loader_mod.get_quest(qid) or {}
+        data = catalog.get(qid) or loader_mod.get_quest(qid) or {}
         title = data.get("title") or qid
         status = entry.get("status") or "?"
         tag = {
@@ -569,7 +758,7 @@ def format_log_lines(character):
             "done": "DONE",
             "abandoned": "ABANDONED",
         }.get(status, status.upper())
-        step_i = _parse_step_index(entry)
+        step_i = _resolve_step_index(data, entry)
         steps = data.get("steps") or []
         total = len(steps)
         phase = ""
@@ -594,15 +783,15 @@ def format_log_lines(character):
                 else f"step {step_i + 1}/{total or '?'}"
             )
         if sr:
-            lines.append(
+            out.append(
                 f"Status: {tag}. Title: {title}. Id: {qid}."
             )
             if phase:
-                lines.append(f"Phase: {phase}.")
-            lines.append(progress_bit)
+                out.append(f"Phase: {phase}.")
+            out.append(progress_bit)
         else:
             phase_bit = f" / {phase}" if phase else ""
-            lines.append(
+            out.append(
                 f"  [{tag}] {title} ({qid}){phase_bit} "
                 f"{progress_bit}"
             )
@@ -610,18 +799,51 @@ def format_log_lines(character):
             step = current_step(character, qid)
             if step and step.get("hint"):
                 if sr:
-                    lines.append(f"Hint: {step['hint']}.")
+                    out.append(f"Hint: {step['hint']}.")
                 else:
-                    lines.append(f"      hint: {step['hint']}")
-            # Preview next few steps as LOCKED (plain tags, not color-alone).
+                    out.append(f"      hint: {step['hint']}")
             for later in steps[step_i + 1 : step_i + 4]:
                 lid = later.get("id") or "?"
                 lphase = later.get("phase") or ""
                 bit = f"{lphase}: {lid}" if lphase else lid
                 if sr:
-                    lines.append(f"Locked next: {bit}.")
+                    out.append(f"Locked next: {bit}.")
                 else:
-                    lines.append(f"      [LOCKED] {bit}")
+                    out.append(f"      [LOCKED] {bit}")
+        return out
+
+    lines = ["Quest log."] if sr else ["Quest log:"]
+
+    for chain_id in sorted(chained.keys()):
+        qids = chained[chain_id]
+        qids.sort(
+            key=lambda q: (
+                (catalog.get(q) or {}).get("chapter") or 0,
+                q,
+            )
+        )
+        sample = catalog.get(qids[0]) or {}
+        chain_title = sample.get("chain_title") or chain_id
+        chapter_total = _chain_chapter_count(chain_id)
+        for qid in qids:
+            data = catalog.get(qid) or {}
+            chapter = data.get("chapter")
+            if chapter is not None:
+                header = (
+                    f"Saga: Chapter {chapter} of {chapter_total}: "
+                    f"{chain_title}."
+                    if sr
+                    else (
+                        f"  -- Chapter {chapter} of {chapter_total}: "
+                        f"{chain_title} --"
+                    )
+                )
+                lines.append(header)
+            lines.extend(_render_quest_line(qid))
+
+    for qid in sorted(standalone):
+        lines.extend(_render_quest_line(qid))
+
     return lines
 
 
@@ -638,12 +860,26 @@ def status_lines(character, quest_id):
 
 def _apply_grant(character, grant, game=None):
     """Apply optional step/quest grant: dollars, favor, items, flags."""
-    if not grant or not isinstance(grant, dict):
+    if not grant:
+        return
+    if isinstance(grant, list):
+        for piece in grant:
+            _apply_grant(character, piece, game=game)
+        return
+    if not isinstance(grant, dict):
         return
     qid = getattr(character, "_quest_grant_target", None) or "?"
     try:
         if _quest_grant_handler is not None:
             _quest_grant_handler(character, grant, game)
+            return
+        gtype = grant.get("type")
+        if gtype == "clear_character_flag":
+            flag = grant.get("flag")
+            if flag:
+                setattr(character, flag, False)
+            return
+        if gtype == "reset_vessel_drift":
             return
         cash = None
         if "dollars" in grant or "cents" in grant:
@@ -918,14 +1154,20 @@ def _skip_start_steps(character, quest_id, game=None):
         when = step.get("complete_when") or {}
         if when.get("type") != "start":
             return
-        # Silent index bump (no narrate) -- grant still applies if present.
-        idx = _parse_step_index(entry)
         if step.get("grant"):
             character._quest_grant_target = quest_id
-            _apply_grant(character, step.get("grant"), game=game)
+            _apply_step_grants(character, step, game=game)
             character._quest_grant_target = None
-        entry["step"] = idx + 1
-        if entry["step"] >= len(steps):
+        next_id = _resolve_next_step_id(
+            character, quest_id, data, step, game=game,
+        )
+        if not next_id:
+            _complete_quest(
+                character, quest_id, game=game, announce=False,
+            )
+            return
+        _write_step_id(entry, next_id)
+        if _resolve_step_index(data, entry) >= len(steps):
             _complete_quest(
                 character, quest_id, game=game, announce=False,
             )
@@ -988,11 +1230,57 @@ def _maybe_opener_meta(character, quest_id):
         return
     if _get_flag(character, quest_id, "opener_meta_told"):
         return
-    # Only after leaving step 0 (look_around) -- first successful beat.
-    if int(entry.get("step", 0) or 0) < 1:
+    steps = data.get("steps") or []
+    if not steps:
+        return
+    first_id = steps[0].get("id")
+    current_id = _resolve_step_id(data, entry)
+    if current_id == first_id:
         return
     _set_flag(character, quest_id, "opener_meta_told", True)
     _send(character, _OPENER_META_LINE)
+
+
+def _apply_step_grants(character, step, game=None):
+    """Apply a step's ``grant`` field (single dict or list)."""
+    if not step:
+        return
+    grant = step.get("grant")
+    if grant:
+        _apply_grant(character, grant, game=game)
+
+
+def _resolve_next_step_id(character, quest_id, data, completed_step, game=None):
+    """Pick the next step id after ``completed_step`` (branches, next, sequential)."""
+    steps = data.get("steps") or []
+    if not steps or not completed_step:
+        return None
+    id_to_idx = _build_step_id_index(steps)
+    current_id = completed_step.get("id")
+    current_idx = id_to_idx.get(current_id, 0)
+
+    for branch in completed_step.get("branches") or []:
+        when = branch.get("when") or {}
+        if _match_when(
+            character,
+            when,
+            "state_check",
+            {},
+            quest_id=quest_id,
+            game=game,
+        ):
+            branch_next = branch.get("next")
+            if branch_next and branch_next in id_to_idx:
+                return branch_next
+
+    explicit_next = completed_step.get("next")
+    if explicit_next and explicit_next in id_to_idx:
+        return explicit_next
+
+    next_idx = current_idx + 1
+    if next_idx < len(steps):
+        return steps[next_idx].get("id")
+    return None
 
 
 def _advance(character, quest_id, game=None):
@@ -1002,25 +1290,29 @@ def _advance(character, quest_id, game=None):
     if data is None or entry is None:
         return
     steps = data.get("steps") or []
-    idx = _parse_step_index(entry)
+    idx = _resolve_step_index(data, entry)
     step = steps[idx] if 0 <= idx < len(steps) else None
-    if step and step.get("grant"):
+    if step:
         character._quest_grant_target = quest_id
-        _apply_grant(character, step.get("grant"), game=game)
+        _apply_step_grants(character, step, game=game)
         character._quest_grant_target = None
 
-    idx += 1
-    entry["step"] = idx
-    if idx >= len(steps):
+    next_id = _resolve_next_step_id(
+        character, quest_id, data, step, game=game,
+    )
+    if not next_id:
+        _complete_quest(character, quest_id, game=game, announce=True)
+        return
+
+    _write_step_id(entry, next_id)
+    if _resolve_step_index(data, entry) >= len(steps):
         _complete_quest(character, quest_id, game=game, announce=True)
         return
 
     _maybe_opener_meta(character, quest_id)
-    # Skip glue ``start`` steps without printing them.
     _skip_start_steps(character, quest_id, game=game)
     if (_entry(character, quest_id) or {}).get("status") == "done":
         return
-    # One beat: narrate + hint. Seek waits for idle nudge / explicit hint.
     _announce_current_step(character, quest_id, game=game, include_seek=False)
 
 
@@ -1070,7 +1362,38 @@ def begin(character, quest_id, game=None, *, force=False, defer_step=False):
                     f"You already have an open case from {other_giver}. "
                     "Finish or abandon it first -- see 'questlog'."
                 )
-    _set_status(character, quest_id, "active", step=0)
+    if not force:
+        for req_id in data.get("requires_quest") or []:
+            req_entry = prog.get(req_id) or {}
+            if req_entry.get("status") != "done":
+                req_data = loader_mod.get_quest(req_id) or {}
+                label = (
+                    req_data.get("chain_title")
+                    or req_data.get("title")
+                    or req_id
+                )
+                return False, f"You haven't finished '{label}' yet."
+        requires = data.get("requires")
+        if isinstance(requires, dict) and requires:
+            if not _match_when(
+                character,
+                requires,
+                "state_check",
+                {},
+                quest_id=quest_id,
+                game=game,
+            ):
+                return False, "You don't meet the requirements for that case yet."
+    first_step_id = None
+    steps_preview = data.get("steps") or []
+    if steps_preview:
+        first_step_id = steps_preview[0].get("id")
+    _set_status(
+        character,
+        quest_id,
+        "active",
+        step=first_step_id if first_step_id is not None else 0,
+    )
     pin_map = data.get("pin_npcs") or {}
     if pin_map and game is not None:
         _pin_mentors(game, pin_map)
@@ -1183,7 +1506,36 @@ def advance_for_gm(character, quest_id, game=None):
     return True, f"Advanced '{quest_id}' -- case complete."
 
 
-def _match_when(character, when, event, payload):
+def _payload_npc_matches(want, payload, *, quest_id=None, game=None):
+    """True when a talk/give payload is the authored NPC or civic office."""
+    want = (want or "").strip()
+    if not want:
+        return True
+    npc_obj = payload.get("npc_obj")
+    data = None
+    if quest_id:
+        data = loader_mod.get_quest(quest_id) or {}
+    if npc_obj is not None:
+        return _npc_matches_giver(
+            npc_obj, want, quest_data=data, game=game,
+        )
+    got = (payload.get("npc") or "").lower()
+    want_l = want.lower()
+    folded_want = fold_giver_token(want)
+    for label in payload.get("npc_needles") or ():
+        if fold_giver_token(label) == folded_want:
+            return True
+    office = office_match_for(
+        None, want, quest_data=data, game=game,
+    )
+    if office is False:
+        return False
+    if office is True:
+        return True
+    return want_l in got or got in want_l
+
+
+def _match_when(character, when, event, payload, *, quest_id=None, game=None):
     """Return True if the step's complete_when matches this event."""
     kind = when.get("type")
     custom = _quest_predicates.get(kind)
@@ -1192,15 +1544,43 @@ def _match_when(character, when, event, payload):
     if kind == "any_of":
         for opt in when.get("options") or []:
             if isinstance(opt, dict) and _match_when(
-                character, opt, event, payload
+                character,
+                opt,
+                event,
+                payload,
+                quest_id=quest_id,
+                game=game,
             ):
                 return True
+        return False
+    state_check = event == "state_check"
+    if kind == "quest_flag" and state_check:
+        target_qid = when.get("quest")
+        flag_name = when.get("flag")
+        if not target_qid or not flag_name:
+            return False
+        ent = _entry(character, target_qid) or {}
+        flags = ent.get("flags") or {}
+        return bool(flags.get(flag_name))
+    if kind == "character_flag" and state_check:
+        flag_name = when.get("flag")
+        if not flag_name:
+            return False
+        return bool(getattr(character, flag_name, False))
+    if kind == "dialogue_done" and (state_check or event == "dialogue_done"):
+        tree_id = when.get("tree")
+        if not tree_id:
+            return False
+        progress = getattr(character, "dialogue_progress", None) or {}
+        tree_state = progress.get(tree_id) or {}
+        if isinstance(tree_state, dict):
+            return bool(tree_state.get("terminal"))
         return False
     if kind == "enter_room" and event == "enter_room":
         want = when.get("room")
         got = payload.get("room_key")
         rooms = when.get("rooms") or []
-        game = _game_from_character(character, payload)
+        game = game or _game_from_character(character, payload)
         if want and room_keys_match(game, want, got):
             return True
         for room_key in rooms:
@@ -1221,16 +1601,20 @@ def _match_when(character, when, event, payload):
             return bool(getattr(character, "true_form", False))
         return False
     if kind == "talk_npc" and event == "talk_npc":
-        want = (when.get("npc") or "").lower()
-        got = (payload.get("npc") or "").lower()
-        if not want:
-            return True
-        return want in got or got in want
+        return _payload_npc_matches(
+            when.get("npc"),
+            payload,
+            quest_id=quest_id,
+            game=game,
+        )
     if kind == "kill_tag" and event == "kill_tag":
         return bool(when.get("tag")) and when.get("tag") == payload.get("tag")
-    if kind == "flag" and event == "flag":
-        # payload may name quest_id; scan active.
+    if kind == "flag" and (event == "flag" or state_check):
         want = when.get("flag")
+        if state_check and quest_id:
+            ent = _entry(character, quest_id) or {}
+            flags = ent.get("flags") or {}
+            return bool(want and flags.get(want))
         for qid in active_quest_ids(character):
             entry = _entry(character, qid) or {}
             flags = entry.get("flags") or {}
@@ -1241,16 +1625,18 @@ def _match_when(character, when, event, payload):
         want = (when.get("item") or "").lower()
         got = (payload.get("item") or "").lower()
         return bool(want) and want in got
-    if kind == "has_item" and event in (
-        "talk_npc", "has_item", "verb", "enter_room", "buy", "gear",
+    if kind == "has_item" and (
+        state_check
+        or event in ("talk_npc", "has_item", "verb", "enter_room", "buy", "gear")
     ):
         return _inventory_has(character, when.get("item"))
     if kind == "give_item" and event in ("talk_npc", "give"):
         # ``talk_npc``: hand over while holding (consume from pack).
         # ``give``: ``cmd_give`` already transferred the item -- only match.
-        want_npc = (when.get("npc") or "").lower()
-        got = (payload.get("npc") or "").lower()
-        if want_npc and not (want_npc in got or got in want_npc):
+        want_npc = when.get("npc") or ""
+        if want_npc and not _payload_npc_matches(
+            want_npc, payload, quest_id=quest_id, game=game,
+        ):
             return False
         item = when.get("item")
         if event == "give":
@@ -1290,11 +1676,31 @@ def _match_when(character, when, event, payload):
     return False
 
 
+def _has_live_player_session(character):
+    """True when a real client rides this body (telnet, viewport, gm-off).
+
+    Idle fixture cast (Ash, Sergei) keep ``is_npc`` until occupied.
+    ``gm on`` parks the body as an Echo; autosave then stamps fixture
+    NPC flags. After ``gm off`` the Session is back but ``is_npc`` can
+    lag -- authored quests must still advance. SilentSession is Cadence
+    ``npc_do``, not a player.
+    """
+    from engine.npc_act import is_live_session
+
+    session = getattr(character, "session", None)
+    if not is_live_session(session):
+        return False
+    rider = getattr(session, "character", None)
+    return rider is None or rider is character
+
+
 def notify(character, event, **payload):
     """Try to advance any active quest whose current step matches `event`."""
     if character is None:
         return
-    if getattr(character, "is_npc", False):
+    if getattr(character, "is_npc", False) and not _has_live_player_session(
+        character,
+    ):
         return
     game = payload.get("game")
     for qid in list(active_quest_ids(character)):
@@ -1314,7 +1720,14 @@ def notify(character, event, **payload):
         if step is None:
             continue
         when = step.get("complete_when") or {}
-        if _match_when(character, when, event, payload):
+        if _match_when(
+            character,
+            when,
+            event,
+            payload,
+            quest_id=qid,
+            game=game,
+        ):
             _advance(character, qid, game=game)
 
 
@@ -1338,20 +1751,30 @@ def allows_talk(character, npc):
         return False
     for qid in active_quest_ids(character):
         data = loader_mod.get_quest(qid) or {}
-        if _npc_matches_giver(npc, data.get("giver_npc") or ""):
+        if _npc_matches_giver(
+            npc, data.get("giver_npc") or "", quest_data=data,
+        ):
             return True
         pin_map = data.get("pin_npcs") or {}
-        if any(_npc_matches_giver(npc, k) for k in pin_map):
+        if any(
+            _npc_matches_giver(npc, k, quest_data=data) for k in pin_map
+        ):
             return True
         lines = data.get("npc_lines") or {}
-        if any(_npc_matches_giver(npc, k) for k in lines):
+        if any(
+            _npc_matches_giver(npc, k, quest_data=data) for k in lines
+        ):
             return True
     room = getattr(character, "location", None)
     for data in list_offers_in_room(character, room):
-        if _npc_matches_giver(npc, data.get("giver_npc") or ""):
+        if _npc_matches_giver(
+            npc, data.get("giver_npc") or "", quest_data=data,
+        ):
             return True
         lines = data.get("npc_lines") or {}
-        if any(_npc_matches_giver(npc, k) for k in lines):
+        if any(
+            _npc_matches_giver(npc, k, quest_data=data) for k in lines
+        ):
             return True
     return False
 
@@ -1372,7 +1795,9 @@ def _giver_direct_offers(character, npc):
         if data.get("auto_start"):
             continue
         giver = data.get("giver_npc") or ""
-        if not giver or not _npc_matches_giver(npc, giver):
+        if not giver or not _npc_matches_giver(
+            npc, giver, quest_data=data,
+        ):
             continue
         entry = prog.get(qid) or {}
         if entry.get("status") in ("active", "done"):
@@ -1380,6 +1805,32 @@ def _giver_direct_offers(character, npc):
         out.append(data)
     out.sort(key=lambda d: d.get("id") or "")
     return out
+
+
+def _first_talk_briefing(data, lines, step, npc):
+    """Spoken briefing for a talk_* step that has no step:<id> line yet.
+
+    Catalog ``active`` is the come-back nag ("Still working it?"). First
+    talk on talk_sheriff / talk_bobby must not use that nag -- use
+    ``brief`` or the last intro line until the catalog grows a step key.
+    """
+    step_id = (step or {}).get("id") or ""
+    if not str(step_id).startswith("talk_"):
+        return None
+    when = (step or {}).get("complete_when") or {}
+    if (when.get("type") or "").lower() != "talk_npc":
+        return None
+    want = when.get("npc") or data.get("giver_npc") or ""
+    if want and not _npc_matches_giver(npc, want):
+        return None
+    if lines.get("brief"):
+        return lines["brief"]
+    intro = data.get("intro") or []
+    if isinstance(intro, list) and intro:
+        return intro[-1]
+    if isinstance(intro, str) and intro.strip():
+        return intro
+    return None
 
 
 def npc_talk_line(character, npc):
@@ -1396,9 +1847,13 @@ def npc_talk_line(character, npc):
     for qid in list(stale_active_quest_ids(character)):
         data = loader_mod.get_quest(qid) or {}
         giver = data.get("giver_npc") or ""
-        if not _npc_matches_giver(npc, giver):
+        if not _npc_matches_giver(
+            npc, giver, quest_data=data, game=game,
+        ):
             continue
-        lines = (data.get("npc_lines") or {}).get(giver) or {}
+        lines = _npc_lines_for(
+            npc, data.get("npc_lines") or {}, quest_data=data, game=game,
+        )
         done_line = lines.get("done")
         if close_stale_quest_with_giver(character, qid, game, npc, room):
             return done_line
@@ -1406,13 +1861,18 @@ def npc_talk_line(character, npc):
     # Active quest lines first.
     for qid in active_quest_ids(character):
         data = loader_mod.get_quest(qid) or {}
-        lines = _npc_lines_for(npc, data.get("npc_lines") or {})
+        lines = _npc_lines_for(
+            npc, data.get("npc_lines") or {}, quest_data=data, game=game,
+        )
         if not lines:
             continue
         step = current_step(character, qid)
         step_id = (step or {}).get("id")
         if step_id and lines.get(f"step:{step_id}"):
             return lines[f"step:{step_id}"]
+        briefing = _first_talk_briefing(data, lines, step, npc)
+        if briefing:
+            return briefing
         if lines.get("active"):
             return lines["active"]
     # Offer line -- talking directly to the giver ignores offer_rooms so a
@@ -1435,7 +1895,9 @@ def npc_talk_line(character, npc):
                 break
         if chosen is None:
             chosen = direct_offers[0]
-        lines = _npc_lines_for(npc, chosen.get("npc_lines") or {})
+        lines = _npc_lines_for(
+            npc, chosen.get("npc_lines") or {}, quest_data=chosen, game=game,
+        )
         if lines.get("offer"):
             return lines["offer"]
     # Done flavor -- optional skip (mission boards, etc.).
@@ -1446,7 +1908,9 @@ def npc_talk_line(character, npc):
         if (entry or {}).get("status") != "done":
             continue
         data = loader_mod.get_quest(qid) or {}
-        lines = _npc_lines_for(npc, data.get("npc_lines") or {})
+        lines = _npc_lines_for(
+            npc, data.get("npc_lines") or {}, quest_data=data, game=game,
+        )
         if lines.get("done"):
             return lines["done"]
     return None

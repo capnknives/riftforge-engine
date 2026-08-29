@@ -84,7 +84,7 @@ IDLE_SPECTATOR = frozenset({
     "score", "sc",
     "help", "commands", "changes",
     "wallet", "coins",
-    "idlemode", "idle", "autoidle",
+    "idlemode", "idle", "autoidle", "afk",
     "seek",
     # Sheet / vitals / examine
     "needs",
@@ -143,7 +143,7 @@ ASLEEP_BLOCK = frozenset({
     "look", "l", "examine", "exa", "ex",
     "say", "'", "emote", "em", "smote", "tell", "whisper", "reply", "r",
     "rest", "sleep", "sit", "stand", "lay",
-    "idlemode", "idle",
+    "idlemode", "idle", "afk",
 }) | IDLE_WAKE_MOVE | IDLE_WAKE_AGGRESSIVE
 
 ASLEEP_SPECTATOR = (IDLE_SPECTATOR - ASLEEP_BLOCK) | frozenset({
@@ -239,6 +239,8 @@ def dispatch(character, raw, game, *, force_actor=None):
             session = getattr(character, "session", None)
             if session is not None:
                 session.send("Smote what?")
+            from engine.viewport import finish_turn
+            finish_turn(session)
             return
         display_prefs.ensure_display_defaults(character)
         actor = force_actor or character
@@ -260,6 +262,8 @@ def dispatch(character, raw, game, *, force_actor=None):
             )
             if command_marks_character_dirty("smote", colon_body):
                 mark_character_dirty(game, actor)
+            from engine.viewport import finish_turn
+            finish_turn(getattr(character, "session", None))
 
     # D65: expand player aliases before parse (never shadows built-ins).
     display_prefs.ensure_display_defaults(character)
@@ -267,6 +271,8 @@ def dispatch(character, raw, game, *, force_actor=None):
 
     verb, args = parse(raw)            # unpack the (verb, args) tuple into two vars
     if not verb:                       # blank line -- do nothing
+        from engine.viewport import finish_turn
+        finish_turn(getattr(character, "session", None))
         return
 
     log_context.set_command_context(
@@ -298,6 +304,8 @@ def dispatch(character, raw, game, *, force_actor=None):
         )
         if command_marks_character_dirty(verb, args):
             mark_character_dirty(game, actor)
+        from engine.viewport import finish_turn
+        finish_turn(getattr(character, "session", None))
 
 
 def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
@@ -346,11 +354,14 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
             rite = cast_args.split(None, 1)[0].lower()
             _asleep_ok = rite in _ASLEEP_DREAM_CAST_RITES
     if asleep_blocks_world(character) and not _asleep_ok:
+        from engine.report_context import note_verb_gate
         if resolve_walk_direction(verb, getattr(character, "location", None)):
+            note_verb_gate(character, verb, "dispatch:asleep_move")
             character.session.send(
                 "You're asleep -- type 'wake' before you can move."
             )
             return
+        note_verb_gate(character, verb, "dispatch:asleep")
         character.session.send(ASLEEP_WORLD_CLOSED_MSG)
         return
 
@@ -359,19 +370,22 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
     # talk to staff / other players. gm mute is what closes those channels.
     _FROZEN_ALLOWED = frozenset({
         "help", "commands", "quit", "logout", "bug", "suggest",
-        "score", "sc", "ooc",
+        "score", "sc", "ooc", "replay",
         "rpseek", "rpwhere",
         "tell", "whisper", "reply", "r",
     })
     if getattr(character, "frozen", False) and verb not in _FROZEN_ALLOWED:
+        from engine.report_context import note_verb_gate
         if resolve_walk_direction(verb, getattr(character, "location", None)):
+            note_verb_gate(character, verb, "dispatch:frozen_move")
             character.session.send(
                 "You're frozen by staff -- you can't move."
             )
             return
+        note_verb_gate(character, verb, "dispatch:frozen")
         character.session.send(
             "You're frozen by staff. You can still use help, bug, "
-            "suggest, quit, ooc, rpseek, rpwhere, and tell."
+            "suggest, quit, ooc, replay, rpseek, rpwhere, and tell."
         )
         return
 
@@ -388,6 +402,8 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
         "say", "'", "emote", "em", "smote", "tell", "whisper", "reply", "r", "ooc",
     })
     if getattr(character, "muted", False) and verb in _MUTED_VERBS:
+        from engine.report_context import note_verb_gate
+        note_verb_gate(character, verb, "dispatch:gm_muted")
         character.session.send(
             "You're muted by staff -- you can't use that channel."
         )
@@ -395,6 +411,8 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
     try:
         from supers import archangel_powers as arch_powers_mod
         if arch_powers_mod.is_biokinesis_muted(character, game) and verb in _MUTED_VERBS:
+            from engine.report_context import note_verb_gate
+            note_verb_gate(character, verb, "dispatch:biokinesis_muted")
             character.session.send(
                 "Your voice is gone -- you can't use that channel. [MUTED]"
             )
@@ -445,6 +463,15 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
         ):
             hooks.cancel_rest(character)
 
+    # Conversation Tree numbered-menu capture. ALWAYS_ALLOWED verbs
+    # (look/help/quit/...) still fall through to normal dispatch so a
+    # player is never soft-locked inside a reply menu.
+    if getattr(actor, "_active_dialogue", None):
+        from engine.systems import dialogue as _dialogue_mod
+        if _dialogue_mod.try_handle_menu_input(actor, verb, args, game):
+            display_prefs.send_prompt(character, game)
+            return
+
     # Soft-but-strict authored quest gate (Family Business foyer, …).
     # Same layer as asleep/frozen -- not a pre-parser black hole.
     _quest_gate = None
@@ -474,11 +501,15 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
             pass
     walk_dir = resolve_walk_direction(verb, walk_room)
     if walk_dir is not None:
+        allowed = True
+        nudge = None
         if _quest_gate is not None:
             allowed, nudge = _quest_gate.pre_dispatch_allowed(
                 actor, verb, is_move=True,
             )
         if not allowed:
+            from engine.report_context import note_verb_gate
+            note_verb_gate(character, verb, "dispatch:quest_gate_move", detail=nudge)
             character.session.send(nudge)
             display_prefs.send_prompt(character, game)
             return
@@ -493,6 +524,8 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
             actor, verb, is_move=False,
         )
         if not allowed:
+            from engine.report_context import note_verb_gate
+            note_verb_gate(character, verb, "dispatch:quest_gate", detail=nudge)
             character.session.send(nudge)
             display_prefs.send_prompt(character, game)
             return
@@ -507,12 +540,16 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
     if entry:
         from engine import command_disable as _cmd_disable
         if _verb_disabled_for_actor(game, verb, actor):
+            from engine.report_context import note_verb_gate
+            note_verb_gate(character, verb, "dispatch:verb_disabled")
             character.session.send(
                 f"'{verb}' is temporarily disabled by staff."
             )
             display_prefs.send_prompt(character, game)
             return
         handler, _help_text = entry
+        from engine.viewport import note_dispatch
+        note_dispatch(getattr(character, "session", None), verb, handler)
         _twin_owner = hooks.pre_command_handler(actor, verb, game)
         def _run_handler():
             from engine import metrics as metrics_mod

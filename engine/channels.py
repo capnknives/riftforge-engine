@@ -41,6 +41,7 @@ AUDIENCE_HELPER = "helper"
 # format kinds for render + gateway export
 FORMAT_OOC = "ooc"
 FORMAT_QUESTIONS = "questions"
+FORMAT_ANSWERS = "answers"
 FORMAT_WIZNET = "wiznet"
 FORMAT_SAY = "say"
 FORMAT_TELL = "tell"
@@ -49,10 +50,11 @@ FORMAT_PLAIN = "plain"
 _VERB_RE = re.compile(r"^[a-z][a-z0-9_]{1,15}$")
 MAX_PLAYER_CHANNELS_PER_ACCOUNT = 3
 RESERVED_CHANNEL_VERBS = frozenset({
-    "say", "tell", "ooc", "questions", "answers", "wiznet", "emote", "who",
+    "say", "tell", "ooc", "questions", "question", "answers", "wiznet", "emote", "who",
     "help", "mute", "unmute", "mutes", "chans", "channel", "reply",
     "whisper", "block", "unblock", "blocks", "query", "queries",
     "querylist", "queryread", "querycomment", "queryclose",
+    "replay",
 })
 
 
@@ -90,6 +92,14 @@ def register_channel(spec: ChannelSpec) -> ChannelSpec:
     return spec
 
 
+def register_channel_verb_alias(name: str, alias: str) -> None:
+    """Let a second verb speak and replay the same channel (question -> questions)."""
+    key = (alias or "").strip().lower()
+    if not key or name not in _BUILTIN:
+        return
+    _VERB_INDEX[key] = name
+
+
 def get_channel(name: str) -> Optional[ChannelSpec]:
     return _BUILTIN.get(name)
 
@@ -125,10 +135,11 @@ def stitch_channel_for_command(text: str) -> Optional[str]:
     if not lower:
         return None
     # First token only — tolerate tabs / runs of spaces after the verb.
+    # lookup_verb also matches aliases (question -> questions).
     head = lower.split(None, 1)[0]
-    for spec in gateway_stitch_channels():
-        if head == spec.verb:
-            return spec.name
+    spec = lookup_verb(head)
+    if spec is not None and spec.gateway_stitch and spec.scope == SCOPE_GLOBAL:
+        return spec.name
     return None
 
 
@@ -428,7 +439,7 @@ def load_channel(conn, channel_name: str) -> list:
     if spec is None:
         return []
     raw = _load_json_list(conn, spec.meta_key, ring_max=spec.ring_max)
-    if spec.format in (FORMAT_OOC, FORMAT_QUESTIONS):
+    if spec.format in (FORMAT_OOC, FORMAT_QUESTIONS, FORMAT_ANSWERS):
         return _normalize_ooc_loaded(raw)
     if spec.format == FORMAT_WIZNET:
         return [line for line in raw if isinstance(line, str)]
@@ -441,7 +452,7 @@ def save_channel(conn, game, channel_name: str) -> None:
         return
     if spec.format == FORMAT_OOC:
         items = _serialize_ooc_ring(game)
-    elif spec.format == FORMAT_QUESTIONS:
+    elif spec.format in (FORMAT_QUESTIONS, FORMAT_ANSWERS):
         items = _serialize_ooc_ring(game, channel_name=channel_name)
     elif spec.format == FORMAT_WIZNET:
         items = _serialize_wiznet_ring(game)
@@ -759,6 +770,11 @@ def render_questions_entry(entry, viewer, game) -> str:
     return questions_channel.format_questions_history_entry(entry, viewer, game)
 
 
+def render_answers_entry(entry, viewer, game) -> str:
+    from engine import answers_channel
+    return answers_channel.format_answers_history_entry(entry, viewer, game)
+
+
 def replay_wiznet_entry(entry) -> str:
     from engine import style
     plain = entry if isinstance(entry, str) else str(entry)
@@ -873,8 +889,36 @@ def _should_hide_public_entry(viewer, game, entry) -> bool:
     return False
 
 
-def replay_global(character, game, channel_name: str) -> None:
-    """Bare-verb history replay for one global channel."""
+def parse_replay_index(args) -> int | None:
+    """Return a 1-based replay index when *args* is only digits."""
+    text = str(args or "").strip()
+    if not text.isdigit():
+        return None
+    n = int(text)
+    if n < 1:
+        return None
+    return n
+
+
+def resolve_global_channel(token: str):
+    """Match a global channel by name or verb, or None."""
+    key = str(token or "").strip().lower()
+    if not key:
+        return None
+    spec = get_channel(key)
+    if spec is None:
+        spec = lookup_verb(key)
+    if spec is None or spec.scope != SCOPE_GLOBAL:
+        return None
+    return spec
+
+
+def replay_global(character, game, channel_name: str, *, index: int | None = None) -> None:
+    """Bare-verb history replay for one global channel.
+
+    *index* is 1-based among lines this viewer can see (same order as a
+    full dump). None dumps the whole numbered ring.
+    """
     spec = get_channel(channel_name)
     session = getattr(character, "session", None)
     if spec is None or session is None:
@@ -885,7 +929,7 @@ def replay_global(character, game, channel_name: str) -> None:
     if is_empty(game, channel_name):
         send_empty_hint(character, channel_name)
         return
-    send_replay_header(character, channel_name)
+    visible = []
     for entry in entries(game, channel_name):
         if _should_hide_public_entry(character, game, entry):
             continue
@@ -893,12 +937,33 @@ def replay_global(character, game, channel_name: str) -> None:
             line = render_ooc_entry(entry, character, game)
         elif spec.format == FORMAT_QUESTIONS:
             line = render_questions_entry(entry, character, game)
+        elif spec.format == FORMAT_ANSWERS:
+            line = render_answers_entry(entry, character, game)
         elif spec.format == FORMAT_WIZNET:
             line = replay_wiznet_entry(entry)
         else:
             line = render_plain_entry(spec, entry, character, game)
         if line:
-            session.send(line)
+            visible.append(line)
+    if not visible:
+        send_empty_hint(character, channel_name)
+        return
+    verb = spec.verb or channel_name
+    if index is not None:
+        if index > len(visible):
+            session.send(
+                f"No {channel_name} line {index} "
+                f"(1-{len(visible)} in the current ring)."
+            )
+            return
+        session.send(f"{visible[index - 1]}")
+        session.send("")
+        return
+    session.send(
+        f"{spec.replay_header} Type replay {verb} <n> for one line."
+    )
+    for i, line in enumerate(visible, start=1):
+        session.send(f"  {i}. {line}")
     session.send("")
 
 
@@ -1073,6 +1138,29 @@ def export_gateway_plain_line(
                 face = questions_channel.speaker_face_for_character(speaker, game)
             return questions_channel.format_questions_line(face, message)
         return None
+    if channel_name == "answers":
+        from engine import answers_channel
+        if isinstance(entry, str):
+            return entry.strip() or None
+        if isinstance(entry, dict):
+            message = str(entry.get("message") or "").strip()
+            if not message:
+                return None
+            speaker_key = entry.get("speaker")
+            finder = getattr(game, "find_character", None)
+            speaker = (
+                finder(speaker_key) if callable(finder) and speaker_key else None
+            )
+            if speaker is None:
+                plain = entry.get("plain")
+                if isinstance(plain, str) and plain.strip():
+                    return plain.strip()
+                fallback = entry.get("face")
+                face = fallback if isinstance(fallback, str) and fallback else "?"
+            else:
+                face = answers_channel.speaker_face_for_character(speaker, game)
+            return answers_channel.format_answers_line(face, message)
+        return None
     if channel_name == "wiznet":
         if isinstance(entry, str) and entry.strip():
             return entry.strip()
@@ -1144,8 +1232,8 @@ register_channel(
         scope=SCOPE_GLOBAL,
         audience=AUDIENCE_ALL,
         replay_header="Recent questions (last 20):",
-        empty_message="No recent questions. Type 'questions <message>' to ask.",
-        usage_message="Usage: questions <message>  (bare questions replays history)",
+        empty_message="No recent questions. Type 'question <message>' (or questions) to ask.",
+        usage_message="Usage: question <message>  (bare question or questions replays history)",
         ring_max=DEFAULT_RING_MAX,
         builtin=True,
         gateway_stitch=True,
@@ -1155,6 +1243,7 @@ register_channel(
         title="Questions",
     )
 )
+register_channel_verb_alias("questions", "question")
 
 register_channel(
     ChannelSpec(
@@ -1170,7 +1259,7 @@ register_channel(
         ring_max=DEFAULT_RING_MAX,
         builtin=True,
         gateway_stitch=True,
-        format=FORMAT_PLAIN,
+        format=FORMAT_ANSWERS,
         prefix="((ANSWERS))",
         color_role="absinthe_green",
         title="Answers",

@@ -26,6 +26,10 @@ _VERB_DOMAINS = {
     "kill": ("combat",),
     "flee": ("combat",),
     "retreat": ("combat",),
+    "approach": ("combat",),
+    "rush": ("combat",),
+    "lunge": ("combat",),
+    "grapple": ("combat",),
     "spar": ("combat",),
     "sparaccept": ("combat",),
     "consider": ("combat",),
@@ -94,9 +98,11 @@ _VERB_DOMAINS = {
     "turnin": ("crime",),
     "payfine": ("crime",),
     "hotwire": ("crime", "vehicle_travel"),
+    "book": ("crime",),
+    "lockup": ("crime",),
     # Vessel
     "possess": ("vessel",),
-    "ride": ("vessel",),
+    "ride": ("vessel", "vehicle_travel"),
     "vacate": ("vessel",),
     "husk": ("vessel",),
     # Divinity
@@ -183,6 +189,20 @@ _VERB_DOMAINS = {
     "fillet": ("gathering",),
     "forage": ("gathering",),
     "craft": ("gathering",),
+    "chop": ("gathering",),
+    "skin": ("gathering",),
+    # Autoloot / corpse scoop
+    "autoloot": ("autoloot",),
+    "loot": ("autoloot",),
+    "scoop": ("autoloot",),
+    # Who / roster
+    "who": ("who_roster",),
+    "whofull": ("who_roster",),
+    # Help lookup
+    "help": ("help_lookup",),
+    # Changelog unread cursor
+    "changes": ("changelog",),
+    "unread": ("changelog",),
     # Stealth / veil overlay
     "hide": ("stealth",),
     "sneak": ("stealth",),

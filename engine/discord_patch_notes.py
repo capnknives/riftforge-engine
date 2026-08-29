@@ -1,136 +1,56 @@
-"""discord_patch_notes.py -- short player changelog summaries to Discord #patch-notes.
+"""discord_patch_notes.py -- short player changelog summaries to Discord #news.
 
-After auto-deploy syncs ``origin/main``, scan CHANGELOG.d fragments touched in
-the deploy range, pick **player-visible** bullets (same filter as in-game
-``changes`` for non-GMs), and post a brief list via ``discord_bridge`` tag
-``patch_notes``.
+Unposted **player-visible** ledger rows become **one** Discord message on
+``#news``, bullets joined with newlines, oldest lookup number first so the
+channel reads ``#N`` then ``#(N+1)`` on the next line (not a new post).
+Staff-only ``[ops]`` / heuristic bullets are skipped. Unset webhook/channel
+= silent no-op.
 
 Configure with ``DISCORD_BRIDGE_WEBHOOK_PATCH_NOTES`` or
-``DISCORD_BRIDGE_CHANNELS=...,patch_notes:CHANNEL_ID``.
+``DISCORD_BRIDGE_CHANNELS=...,patch_notes:NEWS_CHANNEL_ID``.
 
-Ops-only ``[ops]`` / heuristic staff bullets are skipped — public patch channel
-stays player-facing. Unset webhook/channel = silent no-op.
+Pending work is ``WHERE sequence='player' AND posted=0`` in
+``engine/changelog_ledger.py`` — no git diffing, no anchor SHA.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import subprocess
-from pathlib import Path
-
 from engine import changelog_audience
+from engine import changelog_ledger
 from engine import discord_bridge
 
-_STATE_NAME = ".discord_patch_notes_state.json"
 _BULLET_MAX = 180
+# Several ships that land together share one #news post (newlines, not
+# new messages). Sequential #N order is the list order inside that post.
 _MAX_BULLETS = 12
 _MAX_MESSAGE = 1900
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent
+def _repo_root_from_here() -> str:
+    import os
+
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def state_path(root=None) -> Path:
-    base = Path(root) if root is not None else _repo_root()
-    return base / _STATE_NAME
-
-
-def _load_state(root) -> dict:
-    path = state_path(root)
-    if not path.is_file():
-        return {}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return {}
-    return raw if isinstance(raw, dict) else {}
-
-
-def _save_state(root, payload: dict) -> None:
-    path = state_path(root)
-    path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-
-
-def _git(args, *, cwd):
-    out = subprocess.check_output(
-        ["git", *args],
-        cwd=cwd,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
-    return out.strip()
-
-
-def changelog_slugs_in_deploy(root, from_sha: str, to_sha: str) -> list[str]:
-    """Return ``CHANGELOG.d`` fragment slugs touched between two SHAs."""
-    root_s = str(root)
-    paths: list[str] = []
-    from_sha = (from_sha or "").strip()
-    to_sha = (to_sha or "").strip()
-    if not to_sha:
-        return []
-    try:
-        if from_sha and from_sha != to_sha:
-            from tools.apply_pr_fix import changed_files_between
-
-            paths = changed_files_between(from_sha, to_sha, cwd=root_s)
-        else:
-            from tools.apply_pr_fix import files_in_commit
-
-            paths = files_in_commit(to_sha, cwd=root_s)
-    except (subprocess.CalledProcessError, OSError):
-        return []
-
-    slugs: list[str] = []
-    prefix = "CHANGELOG.d/"
-    for rel in paths:
-        rel = rel.replace("\\", "/")
-        if not rel.startswith(prefix) or not rel.endswith(".md"):
-            continue
-        name = rel[len(prefix) :]
-        if name.lower() == "readme.md":
-            continue
-        slug = name[:-3]
-        if slug and slug not in slugs:
-            slugs.append(slug)
-    return slugs
-
-
-def _entries_for_slugs(root, slugs: list[str]) -> list[dict]:
-    """Load index rows matching fragment slugs (newest first)."""
+def _entries_for_unposted_slugs(root, slugs: set[str]) -> list[dict]:
+    """Load full prose/audience rows (from markdown) for these ledger slugs."""
     if not slugs:
         return []
-    from engine import changelog_index as changelog_index_mod
+    from engine.verbs.basic import _load_unreleased_entries
 
-    # Stamp then rebuild — ``ensure_compiled_index`` can keep a same-second
-    # compiled feed with ``id: 0`` after the game host just minted ``#N``.
-    stamp = getattr(changelog_index_mod, "stamp_pending_and_ensure_index", None)
-    if callable(stamp):
-        mint = False
-        should = getattr(changelog_index_mod, "should_mint_ids_on_boot", None)
-        if callable(should):
-            mint = bool(should())
-        stamp(str(root), mint_ids=mint)
-    else:
-        changelog_index_mod.ensure_compiled_index(str(root))
-    entries = changelog_index_mod.load_index_file(
-        changelog_index_mod.index_path(str(root))
-    )
-    if not entries:
-        return []
-    want = set(slugs)
-    matched = [row for row in entries if (row.get("slug") or "") in want]
+    entries = _load_unreleased_entries(root)
+    want = {changelog_ledger.canonical_fragment_slug(s) for s in slugs}
+    matched = [
+        row for row in entries
+        if changelog_ledger.canonical_fragment_slug(row.get("slug") or "") in want
+    ]
+    # Oldest lookup number first — Discord list order stays sequential.
     matched.sort(
         key=lambda row: (
+            int(row.get("id") or 0),
             row.get("sort_ts") or "",
             row.get("slug") or "",
         ),
-        reverse=True,
     )
     return matched
 
@@ -157,18 +77,17 @@ def player_visible_entries(entries: list[dict]) -> list[dict]:
 
 
 def format_patch_notes_message(entries: list[dict]) -> str:
-    """Build the Discord body for one deploy batch."""
+    """Build one Discord body: header, sequential bullets, one footer."""
     lines = ["**Patch notes** — what landed in-game:"]
     shown = entries[:_MAX_BULLETS]
-    first_id = 0
+    ids = []
     for entry in shown:
         summary = _short_player_summary(entry)
         if not summary:
             continue
         cid = int(entry.get("id") or 0)
         if cid:
-            if not first_id:
-                first_id = cid
+            ids.append(cid)
             lines.append(f"• #{cid} {summary} — type `changes {cid}` in-game")
         else:
             lines.append(f"• {summary}")
@@ -176,10 +95,16 @@ def format_patch_notes_message(entries: list[dict]) -> str:
     if extra > 0:
         lines.append(f"• …and {extra} more — type `changes` in-game for the full list.")
     lines.append("")
-    if first_id:
+    if len(ids) == 1:
+        cid = ids[0]
         lines.append(
-            f"In-game: type `changes {first_id}` for #{first_id}, "
+            f"In-game: type `changes {cid}` for #{cid}, "
             "or `changes` for the recent list."
+        )
+    elif ids:
+        lines.append(
+            "In-game: type `changes` for the recent list, "
+            "or `changes N` for a numbered ship."
         )
     else:
         lines.append("Full detail: connect and type `changes`.")
@@ -190,10 +115,11 @@ def format_patch_notes_message(entries: list[dict]) -> str:
 
 
 def schedule_patch_notes(entries: list[dict]) -> bool:
-    """Queue one #patch-notes post; return True when scheduled.
+    """Queue one #news post; return True when scheduled.
 
-    Never post a batch with no ``#N`` — that is the Discord footer
-    ``Full detail: connect and type changes`` with no lookup number.
+    Never post a batch with no ``#N`` — every row here comes straight from
+    the ledger, so this should never actually trip, but it stays as a
+    defensive guard against a malformed/legacy row.
     """
     numbered = [row for row in entries if int(row.get("id") or 0)]
     if not numbered:
@@ -202,169 +128,96 @@ def schedule_patch_notes(entries: list[dict]) -> bool:
     return discord_bridge.schedule_discord("patch_notes", body, kind=None)
 
 
-def _posted_slugs(state: dict) -> set[str]:
-    raw = state.get("posted_slugs") or []
-    return {str(item).strip() for item in raw if str(item).strip()}
+def pending_player_entries(root) -> list[dict]:
+    """Ledger rows not yet posted, enriched with prose/audience for display.
 
-
-def _bootstrap_anchor_sha(root, from_sha: str, to_sha: str, *, max_commits: int = 40) -> str:
-    """When nothing posted yet, scan recent history so late webhook ships catch up."""
-    from_s = (from_sha or "").strip()
-    to_s = (to_sha or "").strip()
-    if not to_s:
-        return from_s
-    if max_commits <= 0:
-        return from_s
-    try:
-        wide = _git(["rev-parse", f"{to_s}~{max_commits}"], cwd=str(root))
-    except (subprocess.CalledProcessError, OSError):
-        return from_s
-    wide = (wide or "").strip()
-    if not wide:
-        return from_s
-    if from_s and from_s != to_s:
-        # Keep whichever is earlier in history (more backfill).
-        try:
-            merge = _git(["merge-base", from_s, wide], cwd=str(root))
-            return (merge or wide).strip() or from_s
-        except (subprocess.CalledProcessError, OSError):
-            return wide
-    return wide
-
-
-def _scan_anchor_sha(state: dict, from_sha: str, to_sha: str, *, root=None) -> str:
-    """Start SHA for cumulative slug scan (backfills missed single-hop deploys)."""
-    anchor = (state.get("patch_notes_anchor_sha") or "").strip()
-    from_s = (from_sha or "").strip()
-    to_s = (to_sha or "").strip()
-    if not to_s:
-        return from_s or anchor
-    if anchor and anchor != to_s:
-        return anchor
-    if not _posted_slugs(state) and not anchor and root is not None:
-        return _bootstrap_anchor_sha(root, from_s, to_s)
-    return from_s or anchor
-
-
-def pending_player_entries(
-    root,
-    from_sha: str,
-    to_sha: str,
-    posted_slugs: set[str],
-) -> tuple[list[dict], list[str]]:
-    """Player-visible index rows in *from_sha*..*to_sha* not yet posted."""
-    slugs = changelog_slugs_in_deploy(root, from_sha, to_sha)
-    if not slugs:
-        return [], slugs
-    entries = _entries_for_slugs(root, slugs)
-    visible = player_visible_entries(entries)
-    new_entries = [
-        row for row in visible if (row.get("slug") or "") not in posted_slugs
-    ]
-    return new_entries, slugs
-
-
-def schedule_for_deploy(root, from_sha: str, to_sha: str) -> bool:
-    """Post summaries for CHANGELOG.d fragments once they have in-game ``#N``.
-
-    Same tip SHA may be scanned again: idle polls and copyover mint ids
-    after the first pass. Do not treat ``last_processed_sha`` as done
-    while unnumbered player bullets are still unposted.
+    Returned oldest-id-first so the combined Discord list reads ``#N`` then
+    ``#(N+1)`` on the next line.
     """
-    root_path = Path(root)
-    to_sha = (to_sha or "").strip()
-    if not to_sha:
-        return False
-
-    state = _load_state(root_path)
-    already = state.get("last_processed_sha") == to_sha
-    posted = _posted_slugs(state)
-    anchor = _scan_anchor_sha(state, from_sha, to_sha, root=root_path)
-    new_entries, slugs = pending_player_entries(
-        root_path,
-        anchor,
-        to_sha,
-        posted,
+    unposted = changelog_ledger.unposted_player_entries(root)
+    if not unposted:
+        return []
+    id_by_slug = {
+        changelog_ledger.canonical_fragment_slug(row["slug"]): int(row["id"])
+        for row in unposted
+        if row.get("slug")
+    }
+    slugs = set(id_by_slug)
+    entries = _entries_for_unposted_slugs(root, slugs)
+    for entry in entries:
+        slug = changelog_ledger.canonical_fragment_slug(entry.get("slug") or "")
+        if slug:
+            entry["slug"] = slug
+        if slug in id_by_slug:
+            entry["id"] = id_by_slug[slug]
+    visible = player_visible_entries(entries)
+    visible.sort(
+        key=lambda row: (int(row.get("id") or 0), row.get("slug") or ""),
     )
+    return visible
 
-    ready = [row for row in new_entries if int(row.get("id") or 0)]
-    waiting = [row for row in new_entries if not int(row.get("id") or 0)]
-    if waiting:
-        # Hold the whole batch until every player bullet has #N. Posting the
-        # numbered subset first taught Discord "type changes" with no number,
-        # then last_processed_sha blocked the retry after stamp.
-        if not already:
-            print(
-                f"[discord_patch_notes] waiting for changelog id stamp on "
-                f"{len(waiting)} bullet(s) — will retry after copyover "
-                f"or the next idle poll",
-                flush=True,
-            )
-            state["last_processed_sha"] = to_sha
-            state["posted_slugs"] = sorted(posted)
-            _save_state(root_path, state)
+
+def _next_fitting_chunk(entries: list[dict]) -> list[dict]:
+    """Take as many sequential bullets as fit in one Discord message."""
+    if not entries:
+        return []
+    chunk = entries[:_MAX_BULLETS]
+    while len(chunk) > 1 and len(format_patch_notes_message(chunk)) > _MAX_MESSAGE:
+        chunk = chunk[:-1]
+    return chunk
+
+
+def schedule_for_deploy(root, from_sha: str | None = None, to_sha: str | None = None) -> bool:
+    """Post unposted player rows as one #news message (newlines, oldest id first).
+
+    Several ships that land together share a single Discord post. Only split
+    into a second message when the batch would exceed Discord's size cap.
+    ``from_sha`` / ``to_sha`` are accepted (and ignored) so every existing
+    call site — auto-deploy after sync, idle polls, copyover retry — keeps
+    working unchanged; posting is driven by the ledger's ``posted`` column.
+    """
+    del from_sha, to_sha  # kept for call-site compatibility; ledger-driven now
+    ready = pending_player_entries(root)
+    if not ready:
         return False
 
-    if already and not ready:
-        return False
-
-    scheduled = False
-    if ready:
-        scheduled = schedule_patch_notes(ready)
-
-    state["last_processed_sha"] = to_sha
-
-    if scheduled:
-        for row in ready:
-            slug = (row.get("slug") or "").strip()
+    posted_slugs = []
+    n_posts = 0
+    remaining = list(ready)
+    while remaining:
+        chunk = _next_fitting_chunk(remaining)
+        if not chunk:
+            break
+        if not schedule_patch_notes(chunk):
+            break
+        n_posts += 1
+        for entry in chunk:
+            slug = changelog_ledger.canonical_fragment_slug(entry.get("slug") or "")
             if slug:
-                posted.add(slug)
-        state["posted_slugs"] = sorted(posted)
-        state["patch_notes_anchor_sha"] = to_sha
-        state["last_sha"] = to_sha
-        state["last_from_sha"] = anchor
-        state["slugs"] = slugs
+                posted_slugs.append(slug)
+        remaining = remaining[len(chunk) :]
+    if posted_slugs:
+        changelog_ledger.mark_posted(root, posted_slugs)
         print(
-            f"[discord_patch_notes] scheduled {len(ready)} player bullet(s) "
-            f"anchor={anchor[:12]} tip={to_sha[:12]}",
-            flush=True,
-        )
-    elif not new_entries:
-        state["posted_slugs"] = sorted(posted)
-        state["patch_notes_anchor_sha"] = to_sha
-        print(
-            f"[discord_patch_notes] nothing player-visible to post for "
-            f"{to_sha[:12]} (anchor={anchor[:12]})",
+            f"[discord_patch_notes] scheduled {len(posted_slugs)} player "
+            f"bullet(s) from ledger as {n_posts} Discord message(s)",
             flush=True,
         )
     else:
         print(
             f"[discord_patch_notes] post skipped (webhook/channel?) — "
-            f"{len(ready)} pending bullet(s) anchor={anchor[:12]}",
+            f"{len(ready)} pending bullet(s)",
             flush=True,
         )
-
-    _save_state(root_path, state)
-    return scheduled
+    return bool(posted_slugs)
 
 
 def retry_deferred_patch_notes(root=None) -> bool:
-    """Re-scan after copyover/idle stamp so Discord can post numbered bullets."""
-    root_path = Path(root) if root is not None else _repo_root()
-    state = _load_state(root_path)
-    to_sha = (state.get("last_processed_sha") or state.get("last_sha") or "").strip()
-    if not to_sha:
-        try:
-            to_sha = _git(["rev-parse", "HEAD"], cwd=str(root_path))
-        except (subprocess.CalledProcessError, OSError):
-            return False
-        to_sha = (to_sha or "").strip()
-    if not to_sha:
-        return False
-    from_sha = (state.get("patch_notes_anchor_sha") or "").strip()
-    return schedule_for_deploy(root_path, from_sha, to_sha)
+    """Re-scan the ledger for unposted rows (boot / copyover companion)."""
+    root_path = root if root is not None else _repo_root_from_here()
+    return schedule_for_deploy(root_path)
 
 
-def catch_up_patch_notes(root, from_sha: str, to_sha: str) -> bool:
-    """Manual/backfill entry: same as deploy hook (tools / one-shot live repair)."""
+def catch_up_patch_notes(root, from_sha: str | None = None, to_sha: str | None = None) -> bool:
+    """Manual/backfill entry: same as the deploy hook (tools / one-shot live repair)."""
     return schedule_for_deploy(root, from_sha, to_sha)
