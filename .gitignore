@@ -5,3 +5,12 @@ __pycache__/
 .game_heartbeat
 _public_engine_export/
 vehicle_parking.json
+.save_health.json
+bug_reports.log
+suggestions.log
+help_proposals.log
+player_queries.log
+player_social.log
+typos.log
+content/map_archives/
+content/map_backups/
