@@ -87,8 +87,19 @@ def asleep_blocks_world(character):
     ``commands.dispatch`` enforces this for typed input; ``cmd_look`` and
     other direct call sites must share the same gate (bug #210: vehicle
     leave / walk arrival auto-look bypassed dispatch).
+
+    Full-moon sleep-hunt is the Cadence exception: offline Echoes / NPCs
+    with ``sleep_hunting`` may still move and hunt via ``npc_do`` (SilentSession).
+    Live players must type ``wake`` first.
     """
-    return bool(getattr(character, "asleep", False))
+    if not getattr(character, "asleep", False):
+        return False
+    if getattr(character, "sleep_hunting", False):
+        from engine.npc_act import is_live_session
+
+        if not is_live_session(getattr(character, "session", None)):
+            return False
+    return True
 
 
 def send_asleep_world_closed(character):
@@ -106,6 +117,30 @@ def send_if_online(character, message):
     session = getattr(character, "session", None)
     if session is not None and hasattr(session, "send"):
         session.send(message)
+
+
+def require_here(character, *, tell=True, nowhere="You're nowhere."):
+    """Return the acting room, or None after an honest nowhere line.
+
+    Limbo (copyover stub, failed place, test double) used to crash any
+    verb that walked ``character.location.contents`` / ``.characters()``
+    or called ``.broadcast`` with no None check.
+    """
+    room = getattr(character, "location", None)
+    if room is None:
+        if tell:
+            send_if_online(character, nowhere)
+        return None
+    return room
+
+
+def broadcast_here(character, message, **kwargs):
+    """Room broadcast that no-ops when the actor has no room."""
+    room = getattr(character, "location", None)
+    if room is None or not message:
+        return False
+    room.broadcast(message, **kwargs)
+    return True
 
 
 def _log_hook_error(where, detail=None):
@@ -225,8 +260,15 @@ def _is_presence_hidden(viewer, other):
     if other is viewer:
         return False
     # Earth Veil layer -- death spirits, faded Ghosts, veiled Reapers, etc.
+    # Deal hellhounds are Prime-physical invisibles. If they were mis-layered
+    # onto the Veil, innate / glasses pierce still wins so Angels see them.
     if in_veil(other) and not veil_visible_to(viewer, other):
-        return True
+        hound_invis = bool(
+            getattr(other, "invisible", False)
+            or getattr(other, "hellhound_invisible", False)
+        )
+        if not (hound_invis and _can_see_hellhound(viewer, other)):
+            return True
     # Staff Cadence Echo while Session pilots GM form -- true invis.
     if getattr(other, "gm_away", False) and not _can_see_gm_away(viewer, other):
         return True
@@ -241,7 +283,17 @@ def _is_presence_hidden(viewer, other):
         from engine import hooks
         if not _is_gm(viewer) and not hooks.is_rpc_staff(viewer):
             return True
-    if getattr(other, "spirit", False) and not _can_see_spirit(viewer, other):
+    # Deal-pack hellhounds are physical dogs. A stray ``spirit`` stamp
+    # must not use death-spirit hide -- hellhound pierce below owns that.
+    pack_hound = bool(
+        getattr(other, "hellhound_invisible", False)
+        or getattr(other, "_hellhound_pack", False)
+    )
+    if (
+        getattr(other, "spirit", False)
+        and not pack_hound
+        and not _can_see_spirit(viewer, other)
+    ):
         return True
     if not _can_perceive_reaper(viewer, other):
         return True
@@ -266,6 +318,13 @@ def _is_presence_hidden(viewer, other):
     if getattr(other, "trickster_laying_low", False):
         from engine import hooks
         if not hooks.can_perceive_trickster_laylow(viewer, other):
+            return True
+    # Magi soul-carry hitchhike -- the passenger is inside the host's
+    # blood (Dean/Benny). Host and staff still see them; everyone else
+    # treats the body as gone from the room.
+    carrier = getattr(other, "soul_carrier_key", "") or ""
+    if carrier:
+        if getattr(viewer, "key", None) != carrier and not _is_gm(viewer):
             return True
     return False
 
@@ -502,23 +561,42 @@ def _strip_leading_article(name):
     return text
 
 
+# Singular stems that already end in ``s`` but still take ``-es``.
+_SINGULAR_ES_EXCEPTIONS = {
+    "glass": "glasses",
+}
+
+
 def _simple_english_plural(noun):
     """Cheap English plural for floor-item stacks (blade -> blades).
 
-    Pluralizes the last word of a multi-word name (``angel blade`` ->
-    ``angel blades``). Invariant plurals (``sweatpants``, ``sneakers``,
-    ``jeans``, ``shoes``) stay unchanged when already ending in ``s``.
-    Good enough for catalog keys; not a full inflection library
-    (stdlib-only).
+    Container phrases (``plate of sugar cookies``) pluralize the first
+    lowercase word only so stacks do not become ``cookieses``. Invariant
+    plurals (``sweatpants``, ``sneakers``, ``jeans``, ``shoes``) stay
+    unchanged when already ending in ``s``. Proper-noun heads such as
+    ``Men of Letters …`` skip the container rule. Good enough for
+    catalog keys; not a full inflection library (stdlib-only).
     """
     word = (noun or "").strip()
     if not word:
         return word
+    # ``plate of sugar cookies`` -> ``plates of sugar cookies``.
+    of_at = word.lower().find(" of ")
+    if of_at > 0:
+        head = word[:of_at]
+        rest = word[of_at:]
+        if " " not in head and head[:1].islower():
+            return _simple_english_plural(head) + rest
     # Multi-word: only inflect the last token.
     if " " in word:
         head, tail = word.rsplit(None, 1)
         return f"{head} {_simple_english_plural(tail)}"
     low = word.lower()
+    if low in _SINGULAR_ES_EXCEPTIONS:
+        suffix = _SINGULAR_ES_EXCEPTIONS[low]
+        if word[0].isupper():
+            return suffix[:1].upper() + suffix[1:]
+        return suffix
     # Singular stems that take -es (kiss, bus, church, box) — not bare -s
     # endings like pants/sneakers/shoes that are already plural-only.
     if low.endswith(("ss", "us", "is", "x", "z", "ch", "sh")):
@@ -909,6 +987,13 @@ def _move_one(character, direction, dest, game, auto_look=True):
         move_public_name, movement_hears_predicate, presence_face_for,
     )
     room = character.location
+    if room is None:
+        # HB-50: limbo actors cannot leave/arrive-broadcast. Refuse
+        # quietly so a follower pull or walk hop does not crash.
+        sess = getattr(character, "session", None)
+        if sess is not None:
+            sess.send("You're nowhere.")
+        return
     # True-invis: GM staff spirit, or the Cadence Echo left by gm on.
     stealth = bool(
         getattr(character, "gm_spirit", False)
@@ -1022,6 +1107,22 @@ def _move_one(character, direction, dest, game, auto_look=True):
     lag_watch.stamp_move_phase(game, "encounter", t_enc)
 
 
+def _would_create_follow_cycle(follower, leader):
+    """True when bonding follower -> leader would close a follow ring."""
+    seen = set()
+    cur = leader
+    while cur is not None:
+        key = getattr(cur, "key", None)
+        if key is not None:
+            if key in seen:
+                return True
+            seen.add(key)
+        if cur is follower:
+            return True
+        cur = getattr(cur, "following", None)
+    return False
+
+
 def start_following(follower, leader):
     """Bond `follower` to trail `leader` (Cadence-safe; no Session needed).
 
@@ -1033,6 +1134,8 @@ def start_following(follower, leader):
         return False
     if getattr(follower, "following", None) is leader:
         return True
+    if _would_create_follow_cycle(follower, leader):
+        return False
     stop_following(follower, silent=True)
     follower.following = leader
     followers = getattr(leader, "followers", None)
@@ -1199,7 +1302,11 @@ def _pull_followers(leader, origin, direction, game):
         from engine import group as group_mod
         group_mod.validate_group_colocation(leader, game)
     except Exception:
-        pass
+        # HB-56: a failed colocation check used to leave stragglers
+        # grouped across rooms with no log.
+        import traceback
+        print("[group] colocation check failed after follow-pull:", flush=True)
+        traceback.print_exc()
 
 
 _ITEM_NAME_TOKEN_SPLIT = re.compile(r"[^a-z0-9]+")
@@ -1281,6 +1388,60 @@ _BULK_ITEM_QUERY_RE = re.compile(
     r"^(all|\*|everything)(?:[.\s]+(.+))?$",
     re.IGNORECASE,
 )
+
+# Counted move: ``10 salt`` / bare ``10``. A dotted first token is an
+# ordinal (``2.pistol``), never a count.
+_QTY_ITEM_QUERY_RE = re.compile(r"^(\d+)\s+(.+)$")
+_QTY_ITEM_CAP = 200
+
+
+def parse_qty_item_query(query):
+    """Return ``(count, name_fragment)`` for counted put/get, else ``(None, query)``.
+
+    ``10 salt`` is ten matching items. Bare ``10`` is ten of whatever is
+    there (first rows in the bag or loose inventory). ``2.pistol`` stays
+    an ordinal -- the dotted first token is never treated as a count.
+    Caps at 200 so a typo cannot walk the whole catalog.
+    """
+    text = (query or "").strip()
+    if not text:
+        return None, text
+    first = text.split(None, 1)[0]
+    if "." in first:
+        return None, text
+    if text.isdigit():
+        n = int(text)
+        if n < 1:
+            return None, text
+        return min(n, _QTY_ITEM_CAP), ""
+    match = _QTY_ITEM_QUERY_RE.match(text)
+    if not match:
+        return None, text
+    n = int(match.group(1))
+    if n < 1:
+        return None, text
+    return min(n, _QTY_ITEM_CAP), match.group(2).strip()
+
+
+def format_item_tally(names):
+    """Condense repeated item keys: scrap, scrap, scrap -> scrap (x3).
+
+    Used on put/get/craft bulk tells so twenty identical pieces do not
+    print twenty times (suggestion report 324).
+    """
+    from collections import OrderedDict
+
+    counts = OrderedDict()
+    for raw in names:
+        key = (raw or "?").strip() or "?"
+        counts[key] = counts.get(key, 0) + 1
+    parts = []
+    for name, n in counts.items():
+        if n > 1:
+            parts.append(f"{name} (x{n})")
+        else:
+            parts.append(name)
+    return ", ".join(parts)
 
 
 def parse_bulk_item_query(query):
@@ -1397,6 +1558,104 @@ def _find_carried_item_prefer_locked(character, query):
     return None, None
 
 
+def _open_container_rank(item):
+    """Sort key for ``open``: picked lockboxes before sealed ones (bug report 1057).
+
+    When several strongboxes match the same keyword, ``lockpick`` may unlock
+    one row while ``open`` used to prefer another still-locked copy and print
+    "force open" even though the player just picked a lock. Prefer an unlocked
+    box that still carries loot (picked, ready to open), then locked boxes
+    (force-open framing), then legacy flavor rows with no loot yet (bug
+    report 21).
+    """
+    from world import Item
+
+    if not isinstance(item, Item):
+        return 3
+    loot = getattr(item, "loot", None)
+    has_loot = bool(loot)
+    locked = bool(getattr(item, "locked", False))
+    if not locked and has_loot:
+        return 0
+    if locked and has_loot:
+        return 1
+    if not locked and not has_loot:
+        return 2
+    return 3
+
+
+def _find_item_for_open(query, items, character=None):
+    """Like ``_find_item``, but when several keys match prefer a picked
+    lockbox (unlocked + loot) over a still-sealed duplicate."""
+    from engine.char_identity import parse_target_ordinal, pick_ordinal
+
+    ordinal, rest = parse_target_ordinal(query)
+    needle = rest if rest else (query or "")
+    matches = _collect_item_matches(needle, items)
+    if not matches:
+        return None
+    if ordinal is not None:
+        return pick_ordinal(matches, ordinal)
+    if len(matches) > 1:
+        if character is not None:
+            from engine import hooks
+
+            matches = sorted(
+                matches,
+                key=lambda item: (
+                    _open_container_rank(item),
+                    hooks.inventory_item_match_rank(character, item),
+                ),
+            )
+        else:
+            matches = sorted(matches, key=_open_container_rank)
+    return matches[0]
+
+
+def _find_carried_item_for_open(character, query):
+    """Return ``(item, holder)`` for ``cmd_open`` container targeting.
+
+    Same search order as ``_find_carried_item_prefer_locked`` (inventory,
+    worn loot bags, gear bag) but prefers an unlocked strongbox the player
+    just picked over a still-locked duplicate in another pocket.
+    """
+    from world import Item
+    from engine.systems import containers as containers_mod
+
+    if character is None:
+        return None, None
+
+    def _pick(items, holder):
+        found = _find_item_for_open(query, items, character=character)
+        if found is not None:
+            return found, holder
+        return None, None
+
+    inv = getattr(character, "inventory", None) or []
+    inv_items = [obj for obj in inv if isinstance(obj, Item)]
+    item, holder = _pick(inv_items, inv)
+    if item is not None:
+        return item, holder
+
+    for bag in containers_mod.worn_bags(character):
+        contents = containers_mod.bag_contents(bag)
+        nested = [obj for obj in contents if isinstance(obj, Item)]
+        item, holder = _pick(nested, contents)
+        if item is not None:
+            return item, holder
+
+    from engine import hooks
+
+    gear = hooks.containers_ensure_gear_bag(character)
+    if gear:
+        nested = [obj for obj in gear if isinstance(obj, Item)]
+        item, holder = _pick(nested, gear)
+        if item is not None:
+            return item, holder
+
+    return None, None
+
+
 # Classic MUD self-target tokens -- never search the world for these names.
 SELF_NAME_ALIASES = frozenset({"me", "self", "myself"})
 
@@ -1436,6 +1695,35 @@ def is_linked_self(actor, other):
     return False
 
 
+def _viewport_staff_body_pref(game, query):
+    """Prefer the Ash viewport play body over world ``Ash`` name collisions.
+
+    Crashgate viewport opens as staff account Ash while the corporeal play
+    body may be a random hunter key (not ``Ash``). ``gm force Ash`` must not
+    hit immersion cast ``Ash Riley`` when the viewport harness is active.
+    """
+    raw = (query or "").strip()
+    if not raw or game is None:
+        return None
+    hub = getattr(game, "viewport_hub", None)
+    session = getattr(hub, "session", None) if hub is not None else None
+    if session is None or not getattr(session, "alive", True):
+        return None
+    staff = (getattr(session, "staff_account", None) or "").strip()
+    if not staff:
+        return None
+    low = raw.lower()
+    if low not in (staff.lower(), "ash"):
+        return None
+    char = getattr(session, "character", None)
+    if char is None:
+        return None
+    body = getattr(char, "gm_mode_body", None)
+    if body is not None:
+        return body
+    return char
+
+
 def resolve_gm_target_character(game, query):
     """Resolve a staff target token to a Character world-wide.
 
@@ -1446,6 +1734,7 @@ def resolve_gm_target_character(game, query):
     offline).
 
     Resolution order:
+      0. Active Ash viewport staff token (``Ash`` / ``staff_account``)
       1. ``game.find_character`` -- keys, faces, NPCs, Echoes, ordinals
       2. ``find_login_character`` -- bare roster keys / unique given names
       3. Account name → online session character on that account
@@ -1454,6 +1743,10 @@ def resolve_gm_target_character(game, query):
     raw = (query or "").strip()
     if not raw or game is None:
         return None
+
+    pref = _viewport_staff_body_pref(game, raw)
+    if pref is not None:
+        return pref
 
     char = game.find_character(raw)
     if char is not None:
@@ -1976,6 +2269,11 @@ DIRECTIONS = {
     "up": "up",       "u": "up",
     "down": "down",   "d": "down",
 }
+# Atlas / overland / demesne grids: n/s/e/w plus ne/nw/se/sw. Not up/down.
+COMPASS_STEPS = frozenset({
+    "north", "south", "east", "west",
+    "northeast", "northwest", "southeast", "southwest",
+})
 # Opposite exit for gait arrive lines ("glides in from the west").
 # Street-address / apartment doors are absent -> arrive says "… in.".
 # Keep aligned with supers/map_store.OPPOSITE (cardinals + diagonals +
@@ -2003,6 +2301,27 @@ for _apt_floor, _apt_letter in (("a", "A"), ("b", "B"), ("c", "C")):
         _apt_exit = f"{_apt_floor}{_apt_n}"
         DIRECTIONS[_apt_exit] = _apt_exit
 del _apt_floor, _apt_letter, _apt_n, _apt_exit
+
+
+def resolve_compass_step(raw):
+    """Canonical n/s/e/w/ne/nw/se/sw, or None.
+
+    Accepts short tokens (``ne``), full words (``northeast``), and spaced
+    pairs (``north east`` / ``n e``). Used by ``walk ne`` / ``drive sw``
+    on atlas and other coord grids so those verbs do not treat the
+    compass as a place name.
+    """
+    text = " ".join(str(raw or "").strip().lower().split())
+    if not text:
+        return None
+    if text in DIRECTIONS:
+        canon = DIRECTIONS[text]
+        return canon if canon in COMPASS_STEPS else None
+    compact = text.replace(" ", "").replace("-", "")
+    if compact in DIRECTIONS:
+        canon = DIRECTIONS[compact]
+        return canon if canon in COMPASS_STEPS else None
+    return None
 
 
 def resolve_walk_direction(verb, room=None):

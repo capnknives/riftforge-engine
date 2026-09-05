@@ -56,10 +56,15 @@ def format_account_status(game, account, viewer, *, screenreader=False, width=52
         body.append(style.paint("muted", "  ── contributions ──"))
     else:
         body.append("Contributions:")
+    spent = int(getattr(account, "chargen_spent", 0) or 0)
+    left = accounts_mod.available_chargen_points(account)
+    points_line = (
+        f"  Account points: {points} earned / {spent} spent / {left} left"
+    )
     body.append(
-        style.paint("soft_crimson", f"  Account points: {points}")
+        style.paint("soft_crimson", points_line)
         if not sr
-        else f"Account points: {points}."
+        else f"Account points: {points} earned / {spent} spent / {left} left."
     )
     body.append(f"  Bugs squashed: {bugs}")
     body.append(f"  Ideas shipped: {ideas}")

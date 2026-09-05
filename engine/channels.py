@@ -152,6 +152,8 @@ def init_game(game) -> None:
     """Attach empty ring deques for every global channel on ``game``."""
     if not hasattr(game, "_room_say_rings") or game._room_say_rings is None:
         game._room_say_rings = {}
+    if not hasattr(game, "_room_emote_rings") or game._room_emote_rings is None:
+        game._room_emote_rings = {}
     for spec in _BUILTIN.values():
         if spec.scope != SCOPE_GLOBAL:
             continue
@@ -175,6 +177,26 @@ def room_say_ring(game, room) -> deque:
     if rings is None:
         game._room_say_rings = {}
         rings = game._room_say_rings
+    key = getattr(room, "key", None) or id(room)
+    buf = rings.get(key)
+    if buf is None:
+        buf = deque(maxlen=DEFAULT_RING_MAX)
+        rings[key] = buf
+    return buf
+
+
+def room_emote_ring(game, room) -> deque:
+    """Last-N emote/smote poses for one room (keyed by room.key).
+
+    Stores structured dicts ``{speaker, raw, mode}`` so replay can
+    re-render ``@name`` tokens for the viewer, matching live emote.
+    """
+    if game is None or room is None:
+        return deque(maxlen=DEFAULT_RING_MAX)
+    rings = getattr(game, "_room_emote_rings", None)
+    if rings is None:
+        game._room_emote_rings = {}
+        rings = game._room_emote_rings
     key = getattr(room, "key", None) or id(room)
     buf = rings.get(key)
     if buf is None:
@@ -216,6 +238,18 @@ def character_tell_ring(character, game=None) -> deque:
     if buf is None:
         buf = deque(maxlen=DEFAULT_RING_MAX)
         owner.tell_history = buf
+    return buf
+
+
+def character_ooctell_ring(character, game=None) -> deque:
+    """Per-character OOC tell history (separate from IC tells)."""
+    owner = _tell_history_owner(character, game)
+    if owner is None:
+        return deque(maxlen=DEFAULT_RING_MAX)
+    buf = getattr(owner, "ooctell_history", None)
+    if buf is None:
+        buf = deque(maxlen=DEFAULT_RING_MAX)
+        owner.ooctell_history = buf
     return buf
 
 
@@ -303,6 +337,27 @@ def append(
         _schedule_gateway_mirror(game, channel_name, plain)
 
 
+def append_room_emote(game, room, entry) -> None:
+    """Append one room emote ring entry (structured dict or legacy plain str)."""
+    if entry is None or room is None:
+        return
+    if isinstance(entry, str):
+        text = entry.strip()
+        if not text:
+            return
+        room_emote_ring(game, room).append(text)
+        return
+    if isinstance(entry, dict):
+        raw = str(entry.get("raw") or "").strip()
+        if not raw:
+            return
+        room_emote_ring(game, room).append(entry)
+        return
+    text = str(entry).strip()
+    if text:
+        room_emote_ring(game, room).append(text)
+
+
 def append_room_say(game, room, entry) -> None:
     """Append one room say ring entry (structured dict or legacy plain str)."""
     if entry is None or room is None:
@@ -358,6 +413,40 @@ def append_tell(session, entry, *, game=None) -> None:
     session_tell_ring(session, game).append(text)
 
 
+def append_ooctell(session, entry, *, game=None) -> None:
+    """Append one OOC tell history entry (structured dict or legacy plain str)."""
+    if entry is None or session is None:
+        return
+    if isinstance(entry, str):
+        text = entry.strip()
+        if not text:
+            return
+        char = getattr(session, "character", None)
+        if char is not None:
+            character_ooctell_ring(char, game).append(text)
+            return
+        buf = getattr(session, "ooctell_history", None)
+        if buf is None:
+            buf = deque(maxlen=DEFAULT_RING_MAX)
+            session.ooctell_history = buf
+        buf.append(text)
+        return
+    if isinstance(entry, dict):
+        message = str(entry.get("message") or "").strip()
+        if not message:
+            return
+        char = getattr(session, "character", None)
+        if char is not None:
+            character_ooctell_ring(char, game).append(entry)
+            return
+        buf = getattr(session, "ooctell_history", None)
+        if buf is None:
+            buf = deque(maxlen=DEFAULT_RING_MAX)
+            session.ooctell_history = buf
+        buf.append(entry)
+        return
+
+
 def is_empty(game, channel_name: str) -> bool:
     history = ring(game, channel_name)
     return not history
@@ -397,25 +486,29 @@ def _save_json_list(conn, meta_key: str, items: list, *, ring_max: int) -> None:
         )
 
 
+def _ooc_ring_entry_persistable(item) -> bool:
+    """True when one OOC/questions/answers ring row should survive save/load."""
+    if isinstance(item, str):
+        return bool(item.strip())
+    if isinstance(item, dict):
+        if str(item.get("message") or "").strip():
+            return True
+        plain = item.get("plain")
+        return isinstance(plain, str) and bool(plain.strip())
+    return False
+
+
 def _normalize_ooc_loaded(data: list) -> list:
     entries = []
     for item in data:
-        if isinstance(item, str):
-            entries.append(item)
-        elif isinstance(item, dict) and item.get("speaker"):
+        if _ooc_ring_entry_persistable(item):
             entries.append(item)
     return entries
 
 
 def _serialize_ooc_ring(game, *, channel_name: str = "ooc") -> list:
     history = ring(game, channel_name) or []
-    entries = []
-    for item in history:
-        if isinstance(item, str):
-            entries.append(item)
-        elif isinstance(item, dict) and item.get("speaker"):
-            entries.append(item)
-    return entries
+    return [item for item in history if _ooc_ring_entry_persistable(item)]
 
 
 def _serialize_wiznet_ring(game) -> list:
@@ -842,6 +935,31 @@ def render_tell_entry(entry, viewer) -> str:
     return plain
 
 
+def render_ooctell_entry(entry, viewer) -> str:
+    """Render one OOC tell history entry for *viewer*."""
+    from engine import display_prefs
+
+    if isinstance(entry, str):
+        return entry
+    if not isinstance(entry, dict):
+        return str(entry or "")
+    message = str(entry.get("message") or "").strip()
+    if not message:
+        return ""
+    peer = str(entry.get("peer") or "?")
+    kind = str(entry.get("kind") or "")
+    if kind == "out":
+        return display_prefs.format_ooctell_chat(
+            viewer, outgoing=True, peer_face=peer, message=message,
+        )
+    if kind == "in":
+        return display_prefs.format_ooctell_chat(
+            viewer, outgoing=False, peer_face=peer, message=message,
+        )
+    plain = str(entry.get("plain") or "").strip()
+    return plain
+
+
 def render_plain_entry(spec: ChannelSpec, entry, viewer, game=None) -> str:
     from engine import display_prefs
     from engine import style
@@ -984,6 +1102,53 @@ def replay_room_say(character, game) -> None:
     session.send("")
 
 
+def replay_room_emote(character, game) -> None:
+    """Bare ``emote`` / ``smote``: replay last poses in this room."""
+    session = getattr(character, "session", None)
+    room = getattr(character, "location", None)
+    if session is None or room is None:
+        return
+    buf = room_emote_ring(game, room)
+    if not buf:
+        session.send("No recent poses here. Type 'emote <action>' to pose.")
+        return
+    session.send(f"Recent poses here (last {DEFAULT_RING_MAX}):")
+    from engine.rp_emote import format_emote_line
+
+    for entry in buf:
+        if isinstance(entry, str):
+            text = entry.strip()
+            if text:
+                session.send(text)
+            continue
+        if not isinstance(entry, dict):
+            continue
+        raw = str(entry.get("raw") or "").strip()
+        if not raw:
+            continue
+        mode = str(entry.get("mode") or "emote")
+        speaker_key = str(entry.get("speaker") or "")
+        speaker = None
+        if speaker_key:
+            for who in room.characters():
+                if getattr(who, "key", None) == speaker_key:
+                    speaker = who
+                    break
+            if speaker is None:
+                finder = getattr(game, "find_character", None)
+                if callable(finder):
+                    speaker = finder(speaker_key)
+        if speaker is None:
+            # Speaker left; still show a third-person fallback.
+            name = speaker_key or "Someone"
+            session.send(f"{name} {raw}")
+            continue
+        line = format_emote_line(speaker, raw, character, game, mode=mode)
+        if line:
+            session.send(line)
+    session.send("")
+
+
 def replay_tells(character, game=None) -> None:
     session = getattr(character, "session", None)
     if session is None:
@@ -995,6 +1160,25 @@ def replay_tells(character, game=None) -> None:
     session.send(f"Recent tells (last {DEFAULT_RING_MAX}):")
     for entry in buf:
         line = render_tell_entry(entry, character)
+        if line:
+            session.send(line)
+    session.send("")
+
+
+def replay_ooctells(character, game=None) -> None:
+    """Bare ``ooctell`` -- replay recent private OOC tells."""
+    session = getattr(character, "session", None)
+    if session is None:
+        return
+    buf = character_ooctell_ring(character, game)
+    if not buf:
+        session.send(
+            "No recent OOC tells. Type 'ooctell <name> <message>' to whisper."
+        )
+        return
+    session.send(f"Recent OOC tells (last {DEFAULT_RING_MAX}):")
+    for entry in buf:
+        line = render_ooctell_entry(entry, character)
         if line:
             session.send(line)
     session.send("")
@@ -1078,8 +1262,9 @@ def cmd_dynamic_channel(character, args: str, game, *, verb: str) -> None:
     if not text:
         replay_global(character, game, spec.name)
         return
-    from command_support import _presence_face
-    face = _presence_face(character)
+    from engine import ooc_channel
+
+    face = ooc_channel.speaker_face_for_character(character, game)
     speak_custom_global(game, spec, character, text, speaker_face=face)
 
 
@@ -1184,6 +1369,300 @@ def export_gateway_snapshot(game) -> dict[str, list[str]]:
                 lines.append(plain)
         out[spec.name] = lines
     return out
+
+
+# Plain lines the gateway stitch buffer uses while game IPC is down (copyover).
+_OOC_PLAIN_RE = re.compile(
+    r"^\(\(OOC\)\)(?: \[AUTHOR\])? \[(?P<face>[^\]]+)\]: (?P<message>.*)$",
+    re.DOTALL,
+)
+_QUESTIONS_PLAIN_RE = re.compile(
+    r"^\(\(QUESTIONS\)\) \[(?P<face>[^\]]+)\]: (?P<message>.*)$",
+    re.DOTALL,
+)
+_ANSWERS_PLAIN_RE = re.compile(
+    r"^\(\(ANSWERS\)\) \[(?P<face>[^\]]+)\]: (?P<message>.*)$",
+    re.DOTALL,
+)
+_WIZNET_PLAIN_RE = re.compile(
+    r"^\[WIZ\] (?P<face>[^:]+): (?P<message>.*)$",
+    re.DOTALL,
+)
+
+
+def parse_gateway_plain_entry(channel_name: str, plain: str) -> Any:
+    """Rebuild one structured ring entry from a gateway stitch plain line."""
+    from engine import ooc_channel
+
+    text = (plain or "").strip()
+    if not text:
+        return None
+    if channel_name == "ooc":
+        match = _OOC_PLAIN_RE.match(text)
+        if not match:
+            return text
+        face = match.group("face")
+        message = match.group("message")
+        kind = (
+            ooc_channel.OOC_KIND_AUTHOR_NUDGE
+            if "[AUTHOR]" in text[:40]
+            else ooc_channel.OOC_KIND_NORMAL
+        )
+        entry: dict[str, Any] = {
+            "speaker": None,
+            "message": message,
+            "face": face,
+            "plain": text,
+        }
+        if kind != ooc_channel.OOC_KIND_NORMAL:
+            entry["kind"] = kind
+        return entry
+    if channel_name == "questions":
+        match = _QUESTIONS_PLAIN_RE.match(text)
+        if not match:
+            return text
+        return {
+            "speaker": None,
+            "message": match.group("message"),
+            "face": match.group("face"),
+            "plain": text,
+        }
+    if channel_name == "answers":
+        match = _ANSWERS_PLAIN_RE.match(text)
+        if not match:
+            return text
+        return {
+            "speaker": None,
+            "message": match.group("message"),
+            "face": match.group("face"),
+            "plain": text,
+        }
+    if channel_name == "wiznet":
+        return text
+    return text
+
+
+def gateway_plain_comm_payload(channel_name: str, plain: str) -> Optional[dict[str, str]]:
+    """Build ``Comm.Channel`` GMCP body from one gateway stitch plain line.
+
+    Gateway stitch relays only ship ``op:text`` today; browser HUD comm panes
+    listen for GMCP ``Comm.Channel`` (same shape as live ``deliver_comm``).
+    """
+    text = (plain or "").strip()
+    if not text:
+        return None
+    spec = get_channel(channel_name)
+    chan = (spec.verb if spec is not None else channel_name) or channel_name
+    if channel_name == "wiznet":
+        match = _WIZNET_PLAIN_RE.match(text)
+        if not match:
+            return None
+        return {
+            "chan": "wiznet",
+            "player": match.group("face").strip(),
+            "msg": match.group("message"),
+        }
+    entry = parse_gateway_plain_entry(channel_name, text)
+    if isinstance(entry, dict):
+        face = str(entry.get("face") or "?").strip() or "?"
+        message = str(entry.get("message") or "").strip()
+        if not message:
+            return None
+        return {"chan": chan, "player": face, "msg": message}
+    return None
+
+
+def _record_gateway_transcript(
+    channel_name: str, entry: Any, plain: str, game,
+) -> None:
+    """Append one imported stitch line to staff mining logs when applicable."""
+    try:
+        from engine import channel_transcript
+    except Exception:
+        return
+    if channel_name not in channel_transcript._FILES:
+        return
+    face = "?"
+    message = ""
+    extra = None
+    if isinstance(entry, dict):
+        face = str(entry.get("face") or "?").strip() or "?"
+        message = str(entry.get("message") or "").strip()
+        kind = entry.get("kind")
+        if kind:
+            extra = {"kind": kind}
+    elif isinstance(entry, str):
+        message = entry.strip()
+        if channel_name == "wiznet" and message.startswith("[WIZ] "):
+            body = message[6:]
+            if ": " in body:
+                face, message = body.split(": ", 1)
+    if not message:
+        return
+    try:
+        channel_transcript.record(
+            channel_name,
+            face=face,
+            message=message,
+            game=game,
+            extra=extra,
+        )
+    except Exception:
+        pass
+
+
+def _stitch_dedupe_keys(channel_name: str, plain: str) -> set[str]:
+    """Dedupe keys for gateway stitch plain lines (full plain + message body)."""
+    text = (plain or "").strip()
+    if not text:
+        return set()
+    keys = {text}
+    # Wiznet rings store plain staff lines only. Never dedupe by message body
+    # alone or reuse old ring rows during replace -- that resurrected an
+    # ancient line as the latest replay entry after copyover (bug 1072).
+    if channel_name == "wiznet":
+        match = _WIZNET_PLAIN_RE.match(text)
+        if match:
+            face = match.group("face").strip()
+            message = match.group("message").strip()
+            if face and message:
+                keys.add(f"face:{face}\0{message}")
+        return keys
+    entry = parse_gateway_plain_entry(channel_name, text)
+    if isinstance(entry, dict):
+        message = str(entry.get("message") or "").strip()
+        if message:
+            keys.add(f"msg:{message}")
+            face = str(entry.get("face") or "").strip()
+            if face:
+                keys.add(f"face:{face}\0{message}")
+    elif isinstance(entry, str) and entry.strip():
+        keys.add(entry.strip())
+    return keys
+
+
+def _entry_for_gateway_plain(
+    channel_name: str,
+    plain: str,
+    existing_by_key: dict[str, Any],
+) -> Any | None:
+    """Reuse a structured ring row when gateway plain matches an existing line."""
+    text = (plain or "").strip()
+    if not text:
+        return None
+    if channel_name == "wiznet":
+        return text
+    for key in _stitch_dedupe_keys(channel_name, text):
+        entry = existing_by_key.get(key)
+        if entry is not None:
+            return entry
+    return parse_gateway_plain_entry(channel_name, text)
+
+
+def replace_ring_from_gateway_lines(
+    game, channel_name: str, plain_lines: list,
+) -> int:
+    """Rebuild one global ring from the gateway merged stitch buffer."""
+    spec = get_channel(channel_name)
+    if spec is None or spec.scope != SCOPE_GLOBAL:
+        return 0
+    history = ring(game, channel_name)
+    if history is None:
+        return 0
+    existing_by_key: dict[str, Any] = {}
+    for entry in entries(game, channel_name):
+        plain = export_gateway_plain_line(channel_name, entry, game)
+        if not plain:
+            continue
+        for key in _stitch_dedupe_keys(channel_name, plain.strip()):
+            existing_by_key.setdefault(key, entry)
+    rebuilt: list[Any] = []
+    seen_keys: set[str] = set()
+    for raw in plain_lines or []:
+        text = (raw or "").strip() if isinstance(raw, str) else ""
+        if not text:
+            continue
+        dedupe_keys = _stitch_dedupe_keys(channel_name, text)
+        if dedupe_keys & seen_keys:
+            continue
+        entry = _entry_for_gateway_plain(channel_name, text, existing_by_key)
+        if entry is None:
+            continue
+        rebuilt.append(entry)
+        seen_keys.update(dedupe_keys)
+    ring_max = max(1, int(spec.ring_max or DEFAULT_RING_MAX))
+    if len(rebuilt) > ring_max:
+        rebuilt = rebuilt[-ring_max:]
+    before_plain: set[str] = set()
+    for entry in entries(game, channel_name):
+        plain = export_gateway_plain_line(channel_name, entry, game)
+        if plain:
+            before_plain.add(plain.strip())
+    history.clear()
+    for entry in rebuilt:
+        history.append(entry)
+    imported = 0
+    for entry in rebuilt:
+        plain = export_gateway_plain_line(channel_name, entry, game)
+        if not plain:
+            continue
+        text = plain.strip()
+        if text in before_plain:
+            continue
+        imported += 1
+        _record_gateway_transcript(channel_name, entry, text, game)
+    return imported
+
+
+def import_gateway_stitch_lines(game, channels: dict[str, list]) -> int:
+    """Merge gateway-only stitch lines into game channel rings + ooc.log.
+
+    During copyover the gateway relays OOC/wiznet while game IPC is down.
+    Those lines live in the gateway stitch buffer until the game child
+    reconnects and pulls anything missing from the saved snapshot.
+    """
+    imported = 0
+    for channel_name, lines in (channels or {}).items():
+        spec = get_channel(channel_name)
+        if spec is None or spec.scope != SCOPE_GLOBAL:
+            continue
+        history = ring(game, channel_name)
+        if history is None:
+            continue
+        existing_plain: set[str] = set()
+        existing_keys: set[str] = set()
+        for entry in entries(game, channel_name):
+            plain = export_gateway_plain_line(channel_name, entry, game)
+            if plain:
+                stripped = plain.strip()
+                existing_plain.add(stripped)
+                existing_keys.update(_stitch_dedupe_keys(channel_name, stripped))
+        for raw in lines or []:
+            text = (raw or "").strip() if isinstance(raw, str) else ""
+            if not text or text in existing_plain:
+                continue
+            dedupe_keys = _stitch_dedupe_keys(channel_name, text)
+            if dedupe_keys & existing_keys:
+                continue
+            entry = parse_gateway_plain_entry(channel_name, text)
+            if entry is None:
+                continue
+            history.append(entry)
+            existing_plain.add(text)
+            existing_keys.update(dedupe_keys)
+            imported += 1
+            _record_gateway_transcript(channel_name, entry, text, game)
+    return imported
+
+
+def sync_gateway_stitch_channels(game, channels: dict[str, list], *, mode: str) -> int:
+    """Apply one gateway stitch payload to global channel rings."""
+    if (mode or "").strip().lower() == "replace":
+        count = 0
+        for channel_name, lines in (channels or {}).items():
+            count += replace_ring_from_gateway_lines(game, channel_name, lines or [])
+        return count
+    return import_gateway_stitch_lines(game, channels)
 
 
 def _schedule_gateway_mirror(game, channel_name: str, plain_line: str) -> None:

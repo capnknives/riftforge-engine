@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections import deque
 
 _MAX_OCCUPANTS = 15
@@ -106,6 +107,25 @@ def note_verb_gate(character, verb, code, *, detail=None):
     sess._last_verb_gate = entry
 
 
+def note_last_look(character, room):
+    """Stamp the room a bare ``look`` just rendered (bug report 981 class).
+
+    After a highway fill or copyover, look can describe a different room
+    than ``character.location``. Bug reports compare this key to the
+    live location so triage does not need a live repro.
+    """
+    if character is None:
+        return
+    sess = getattr(character, "session", None)
+    if sess is None:
+        return
+    key = getattr(room, "key", None) if room is not None else None
+    sess._last_look_room_key = str(key) if key else None
+    title = getattr(room, "title", None) if room is not None else None
+    if title:
+        sess._last_look_room_title = str(title)[:120]
+
+
 def _presence_mode(character):
     """Short presence label for triage."""
     if getattr(character, "is_npc", False):
@@ -136,6 +156,166 @@ def _deploy_sha(report_dir):
         return None
     sha = last.get("sha")
     return _safe_str(sha, "") or None
+
+
+def _head_sha_cheap(report_dir):
+    """Read ``.git/HEAD`` without spawning git (bug reports must stay cheap)."""
+    roots = []
+    if report_dir:
+        roots.append(report_dir)
+    roots.append(os.getcwd())
+    seen = set()
+    for root in roots:
+        if not root or root in seen:
+            continue
+        seen.add(root)
+        git_dir = os.path.join(root, ".git")
+        head_path = os.path.join(git_dir, "HEAD")
+        try:
+            with open(head_path, encoding="utf-8") as fh:
+                ref = fh.read().strip()
+        except OSError:
+            continue
+        if not ref:
+            continue
+        if ref.startswith("ref:"):
+            ref_path = os.path.join(git_dir, ref[4:].strip())
+            try:
+                with open(ref_path, encoding="utf-8") as fh:
+                    sha = fh.read().strip()
+            except OSError:
+                continue
+        else:
+            sha = ref
+        if sha:
+            return sha
+    return None
+
+
+def _copyover_abort_snap():
+    """Last cancelled Veil rewrite, if the abort log is on disk."""
+    path = None
+    try:
+        from engine import copyover as copyover_mod
+
+        path = copyover_mod.abort_log_path()
+    except Exception:
+        path = os.path.join(os.getcwd(), ".copyover_last_abort.json")
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    out = {}
+    at = data.get("at")
+    if at:
+        out["at"] = str(at)
+    reason = data.get("reason")
+    if reason:
+        out["reason"] = str(reason)[:200]
+    detail = (data.get("detail") or "").strip()
+    if detail:
+        out["detail"] = detail[:240]
+    return out or None
+
+
+def _persist_helpers_missing():
+    """Names of save/copyover helpers this process does not have yet.
+
+    Partial auto-deploy overlays land new persist_blob / skills_sheet
+    before the matching helper exists in ``sys.modules``. A missing
+    name here is the 960 / 968 / stale-taxi-blob class.
+    """
+    from engine import hooks as hooks_mod
+
+    return list(hooks_mod.report_persist_helper_gaps())
+
+
+def _tick_health_snapshot(game):
+    """Compact heartbeat / autosave facts for lag and auto-diag triage."""
+    if game is None:
+        return None
+    out = {}
+    ring = list(getattr(game, "_tick_stats", ()) or ())
+    if ring:
+        totals = [float(s.get("total_ms", 0) or 0) for s in ring]
+        last = ring[-1]
+        out["last_tick_ms"] = round(float(last.get("total_ms", 0) or 0), 1)
+        out["avg_tick_ms"] = round(sum(totals) / len(totals), 1)
+        out["worst_tick_ms"] = round(max(totals), 1)
+        out["tick_samples"] = len(ring)
+        slow = last.get("slow") or []
+        if slow:
+            out["last_slow_handlers"] = [
+                {"name": str(name), "ms": round(float(ms or 0), 1)}
+                for name, ms in slow[:6]
+            ]
+    meta = getattr(game, "_cadence_budget_meta", None) or {}
+    if meta:
+        used = meta.get("used")
+        limit = meta.get("limit")
+        if used is not None:
+            out["cadence_used"] = used
+        if limit is not None:
+            out["cadence_limit"] = limit
+    autosave = getattr(game, "_last_autosave_stats", None) or {}
+    if autosave:
+        save_ms = autosave.get("save_ms")
+        if save_ms is not None:
+            out["last_autosave_ms"] = save_ms
+        if autosave.get("skipped"):
+            out["last_autosave_skipped"] = True
+    return out or None
+
+
+def _runtime_snapshot(game, report_dir):
+    """Always-on copyover / overlay honesty for every full bug report.
+
+    ``deploy_sha`` alone is one SHA. The last two days of tickets were
+    "overlay landed, process still old" -- this block names that split.
+    """
+    out = {}
+    deploy = _deploy_sha(report_dir)
+    if deploy:
+        out["deploy_sha"] = deploy
+    head = _head_sha_cheap(report_dir)
+    if head:
+        out["head_sha"] = head
+    if deploy and head and deploy != head:
+        out["overlay_dirty"] = True
+    abort = _copyover_abort_snap()
+    if abort:
+        out["last_copyover_abort"] = abort
+    try:
+        from engine import copyover as copyover_mod
+
+        ready_path = copyover_mod._ready_path()
+        if os.path.isfile(ready_path):
+            out["copyover_ready"] = True
+            try:
+                age = max(0, int(time.time() - os.path.getmtime(ready_path)))
+                out["copyover_ready_age_s"] = age
+            except OSError:
+                pass
+    except Exception:
+        pass
+    missing = _persist_helpers_missing()
+    if missing:
+        out["persist_helpers_missing"] = missing
+        out["partial_overlay"] = True
+    if game is not None:
+        try:
+            out["tick"] = int(getattr(game, "game_time_ticks", 0) or 0)
+        except (TypeError, ValueError):
+            pass
+        tick_health = _tick_health_snapshot(game)
+        if tick_health:
+            out["tick_health"] = tick_health
+    return {k: v for k, v in out.items() if v not in (None, "", [], {})}
 
 
 def _room_occupants(room, reporter, context_errors=None):
@@ -411,6 +591,13 @@ def build(character, game, *, history=None, description=None, kind=None):
             "deploy_sha": _deploy_sha(report_dir),
         },
     }
+    runtime = _runtime_snapshot(game, report_dir)
+    if runtime:
+        # Keep deploy_sha on game for older triage tools; runtime adds
+        # overlay / copyover honesty beside it.
+        ctx["game"]["runtime"] = runtime
+        if runtime.get("deploy_sha") and not ctx["game"].get("deploy_sha"):
+            ctx["game"]["deploy_sha"] = runtime["deploy_sha"]
 
     for flag in ("gm_mode", "gm_spirit", "gm_away"):
         if getattr(character, flag, False):
@@ -443,6 +630,15 @@ def build(character, game, *, history=None, description=None, kind=None):
         gate = getattr(sess, "_last_verb_gate", None)
         if isinstance(gate, dict) and gate:
             ctx["session"]["last_verb_gate"] = gate
+        last_look_key = getattr(sess, "_last_look_room_key", None)
+        if last_look_key:
+            ctx["session"]["last_look_room_key"] = str(last_look_key)
+            loc_key = getattr(room, "key", None) if room is not None else None
+            if loc_key and str(loc_key) != str(last_look_key):
+                ctx["session"]["look_location_mismatch"] = True
+        last_look_title = getattr(sess, "_last_look_room_title", None)
+        if last_look_title:
+            ctx["session"]["last_look_room_title"] = str(last_look_title)[:120]
 
     pos = {}
     macro = getattr(character, "macro_pos", None)

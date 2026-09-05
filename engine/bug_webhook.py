@@ -112,8 +112,13 @@ def payload_from_record(record_payload):
     same dict plus an explicit kind='bug' so the automation can tell bugs
     from anything else without guessing from the URL alone.
     """
+    from engine import reports as reports_mod
+
     body = dict(record_payload)
     body["kind"] = "bug"
+    summary = reports_mod.format_messages_for_webhook(body)
+    if summary:
+        body["ticket_comments"] = summary
     return body
 
 

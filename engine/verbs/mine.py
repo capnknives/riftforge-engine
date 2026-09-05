@@ -4,8 +4,9 @@ mine.py -- player mining verbs (engine-generic dispatch).
 SUPERS wires these into COMMANDS; gathering ``mine`` delegates here when
 args are present or the actor stands underground / uses mine down.
 """
-
 from __future__ import annotations
+
+from command_support import broadcast_here
 
 import random
 
@@ -33,7 +34,10 @@ _MARKER_STUMBLE_LINES = (
 
 
 def _send(character, message):
-    character.session.send(str(message))
+    """Send to a live Session if present (HB-42: tick/helper calls stay quiet)."""
+    session = getattr(character, "session", None)
+    if session is not None:
+        session.send(str(message))
 
 
 def _in_mine_room(room):
@@ -69,7 +73,7 @@ def cmd_prospect(character, args, game):
         _send(character, "Prospect where? Stand on a wilderness mining cell.")
         return
     area = getattr(room, "area_type", None) or "mountains"
-    if not graph_mod.is_mine_capable_area(area) and not _in_mine_room(room):
+    if not graph_mod.is_mine_capable_room(room) and not _in_mine_room(room):
         _send(character, "This ground does not read as mine-country.")
         return
     mouth = graph_mod.get_mouth(game, mouth_key, create=True, area_type=area)
@@ -138,7 +142,7 @@ def _mine_down(character, game, room):
         _send(character, "You cannot mine down here.")
         return
     area = getattr(room, "area_type", None) or "mountains"
-    if not graph_mod.is_mine_capable_area(area):
+    if not graph_mod.is_mine_capable_room(room):
         _send(character, "This terrain is not mine-capable.")
         return
     mouth = graph_mod.get_mouth(game, mouth_key, create=True, area_type=area)
@@ -188,7 +192,6 @@ def _harvest_vein(character, game, room, mouth, room_id):
     mat_mod.stamp_ore_instance(
         item, material_id=element, purity=purity, depth_band=depth,
     )
-    from engine.systems import material_instances as mat_mod
     ok, msg = mat_mod.try_give_item(character, item)
     if not ok:
         _send(character, msg)
@@ -423,7 +426,11 @@ def cmd_smelt(character, args, game):
     _send(character, msg)
     if ok and ingot:
         mat_mod.remove_from_inventory(character, item)
-        mat_mod.try_give_item(character, ingot)
+        gave_ok, gave_msg = mat_mod.try_give_item(character, ingot)
+        if not gave_ok:
+            character.inventory.append(item)
+            _send(character, gave_msg)
+            return
         room.broadcast(f"{character.key} smelts ore.", exclude=character)
 
 
@@ -519,9 +526,16 @@ def cmd_forge_mine(character, args, game):
     _send(character, msg)
     if ok and out:
         mat_mod.remove_from_inventory(character, ingot)
-        for extra in getattr(out, "_forge_extra_consumables", None) or ():
+        extras = list(getattr(out, "_forge_extra_consumables", None) or ())
+        for extra in extras:
             mat_mod.remove_from_inventory(character, extra)
-        mat_mod.try_give_item(character, out)
+        gave_ok, gave_msg = mat_mod.try_give_item(character, out)
+        if not gave_ok:
+            character.inventory.append(ingot)
+            for extra in extras:
+                character.inventory.append(extra)
+            _send(character, gave_msg)
+            return
         room.broadcast(f"{character.key} forges metal.", exclude=character)
 
 
@@ -532,7 +546,7 @@ def stumble_marker_on_look(room, character, game):
         return None
     area = getattr(room, "area_type", None) or "plains"
     chance = hooks.mine_marker_chance(room, character)
-    if area in graph_mod.MINE_CAPABLE_AREA_TYPES:
+    if graph_mod.is_mine_capable_room(room):
         chance = max(chance, 0.08)
     else:
         chance = max(chance, 0.02)
@@ -564,7 +578,7 @@ def _roll_discoverable(game, mouth_key, room_id, character):
         game._mine_graphs_dirty = True
     text = row.get("text") or ""
     if text and character.location:
-        character.location.broadcast(text)
+        broadcast_here(character, text)
 
 
 def on_character_relocate(character, game):

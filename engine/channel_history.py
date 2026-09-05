@@ -15,6 +15,7 @@ from engine.channels import (  # noqa: F401
     export_gateway_snapshot,
     gateway_stitch_channels,
     get_channel,
+    import_gateway_stitch_lines,
     init_game,
     is_empty,
     load_all,
@@ -22,12 +23,14 @@ from engine.channels import (  # noqa: F401
     register_channel,
     render_ooc_entry,
     replay_wiznet_entry,
+    replace_ring_from_gateway_lines,
     ring,
     save_all,
     save_channel,
     send_empty_hint,
     send_replay_header,
     stitch_channel_for_command,
+    sync_gateway_stitch_channels,
 )
 
 OOC_HISTORY_MAX = DEFAULT_RING_MAX

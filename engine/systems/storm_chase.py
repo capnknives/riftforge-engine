@@ -8,12 +8,6 @@ import random
 import engine.systems.economy as economy_wallet
 
 JOB_ID = "tornado_hunter"
-DESK_KEYS = frozenset({
-    "lebanon:Storm Watch Office",
-    "Storm Watch Office",
-    "NB00002",
-    "notbigville:Storm Watch Office",
-})
 
 RESEARCH_PAY_DOLLARS = 2
 CHASE_BASE_PAY_DOLLARS = 12
@@ -22,10 +16,12 @@ PROBE_RADIUS = 1  # Chebyshev tiles from target macro
 
 
 def is_storm_desk_room(room):
-    """True when room is the Storm Watch Office (job site + board)."""
+    """True when room is a storm-watch desk (job site + board)."""
     if room is None:
         return False
-    if room.key in DESK_KEYS:
+    from engine import hooks as hooks_mod
+
+    if room.key in hooks_mod.storm_chase_desk_keys():
         return True
     jobs = tuple(getattr(room, "jobs", None) or ())
     return JOB_ID in jobs
@@ -47,7 +43,7 @@ def refuse_duty(character, game=None):
     if getattr(character, "job", None) != JOB_ID:
         return (
             "You need the Tornado Hunter gig here. "
-            "Type 'work' (or 'work as tornado_hunter') at Storm Watch Office."
+            "Type 'work' (or 'work as tornado hunter') at Storm Watch Office."
         )
     from engine import hooks as hooks_mod
 
@@ -176,7 +172,7 @@ def takechase(character, game):
             "scale": t.get("scale"),
             "kind": "live_tornado",
             "pay_dollars": CHASE_BASE_PAY_DOLLARS,
-            "board_room": "lebanon:Storm Watch Office",
+            "board_room": getattr(getattr(character, "location", None), "key", None),
         }
     else:
         # Seeded storm cell in great_plains when no live funnel.
@@ -197,7 +193,7 @@ def takechase(character, game):
             "scale": None,
             "kind": "storm_cell",
             "pay_dollars": CHASE_BASE_PAY_DOLLARS - 2,
-            "board_room": "lebanon:Storm Watch Office",
+            "board_room": getattr(getattr(character, "location", None), "key", None),
         }
 
     character.chase_id = brief["chase_id"]

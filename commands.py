@@ -83,6 +83,7 @@ IDLE_SPECTATOR = frozenset({
     "who", "whofull", "whohide",
     "score", "sc",
     "help", "commands", "changes",
+    "more", "stop",  # pager continuation for long help / staff dumps
     "wallet", "coins",
     "idlemode", "idle", "autoidle", "afk",
     "seek",
@@ -147,7 +148,8 @@ ASLEEP_BLOCK = frozenset({
 }) | IDLE_WAKE_MOVE | IDLE_WAKE_AGGRESSIVE
 
 ASLEEP_SPECTATOR = (IDLE_SPECTATOR - ASLEEP_BLOCK) | frozenset({
-    "wake", "logout", "hp", "fuel", "where", "coins",
+    "wake", "logout", "hp", "fuel", "energy", "stamina", "where", "coins",
+    "professions", "prof",
     "account", "combatnumbers", "scoremeters", "bigmap", "atlas", "brief",
     "dominion", "bounty", "cases", "quests", "journal", "mail",
     # Spirit Expert dream lane: sleep gate requires dreamenter while
@@ -227,20 +229,30 @@ def dispatch(character, raw, game, *, force_actor=None):
     from engine import log_context
     from engine.session_attach import heal_character_session
 
+    if character is None:
+        return
+
     # Heal half-cleared Session <-> Character links before any verb runs.
-    if character is not None:
-        heal_character_session(character, game)
+    heal_character_session(character, game)
+    if game is not None:
+        ticks = int(getattr(game, "game_time_ticks", 0) or 0)
+        if ticks > 0:
+            character._last_game_time_ticks = ticks
+            if force_actor is not None and force_actor is not character:
+                force_actor._last_game_time_ticks = ticks
+
+    session = getattr(character, "session", None)
+    viewport_turn_id = getattr(session, "_viewport_turn_id", None)
 
     # Colon emote shorthand (:grins) before alias expansion.
     stripped = (raw or "").strip()
     if stripped.startswith(":"):
         colon_body = stripped[1:].lstrip()
         if not colon_body:
-            session = getattr(character, "session", None)
             if session is not None:
                 session.send("Smote what?")
             from engine.viewport import finish_turn
-            finish_turn(session)
+            finish_turn(session, turn_id=viewport_turn_id)
             return
         display_prefs.ensure_display_defaults(character)
         actor = force_actor or character
@@ -263,7 +275,7 @@ def dispatch(character, raw, game, *, force_actor=None):
             if command_marks_character_dirty("smote", colon_body):
                 mark_character_dirty(game, actor)
             from engine.viewport import finish_turn
-            finish_turn(getattr(character, "session", None))
+            finish_turn(getattr(character, "session", None), turn_id=viewport_turn_id)
 
     # D65: expand player aliases before parse (never shadows built-ins).
     display_prefs.ensure_display_defaults(character)
@@ -272,7 +284,7 @@ def dispatch(character, raw, game, *, force_actor=None):
     verb, args = parse(raw)            # unpack the (verb, args) tuple into two vars
     if not verb:                       # blank line -- do nothing
         from engine.viewport import finish_turn
-        finish_turn(getattr(character, "session", None))
+        finish_turn(getattr(character, "session", None), turn_id=viewport_turn_id)
         return
 
     log_context.set_command_context(
@@ -305,7 +317,7 @@ def dispatch(character, raw, game, *, force_actor=None):
         if command_marks_character_dirty(verb, args):
             mark_character_dirty(game, actor)
         from engine.viewport import finish_turn
-        finish_turn(getattr(character, "session", None))
+        finish_turn(getattr(character, "session", None), turn_id=viewport_turn_id)
 
 
 def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
@@ -344,6 +356,7 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
     from engine.command_support import (
         ASLEEP_WORLD_CLOSED_MSG,
         asleep_blocks_world,
+        send_if_online,
     )
     _asleep_ok = verb in ASLEEP_SPECTATOR
     if not _asleep_ok and verb == "cast":
@@ -357,19 +370,20 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
         from engine.report_context import note_verb_gate
         if resolve_walk_direction(verb, getattr(character, "location", None)):
             note_verb_gate(character, verb, "dispatch:asleep_move")
-            character.session.send(
-                "You're asleep -- type 'wake' before you can move."
+            send_if_online(
+                character,
+                "You're asleep -- type 'wake' before you can move.",
             )
             return
         note_verb_gate(character, verb, "dispatch:asleep")
-        character.session.send(ASLEEP_WORLD_CLOSED_MSG)
+        send_if_online(character, ASLEEP_WORLD_CLOSED_MSG)
         return
 
     # GM freeze: staff paralyzed the body -- movement, room speech, and
     # verbs stay closed. OOC and private tells stay open so they can still
     # talk to staff / other players. gm mute is what closes those channels.
     _FROZEN_ALLOWED = frozenset({
-        "help", "commands", "quit", "logout", "bug", "suggest",
+        "help", "commands", "more", "stop", "quit", "logout", "bug", "suggest",
         "score", "sc", "ooc", "replay",
         "rpseek", "rpwhere",
         "tell", "whisper", "reply", "r",
@@ -378,14 +392,16 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
         from engine.report_context import note_verb_gate
         if resolve_walk_direction(verb, getattr(character, "location", None)):
             note_verb_gate(character, verb, "dispatch:frozen_move")
-            character.session.send(
-                "You're frozen by staff -- you can't move."
+            send_if_online(
+                character,
+                "You're frozen by staff -- you can't move.",
             )
             return
         note_verb_gate(character, verb, "dispatch:frozen")
-        character.session.send(
+        send_if_online(
+            character,
             "You're frozen by staff. You can still use help, bug, "
-            "suggest, quit, ooc, replay, rpseek, rpwhere, and tell."
+            "suggest, quit, ooc, replay, rpseek, rpwhere, and tell.",
         )
         return
 
@@ -394,7 +410,7 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
         character, verb, args, game,
     )
     if blocked:
-        character.session.send(gate_msg)
+        send_if_online(character, gate_msg)
         return
 
     # GM mute: block global / room speech channels only (not movement).
@@ -404,8 +420,9 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
     if getattr(character, "muted", False) and verb in _MUTED_VERBS:
         from engine.report_context import note_verb_gate
         note_verb_gate(character, verb, "dispatch:gm_muted")
-        character.session.send(
-            "You're muted by staff -- you can't use that channel."
+        send_if_online(
+            character,
+            "You're muted by staff -- you can't use that channel.",
         )
         return
     try:
@@ -413,8 +430,9 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
         if arch_powers_mod.is_biokinesis_muted(character, game) and verb in _MUTED_VERBS:
             from engine.report_context import note_verb_gate
             note_verb_gate(character, verb, "dispatch:biokinesis_muted")
-            character.session.send(
-                "Your voice is gone -- you can't use that channel. [MUTED]"
+            send_if_online(
+                character,
+                "Your voice is gone -- you can't use that channel. [MUTED]",
             )
             return
     except ImportError:
@@ -566,11 +584,24 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
                     and not verb.startswith("gm")
                 ):
                     preview = (args or "")[:80]
+                    cmd_payload = {"verb": verb, "args_preview": preview}
+                    loc = getattr(actor, "location", None)
+                    if loc is not None:
+                        try:
+                            title = (
+                                loc.look_title()
+                                if callable(getattr(loc, "look_title", None))
+                                else getattr(loc, "name", None)
+                            )
+                        except (TypeError, ValueError, AttributeError):
+                            title = getattr(loc, "name", None)
+                        if title:
+                            cmd_payload["room_title"] = str(title).strip()
                     life_log_mod.record(
                         game,
                         actor,
                         "player_cmd",
-                        {"verb": verb, "args_preview": preview},
+                        cmd_payload,
                     )
         _loan_session_to_actor(_run_handler)
         hooks.post_command_handler(_twin_owner, actor, game)

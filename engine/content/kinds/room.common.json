@@ -92,6 +92,11 @@
       "required": false,
       "doc": "Pocket hub mouth; exit verb returns to overland."
     },
+    "enter_as": {
+      "type": "list",
+      "required": false,
+      "doc": "Player enter aliases on authored hub rooms (e.g. treaty mouths, separatio annex)."
+    },
     "vnum": {
       "type": "string",
       "required": false,

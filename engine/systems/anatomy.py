@@ -76,7 +76,9 @@ _TARGET_SPECS = {
     # Body line -- torso, stamina / organ trauma.
     "solar_plexus": ("torso", "body", "solar plexus", "winded"),
     "liver": ("torso", "body", "liver", "winded"),
-    "floating_ribs": ("torso", "body", "floating ribs", "winded"),
+    # Bottom of the ribcage (ribs 11-12). Print "lower ribs" -- "floating
+    # ribs" is textbook jargon most players do not use (bug report 1196).
+    "lower_ribs": ("torso", "body", "lower ribs", "winded"),
     "ribs": ("torso", "body", "ribs", None),
     "sternum": ("torso", "body", "sternum", None),
     "kidney": ("torso", "body", "kidney", "winded"),
@@ -111,7 +113,7 @@ _TARGET_AUTO_WEIGHTS = {
     "ear": 1, "brow": 1, "eye": 1, "mouth": 1, "throat": 2, "nape": 1,
     "collarbone": 1,
     # Body -- torso bread-and-butter; limbs lighter.
-    "solar_plexus": 3, "liver": 2, "floating_ribs": 2, "kidney": 2,
+    "solar_plexus": 3, "liver": 2, "lower_ribs": 2, "kidney": 2,
     "ribs": 2, "sternum": 1, "abdomen": 2, "heart": 1, "gut": 2,
     "shoulder": 1, "upper_arm": 1, "elbow": 1, "forearm": 1,
     "wrist": 1, "knuckles": 1, "fingers": 1,
@@ -182,6 +184,13 @@ def resolve_called_shot(value):
     if not value:
         return None
     key = str(value).strip().lower().replace(" ", "_")
+    if key == "core":
+        return "gut"
+    # Old textbook name for lower ribs -- still aim if someone types it.
+    if key in ("floating_ribs", "floating_rib"):
+        return "lower_ribs"
+    if key in ("lower_rib",):
+        return "lower_ribs"
     if key in TARGETS:
         return key
     for tid, spec in TARGETS.items():
@@ -213,8 +222,27 @@ def _line_weights(reaction=None, press=False, feint_exposed=False,
     return _DEFAULT_LINE_WEIGHTS
 
 
+def _target_in_pool(target_id, exclude_targets=None, allowed_regions=None):
+    """True when ``target_id`` may be auto-picked under the given filters.
+
+    ``exclude_targets`` drops named fine marks (lower ribs on a ghost).
+    ``allowed_regions`` keeps only marks whose mechanical region exists on
+    this body (no throat hit on a template with no neck). Called shots still
+    win in ``choose_target`` and are remapped by the game layer if illegal.
+    """
+    spec = TARGETS.get(target_id)
+    if spec is None:
+        return False
+    if exclude_targets and target_id in exclude_targets:
+        return False
+    if allowed_regions is not None and spec["region"] not in allowed_regions:
+        return False
+    return True
+
+
 def choose_target(reaction=None, press=False, feint_exposed=False,
-                  stance="balanced", called_shot=None, rng=None):
+                  stance="balanced", called_shot=None, rng=None,
+                  exclude_targets=None, allowed_regions=None):
     """Pick (target_id, region) for one swing.
 
     A `called_shot` (already a raw player aim string) wins when it
@@ -222,6 +250,10 @@ def choose_target(reaction=None, press=False, feint_exposed=False,
     attack-line weights that shift with the fight state (see
     `_line_weights`). `rng` defaults to this module's dedicated
     `_AUTO_RNG`; tests pass an explicit seeded `rng` to pin the choice.
+
+    ``exclude_targets`` / ``allowed_regions`` filter the auto-pick pool so a
+    non-humanoid defender is not rolled a liver or lower-ribs mark.
+    Called shots still return as resolved -- the caller legalizes them.
 
     Never returns None: if the seeded tables were somehow empty, falls
     back to a plain torso hit so a fight can always narrate a location.
@@ -236,13 +268,28 @@ def choose_target(reaction=None, press=False, feint_exposed=False,
         reaction=reaction, press=press,
         feint_exposed=feint_exposed, stance=stance,
     )
-    lines = [ln for ln in weights if _TARGETS_BY_LINE.get(ln)]
+
+    def _pool_for(line):
+        return [
+            tid for tid in (_TARGETS_BY_LINE.get(line) or ())
+            if _target_in_pool(tid, exclude_targets, allowed_regions)
+        ]
+
+    lines = [ln for ln in weights if _pool_for(ln)]
     if not lines:
+        # Filtered tables empty (mist body, odd template) -- still land
+        # somewhere narratable rather than crashing the swing.
+        for fallback in ("abdomen", "gut", "skull", "thigh"):
+            if _target_in_pool(fallback, exclude_targets, allowed_regions):
+                return fallback, TARGETS[fallback]["region"]
+        for tid, spec in TARGETS.items():
+            if _target_in_pool(tid, exclude_targets, allowed_regions):
+                return tid, spec["region"]
         return "abdomen", "torso"
     chosen_line = rng.choices(
         lines, weights=[weights[ln] for ln in lines], k=1
     )[0]
-    pool = _TARGETS_BY_LINE[chosen_line]
+    pool = _pool_for(chosen_line)
     pick_weights = [_TARGET_AUTO_WEIGHTS.get(tid, 1) for tid in pool]
     target = rng.choices(pool, weights=pick_weights, k=1)[0]
     return target, TARGETS[target]["region"]

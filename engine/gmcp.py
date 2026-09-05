@@ -10,6 +10,7 @@ Pure engine: no supers imports. SUPERS vitals/status payloads come in through
 engine.hooks so two-repo purity stays intact.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -197,6 +198,52 @@ def client_supports(session, package: str) -> bool:
     return parent in supports
 
 
+def _wants_mapper_gmcp(character) -> bool:
+    """False when the body asked for spoken/plain output (no glyph dumps).
+
+    Phone apps such as MudRammer print unknown GMCP as one story line.
+    The America atlas payload is thousands of glyphs with no newlines --
+    that is the giant line after every copyover (bug report 1221).
+    Screenreader mode already hides the HUD maps; skip mapper packages.
+    """
+    if character is None:
+        return True
+    return not bool(getattr(character, "screenreader", False))
+
+
+def _notify_gateway_gmcp_supports(session) -> None:
+    """Copy this session's Core.Supports map onto the long-lived gateway slot.
+
+    Browser WebSocket clients already stash Supports in the gateway. Telnet
+    (Mudlet, MudRammer, TinTin++) never hit that path, so reattach used to
+    assume the full SERVER_SUPPORTS list -- including RiftForge.Map.Atlas.
+    """
+    bridge = getattr(session, "gateway_bridge", None)
+    sid = getattr(session, "gateway_session_id", None)
+    if bridge is None or not sid:
+        return
+    notify = getattr(bridge, "notify_gmcp_supports", None)
+    if not callable(notify):
+        return
+    mapping = dict(getattr(session, "gmcp_supports", None) or {})
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    task = loop.create_task(notify(sid, mapping))
+
+    def _done(done):
+        err = done.exception() if not done.cancelled() else None
+        if err is None:
+            return
+        print(
+            f"[gmcp] gateway supports notify failed sid={sid}: {err!r}",
+            flush=True,
+        )
+
+    task.add_done_callback(_done)
+
+
 def send_hello(session):
     """Outbound Core.Hello identifying this server."""
     session.send_gmcp(
@@ -278,15 +325,18 @@ def handle_inbound(session, package: str, payload):
         session.gmcp_supports = _parse_supports_list(payload)
         # Client just told us what it wants -- push identity packages if
         # a character is already attached (copyover / late Supports).
+        _notify_gateway_gmcp_supports(session)
         _refresh_after_supports(session)
         return
     if package == "Core.Supports.Add":
         session.gmcp_supports.update(_parse_supports_list(payload))
+        _notify_gateway_gmcp_supports(session)
         _refresh_after_supports(session)
         return
     if package == "Core.Supports.Remove":
         for name in _parse_supports_list(payload):
             session.gmcp_supports.pop(name, None)
+        _notify_gateway_gmcp_supports(session)
         return
     if package == "RiftForge.Client":
         # Browser HUD prefs (gag captured comms from the main transcript).
@@ -363,6 +413,40 @@ def handle_telnet_event(session, event):
 def offer_gmcp(session):
     """Send IAC WILL GMCP at connect / copyover resume."""
     session._write_raw(telnet.will(telnet.TELOPT_GMCP))
+
+
+def resume_gmcp_after_gateway_reattach(session):
+    """Restore GMCP Supports after a game-only gateway reload.
+
+    ``reset_gmcp()`` wipes ``gmcp_supports``; Mudlet does not re-send
+    Core.Supports.Set after the Veil. The gateway stashes the last client
+    Supports map on ``session._gateway_reattach_gmcp_supports`` (browser
+    WebSocket path, plus telnet once the game copies Supports back to the
+    gateway slot). Restore that map and re-push. When the stash is empty,
+    do **not** assume SERVER_SUPPORTS -- that list includes RiftForge.Map
+    and dumps the full America atlas as one GMCP frame. Phone apps such as
+    MudRammer print that JSON as a giant story line after every copyover
+    (bug report 1221). Offer WILL GMCP and wait for a real Supports frame.
+    """
+    saved = getattr(session, "_gateway_reattach_gmcp_supports", None)
+    session._gateway_reattach_gmcp_supports = None
+    session._recv_buf = bytearray()
+    session._text_buf = bytearray()
+    session._pending_lines.clear()
+    session._web_map_grid_ids = set()
+    session._web_map_atlas_id = None
+    session.gag_captured_comms = False
+    if isinstance(saved, dict) and saved:
+        session.gmcp_supports = dict(saved)
+    else:
+        session.gmcp_supports = {}
+    session.gmcp_enabled = bool(session.gmcp_supports)
+    if session.gmcp_enabled:
+        send_hello(session)
+        send_supports(session)
+        _refresh_after_supports(session)
+        return
+    offer_gmcp(session)
 
 
 # --- Outbound package helpers ---------------------------------------------
@@ -550,7 +634,7 @@ def push_room(character):
         push_map(character)
     # Fog + interior graph only for HUD/Mudlet clients that asked for them.
     # Telnet does not grow visited_room_keys on every look.
-    if (
+    if _wants_mapper_gmcp(character) and (
         client_supports(session, "RiftForge.Zone")
         or client_supports(session, "RiftForge.Map")
     ):
@@ -568,6 +652,8 @@ def push_zone(character):
     """
     session = getattr(character, "session", None)
     if session is None:
+        return
+    if not _wants_mapper_gmcp(character):
         return
     if not (
         client_supports(session, "RiftForge.Zone")
@@ -595,6 +681,8 @@ def push_map(character, *, force_grid=False):
     session = getattr(character, "session", None)
     if session is None or not client_supports(session, "RiftForge.Map"):
         return
+    if not _wants_mapper_gmcp(character):
+        return
     game = getattr(session, "game", None)
     from engine import map_hud
 
@@ -610,6 +698,14 @@ def push_map(character, *, force_grid=False):
     if not payload:
         return
     session.send_gmcp("RiftForge.Map", payload)
+    # Compact here-ping so Mudlet can move @ on the country silhouette
+    # without waiting for the telnet camera (Map.View). look / overland
+    # hops already call push_room -> push_map; View is only atlas / map big.
+    _push_map_here(
+        session,
+        payload.get("you"),
+        atlas=payload.get("title") or payload.get("map"),
+    )
 
 
 def push_comm(session, chan: str, msg: str, player: str):
@@ -665,10 +761,40 @@ def deliver_comm(session, chan: str, msg: str, player: str, *prose_lines):
         session.send(line)
 
 
+def _push_map_here(session, you, *, atlas=None, origin=None):
+    """Compact you-are-here ping so a mapper can move @ without a glyph redraw.
+
+    Optional ``route`` (drive-preview overlay) stays on View only: Here is
+    a position ping (``you`` / ``origin``) so clients can skip a country
+    redraw. The trail is a full-window glyph change that belongs with
+    ``rows`` on View.
+    """
+    if session is None:
+        return
+    character = getattr(session, "character", None)
+    if not _wants_mapper_gmcp(character):
+        return
+    if not (
+        client_supports(session, "RiftForge.Map")
+        or client_supports(session, "RiftForge.Map.Here")
+    ):
+        return
+    session.send_gmcp(
+        "RiftForge.Map.Here",
+        {
+            "you": you,
+            "atlas": atlas,
+            "origin": origin,
+        },
+    )
+
+
 def push_map_view(character, payload):
     """Send RiftForge.Map.View (viewport glyphs + you-are-here)."""
     session = getattr(character, "session", None)
     if session is None or not payload:
+        return
+    if not _wants_mapper_gmcp(character):
         return
     if not (
         client_supports(session, "RiftForge.Map")
@@ -676,20 +802,11 @@ def push_map_view(character, payload):
     ):
         return
     session.send_gmcp("RiftForge.Map.View", payload)
-    # Compact here-packet so a mapper can skip redrawing the whole window.
-    # Optional ``route`` (drive-preview overlay) stays on View only: Here
-    # is a position ping (``you`` / ``origin``) so clients can skip a
-    # glyph redraw. The trail is a full-window glyph change (and a HUD
-    # polyline) that belongs with ``rows`` on View. Forwarding it here
-    # would either spam the path on every step or leave compact-only
-    # clients without the matching glyph grid.
-    session.send_gmcp(
-        "RiftForge.Map.Here",
-        {
-            "you": payload.get("you"),
-            "atlas": payload.get("atlas"),
-            "origin": payload.get("origin"),
-        },
+    _push_map_here(
+        session,
+        payload.get("you"),
+        atlas=payload.get("atlas"),
+        origin=payload.get("origin"),
     )
 
 
@@ -701,6 +818,8 @@ def push_map_atlas(character, game=None):
     """
     session = getattr(character, "session", None)
     if session is None:
+        return
+    if not _wants_mapper_gmcp(character):
         return
     if not (
         client_supports(session, "RiftForge.Map")

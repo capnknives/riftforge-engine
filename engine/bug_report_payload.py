@@ -29,12 +29,14 @@ def enrich_bug_payload(entry, game=None):
 
     if game is None:
         out["context_refresh"] = refresh
+        _attach_ticket_comments(out)
         return out
 
     reporter_key = (out.get("reporter") or "").strip()
     if not reporter_key:
         refresh["status"] = "no_reporter"
         out["context_refresh"] = refresh
+        _attach_ticket_comments(out)
         return out
 
     # When filed about another character, refresh *their* snapshot on squash.
@@ -46,6 +48,7 @@ def enrich_bug_payload(entry, game=None):
         refresh["status"] = "subject_offline" if out.get("subject") else "reporter_offline"
         refresh["context_key"] = context_key
         out["context_refresh"] = refresh
+        _attach_ticket_comments(out)
         return out
 
     from engine import accounts as accounts_mod
@@ -76,4 +79,14 @@ def enrich_bug_payload(entry, game=None):
         "presence": (fresh.get("character") or {}).get("presence"),
     }
     out["context_refresh"] = refresh
+    _attach_ticket_comments(out)
     return out
+
+
+def _attach_ticket_comments(out):
+    """Add a plain-text comment block so squash webhooks surface staff notes."""
+    from engine import reports as reports_mod
+
+    summary = reports_mod.format_messages_for_webhook(out)
+    if summary:
+        out["ticket_comments"] = summary

@@ -135,6 +135,25 @@ def clear_chargen_draft(account, game) -> None:
         pass
 
 
+def purge_chargen_draft_vault(game, storage_key) -> bool:
+    """Delete a ``chargen-draft`` vault row when present (idempotent).
+
+    Copyover snapshots mid-create without despawning the live body. If create
+    finishes without consuming that row, gateway reattach must not hydrate the
+    stale snapshot over a playing PC (Andri / Velaniel 2026-08-30).
+    """
+    if not storage_key or game is None:
+        return False
+    if not is_chargen_draft_vault(game, storage_key):
+        return False
+    db = getattr(game, "db", None)
+    if db is None:
+        return False
+    from engine import persistence as persistence_mod
+
+    return persistence_mod.vault_delete(db, storage_key)
+
+
 def is_chargen_draft_vault(game, storage_key) -> bool:
     """True when ``storage_key`` is vaulted for mid-chargen resume."""
     if not storage_key:
@@ -236,11 +255,55 @@ def vault_chargen_draft(character, game, account) -> tuple[bool, str]:
     return ok, msg
 
 
-def finish_chargen_draft(account, game) -> None:
-    """Clear draft flags after successful chargen."""
+def finish_chargen_draft(account, game, character=None) -> None:
+    """Clear draft flags and drop any copyover snapshot after successful chargen."""
     if account is None:
         return
+    key = ""
+    if character is not None:
+        key = (getattr(character, "key", None) or "").strip()
+        character.chargen_draft = False
+    if not key:
+        key = get_chargen_draft_key(account)
+    if key:
+        purge_chargen_draft_vault(game, key)
     clear_chargen_draft(account, game)
+
+
+def heal_stale_chargen_draft_vaults(game) -> int:
+    """Drop ``chargen-draft`` vault rows when the live PC already finished create.
+
+    One-time boot sweep for saves left behind when copyover snapshotted
+    mid-chargen and create later finished without deleting the vault row.
+    """
+    db = getattr(game, "db", None)
+    if db is None:
+        return 0
+    from engine import accounts as accounts_mod
+    from engine import persistence as persistence_mod
+
+    dropped = 0
+    for name, _room_key, _folded_at, folded_by in persistence_mod.vault_list(db):
+        if folded_by != CHARGEN_DRAFT_VAULT_TAG:
+            continue
+        finder = getattr(game, "find_login_character", None)
+        if callable(finder):
+            char = finder(name)
+        else:
+            char = game.find_character(name)
+        if char is None or not looks_like_finished_play_body(char):
+            continue
+        char.chargen_draft = False
+        if purge_chargen_draft_vault(game, name):
+            dropped += 1
+        account_name = (getattr(char, "account", None) or "").strip()
+        if account_name:
+            acct = accounts_mod.find_account(game, account_name)
+            if acct is not None:
+                draft_key = get_chargen_draft_key(acct)
+                if draft_key.lower() == (name or "").lower():
+                    clear_chargen_draft(acct, game)
+    return dropped
 
 
 def persist_for_copyover(character, game, account) -> bool:
@@ -329,6 +392,21 @@ def resolve_copyover_chargen_body(game, name):
         char = game.find_character(name)
     if char is not None and is_chargen_draft_character(game, char):
         return char
+    if char is not None and looks_like_finished_play_body(char):
+        if getattr(char, "chargen_draft", False):
+            char.chargen_draft = False
+        if is_chargen_draft_vault(game, name):
+            purge_chargen_draft_vault(game, name)
+        account_name = (getattr(char, "account", None) or "").strip()
+        if account_name:
+            from engine import accounts as accounts_mod
+
+            acct = accounts_mod.find_account(game, account_name)
+            if acct is not None:
+                draft_key = get_chargen_draft_key(acct)
+                if draft_key.lower() == (name or "").lower():
+                    clear_chargen_draft(acct, game)
+        return None
     if is_chargen_draft_vault(game, name):
         restored = hooks.try_restore_chargen_draft(game, name)
         if restored is not None:

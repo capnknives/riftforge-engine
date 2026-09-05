@@ -39,63 +39,63 @@ Umbral shroud). Type weather, exit from Main Street to walk the atlas,
 help tornado-hunter for the desk loop, help origins for Bloodlines,
 help stellar for flight tiers.
 """,
-    "score": """score -- your character sheet
+    "score": """score -- compact sheet; score combat/vitals/lineage/full for detail
 
-Bare score is a short gothic sheet: who you are, how healthy you feel, your six primaries, cash and bank (when you have savings), and only the rows that matter right now (injuries, exhaustion, fuel, urgent deals). A Detail footer at the bottom lists deeper slices when you want more. Alias: sc.
-
-How you play
-  1. score -- compact sheet (start here).
-  2. score combat -- primaries, fight secondaries (Precision, Eva, …), and each limb injury.
-  3. score needs -- hunger / rest meters (same as bare needs).
-  4. score vitals -- lifeforce, stamina, fuel, Spirit, and similar tanks.
-  5. score full -- the long verbose dump (old bare-score style).
-
-More detail: help score more
-See also: help score more | help stats | help needs | help tiers
-""",
-    "mail": """RiftForge reference town -- mail
-
-How you play:
-  1. Walk to the Post Office (east from General Store).
-  2. Type bare mail to list your inbox.
-  3. mail send <name> <text> to leave a letter for someone in the world.
-  4. mail read <n> / mail discard <n|all> to manage letters.
-
-Letters queue on the recipient even when they are offline.
-""",
-    "weather": """
-weather -- regional CONUS sky (look, dial, forecast)
+Compact sheet; score combat/vitals/lineage/full for detail.
+Type score to do it. help personality is the full article.
 
 How you play
-  1. Stand outdoors (town street or America Overland) and look -- [WX] shows
-     condition, temp, and wind for your climate region
-  2. weather              full regional snapshot + tornado warnings
-  3. forecast             short outlook line
-  4. radio tune to WX     NOAA-style rotating bulletin (regional)
-  5. Leave a dial on      town WX news cuts in at the top of the hour every four game-hours (Discord mirrors that slot)
+  1. score
+  2. help personality -- the full loop
+
+See also: help personality | help echo | help stats | help needs | help tiers
+""",
+    "mail": """
+mail -- letters and consignment via the Post Office
+
+Send from a mail room (the town Post Office on Civic Row).
+Text letters and physical consignments use different verbs.
+
+How you play
+  1. mail
+
+  2. mail -- list your inbox
+  3. mail read <n> -- read letter number n
+  4. mail discard <n|all> -- throw away one letter or all
+  5. mail send <name> <text> -- queue a letter (also: mail <name> <text>)
+  6. mail long send <name> <text> -- longer letter (up to 4000 characters)
+  7. mail ship <name> <item> -- consign rare salvage to Curio Lux (traveling salesman)
+
+Curio Lux rotates between Lebanon and Lawrence plazas. When he is on your square, list / shop / buy from his wagon. Scavengers can mail him angel blades and other rare pieces, and pawn desks now forward rare salvage, magi reagents, and hunter combat kit to the same wagon when you sell. Full dealer loop: help curio.
+
+Recipients can be online or Echoes. Login reminds you if mail waits.
+Cap 30 letters, 2000 characters each (mail long up to 4000).
+See also: help scavenge | help journal | help cadence | help curio | help oocmail
+""",
+    "weather": """weather -- regional CONUS sky (look, dial, forecast)
+
+How you play
+  1. Stand outdoors (town street or America Overland) and look -- [WX] shows condition, temp, and wind for your climate region
+  2. weather -- full regional snapshot + tornado warnings
+  3. forecast -- short outlook line
+  4. radio tune to WX -- NOAA-style rotating bulletin (regional)
+
+What it does
+  0 Spirit. Reads the climate band you are standing in, not the whole country.
+
+2. This page covers hard-to-see look, tornadoes, and ice
 
 Hard to see
-  Rain, storms, nearby tornadoes, and blowing snow (snow plus strong wind)
-  make outdoor look harder. Rain is overlay only -- it never whites out.
-  Ordinary snow still shows on look -- it does not wipe the street. Gusty
-  snow may add a hard-to-see [WX] line. In a true blow, look can white out:
-  you keep the room name and weather, but people, items, and exits vanish
-  behind "you can't see through …" until you look again.
-  Cars soften that; sturdy indoor rooms do not white out (roof dampen only).
-  Walking still works by direction even when you cannot see.
+  Rain, storms, nearby tornadoes, and blowing snow (snow plus strong wind) make outdoor look harder. Rain is overlay only -- it never whites out. Ordinary snow still shows on look -- it does not wipe the street. Gusty snow may add a hard-to-see [WX] line. In a true blow, look can white out: you keep the room name and weather, but people, items, and exits vanish behind "you can't see through …" until you look again. Cars soften that; sturdy indoor rooms do not white out (roof dampen only). Walking still works by direction even when you cannot see.
 
-  weather reports the climate band you are standing in, not the whole
-  country. Kansas snow does not mean Miami is snowing.
+weather reports the climate band you are standing in, not the whole country. Kansas snow does not mean Miami is snowing.
 
 Tornadoes
   Rare severe events move across the atlas. [WARNING] lines escalate when a funnel is near. Seek sturdy shelter (Storm Watch Office, bunkers, clinics). Vehicles are NOT storm cellars. Strong funnels can injure people who are not strong enough outdoors -- clinic, never loot.
 
 Seasonal water
-  Winter adds ice-edge look lines on outdoor lakes and water rooms (Lebanon lake, Stull shore, overland lake cells). You can still cross -- the game may flash
-  [ALERT] tells on the ice (flavor only in v1; no cold damage).
-
-Staff: gm weather / gm weather tornado (help gm).
-See also: help tornado-hunter | help radio | help calendar | help gm
+  Winter adds ice-edge look lines on outdoor lakes and water rooms. You can still cross -- the game may flash [ALERT] tells on the ice (flavor only in v1; no cold damage).
+See also: help tornado-hunter | help radio | help calendar
 """,
     "travel": """Notbigville -- America overland travel
 
@@ -111,13 +111,13 @@ tornado-hunter -- Storm Watch desk job + chase board
 
 Desk (boring pay): clock in at Storm Watch Office (east of Main Street N7).
 
-How you play (desk)
+How you play
   1. Go to Storm Watch Office
   2. work as tornado_hunter   (or work if that is your favorite)
   3. research                 log regional normals for small dollars
   4. radar                    list watches and live tornado tracks
 
-How you play (chase)
+How you play
   1. chaseboard take         accept a live funnel or storm-cell probe (also: takechase)
   2. track chase              soft lead toward the target atlas cell
   3. probe                    outdoors within one cell of the target
@@ -125,6 +125,7 @@ How you play (chase)
   5. chaseboard abandon       drop the job with no pay (also: abandonchase)
 
 Board (fun chase): anyone at the office can pick up a chase -- on-duty hunters get a turn-in bonus.
+
 See also: help weather | help work | help radio
 """,
     "reporter": """
@@ -133,12 +134,12 @@ reporter -- Mundane Background + Gazette desk gig
 Humans: pick with path reporter -- Spirit, commit / settle, and Mutation Pool still apply (help human).
 Awakened cover: path background reporter on Monster / Celestial -- craft spends Origin fuel, not Spirit (help path | help fuel).
 
-How you play (field)
+How you play
   1. photograph       shoot fights, crowds, crime scenes, or sky drama (may tag [PHOTO] hunter tells on stills -- not masquerade heat)
   2. photos           list held shots on your roll
   3. sellphoto        cash a print at the Lebanon Gazette (west of the Library)
 
-How you play (stories)
+How you play
   1. storyboard       read tips at the Gazette news desk
   2. storyboard take  claim a brief (interviews + optional photo; also: takestory)
   3. interview <name> quote someone in the room for your open brief
@@ -152,6 +153,7 @@ Desk gig (anyone with the job)
 Detective casework can make scenes more photogenic; the Sheriff board and the Gazette are separate loops.
 
 Top stats lean PRE / FOC / FIN.
+
 See also: help detective | help cases | help work | help jobs-hub
 """,
     "stellar": """Notbigville -- Stellar flight demo
@@ -174,20 +176,49 @@ Soldier, priest, monster, machine, god -- Lebanon is full of people who used to 
 
 How you play
   1. At chargen: mortal or Awakened, then Background or Path (set once)
-  2. Shape your look, then starting clothes (skip = road casual; help clothing)
-  3. Humans: home state on your ID (skip = Kansas), then a registration address
-  4. Mutant, Constructed, and Alien are not Awakened picks at create (help paths)
-  5. Awakened Monster / Celestial: optional mortal cover (or Skip)
-  6. Optional: seed personality traits + traveler reach (help personality)
-  7. path                 see what you have; Humans pick path <id> once
-  8. path background      Monster / Celestial: list or set a mortal cover
-  9. help paths           browse every live Origin and Path in the catalog
-  10. help <your Path>     open that hub (vampire, hunter, angel, …)
-  11. train / spar         grow body stats (help training)
-  12. learn <id>           open Disciplines you qualify for
+  2. Mortal Humans: pick one physical school (boxing / wrestling / martial arts) or none
+  3. Shape your look, then starting clothes (skip = road casual; help clothing)
+  4. Humans: home state on your ID (skip = Kansas), then a registration address
+  5. Mutant, Constructed, and Alien are not Awakened picks at create (help paths)
+  6. Awakened Monster / Celestial: optional mortal cover (or Skip); optional physical school cover
+  7. Optional: seed personality traits + traveler reach (help personality)
+  8. path                 see what you have; Humans pick path <id> once
+  9. path background      Monster / Celestial: list or set a mortal cover
+  10. help paths           browse every live Origin and Path in the catalog
+  11. help <your Path>     open that hub (vampire, hunter, angel, …)
+  12. train / spar         grow body stats (help training)
+  13. learn <id>           open Disciplines you qualify for
 
-More detail: help origins more
-See also: help origins more | help paths | help newbie | help human
+Second character? account characters lists alts; create opens chargen again. help paths and help <your Path> compare Origins before you pick.
+
+Your Origin is the big family you belong to. Under that sits a Path -- the game may call it a Background, Lineage, Mantle, Strain, Tether, Core, or Bloodline depending on the family. Path is the concrete role you play day to day.
+
+Live chargen families (today)
+  Human Backgrounds     help human — detective, soldier, hunter, witch, …
+  Monster Lineages      help monster — vampire, shifter, ghost, …
+  Celestial Mantles     help angel | help demon | help reaper
+  Divine Faith Gods     help divine | help god -- episode pantheon worship
+  Cosmic Tethers        help elemental | help eldritch | help void_touched
+
+Type help paths for the full live catalog (built from origins.json).
+  Mutant, Constructed, Alien, and Creation are not player picks at create.
+
+Each Path names three preferred primaries (top stats) -- shown on path and on help paths. Hunter / Occultist / Slayer edges line up with those.
+Echo training uses them for default gym drills (all six primaries have a solo activity). Chargen or kit tools assign non-Human Paths; bare path always shows what you have.
+
+Mortal cover (Monster / Celestial)
+  You keep your Lineage or Mantle. A Mundane Background cover adds the mortal kit (detective, witch, …). Spirit stays Human-only -- cover craft spends your Lineage fuel instead (Ghost Presence, Vampire Blood, Angel Grace, …; check fuel / score). nervework refills that same tank. Type help path for the menu, blocks (no Hunter / Slayer cover), and path background <id>.
+
+Disciplines (learnable powers)
+  learn <id>        open a Discipline you qualify for disciplines       what you know and what you can still open
+  Some Disciplines stay locked until your Origin or Path matches
+  (for example God rites, Hunter arts, Occultist hellcraft).
+
+Useful commands
+  path              show Path; Humans pick a Background once
+  path background   Monster / Celestial mortal cover
+  score             Origin / Path / cover on your sheet
+  alignment         reputation axis good / neutral / evil (help reputation)
 """,
     "shop": """Notbigville -- General Store shopping
 
@@ -199,8 +230,13 @@ How you play:
 
 You need dollars in your wallet to buy. See help score for your cash line.
 """,
-    "clinic": """
-clinic -- alias for hospitalize / Lebanon Hospital help
+    "clinic": """clinic -- hospitalize
+
+Type hospitalize. clinic still works.
+
+How you play
+  1. hospitalize
+
 See also: help hospital
 """,
     "justice": """Notbigville -- wanted / fines / jail
@@ -323,25 +359,120 @@ Calls go to a **phone number on an item**, not a character name.
 call dean only works after you phone save dean 555-0142 (alias → number on *your* phonebook).
 
 How you play
-  1. Buy a flip phone (Ash Garage in Lebanon, or the Lawrence gas station) or find a payphone (Lebanon Square).
+  1. Buy a flip phone or smartphone (Radioshack on Main Street block 3 in Lebanon, or the Lawrence gas station) or find a payphone (Lebanon Square).
   2. phone                 -- status: your number(s), call, contacts
   3. phone number          -- show handset number(s)
-  4. dial 555-0142         -- ring that handset (same plane only)
-     call dean             -- dial a saved alias
-     call sheriff          -- ring whoever holds Lebanon's desk (Calder, Vale, or the officer who took the star). They pick up. Type talk (or talk sheriff) on the line.
-  5. answer / hangup       -- pick up or end
-  6. phone say hello       -- private line; room sees you talk into a phone
-  7. phone text dean you ok?  -- SMS a saved alias (flip phone on both ends)
-  8. phone save dean 555-0142
+  4. phone primary <name|nick>  -- pick which portable speaks, texts, and opens apps
+  5. nickname <item> as <nick> -- -- label a handset or any carried item
+  5. dial 555-0142         -- ring that handset (same plane only)
+  7. call dean -- -- dial a saved alias
+  8. call sheriff -- -- ring whoever holds Lebanon's desk (Calder, Vale, or the officer who took the star). They pick up. Type talk (or talk sheriff) on the line.
+  6. answer / hangup       -- pick up or end
+  7. phone say hello       -- private line; room sees you talk into a phone
+  8. phone text dean you ok?  -- SMS a saved alias (voice handset on both ends)
+  12. phone texts -- -- numbered inbox on your primary handset
+  13. phone texts 2 -- -- read one thread (who / when / body)
+  14. phone voicemail -- -- missed-call tape (phone vm)
+  9. phone save dean 555-0142
      phone forget dean
      phone contacts
-  9. dial WKNZ <text>      -- call-in queue (no radio tune needed)
-     phone request <song>  -- song request queue
- 10. phone ask group|food|water|help -- when an Echo answers (not voicemail)
- 11. phone carvana            -- sell or buy rides (help carvana)
+  16. phone claim 555-0142 -- -- keep a disconnected number (after someone is gone, numbers free up in a day unless you claim them)
+  17. phone transfer -- -- move your primary number to a second handset (upgrade without losing your line)
+  18. phone transfer to <handset> -- -- move your number to the other phone you carry
+ 10. dial WKNZ <text>      -- call-in queue (no radio tune needed)
+  20. phone request <song> -- -- song request queue
+ 11. phone ask group|food|water|help -- when an Echo answers (not voicemail)
+ 12. phone speaker on|off     -- speakerphone (crowded rooms drown the words)
+  23. approach <name> -- -- overhear a nearby caller when you are close
+     phone conference <name> -- add a third party (max 3 on the line)
+  24. dial collect <alias> -- -- collect call; callee types answer collect
+                               (they pay the collect fee from wallet)
+  25. phone bill -- -- smartphone plan owed
+  26. phone bill pay -- -- pay that bill from cash
+  27. buy <item> peachpay -- -- in-person PeachPay at the counter (smartphone)
+ 13. phone protect <handset>  -- stamp shield (Operator+ or Charlie desk/drop
+     or Ash's Roadhouse rig when Ash is there)
+  29. phone protect drop -- -- library drop without entering the bunker
+     phone protect handle <alias> -- secret stamp alias (Desk+ Path or Operator wire)
+  30. phone track <number> -- -- legal ping (sheriff/PI) or illegal heat
+  31. phone bug <smartphone> -- -- live tap while logged in (flip immune)
+  32. page <alias> <short> -- -- pager burst (blackout-live)
+  33. ham say <short> -- -- ham handheld, same room only (blackout-live)
+  34. dashcam replay -- -- vehicle ring buffer
+ 14. Smartphones: phone app list | phone app install <id> | phone app open <id>
+     phone settings ringtone|texttone|wallpaper <name>
+     Flip phones: phone carvana (no app store). Smartphone: install Carvana app
+     first, then phone carvana or phone app open carvana (help carvana)
 
-More detail: help phone more
-See also: help phone more | help echo | help radio | help station
+Handsets
+  Flip phones are prepaid — buy once, dial and text. Smartphones cost more up front and run apps from Peach Market (phone app list). Flip phones do not install apps — voice, text, and phone carvana only. Smartphones need the Carvana app installed before phone carvana when the smartphone is your primary handset.
+  Pagers beep short codes only — not voice dial or SMS. Ham radios and dashcams are wire gear, not phone lines.
+
+Apps (smartphone primary)
+  phone app list — Peach Market glance (built-in, installed, not yet installed)
+  phone app install <id> | phone app uninstall <id> | phone app open <id>
+  Built-in: phone, messages, settings (cannot uninstall)
+  Installable v1: carvana, town, weather, news, maps, bank, camera, games, radio, tv, peachpay
+  phone settings ringtone|texttone|wallpaper <name> — cosmetic tones on the handset
+  phone app open radio | phone app open tv — live program from the town bus (Channel 7 when a host is on air)
+  phone radio — smartphone needs Radio app; flips use room or car radio (help radio)
+
+Cell blackout
+  Severe weather, a Signal god's parish kit, or staff action can kill cell in a room or zone. Smartphones show no bars unless a Signal god in the room projects Kind coverage (lifeline) — apps, PeachPay, and phone app list refuse the same way. Flip phones stay spotty for outbound dial and text — about one call in three may fail with one bar. Weather WEA still lands on flips. Payphones, house landlines, motel room phones, pagers, and ham rigs ignore the blackout. Signal gods: signal blackout [parish] | signal blackout off (help godkind).
+
+Payphones
+  Cost 1 dollars per outbound call. Usable only if the room has a payphone item or the room description mentions a payphone. Outbound only.
+
+House and motel copper
+  Dial a house landline or motel room phone and it rings the people in that room (and, for a house line, the homestead owner if they are still inside the house). Empty rooms give a ring-and-no-pickup tell — not "nobody is carrying that phone."
+
+Collect
+  dial collect <alias|number> rings collect; the callee must type answer collect. That accepts the charges and takes the collect fee from their wallet. Hang up or refuse if they cannot pay.
+
+Smartphone bill
+  Smartphone primaries accrue a monthly plan charge (~$35). Unpaid bills degrade data and apps (one-bar tell); voice may still connect. Type phone bill, then phone bill pay from cash. Flips and pagers stay prepaid.
+
+Planes
+  Signal stays on the plane you are on (Earth phone cannot ring Hell).
+
+Cadence
+  Offline Echoes and town NPCs on Earth earn toward a flip phone (gig work), then walk to an in-town phone shelf (Radioshack in Lebanon; gas station in Lawrence) and buy one -- same buy verb players use.
+  Towns without a shelf do not soft-lock on endless grocery gigs.
+  Critical hunger/thirst still outranks shopping.
+  On-shift desk clerks stay at their workplace before the phone grind.
+  Hunters on a haunt / hunt lead may call a close-tie Echo partner
+  (sibling, ashkin, …) with phone ask group so the road trip waits for the meetup -- same ask path players use.
+Echoes
+  Offline bodies can answer unless echo voicemail on. Live players must type answer. See help echo.
+
+Texts (SMS)
+  phone text <alias|number> <message> sends a short one-way SMS. Both ends need a voice handset (flip or smartphone). Threads live on the handset item — steal the phone, steal the inbox. phone texts lists threads; phone texts <n> shows who, when, and body. True-offline players still get the line on login (queued flush) and the thread on the phone. Live and idlemode watchers get texts immediately. Echoes do not auto-reply to texts. Sheriff and weather WEA texts land in their own official thread, not mixed with friends — smartphones dead in a cell blackout do not receive WEA until coverage returns; flips still get emergency SMS. After greet, talk curio number then text curio where or quote <item> (help curio). Same-plane only.
+
+Voicemail (handset)
+  Missed calls on your portable leave a short tape on that handset — phone voicemail or phone vm to list, phone voicemail <n> to listen, phone voicemail delete <n>. Echo voicemail on|off is separate (help echo): that pref blocks Echo pickup, not this tape.
+
+Overhear and speakerphone
+  By default only your call peer hears your words; the room sees you talk into a phone. approach <name> while they are on a call to stand close and catch their side. phone speaker on broadcasts your words to the room unless it is crowded (five or more people, or a plaza bustle) — then listeners only get muffled chatter. Vehicle cabins pipe Bluetooth audio to everyone inside.
+
+Conference and collect
+  phone conference <alias|number> (or phone add …) while connected adds a third party — three characters max. Collect charges are covered above.
+
+PeachPay
+  Install PeachPay on a smartphone primary, stand at an on-duty shop counter, then buy <item> peachpay or phone peachpay <item>. You hand the clerk your phone for a short trust window — steal the phone during the window and the sale dies. No paying from another room.
+
+Wirecraft and Charlie
+  Secret wirecraft ranks up on contested protect, track, and BUG. Protect replies may name your band (Civilian through Ghost) when you outbox Charlie's stamp — never a raw XP number on score. Track and BUG stay terse (legal ping or heat), not a band ladder readout. Charlie Bradbury (alive AU) stamps Operator-quality shields at the Lebanon Town Library afternoons (phone protect drop) and the Men of Letters bunker nights. Ash stamps at the Roadhouse rig when he is in the back room. Ghost-tier operators outbox named stamps. phone protect stamps your handset; phone protect handle <alias> sets a secret handle from Desk-rank Hacker Path or Operator wire — the alias never prints on score. phone protect drop leaves a handset in the library slot without entering the bunker (evils welcome). phone track <number> is legal for sheriff/PI/detective desks (fee) or illegal heat otherwise. phone bug <smartphone> feeds live call audio to you while logged in — flip phones and pagers refuse the tap.
+
+APK Barn
+  phone app barn list | phone app barn install torch — sideload sketchy apps outside Peach Market. No online clone or hack bank in v1.
+
+Pager / ham / dashcam
+  page <alias|number> <short> — pager SKU only; works in cell blackout. ham say <short> — handheld ham rig, heard in this room only (no phone number, ignores blackout). dashcam replay — ring buffer on the dashcam item; it records as the vehicle rolls (carry it in the cabin). vehicle dashcam replay from inside the cabin.
+
+Civic hold
+  When the sheriff desk line is busy, the next caller hears short local hold spots until the desk picks up — not the Veil gateway wait tone.
+
+Screenreader: lines use [PHONE] / [CALL] tags (never color alone).
 """,
     "appearance": """appearance -- structured look slots
 
@@ -350,11 +481,28 @@ No args: list every slot and your current look description.
       appearance eye_color storm grey
       appearance hair_color sun-bleached wheat
 
-How you play
-  Type help appearance more for the full writeup.
+Chargen asks who you are first (mortal Background or Awakened Nature), then lists the catalog for your look. Elementals see an Aspect kit
+(Fire / Water / Air / Earth) -- living matter, not mortal hair and skin.
+Void-Touched Cosmics see an uncanny kit (void-bleached skin, wrong eyes).
+Glamour over a mortal face is later magic, not chargen. You can still type custom text instead of a number/id. Chargen also asks when you were born (see help age).
 
-More detail: help appearance more
-See also: help appearance more | help pronoun | help setdesc | help setshort
+One-time refresh: if you have ``appearance_retro_pick`` (Void-Touched catalog expansion), type ``appearance repick``, set each slot, then ``appearance repick done``.
+
+Height bands (mortal catalog): very_short, short, below_average, average, above_average, tall, very_tall.
+Help flavor only -- approximate ranges like ~5 ft 8 in are not mechanical. Type your own height at chargen or with appearance height if you prefer (e.g. 5 ft 9 in or 175 cm).
+
+Slots: hair_style, hair_color, eye_color, height, physique, skin_tone, facial_hair, scars, voice.
+Voice is a look tag and flavors what listeners hear on room say (in a gravelly voice, …). No mechanical range or carry.
+Physique is your build or frame (slim, athletic, average build, stocky, heavyset) -- appearance only, not combat body_type and not a weight stat.
+Mortals may age slowly over long in-game time (look only -- no stat loss). Vampires and other supernaturals do not visibly age. Offline Echo bodies age on the same calendar.
+
+  1. pronoun he|she|they|it -- -- combat prose + look grammar
+  2. setdesc <text> -- -- full freeform look override (setdesc clear restores the auto-built sentence from slots)
+  3. setshort <text> -- -- short room-face strangers see (height/hair auto, or your own line; see 'help setshort')
+  4. gait <id> -- -- how you enter/leave rooms (walk, glide, skip…; see 'help gait')
+
+New characters set this in chargen; these commands edit afterward.
+See also: help age
 """,
     "relationships": """
 relationships -- friends, family, rivals, enemies, ashkin, favorites

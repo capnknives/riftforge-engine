@@ -78,6 +78,17 @@ _prompt_supplemental_bands = None
 _help_topics = {}
 _gm_only_help_keywords = frozenset()
 _help_categories = []
+# Staff-only catalog for ``gmhelp`` (GM/Builder index + jargon overrides).
+# Player ``help`` never lists these, even for ranked staff -- they type
+# gmhelp so they can still read the player handbook as a player would.
+_gmhelp_categories = []
+_gmhelp_topic_overrides = {}
+# Optional: fn(character) -> bool. When True, the help index includes
+# GM/Builder bands. Default falls back to ``_is_gm``. SUPERS gates on
+# GM form so ``gm off`` staff see the player catalog (bug report 934).
+# Player ``help`` no longer uses this for the catalog (gmhelp owns it);
+# kept so diagnostics and older callers stay defined.
+_help_index_staff_view = None
 
 # Player-verb dispatch: engine/npc_act.py needs to run one raw command line
 # the same way a real player's input would, but the actual `dispatch()`
@@ -195,6 +206,8 @@ _paced_travel_destinations = None
 _paced_travel_enter_alias = None
 _paced_travel_drive_to = None
 _paced_travel_gait_of = None
+_paced_travel_hops_of = None
+_paced_travel_eta_tick = None
 _paced_travel_engaged_refuse = None
 _paced_travel_list_destinations = None
 _paced_travel_zone_rooms = None
@@ -458,6 +471,7 @@ def orphan_item_room(game):
 # Combat-gear persistence helpers (SUPERS items catalog enrich + rebind).
 _enrich_loaded_item = None
 _rebind_character_equipment = None
+_sync_equipped_flags_from_equipment = None
 
 
 def set_enrich_loaded_item(fn):
@@ -483,6 +497,18 @@ def rebind_character_equipment(character):
     """Rebuild character.equipment after inventory load (no-op bare)."""
     if _rebind_character_equipment is not None:
         return _rebind_character_equipment(character)
+
+
+def set_sync_equipped_flags_from_equipment(fn):
+    """Register fn(character) to stamp inventory flags from equipment map."""
+    global _sync_equipped_flags_from_equipment
+    _sync_equipped_flags_from_equipment = fn
+
+
+def sync_equipped_flags_from_equipment(character):
+    """Align inventory equipped flags with live combat slots before save."""
+    if _sync_equipped_flags_from_equipment is not None:
+        return _sync_equipped_flags_from_equipment(character)
     return None
 
 
@@ -1049,9 +1075,16 @@ def set_after_session_attach(fn):
 
 
 def after_session_attach(character, game):
-    """Run the registered Session-attach hook, or do nothing if none is set."""
+    """Run the registered Session-attach hook, or do nothing if none is set.
+
+    A raising game hook must not kill login -- log and continue so the
+    Session still reaches play() (see logging_gaps_2026-08-30.md).
+    """
     if _after_session_attach is not None:
-        _after_session_attach(character, game)
+        try:
+            _after_session_attach(character, game)
+        except Exception as exc:
+            _log_hook_fail(game, "after_session_attach", exc)
 
 
 def set_after_session_attach_deferred(fn):
@@ -1068,7 +1101,10 @@ def set_after_session_attach_deferred(fn):
 def after_session_attach_deferred(character, game):
     """Run deferred Session-attach hooks after the first room look."""
     if _after_session_attach_deferred is not None:
-        _after_session_attach_deferred(character, game)
+        try:
+            _after_session_attach_deferred(character, game)
+        except Exception as exc:
+            _log_hook_fail(game, "after_session_attach_deferred", exc)
 
 
 def set_on_session_disconnect(fn):
@@ -1082,9 +1118,15 @@ def set_on_session_disconnect(fn):
 
 
 def on_session_disconnect(character, game, *, to_echo=True):
-    """Run the registered Session-detach hook, or do nothing if none is set."""
+    """Run the registered Session-detach hook, or do nothing if none is set.
+
+    Logout must still detach the Session even when a game hook raises.
+    """
     if _on_session_disconnect is not None:
-        _on_session_disconnect(character, game, to_echo=to_echo)
+        try:
+            _on_session_disconnect(character, game, to_echo=to_echo)
+        except Exception as exc:
+            _log_hook_fail(game, "on_session_disconnect", exc)
 
 
 def set_on_echo_begin(fn):
@@ -1096,7 +1138,10 @@ def set_on_echo_begin(fn):
 def on_echo_begin(character, game):
     """Run the registered Echo-begin hook, or no-op."""
     if _on_echo_begin is not None:
-        _on_echo_begin(character, game)
+        try:
+            _on_echo_begin(character, game)
+        except Exception as exc:
+            _log_hook_fail(game, "on_echo_begin", exc)
 
 
 def set_park_gm_spirit_on_disconnect(fn):
@@ -1112,7 +1157,10 @@ def set_park_gm_spirit_on_disconnect(fn):
 def park_gm_spirit_on_disconnect(spirit, game):
     """Fold a sessionless permanent GM spirit on disconnect, if registered."""
     if _park_gm_spirit_on_disconnect is not None:
-        _park_gm_spirit_on_disconnect(spirit, game)
+        try:
+            _park_gm_spirit_on_disconnect(spirit, game)
+        except Exception as exc:
+            _log_hook_fail(game, "park_gm_spirit_on_disconnect", exc)
 
 
 def set_gmcp_char_vitals(fn):
@@ -1128,7 +1176,12 @@ def set_gmcp_char_vitals(fn):
 def gmcp_char_vitals(character):
     """Build a Char.Vitals dict, or None when no game hook is registered."""
     if _gmcp_char_vitals is not None:
-        return _gmcp_char_vitals(character)
+        try:
+            return _gmcp_char_vitals(character)
+        except Exception as exc:
+            game = getattr(getattr(character, "session", None), "game", None)
+            _log_hook_fail(game, "gmcp_char_vitals", exc)
+            return None
     return None
 
 
@@ -1146,7 +1199,8 @@ def prompt_target_band(character, game=None):
     if _prompt_target_band is not None:
         try:
             return _prompt_target_band(character, game) or ""
-        except Exception:
+        except Exception as exc:
+            _log_hook_fail(game, "prompt_target_band", exc)
             return ""
     return ""
 
@@ -1165,7 +1219,8 @@ def prompt_need_band(character, game=None):
     if _prompt_need_band is not None:
         try:
             return _prompt_need_band(character, game) or ""
-        except Exception:
+        except Exception as exc:
+            _log_hook_fail(game, "prompt_need_band", exc)
             return ""
     return ""
 
@@ -1184,8 +1239,9 @@ def origin_default_prompt(character):
     if _origin_default_prompt is not None:
         try:
             return _origin_default_prompt(character)
-        except Exception:
-            pass
+        except Exception as exc:
+            game = getattr(getattr(character, "session", None), "game", None)
+            _log_hook_fail(game, "origin_default_prompt", exc)
     from engine import display_prefs
     return display_prefs.DEFAULT_PROMPT
 
@@ -1201,8 +1257,8 @@ def is_factory_prompt(template):
     if _is_factory_prompt is not None:
         try:
             return bool(_is_factory_prompt(template))
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_hook_fail(None, "is_factory_prompt", exc)
     from engine import display_prefs
     return display_prefs.is_generic_prompt(template)
 
@@ -1223,7 +1279,8 @@ def prompt_supplemental_bands(character, game=None):
     if _prompt_supplemental_bands is not None:
         try:
             return _prompt_supplemental_bands(character, game) or {}
-        except Exception:
+        except Exception as exc:
+            _log_hook_fail(game, "prompt_supplemental_bands", exc)
             return {}
     return {}
 
@@ -1240,7 +1297,12 @@ def set_gmcp_char_status(fn):
 def gmcp_char_status(character):
     """Extra Char.Status fields from the game, or None."""
     if _gmcp_char_status is not None:
-        return _gmcp_char_status(character)
+        try:
+            return _gmcp_char_status(character)
+        except Exception as exc:
+            game = getattr(getattr(character, "session", None), "game", None)
+            _log_hook_fail(game, "gmcp_char_status", exc)
+            return None
     return None
 
 
@@ -1261,7 +1323,12 @@ def web_map_cell_verbs(character, map_id, x, y, landmark):
             rows = _web_map_cell_verbs(character, map_id, x, y, landmark)
             if isinstance(rows, list):
                 return _sanitize_web_map_verbs(rows)
-        except Exception:
+        except Exception as exc:
+            _log_hook_fail(
+                getattr(getattr(character, "session", None), "game", None),
+                "web_map_cell_verbs",
+                exc,
+            )
             return []
     return _default_web_map_verbs(landmark)
 
@@ -1319,6 +1386,27 @@ def get_help_categories():
     return _help_categories
 
 
+def set_gmhelp(categories, overrides=None):
+    """Inject the staff ``gmhelp`` index and topic-body overrides.
+
+    categories: list of (heading, [topic names]) like HELP_CATEGORIES
+    overrides: name -> page string (e.g. jargon internals, gmhelp hub)
+    """
+    global _gmhelp_categories, _gmhelp_topic_overrides
+    _gmhelp_categories = list(categories) if categories is not None else []
+    _gmhelp_topic_overrides = dict(overrides) if overrides else {}
+
+
+def get_gmhelp_categories():
+    """Return the injected GMHELP_CATEGORIES list (may be empty)."""
+    return _gmhelp_categories
+
+
+def get_gmhelp_topic_overrides():
+    """Return staff-only page bodies that replace player HELP_TOPICS keys."""
+    return _gmhelp_topic_overrides
+
+
 def set_gm_only_help_keywords(keywords):
     """Register static help topic keys visible only to staff (``_is_gm``)."""
     global _gm_only_help_keywords
@@ -1330,6 +1418,23 @@ def set_gm_only_help_keywords(keywords):
 def is_gm_only_help(keyword):
     """True when a static HELP_TOPICS key requires GM rank to view."""
     return (keyword or "").strip().lower() in _gm_only_help_keywords
+
+
+def set_help_index_staff_view(fn):
+    """Register fn(character) -> bool for GM/Builder help-index visibility.
+
+    Pass None to restore the default (``_is_gm``).
+    """
+    global _help_index_staff_view
+    _help_index_staff_view = fn
+
+
+def help_index_staff_view(character):
+    """True when this viewer should see GM/Builder bands on help indexes."""
+    if _help_index_staff_view is not None:
+        return bool(_help_index_staff_view(character))
+    from engine.command_support import _is_gm
+    return _is_gm(character)
 
 
 def set_dispatch(fn):
@@ -1592,11 +1697,20 @@ def group_sheet_extra(character, game=None):
     return str(result)
 
 
-def register_sheet_field(field_id, fn):
-    """Register a ``hook:<field_id>`` row in ``engine/content/sheet_profile.json``."""
+def register_sheet_field(field_id, fn, **kwargs):
+    """Register a ``hook:<field_id>`` row in ``engine/content/sheet_profile.json``.
+
+    Extra kwargs (``slot``, ``panes``, ``compact``, ``filter_prefixes``)
+    go to ``register_auto_field`` so a meter can appear before it has a
+    catalog row. When the catalog already lists ``field_id``, kwargs are
+    ignored and this is a plain hook install.
+    """
     from engine.systems import sheet as sheet_mod
 
-    sheet_mod.register_field_hook(field_id, fn)
+    if kwargs:
+        sheet_mod.register_auto_field(field_id, fn, **kwargs)
+    else:
+        sheet_mod.register_field_hook(field_id, fn)
 
 
 def register_sheet_contributor(section_id, fn, *, priority=100):
@@ -1972,8 +2086,8 @@ def perception_character(character, game=None):
             perceived = _perception_character(character, game)
             if perceived is not None:
                 return perceived
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_hook_fail(game, "perception_character", exc)
     return character
 
 
@@ -1995,8 +2109,8 @@ def preference_character(character, game=None):
             owner = _preference_character(character, game)
             if owner is not None:
                 return owner
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_hook_fail(game, "preference_character", exc)
     return character
 
 
@@ -2314,6 +2428,14 @@ def after_growth_banked(character, amount, source="unknown"):
 # optional player message str, or None.
 _after_acquire_item = None
 _before_acquire_item = None
+# Before ``give`` transfers an item (in-room). Games may refuse Echo
+# gift policy without engine importing the game package.
+# fn(giver, target, item) -> optional refusal str, or None.
+_before_give = None
+# After a successful in-room ``give``. Games may count courtship gifts
+# without engine importing the game package.
+# fn(giver, target, item, amount=1, game=None) -> None.
+_after_give = None
 
 
 def set_before_acquire_item(fn):
@@ -2344,6 +2466,59 @@ def after_acquire_item(character, item):
     if _after_acquire_item is not None:
         return _after_acquire_item(character, item)
     return None
+
+
+def set_before_give(fn):
+    """Register fn(giver, target, item) -> str|None before ``give`` transfers.
+
+    Return a refusal message to abort the hand-off, or None to allow it.
+    Pass None to restore the no-op default.
+    """
+    global _before_give
+    _before_give = fn
+
+
+def before_give(giver, target, item):
+    """Run the pre-give hook; return refusal message or None if allowed."""
+    if _before_give is not None:
+        return _before_give(giver, target, item)
+    return None
+
+
+_try_give_cash = None
+
+
+def set_try_give_cash(fn):
+    """Register fn(giver, target, cents, game) -> bool for pocket-cash ``give``.
+
+    Return True when the hook handled the transfer (messages already sent).
+    Pass None to restore the no-op default (``give $N`` falls through to items).
+    """
+    global _try_give_cash
+    _try_give_cash = fn
+
+
+def try_give_cash(giver, target, cents, game):
+    """Hand pocket cash via ``give $N to <name>`` when a game hook is registered."""
+    if _try_give_cash is not None:
+        return _try_give_cash(giver, target, cents, game)
+    return False
+
+
+def set_after_give(fn):
+    """Register fn(giver, target, item, amount=1, game=None) after ``give``.
+
+    Called only when at least one unit actually changed hands. Pass None
+    to restore the no-op default.
+    """
+    global _after_give
+    _after_give = fn
+
+
+def after_give(giver, target, item, amount=1, game=None):
+    """Run the post-give hook (courtship, quests, etc.)."""
+    if _after_give is not None:
+        _after_give(giver, target, item, amount=amount, game=game)
 
 
 def set_can_see_spirit(fn):
@@ -2380,8 +2555,9 @@ def set_can_see_hellhound(fn):
 def can_see_hellhound(viewer, hound=None):
     """Can `viewer` see a Deal hellhound (or other hellhound_invisible)?
 
-    Default (no game installed): False. SUPERS registers Celestial /
-    glasses / engage checks from ``supers.hellhounds``.
+    Default (no game installed): False. SUPERS registers innate astral
+    perception (Angels / Demons / Gods / Cosmic) / glasses / True Sight
+    Deal checks from ``supers.hellhounds``.
     """
     if _can_see_hellhound is not None:
         return bool(_can_see_hellhound(viewer, hound))
@@ -2586,7 +2762,9 @@ def extra_affect_rows(character):
         return []
     try:
         rows = _extra_affect_rows(character)
-    except Exception:
+    except Exception as exc:
+        game = getattr(getattr(character, "session", None), "game", None)
+        _log_hook_fail(game, "extra_affect_rows", exc)
         return []
     return list(rows or [])
 
@@ -2998,7 +3176,9 @@ def extra_target_match_needles(viewer, subject):
         return []
     try:
         raw = _extra_target_match_needles(viewer, subject)
-    except Exception:
+    except Exception as exc:
+        game = getattr(getattr(viewer, "session", None), "game", None)
+        _log_hook_fail(game, "extra_target_match_needles", exc)
         return []
     if not raw:
         return []
@@ -3113,7 +3293,8 @@ def staff_login_cast_keys():
             for k in (_staff_login_cast_keys() or ())
             if k
         )
-    except Exception:
+    except Exception as exc:
+        _log_hook_fail(None, "staff_login_cast_keys", exc)
         return frozenset()
 
 
@@ -3645,7 +3826,8 @@ def vehicle_extra_persist_fields(veh):
             extra = _vehicle_extra_persist_fields(veh)
             if isinstance(extra, dict) and extra:
                 return dict(extra)
-        except Exception:
+        except Exception as exc:
+            _log_hook_fail(None, "vehicle_extra_persist_fields", exc)
             return {}
     return {}
 
@@ -3670,7 +3852,8 @@ def vehicle_extra_persist_apply(veh, extra):
         return
     try:
         _vehicle_extra_persist_apply(veh, extra)
-    except Exception:
+    except Exception as exc:
+        _log_hook_fail(None, "vehicle_extra_persist_apply", exc)
         return
 
 
@@ -3728,6 +3911,22 @@ def after_zone_enter(character, game, dest):
     """Run the registered post-zone-enter hook, or do nothing."""
     if _after_zone_enter is not None:
         _after_zone_enter(character, game, dest)
+
+
+_zone_enter_dest = None
+
+
+def set_zone_enter_dest(fn):
+    """Register fn(character, dest, raw_enter, game) -> dest room rewrite."""
+    global _zone_enter_dest
+    _zone_enter_dest = fn
+
+
+def zone_enter_dest(character, dest, raw_enter, game):
+    """Optional rewrite of classic zone enter destination."""
+    if _zone_enter_dest is not None:
+        return _zone_enter_dest(character, dest, raw_enter, game)
+    return dest
 
 
 def set_try_exit_zone(fn):
@@ -4013,6 +4212,7 @@ def weather_radio_bulletin(game, line):
 
 
 _storm_chase_is_on_duty = None
+_storm_chase_desk_keys = frozenset()
 
 
 def set_storm_chase_is_on_duty(fn):
@@ -4032,6 +4232,7 @@ _press_beat_is_reporter = None
 _press_beat_is_on_duty = None
 _press_beat_room_excitement = None
 _press_beat_interview_line = None
+_press_beat_desk_keys = frozenset()
 
 
 def set_press_beat_is_reporter(fn):
@@ -4367,6 +4568,7 @@ _resolve_gm_body = None
 _stamp_input_activity = None
 _blob_codec_reload = None
 _taxi_mode_saver = None
+_help_overlay_mode_saver = None
 _map_snapshot_write_all = None
 _map_snapshot_daily_archive = None
 
@@ -4508,6 +4710,18 @@ def save_taxi_mode_meta(conn, game):
     """Persist taxi pacing mode when a game registered a saver."""
     if _taxi_mode_saver is not None:
         _taxi_mode_saver(conn, game)
+
+
+def set_help_overlay_mode_saver(fn):
+    """Register fn(conn, game) -> None to persist game.help_overlay_mode meta."""
+    global _help_overlay_mode_saver
+    _help_overlay_mode_saver = fn
+
+
+def save_help_overlay_mode_meta(conn, game):
+    """Persist help overlay mode when a game registered a saver."""
+    if _help_overlay_mode_saver is not None:
+        _help_overlay_mode_saver(conn, game)
 
 
 def set_map_snapshot_hooks(write_all=None, daily_archive=None):
@@ -4772,9 +4986,11 @@ def deliver_say(character, spoken, game, **kwargs):
     face = _presence_face(character)
     tag = f" {drunk_tag}" if drunk_tag else ""
     tone_bit = f" {tone}" if tone else ""
-    character.session.send(
-        f"You {you_verb},{tone_bit} \"{spoken}\"{tag}"
-    )
+    session = getattr(character, "session", None)
+    if session is not None:
+        session.send(
+            f"You {you_verb},{tone_bit} \"{spoken}\"{tag}"
+        )
     if room is not None:
         line = (
             f'{_display_name(character)} {they_verb},{tone_bit} "{spoken}"{tag}'
@@ -4783,8 +4999,8 @@ def deliver_say(character, spoken, game, **kwargs):
         try:
             from engine import channels
             channels.append_room_say(game, room, line)
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_hook_fail(game, "deliver_say_history", exc)
 
 
 def set_autoloot_is_combat_zone(fn):
@@ -4881,6 +5097,50 @@ def blocked_foot_step(game, macro, micro):
     if _blocked_foot_step is not None:
         return _blocked_foot_step(game, macro, micro)
     return None
+
+
+_can_enter_water = None
+_water_may_enter_band = None
+_max_water_band = None
+
+
+def set_can_enter_water(fn):
+    """Register hard refuse before entering playable water (Fire Elemental)."""
+    global _can_enter_water
+    _can_enter_water = fn
+
+
+def can_enter_water(character):
+    """(ok, tell) — permissive when no game hook is registered."""
+    if _can_enter_water is not None:
+        return _can_enter_water(character)
+    return True, ""
+
+
+def set_water_may_enter_band(fn):
+    """Register depth-band endurance gate (character, water_kind, band)."""
+    global _water_may_enter_band
+    _water_may_enter_band = fn
+
+
+def water_may_enter_band(character, water_kind, band):
+    """(ok, tell) for one target depth band."""
+    if _water_may_enter_band is not None:
+        return _water_may_enter_band(character, water_kind, band)
+    return True, ""
+
+
+def set_max_water_band(fn):
+    """Register max depth label for (character, water_kind)."""
+    global _max_water_band
+    _max_water_band = fn
+
+
+def max_water_band(character, water_kind):
+    """Shallowest allowed max band label, or ``surface`` / ``inshore``."""
+    if _max_water_band is not None:
+        return _max_water_band(character, water_kind)
+    return "surface" if str(water_kind) == "lake" else "inshore"
 
 
 def set_character_atmos_tick(fn):
@@ -5548,6 +5808,32 @@ def paced_travel_gait_of(character):
     if _paced_travel_gait_of is not None:
         return _paced_travel_gait_of(character)
     return "go"
+
+
+def set_paced_travel_hops_of(fn):
+    """Register fn(character, pace) -> hops int or None (keep engine default)."""
+    global _paced_travel_hops_of
+    _paced_travel_hops_of = fn
+
+
+def paced_travel_hops_of(character, pace="run"):
+    """Optional Origin hop override for one paced advance, or None."""
+    if _paced_travel_hops_of is not None:
+        return _paced_travel_hops_of(character, pace)
+    return None
+
+
+def set_paced_travel_eta_tick(fn):
+    """Register fn(character, game, focus, now) for mode=eta journeys."""
+    global _paced_travel_eta_tick
+    _paced_travel_eta_tick = fn
+
+
+def paced_travel_eta_tick(character, game, focus, now):
+    """Advance one skip-road ETA stamp, or False if no hook."""
+    if _paced_travel_eta_tick is not None:
+        return _paced_travel_eta_tick(character, game, focus, now)
+    return False
 
 
 def set_paced_travel_engaged_refuse(fn):
@@ -6316,3 +6602,202 @@ def maybe_mine_job_bark(character, game, action):
     if _maybe_mine_job_bark is not None:
         return bool(_maybe_mine_job_bark(character, game, action))
     return False
+
+
+# --- Phase 2 purity (2026-09 v0.7.0) -------------------------------------
+# These replaced live ``from supers import …`` inside engine modules.
+# Games register the real implementations in bootstrap.
+
+_resolve_account_character = None
+_after_group_focus_change = None
+_ensure_quest_mentor_reach = None
+_note_zone_visit = None
+_is_ephemeral_instance_room = None
+_report_persist_helper_gaps = None
+_containers_is_profession_bag_item = None
+_containers_matching_profession_bag = None
+_containers_is_weave_bag_item = None
+_containers_is_extradim_bag_item = None
+_containers_is_generic_weave_query = None
+_containers_active_weave_bag = None
+
+
+def set_resolve_account_character(fn):
+    """Register fn(character, game) -> Character for account-face mapping.
+
+    God bilocate twins have no account row; SUPERS maps them to the Mantle.
+    Pass None to restore identity (lean engine).
+    """
+    global _resolve_account_character
+    _resolve_account_character = fn
+
+
+def resolve_account_character(character, game):
+    """Return the account-owning body, or ``character`` unchanged."""
+    if character is None:
+        return None
+    if _resolve_account_character is None:
+        return character
+    mapped = _resolve_account_character(character, game)
+    return mapped if mapped is not None else character
+
+
+def set_after_group_focus_change(fn):
+    """Register fn(game) after a player sets or clears group focus."""
+    global _after_group_focus_change
+    _after_group_focus_change = fn
+
+
+def after_group_focus_change(game):
+    """Notify the game that party focus changed (NPC mate retarget)."""
+    if _after_group_focus_change is not None:
+        _after_group_focus_change(game)
+
+
+def set_ensure_quest_mentor_reach(fn):
+    """Register fn(game, pin_map) -> int for quest-mentor phone/mail reach."""
+    global _ensure_quest_mentor_reach
+    _ensure_quest_mentor_reach = fn
+
+
+def ensure_quest_mentor_reach(game, pin_map):
+    """Ensure quest mentors are reachable; default no-op returns 0."""
+    if _ensure_quest_mentor_reach is None:
+        return 0
+    return int(_ensure_quest_mentor_reach(game, pin_map) or 0)
+
+
+def set_note_zone_visit(fn):
+    """Register fn(character, game, room=dest) after a landmark/hub enter."""
+    global _note_zone_visit
+    _note_zone_visit = fn
+
+
+def note_zone_visit(character, game, room=None):
+    """Optional visit stamp (Cultivator qi sites, etc.). Default no-op."""
+    if _note_zone_visit is not None:
+        _note_zone_visit(character, game, room=room)
+
+
+def set_is_ephemeral_instance_room(fn):
+    """Register fn(room) -> bool for wilderness procedural pockets."""
+    global _is_ephemeral_instance_room
+    _is_ephemeral_instance_room = fn
+
+
+def is_ephemeral_instance_room(room):
+    """True when the game says this room is a short-lived combat pocket."""
+    if _is_ephemeral_instance_room is None:
+        return False
+    return bool(_is_ephemeral_instance_room(room))
+
+
+def set_report_persist_helper_gaps(fn):
+    """Register fn() -> list[str] of missing persist helper names."""
+    global _report_persist_helper_gaps
+    _report_persist_helper_gaps = fn
+
+
+def report_persist_helper_gaps():
+    """Names of save helpers the game process does not have yet."""
+    if _report_persist_helper_gaps is None:
+        return []
+    try:
+        out = _report_persist_helper_gaps()
+        return list(out) if out else []
+    except Exception as exc:
+        return [f"persist_helper_gap_check_failed:{exc}"]
+
+
+def set_containers_is_profession_bag_item(fn):
+    """Register fn(item) -> bool for hip-slot profession satchels."""
+    global _containers_is_profession_bag_item
+    _containers_is_profession_bag_item = fn
+
+
+def containers_is_profession_bag_item(item):
+    if _containers_is_profession_bag_item is not None:
+        return bool(_containers_is_profession_bag_item(item))
+    return False
+
+
+def set_containers_matching_profession_bag(fn):
+    """Register fn(character, item) -> bag Item | None."""
+    global _containers_matching_profession_bag
+    _containers_matching_profession_bag = fn
+
+
+def containers_matching_profession_bag(character, item):
+    if _containers_matching_profession_bag is not None:
+        return _containers_matching_profession_bag(character, item)
+    return None
+
+
+def set_containers_is_weave_bag_item(fn):
+    """Register fn(item) -> bool for temporary pocket-weave bags."""
+    global _containers_is_weave_bag_item
+    _containers_is_weave_bag_item = fn
+
+
+def containers_is_weave_bag_item(item):
+    if _containers_is_weave_bag_item is not None:
+        return bool(_containers_is_weave_bag_item(item))
+    return False
+
+
+def set_containers_is_extradim_bag_item(fn):
+    """Register fn(item) -> bool for bound/stitched extra-carry bags."""
+    global _containers_is_extradim_bag_item
+    _containers_is_extradim_bag_item = fn
+
+
+def containers_is_extradim_bag_item(item):
+    if _containers_is_extradim_bag_item is not None:
+        return bool(_containers_is_extradim_bag_item(item))
+    return False
+
+
+def set_containers_is_generic_weave_query(fn):
+    """Register fn(query) -> bool for 'weave' / pocket-weave look tokens."""
+    global _containers_is_generic_weave_query
+    _containers_is_generic_weave_query = fn
+
+
+def containers_is_generic_weave_query(query):
+    if _containers_is_generic_weave_query is not None:
+        return bool(_containers_is_generic_weave_query(query))
+    return False
+
+
+def set_containers_active_weave_bag(fn):
+    """Register fn(character) -> weave bag Item | None."""
+    global _containers_active_weave_bag
+    _containers_active_weave_bag = fn
+
+
+def containers_active_weave_bag(character):
+    if _containers_active_weave_bag is not None:
+        return _containers_active_weave_bag(character)
+    return None
+
+
+def set_press_beat_desk_keys(keys):
+    """Register extra news-desk room keys (game towns, not engine defaults)."""
+    global _press_beat_desk_keys
+    _press_beat_desk_keys = frozenset(keys or ())
+
+
+def press_beat_desk_keys():
+    """Room keys the game treats as a news desk (empty in a bare engine)."""
+    return _press_beat_desk_keys
+
+
+def set_storm_chase_desk_keys(keys):
+    """Register extra storm-watch desk room keys."""
+    global _storm_chase_desk_keys
+    _storm_chase_desk_keys = frozenset(keys or ())
+
+
+def storm_chase_desk_keys():
+    """Room keys the game treats as a storm-watch desk."""
+    return _storm_chase_desk_keys

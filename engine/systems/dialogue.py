@@ -418,7 +418,14 @@ def _resolve_check(character, check, *, npc=None, game=None):
         return False
     try:
         return bool(fn(character, check, npc=npc, game=game))
-    except Exception:
+    except Exception as exc:
+        from engine import log_util
+
+        log_util.ops(
+            "dialogue",
+            f"check failed kind={kind} char={getattr(character, 'key', '?')}",
+            exc=exc,
+        )
         return False
 
 
@@ -433,8 +440,14 @@ def _apply_grant(character, grant, *, tree_id=None, game=None):
     if _GRANT_HANDLER is not None:
         try:
             _GRANT_HANDLER(character, grant, game)
-        except Exception:
-            pass
+        except Exception as exc:
+            from engine import log_util
+
+            log_util.ops(
+                "dialogue",
+                f"grant failed tree={tree_id} char={getattr(character, 'key', '?')}",
+                exc=exc,
+            )
 
 
 def _mark_terminal(character, tree_id, game=None):
@@ -449,8 +462,15 @@ def _mark_terminal(character, tree_id, game=None):
         quests_engine.notify(
             character, "dialogue_done", tree=tree_id, game=game,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        from engine import log_util
+
+        log_util.ops(
+            "dialogue",
+            f"dialogue_done notify failed tree={tree_id} "
+            f"char={getattr(character, 'key', '?')}",
+            exc=exc,
+        )
 
 
 def _goto_or_stay(character, tree_id, outcome, node_id, *, game=None):

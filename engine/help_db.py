@@ -13,6 +13,7 @@ Every function here takes ``conn`` -- the SAME sqlite3 connection
 and their sync triggers). No networking, no world model, no SUPERS import --
 same purity discipline as ``engine/persistence.py``.
 """
+import re
 import time
 
 
@@ -88,6 +89,54 @@ def save_entry(
         )
     conn.commit()
     return get_entry(conn, keyword)
+
+
+# Live hedit overlays that are just leftover quality stubs (bug reports 955
+# and 962): the git hub is the joined full page, but a short overlay saved
+# during the more/non-more mess still wins at lookup and hides the facts.
+# A *substantial* hedit article must keep winning even when git later grew
+# (helpfile --apply audits must not silently ignore Matt/Daniel gold).
+_STALE_OVERLAY_WORD_FLOOR = 80
+_STALE_OVERLAY_WORD_GAP = 80
+_MORE_DETAIL_RE = re.compile(
+    r"^More detail:\s*help\s+\S",
+    re.I | re.M,
+)
+_JOIN_LEFTOVER_RE = re.compile(
+    r"This page is extra detail for that loop",
+    re.I,
+)
+
+
+def overlay_is_stale_stub(overlay_body, static_body):
+    """True when a hedit overlay is a shrink-stub of the static hub.
+
+    Staff can still ``hedit`` the overlay (get_primary_entry is unchanged).
+    Player ``help`` should prefer the longer git page so soul-thread facts
+    and other overflow text are not hidden by a leftover *card*.
+
+    A real handbook overlay (at least ``_STALE_OVERLAY_WORD_FLOOR`` words,
+    no leftover more-split markers) is never stale just because git is
+    longer -- that is how live hedit stays safe from audit growth.
+    """
+    overlay = overlay_body or ""
+    static = static_body or ""
+    if not overlay.strip() or not static.strip():
+        return False
+    overlay_words = len(overlay.split())
+    gap = len(static.split()) - overlay_words
+    # Only leftover short cards lose on word-count. Gold hedit articles
+    # stay in front even if a later git pass added more sentences.
+    if (
+        overlay_words < _STALE_OVERLAY_WORD_FLOOR
+        and gap > _STALE_OVERLAY_WORD_GAP
+    ):
+        return True
+    if _MORE_DETAIL_RE.search(overlay) and not _MORE_DETAIL_RE.search(static):
+        return True
+    if _JOIN_LEFTOVER_RE.search(overlay) and not _JOIN_LEFTOVER_RE.search(static):
+        return True
+    return False
 
 
 def delete_entry(conn, keyword):

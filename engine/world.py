@@ -327,6 +327,20 @@ class Room(GameObject):
         # Optional color layer for atlas glyphs: ocean|plains|mountains|
         # lake|highway|city|mountain_highway. Muted topo / bright routes.
         self.map_layer = None
+        # Land under a highway overlay (plains/forest/mountains/…). Atlas
+        # paint uses this for the colored fill so asphalt is a yellow "="
+        # on green, not a 30-mile brown block. None = no overlay.
+        self.terrain_base = None
+        # HUD-only Gulf/Lakes tint on America void cells (area_type void).
+        self.water_view = False
+        # HUD-only Canada land tint on America void cells (area_type void).
+        self.land_view = False
+        # Max depth band index on playable water maps (0=surface/inshore).
+        self.max_water_band = None
+        # Mining-country flag from atlas highland_rows (Rockies / Sierra /
+        # Appalachian belts). Independent of area_type paint so forested
+        # highland still mines without filling the map as grey rock.
+        self.highland = False
         # Optional glyph table name ("atlas") for default topo symbols.
         self.glyph_set = None
         # Optional spoofed ROOM NAME (Djinn mirage pockets). Internal key
@@ -361,7 +375,9 @@ class Room(GameObject):
         # (room_naming is pure helpers; world is the domain model).
         from engine.room_naming import (
             authored_title_is_usable,
+            derive_room_title_from_context,
             generic_title_from_flags,
+            is_internal_place_key,
             is_opaque_storage_key,
         )
         title = getattr(self, "title", None)
@@ -373,7 +389,11 @@ class Room(GameObject):
             generic = generic_title_from_flags(self)
             if generic:
                 return generic
-        if title:
+        if is_internal_place_key(str(title or "")):
+            derived = derive_room_title_from_context(self)
+            if derived:
+                return derived
+        if title and not is_internal_place_key(str(title)):
             return str(title).strip()
         key = getattr(self, "key", "") or ""
         # Phase 3 rekeys use VNUM as storage id -- never show bare codes in
@@ -486,12 +506,9 @@ class Room(GameObject):
             if predicate is not None and not predicate(char):
                 continue
             game = getattr(self, "game", None)
-            try:
-                from engine import hooks
-                if not hooks.room_broadcast_deliver(char, self, game):
-                    continue
-            except Exception:
-                pass
+            from engine import hooks
+            if not hooks.room_broadcast_deliver(char, self, game):
+                continue
             # Per-watcher formatting for introduction / hood faces.
             if callable(message) and not isinstance(message, (str, bytes)):
                 text = message(char)
@@ -499,11 +516,8 @@ class Room(GameObject):
                     continue
             else:
                 text = message
-            try:
-                from engine import hooks
-                text = hooks.room_broadcast_transform(char, self, text, game)
-            except Exception:
-                pass
+            from engine import hooks
+            text = hooks.room_broadcast_transform(char, self, text, game)
             if char.session:
                 char.session.send(text)
                 if blank_after:
@@ -691,6 +705,10 @@ class Character(GameObject):
         # Cleared on reconnect so a fresh login is never stuck idle.
         # Persisted so a mid-idle copyover keeps the flag; reconnect clears it.
         self.idle_mode = False
+        # RP pause while still logged in -- does NOT hand the body to Cadence.
+        # Distinct from idlemode (idle_mode). Cleared on movement/aggression
+        # verbs and on password reconnect. Persisted across copyover.
+        self.afk_mode = False
         # Auto-idle preference: after ~30 real minutes with no typed input,
         # slip into idlemode (supers.verbs.engine_flavor). Default on;
         # toggle with `autoidle`. Persisted. last_input_monotonic is
@@ -885,6 +903,49 @@ class Character(GameObject):
                 except Exception:
                     _log_activity_error("logger.move", self)
         return True
+
+
+def safe_place(who, room):
+    """Put ``who`` in ``room`` even when ``move_to`` is blocked or raises.
+
+    Heal / weather / abandon fallbacks used to assign ``who.location = room``
+    alone. ``look`` / ``who`` / save room_key walk ``Room.contents`` and the
+    char index, so that left actors invisible and saved in the wrong place.
+
+    1. Set ``_force_move`` so immovable fixtures can be reseated once.
+    2. Call ``move_to`` (happy path updates contents + index).
+    3. If that fails or raises, ``room.add(who)`` -- never assign
+       ``.location`` without updating ``contents``.
+    """
+    if who is None or room is None:
+        return False
+    who._force_move = True
+    try:
+        if getattr(who, "move_to", None) is not None:
+            try:
+                if who.move_to(room):
+                    return who in getattr(room, "contents", [])
+            except Exception:
+                pass
+        old = getattr(who, "location", None)
+        if old is not None and old is not room:
+            contents = getattr(old, "contents", None)
+            if contents is not None and who in contents:
+                try:
+                    contents.remove(who)
+                except ValueError:
+                    pass
+        room.add(who)
+        # Character.add does not stamp .location (move_to does). Heal
+        # fallbacks must set both pointer and contents.
+        if getattr(who, "location", None) is not room:
+            who.location = room
+        return who in getattr(room, "contents", [])
+    finally:
+        try:
+            del who._force_move
+        except Exception:
+            who._force_move = False
 
 
 def make_body(character):

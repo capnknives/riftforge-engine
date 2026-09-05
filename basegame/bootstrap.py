@@ -199,6 +199,16 @@ def register_all_hooks():
         return bool(getattr(character, "on_duty", False))
 
     hooks.set_storm_chase_is_on_duty(_storm_on_duty)
+    hooks.set_storm_chase_desk_keys((
+        "NB00002",
+        "notbigville:Storm Watch Office",
+        "Storm Watch Office",
+    ))
+    hooks.set_press_beat_desk_keys((
+        "notbigville:News Office",
+        "News Office",
+        "NB00013",
+    ))
 
     def _press_on_duty(character, game=None):
         return bool(getattr(character, "on_duty", False))

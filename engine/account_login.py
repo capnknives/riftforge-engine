@@ -14,6 +14,7 @@ from engine import accounts as accounts_mod
 from engine import auth
 from engine import hooks
 from engine import account_chargen_draft as draft_mod
+from engine.chargen_menu import CHARGEN_MENU, is_menu_cancel
 from engine.command_support import _presence_face
 
 
@@ -288,12 +289,34 @@ async def _authenticate_account_password(session, account):
     Returns ``True`` on success, ``False`` when both tries failed (caller
     should return to the account-name prompt), or ``None`` on disconnect.
     """
+    from engine.connection import (
+        _clear_login_failures,
+        _login_backoff_seconds,
+        _note_login_failure,
+    )
+
+    peer = getattr(session, "peer", None) or getattr(session, "addr", None)
+    acct_name = getattr(account, "name", None) or getattr(account, "display_name", "")
+    wait_s = _login_backoff_seconds(acct_name, peer)
+    if wait_s > 0:
+        import asyncio
+        session.send(
+            f"Too many failed logins. Wait {wait_s:.0f}s and try again."
+        )
+        await asyncio.sleep(wait_s)
     for attempt in range(2):
         ok = await _prompt_account_password(session, account)
         if ok is None:
             return None
         if ok:
+            _clear_login_failures(acct_name, peer)
             return True
+        _note_login_failure(acct_name, peer)
+        from engine import log_util
+        log_util.ops(
+            "connection",
+            f"login fail account={acct_name!r} peer={peer!r} attempt={attempt + 1}",
+        )
         if attempt == 0:
             session.send("Incorrect password. Try again:")
         else:
@@ -364,9 +387,14 @@ async def _prompt_given_name(session, game, *, prompt):
 
     while True:
         session.send(prompt)
+        session.send(
+            "Type cancel to return to the character menu without quitting."
+        )
         raw = await session.read_line()
         if raw is None:
             return None
+        if is_menu_cancel(raw):
+            return CHARGEN_MENU
         name, err, stripped = normalize_login_name(raw)
         if err:
             session.send(err + " Try again:")
@@ -398,6 +426,8 @@ async def _prompt_surname_for_create(session, game, given_name):
         if raw is None:
             return None
         raw = (raw or "").strip()
+        if is_menu_cancel(raw):
+            return CHARGEN_MENU
         if identity_mod.surname_required_for_create(game, given_name):
             cleaned, err = identity_mod.normalize_surname(raw)
         else:
@@ -429,6 +459,8 @@ async def _prompt_character_password(session, *, create=False):
         if password is None:
             return None
         password = password or ""
+        if create and is_menu_cancel(password):
+            return CHARGEN_MENU
         if create:
             policy_err = auth.password_policy_error(password, for_gm=False)
             if policy_err is None:
@@ -456,8 +488,14 @@ def _purge_stale_vault_for_create(game, storage_key) -> None:
         from engine import persistence as persistence_mod
 
         persistence_mod.vault_delete(db, key)
-    except Exception:
-        pass
+    except Exception as exc:
+        from engine import log_util
+
+        log_util.ops(
+            "account_login",
+            f"vault_delete failed key={key}",
+            exc=exc,
+        )
 
 
 def _find_unlinked_body(game, given_name, surname):
@@ -497,9 +535,9 @@ async def _finish_new_character_after_chargen(session, game, account, char):
     if start_room is None:
         start_room = game.start_room
     char.chargen_start_room_key = None
-    char.chargen_draft = False
     char.chargen_step = 0
-    draft_mod.finish_chargen_draft(account, game)
+    draft_mod.finish_chargen_draft(account, game, character=char)
+    await _persist_account_change(game, reason="chargen_finish")
     char.move_to(start_room)
     session._promote_to_sessions()
     legal = identity_mod.legal_public_name(char, force_surname=True)
@@ -517,6 +555,22 @@ async def _finish_new_character_after_chargen(session, game, account, char):
     hooks.after_new_character(char, game)
     hooks.after_session_attach(char, game)
     return AccountLoginResult(character=char, is_new=True)
+
+
+async def _abort_chargen_to_menu(session, game, account, char):
+    """Vault a partial create body and return to the roster menu."""
+
+    char.session = None
+    session.character = None
+    clear_creating = getattr(session, "_clear_creating", None)
+    if callable(clear_creating):
+        clear_creating()
+    draft_mod.vault_chargen_draft(char, game, account)
+    session.send(
+        "Creation paused. Your draft stays on the roster -- pick them "
+        "again to resume, or create someone new."
+    )
+    return CHARGEN_MENU
 
 
 async def _flow_resume_chargen(
@@ -543,7 +597,10 @@ async def _flow_resume_chargen(
         exclude=char,
         peer_session=session,
     )
-    if not await hooks.run_chargen(session, char):
+    result = await hooks.run_chargen(session, char)
+    if result is CHARGEN_MENU:
+        return await _abort_chargen_to_menu(session, game, account, char)
+    if not result:
         draft_mod.vault_chargen_draft(char, game, account)
         return None
     return await _finish_new_character_after_chargen(
@@ -587,12 +644,18 @@ async def _flow_create_character(session, game, account):
     )
     if given is None:
         return None
+    if given is CHARGEN_MENU:
+        return CHARGEN_MENU
     surname = await _prompt_surname_for_create(session, game, given)
     if surname is None:
         return None
+    if surname is CHARGEN_MENU:
+        return CHARGEN_MENU
     password = await _prompt_character_password(session, create=True)
     if password is None:
         return None
+    if password is CHARGEN_MENU:
+        return CHARGEN_MENU
 
     storage_key = identity_mod.allocate_storage_key(game, given, surname)
     _purge_stale_vault_for_create(game, storage_key)
@@ -617,7 +680,10 @@ async def _flow_create_character(session, game, account):
         exclude=char,
         peer_session=session,
     )
-    if not await hooks.run_chargen(session, char):
+    result = await hooks.run_chargen(session, char)
+    if result is CHARGEN_MENU:
+        return await _abort_chargen_to_menu(session, game, account, char)
+    if not result:
         draft_mod.vault_chargen_draft(char, game, account)
         return None
 
@@ -753,6 +819,8 @@ async def run_account_login_flow(session, *, known_account=None, skip_password=F
                 continue
             if picked is CREATE_NEW_MARKER:
                 result = await _flow_create_character(session, game, account)
+                if result is CHARGEN_MENU:
+                    continue
                 if result is None:
                     return None
                 return result
@@ -771,15 +839,36 @@ async def run_account_login_flow(session, *, known_account=None, skip_password=F
                 result = await _flow_resume_chargen(
                     session, game, account, picked,
                 )
+                if result is CHARGEN_MENU:
+                    continue
                 if result is None:
                     return None
                 return result
 
-            live_holder = picked if getattr(picked, "session", None) else None
+            # Cadence ``npc_do`` briefly hangs a SilentSession on Echoes.
+            # That is not a live client -- treating it as one used to
+            # fire the GM-form lock (bug report 1063).
+            from engine.npc_act import is_live_session
+
+            picked_sess = getattr(picked, "session", None)
+            live_holder = picked if is_live_session(picked_sess) else None
             takeover = False
-            if live_holder is None:
+            spirit_holder = None
+            # Follow the GM spirit seat only when THIS picked body is the
+            # one in staff form. Sibling alts on the same account log in
+            # as themselves (alpha: several windows, several characters).
+            # Never steal a live ``gmspirit:`` session just because the
+            # account is staff -- that locked every other roster pick
+            # (bug reports 914 / 1063).
+            in_staff_form = bool(
+                getattr(picked, "gm_staff_form", False)
+                or getattr(picked, "gm_away", False)
+            )
+            if live_holder is None and in_staff_form:
                 sk = getattr(picked, "gm_spirit_key", None)
-                if not sk and getattr(picked, "gm_staff_form", False):
+                if not sk and accounts_mod.account_is_staff(account):
+                    sk = accounts_mod.gm_spirit_key_for_account(account)
+                if not sk:
                     from engine.command_support import (
                         strip_ephemeral_storage_prefix,
                     )
@@ -789,12 +878,26 @@ async def run_account_login_flow(session, *, known_account=None, skip_password=F
                     )
                 if sk:
                     spirit = game.find_character(sk)
-                    if (
-                        spirit is not None
-                        and getattr(spirit, "session", None) is not None
+                    if spirit is not None and is_live_session(
+                        getattr(spirit, "session", None)
                     ):
-                        live_holder = spirit
-            if live_holder is not None:
+                        spirit_holder = spirit
+            if spirit_holder is not None:
+                busy = accounts_mod.login_blocked_by_live_gm_spirit(
+                    game,
+                    account,
+                    picked,
+                    session,
+                    spirit_holder,
+                )
+                if busy:
+                    session.send(busy)
+                    continue
+                session._take_over_session(spirit_holder)
+                takeover = True
+            elif live_holder is not None:
+                # Same character already live in another window: reconnect
+                # takeover, not a GM-form lock.
                 session._take_over_session(live_holder)
                 takeover = True
             accounts_mod.stamp_rpc_cast_login_session(

@@ -661,8 +661,14 @@ def set_revert_hold(*, reason="", root=None, hold_baseline_sha=None):
                 (reason or "crash budget exceeded").strip(),
                 sha=sha or "",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            from engine import log_util
+
+            log_util.ops(
+                "crash_recovery",
+                "ops_webhook schedule failed",
+                exc=exc,
+            )
 
 
 def clear_revert_hold(*, root=None):

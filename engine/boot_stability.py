@@ -152,7 +152,14 @@ def write_stable(*, root=None, ticks=None):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
-    except OSError:
+    except OSError as exc:
+        from engine import log_util
+
+        log_util.ops(
+            "boot_stability",
+            f"stable stamp write failed path={path!r}",
+            exc=exc,
+        )
         return None
     _push_stable_history(payload, root=root)
     # Deploy catch-up protect-restore rewrites hundreds of mtimes; keep the
@@ -162,8 +169,14 @@ def write_stable(*, root=None, ticks=None):
 
         if auto_deploy.tree_sync_quiesce_active(root):
             auto_deploy.clear_tree_sync_quiesce(root)
-    except Exception:
-        pass
+    except Exception as exc:
+        from engine import log_util
+
+        log_util.ops(
+            "boot_stability",
+            "clear_tree_sync_quiesce failed",
+            exc=exc,
+        )
     print(
         f"[boot_stability] stable boot recorded at {sha[:12]} "
         f"({payload['ticks']} ticks)",

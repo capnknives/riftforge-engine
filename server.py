@@ -96,6 +96,61 @@ def db_path_from_env(default="riftforge.db"):
     return raw or default
 
 
+# Cooperative autosave reasons share fingerprint skip + one-slice stagger.
+# ``scheduled`` is the coalesced follow-up after writer/collect overlap --
+# it must not force a full meta rewrite (live lag_watch 2026-09-03 wrote
+# all 18 P8 slices ~12s every heartbeat).
+_ROUTINE_COOPERATIVE_SAVE_REASONS = frozenset({
+    "autosave",
+    "scheduled",
+    "login",
+})
+
+
+def _save_meta_force_full(reason):
+    """True only when every SUPERS meta slice must rewrite (shutdown paths)."""
+    if reason in _ROUTINE_COOPERATIVE_SAVE_REASONS:
+        return False
+    if reason in ("copyover", "shutdown", "sync", "world_backup", "vault_restore"):
+        return True
+    if reason and str(reason).startswith("gm_"):
+        return True
+    return False
+
+
+def _save_meta_autosave_stagger(reason):
+    """Rotate one forced meta slice per ``persist_full_every`` world tick."""
+    return reason in _ROUTINE_COOPERATIVE_SAVE_REASONS
+
+
+def _save_meta_respect_wall_budget(reason):
+    """Defer meta slices once the cooperative save wall budget is spent."""
+    return reason in _ROUTINE_COOPERATIVE_SAVE_REASONS
+
+
+def _copy_game_meta_save_stats(meta_stats, game):
+    """Merge ``save_supers_meta*`` slice counters into autosave diag stats."""
+    gm_meta = getattr(game, "_last_game_meta_save_stats", None) or {}
+    meta_stats["game_meta_skipped"] = gm_meta.get("skipped")
+    meta_stats["game_meta_full"] = gm_meta.get("force_full")
+    meta_stats["game_meta_slices_written"] = gm_meta.get("n_written")
+    meta_stats["game_meta_slices_skipped"] = gm_meta.get("n_skipped")
+    meta_stats["game_meta_slices_throttled"] = gm_meta.get("n_throttled")
+    if gm_meta.get("slices_written"):
+        meta_stats["game_meta_wrote"] = ",".join(gm_meta["slices_written"])
+    if gm_meta.get("slices_skipped"):
+        meta_stats["game_meta_skip_tags"] = ",".join(gm_meta["slices_skipped"])
+    for tag in gm_meta.get("slices_written") or []:
+        slice_ms = gm_meta.get(f"{tag}_ms")
+        if slice_ms is not None:
+            meta_stats[f"{tag}_ms"] = slice_ms
+    if gm_meta.get("wall_budget_hit"):
+        meta_stats["game_meta_wall_budget"] = True
+        deferred = gm_meta.get("slices_deferred") or []
+        if deferred:
+            meta_stats["game_meta_deferred"] = ",".join(deferred)
+
+
 class Game:
     """Holds all shared game state: the world, the database, and live sessions."""
 
@@ -365,6 +420,7 @@ class Game:
         self.vampire_townsfolk_kills = 0
         self.moral_balance = 0
         self.roadtrip_minutes = 30.0
+        self.roadtrip_mode = "wall"
         self.vehicle_pvp_enabled = False
         self.heaven_soul_count = 0
         self.hell_soul_count = 0
@@ -418,8 +474,10 @@ class Game:
         # GM Marches fog-rim ring cap + monthly rim seed state.
         self.marches_rim_tuning = {}
         self.marches_rim_state = {}
-        self.rowena_portal_run = None
+        self.portal_runs = {}
         self.portal_giver_costs = {}
+        # Sparse GM overrides for chargen account-point SKUs (catalog 0).
+        self.chargen_sku_costs = {}
         # GM runtime verb blocks (``gm disable <verb>``) -- in-memory toggle set.
         # ``dothepit`` starts disabled; staff toggle with ``gm disable``.
         self.disabled_verbs = {"dothepit"}
@@ -431,6 +489,7 @@ class Game:
         self._personal_realms_dirty = False
         self.dream_pockets = {}
         self._floor_item_room_keys = set()
+        self._cultivator_rival_keys = set()
         self._load_persisted_meta()
 
         # Hot-loaded deferred maps (gm maps load) — restore BEFORE
@@ -475,6 +534,9 @@ class Game:
             # A returning world: restore every character (as an Echo) and every
             # item to wherever they were when the server last saved.
             persistence.load_world(self.db, self)
+            if _HAS_SUPERS:
+                from supers import eve as eve_mod
+                eve_mod.ensure_cast_after_characters(self)
             # Wire deferred demesne hub exits AFTER rooms are placed (demesne
             # hub exit targets may be classic rooms placed by load_world).
             if _HAS_SUPERS:
@@ -497,6 +559,9 @@ class Game:
 
         from engine import persistence as persistence_mod
         persistence_mod.rebuild_floor_item_room_index(self)
+        if _HAS_SUPERS:
+            from supers import cadence_cultivator as cult_cadence_mod
+            cult_cadence_mod.rebuild_cultivator_rival_index(self)
         if persistence.is_seeded(self.db):
             persistence_mod.seed_snapshot_hashes_after_load(self)
 
@@ -849,7 +914,9 @@ class Game:
                     homestead_mod.save_homesteads(self.db, self, force=True)
                     gathering_mod.save_gather_nodes(self.db, self)
                     from supers import player_shops as player_shops_mod
-                    player_shops_mod.save_player_shops(self.db, self)
+                    player_shops_mod.save_player_shops(
+                        self.db, self, force=True
+                    )
                     from supers import township as township_mod
                     township_mod.save_townships(self.db, self)
                     from supers import personal_realm as personal_realm_mod
@@ -861,6 +928,16 @@ class Game:
                     dream_pocket_mod.save_dream_pockets(self.db, self)
                 except Exception:
                     print("[server] homestead/gather save failed:", flush=True)
+                    traceback.print_exc()
+                try:
+                    from supers import vehicles as vehicles_mod
+
+                    vehicles_mod.flush_vehicle_parking_from_aboard_macros(self)
+                except Exception:
+                    print(
+                        "[server] copyover vehicle parking flush failed:",
+                        flush=True,
+                    )
                     traceback.print_exc()
             return
 
@@ -1006,6 +1083,7 @@ class Game:
 
     def _enqueue_writer_persist_batch(
         self, handoff, meta_stats, *, reason, save_wall_start, save_wall_budget_ms,
+        skip_game_meta=False,
     ):
         """Hand world + meta SQL to the background writer (lag P30)."""
         import time as _save_time
@@ -1045,6 +1123,10 @@ class Game:
         tw_packet = None
         pr_packet = None
         dm_packet = None
+        acct_packet = None
+        gather_packet = None
+        shops_packet = None
+        dream_packet = None
         if not _over_budget():
             batch.steps.append(PersistWriterStep(
                 "game_time",
@@ -1062,16 +1144,22 @@ class Game:
                 "clock",
                 lambda conn: persistence.save_game_clock_tuning(conn, self),
             ))
+            acct_packet = persistence.collect_accounts_persist_packet(self)
             batch.steps.append(PersistWriterStep(
                 "accounts",
-                lambda conn: persistence.save_accounts(conn, self),
+                lambda conn, pkt=acct_packet: (
+                    persistence.apply_accounts_persist_packet(conn, pkt)
+                ),
             ))
-            if _HAS_SUPERS:
+            if _HAS_SUPERS and not skip_game_meta:
                 from supers.persist_meta import save_supers_meta
                 batch.steps.append(PersistWriterStep(
                     "game_meta",
                     lambda conn: save_supers_meta(
-                        self, conn, autosave_stagger=True,
+                        self,
+                        conn,
+                        force_full=_save_meta_force_full(reason),
+                        autosave_stagger=_save_meta_autosave_stagger(reason),
                     ),
                 ))
                 from supers import homestead as homestead_mod
@@ -1096,6 +1184,19 @@ class Game:
                 dm_packet = demesne_persist_mod.collect_demesne_persist_packet(
                     self,
                 )
+                gather_packet = gathering_mod.collect_gather_persist_packet(
+                    self,
+                )
+                shops_packet = (
+                    player_shops_mod.collect_player_shops_persist_packet(
+                        self,
+                    )
+                )
+                dream_packet = (
+                    dream_pocket_mod.collect_dream_pockets_persist_packet(
+                        self,
+                    )
+                )
                 writer_steps = []
                 if hs_packet is not None:
                     writer_steps.append(PersistWriterStep(
@@ -1115,16 +1216,24 @@ class Game:
                             )
                         ),
                     ))
-                writer_steps.extend([
-                    PersistWriterStep(
+                if gather_packet is not None:
+                    writer_steps.append(PersistWriterStep(
                         "gather",
-                        lambda conn: gathering_mod.save_gather_nodes(conn, self),
-                    ),
-                    PersistWriterStep(
+                        lambda conn, pkt=gather_packet: (
+                            gathering_mod.apply_gather_persist_packet(
+                                conn, self, pkt,
+                            )
+                        ),
+                    ))
+                if shops_packet is not None:
+                    writer_steps.append(PersistWriterStep(
                         "player_shops",
-                        lambda conn: player_shops_mod.save_player_shops(conn, self),
-                    ),
-                ])
+                        lambda conn, pkt=shops_packet: (
+                            player_shops_mod.apply_player_shops_persist_packet(
+                                conn, self, pkt,
+                            )
+                        ),
+                    ))
                 if pr_packet is not None:
                     writer_steps.append(PersistWriterStep(
                         "personal_realms",
@@ -1148,10 +1257,15 @@ class Game:
                         "demesnes",
                         _apply_demesnes,
                     ))
-                writer_steps.append(PersistWriterStep(
-                    "dream_pockets",
-                    lambda conn: dream_pocket_mod.save_dream_pockets(conn, self),
-                ))
+                if dream_packet is not None:
+                    writer_steps.append(PersistWriterStep(
+                        "dream_pockets",
+                        lambda conn, pkt=dream_packet: (
+                            dream_pocket_mod.apply_dream_pockets_persist_packet(
+                                conn, self, pkt,
+                            )
+                        ),
+                    ))
                 batch.steps.extend(writer_steps)
             else:
                 batch.steps.append(PersistWriterStep(
@@ -1169,6 +1283,16 @@ class Game:
             )
             meta_stats["writer_total_ms"] = stats.get("writer_total_ms")
             meta_stats["writer_steps"] = stats.get("writer_steps")
+            meta_stats["writer_enqueued"] = True
+            if _HAS_SUPERS:
+                game_meta_ms = None
+                for label, step_ms in stats.get("writer_steps") or ():
+                    if label == "game_meta":
+                        game_meta_ms = step_ms
+                        break
+                if game_meta_ms is not None:
+                    meta_stats["game_meta_ms"] = round(float(game_meta_ms), 2)
+                _copy_game_meta_save_stats(meta_stats, self)
             world = getattr(self, "_last_world_save_stats", None) or {}
             meta_stats["world_ms"] = round(
                 float(world.get("collect_ms") or 0.0)
@@ -1179,12 +1303,15 @@ class Game:
                 (_save_time.perf_counter() - save_wall_start) * 1000.0, 2,
             )
             self._last_meta_save_stats = meta_stats
+            persistence.ack_accounts_persist_packet(self, acct_packet)
             if _HAS_SUPERS:
                 from supers import homestead as homestead_mod
+                from supers import gathering as gathering_mod
+                from supers import player_shops as player_shops_mod
                 from supers import township as township_mod
                 from supers import personal_realm as personal_realm_mod
                 from supers.demesne import persist as demesne_persist_mod
-
+                from supers import dream_pocket as dream_pocket_mod
                 if hs_packet is not None:
                     homestead_mod.ack_homestead_persist_packet(self, hs_packet)
                 if tw_packet is not None:
@@ -1192,6 +1319,16 @@ class Game:
                 if pr_packet is not None:
                     personal_realm_mod.ack_personal_realm_persist_packet(
                         self, pr_packet,
+                    )
+                if gather_packet is not None:
+                    gathering_mod.ack_gather_persist_packet(self, gather_packet)
+                if shops_packet is not None:
+                    player_shops_mod.ack_player_shops_persist_packet(
+                        self, shops_packet,
+                    )
+                if dream_packet is not None:
+                    dream_pocket_mod.ack_dream_pockets_persist_packet(
+                        self, dream_packet,
                     )
                 if (
                     dm_packet is not None
@@ -1283,19 +1420,23 @@ class Game:
                 )
                 self._save_collecting = False
                 if writer_handoff and writer_handoff.get("world"):
+                    # P30: meta SQL runs on the writer thread with the
+                    # pre-collected world packet -- not on the asyncio loop
+                    # (save_supers_meta_async here pegged live for ~12s).
                     self._enqueue_writer_persist_batch(
                         writer_handoff,
                         meta_stats,
                         reason=reason,
                         save_wall_start=save_wall_start,
                         save_wall_budget_ms=save_wall_budget_ms,
+                        skip_game_meta=False,
                     )
                     return
 
                 async def _meta_slice(name, fn, *, required=True):
                     nonlocal save_meta_deferred
                     if (
-                        reason == "autosave"
+                        _save_meta_respect_wall_budget(reason)
                         and not required
                         and persistence._persist_save_over_wall_budget(
                             save_wall_start, save_wall_budget_ms,
@@ -1344,9 +1485,13 @@ class Game:
                         from supers.persist_meta import save_supers_meta_async
                         await save_supers_meta_async(
                             self, self.db,
+                            force_full=_save_meta_force_full(reason),
                             wall_start=meta_wall_start,
                             wall_budget_ms=save_wall_budget_ms,
-                            respect_wall_budget=(reason == "autosave"),
+                            respect_wall_budget=_save_meta_respect_wall_budget(
+                                reason,
+                            ),
+                            autosave_stagger=_save_meta_autosave_stagger(reason),
                         )
                     finally:
                         meta_stats["game_meta_ms"] = round(
@@ -1355,18 +1500,9 @@ class Game:
                     gm_wall = (
                         getattr(self, "_last_game_meta_save_stats", None) or {}
                     )
-                    for tag in gm_wall.get("slices_written") or []:
-                        slice_ms = gm_wall.get(f"{tag}_ms")
-                        if slice_ms is not None:
-                            meta_stats[f"{tag}_ms"] = slice_ms
                     if gm_wall.get("wall_budget_hit"):
                         save_meta_deferred = True
-                        meta_stats["game_meta_wall_budget"] = True
-                        deferred = gm_wall.get("slices_deferred") or []
-                        if deferred:
-                            meta_stats["game_meta_deferred"] = ",".join(
-                                deferred,
-                            )
+                    _copy_game_meta_save_stats(meta_stats, self)
                     await asyncio.sleep(0)
                 else:
                     await _meta_slice(
@@ -1374,20 +1510,7 @@ class Game:
                         lambda: hooks_mod.save_game_meta(self, self.db),
                     )
                     meta_stats["game_meta_ms"] = meta_stats.get("game_meta_ms")
-                gm_meta = getattr(self, "_last_game_meta_save_stats", None) or {}
-                meta_stats["game_meta_skipped"] = gm_meta.get("skipped")
-                meta_stats["game_meta_full"] = gm_meta.get("force_full")
-                meta_stats["game_meta_slices_written"] = gm_meta.get("n_written")
-                meta_stats["game_meta_slices_skipped"] = gm_meta.get("n_skipped")
-                meta_stats["game_meta_slices_throttled"] = gm_meta.get("n_throttled")
-                if gm_meta.get("slices_written"):
-                    meta_stats["game_meta_wrote"] = ",".join(
-                        gm_meta["slices_written"]
-                    )
-                if gm_meta.get("slices_skipped"):
-                    meta_stats["game_meta_skip_tags"] = ",".join(
-                        gm_meta["slices_skipped"]
-                    )
+                    _copy_game_meta_save_stats(meta_stats, self)
                 if _HAS_SUPERS:
                     try:
                         from supers import homestead as homestead_mod
@@ -1655,6 +1778,13 @@ class Game:
             "char_build_total_ms": world.get("char_build_total_ms"),
             "char_build_count": world.get("char_build_count"),
             "char_build_avg_ms": world.get("char_build_avg_ms"),
+            "floor_rooms_scanned": world.get("floor_rooms_scanned"),
+            "floor_rooms_hash_skip": world.get("floor_rooms_hash_skip"),
+            "floor_yield_count": world.get("floor_yield_count"),
+            "floor_build_total_ms": world.get("floor_build_total_ms"),
+            "floor_build_count": world.get("floor_build_count"),
+            "floor_build_avg_ms": world.get("floor_build_avg_ms"),
+            "slow_floor_rooms": world.get("slow_floor_rooms"),
             "autosave_count": world.get("autosave_count"),
             "full_every": world.get("full_every"),
             "game_time_ticks": self.game_time_ticks,

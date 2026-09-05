@@ -46,10 +46,13 @@ _FILENAMES = {
     TYPO: "typos.log",
 }
 
-# A report starts "open"; a GM later marks it "resolved" (fixed/built) or
-# "rejected" (won't do) instead of the log growing forever with no way to
-# tell triaged entries apart from new ones.
-STATUSES = ("open", "resolved", "rejected")
+# A report starts "open"; staff may mark an idea "approved" (yes, implement
+# — not closed) before squashsuggest queues it. "resolved" is shipped/fixed;
+# "rejected" is won't-do. Inbox lists stay open-only so approved ideas do
+# not mix with untriaged tickets.
+STATUSES = ("open", "approved", "resolved", "rejected")
+# Still in play (player ideas list, comments, ship-heal close set).
+ACTIVE_STATUSES = ("open", "approved")
 
 # Threaded comments (suggestion 258 remainder). Same messages[] shape as
 # the player board / helper queries -- separate files, shared kit.
@@ -117,6 +120,11 @@ def ensure_report_logs(directory="."):
 def parse_kind_word(kind_word):
     """Map a staff-facing kind token to BUG / SUGGEST / HELP / TYPO, or None."""
     return KIND_ALIASES.get((kind_word or "").lower())
+
+
+def is_active_status(status):
+    """True while a ticket is still in play (open inbox or approved to ship)."""
+    return (status or "open") in ACTIVE_STATUSES
 
 
 def _path(kind, directory):
@@ -240,25 +248,97 @@ def get_by_id(kind, entry_id, directory="."):
     return None
 
 
-def by_reporter(kind, reporter_key, directory=".", *, open_only=True):
-    """Return every report filed by ``reporter_key`` (``Character.key``).
+def reporter_keys_for_character(game, character):
+    """Storage keys whose tickets this player may list (account rollup).
 
-    Default ``open_only=True`` keeps resolved/rejected tickets out of the
-    player ``bugs`` / ``ideas`` listings -- the usual "have I already filed
-    this?" check. Pass ``open_only=False`` when the player asks for full
-    history (``bugs all``). Oldest-first, same order as ``recent()``.
+    Linked accounts see open/closed tickets filed by any roster body, not
+    only the face they are playing now (bug report 1050).
     """
-    needle = (reporter_key or "").strip()
-    if not needle:
+    keys = set()
+    key = (getattr(character, "key", None) or "").strip()
+    if key:
+        keys.add(key)
+    if game is None or character is None:
+        return keys
+    from engine import accounts as accounts_mod
+
+    account = accounts_mod.account_for_character(game, character)
+    if account is None:
+        return keys
+    for raw in getattr(account, "character_keys", None) or ():
+        roster_key = (raw or "").strip()
+        if roster_key:
+            keys.add(roster_key)
+    return keys
+
+
+def by_reporter(
+    kind,
+    reporter_key,
+    directory=".",
+    *,
+    open_only=True,
+    game=None,
+    character=None,
+):
+    """Return every report filed by this player (``Character.key`` + account).
+
+    When ``game`` and ``character`` are passed, linked-account roster keys
+    are included so ``bugs`` / ``ideas`` follow the account, not one alt.
+    Default ``open_only=True`` keeps resolved/rejected tickets out of the
+    player listings (approved ideas still show — not shipped yet).
+    Pass ``open_only=False`` for ``bugs all``. Oldest-first.
+    """
+    if character is not None and game is not None:
+        keys = reporter_keys_for_character(game, character)
+    else:
+        needle = (reporter_key or "").strip()
+        keys = {needle} if needle else set()
+    if not keys:
         return []
     out = []
     for entry in recent(kind, None, directory=directory):
-        if entry.get("reporter") != needle:
+        if entry.get("reporter") not in keys:
             continue
-        if open_only and entry.get("status", "open") != "open":
+        if open_only and not is_active_status(entry.get("status", "open")):
             continue
         out.append(entry)
     return out
+
+
+def recently_resolved_for_keys(
+    kind,
+    keys,
+    directory=".",
+    *,
+    limit=5,
+    within_hours=168,
+):
+    """Recently resolved tickets for ``keys`` (newest first, capped)."""
+    if not keys or limit <= 0:
+        return []
+    from datetime import datetime, timedelta
+
+    cutoff = datetime.now() - timedelta(hours=within_hours)
+    picked = []
+    for entry in reversed(recent(kind, None, directory=directory)):
+        if entry.get("reporter") not in keys:
+            continue
+        if entry.get("status") != "resolved":
+            continue
+        raw_time = entry.get("time")
+        if raw_time:
+            try:
+                stamp = datetime.fromisoformat(str(raw_time))
+            except ValueError:
+                stamp = None
+            if stamp is not None and stamp < cutoff:
+                continue
+        picked.append(entry)
+        if len(picked) >= limit:
+            break
+    picked.reverse()
+    return picked
 
 
 def format_entry_lines(kind, entry, *, game=None):
@@ -361,7 +441,7 @@ def format_player_thread_lines(kind, entry, *, game=None):
         TYPO: "typos",
         HELP: "helpsubmit",
     }.get(kind, "bugs")
-    if entry.get("status") == "open":
+    if is_active_status(entry.get("status")):
         lines.extend([
             "",
             f"Add a note: {cmd} comment {entry_id} <text>",
@@ -369,22 +449,66 @@ def format_player_thread_lines(kind, entry, *, game=None):
     return lines
 
 
-def can_player_comment(entry, character_key):
-    """Reporter may comment only while the ticket is still open."""
+def is_ticket_reporter(entry, character_key, *, game=None, character=None):
+    """True when this ticket belongs to the player (body or linked account)."""
     if entry is None:
         return False
-    if (entry.get("status") or "open") != "open":
+    reporter = (entry.get("reporter") or "").strip()
+    if not reporter:
         return False
+    if character is not None and game is not None:
+        return reporter in reporter_keys_for_character(game, character)
     needle = (character_key or "").strip()
-    return bool(needle) and entry.get("reporter") == needle
+    return bool(needle) and reporter == needle
+
+
+def can_player_comment(entry, character_key):
+    """Reporter may comment while the ticket is still in play (open/approved)."""
+    return can_ticket_comment(entry, character_key, staff=False)
 
 
 def can_player_read(entry, character_key):
     """Reporter may read their own ticket (any status)."""
+    return can_ticket_read(entry, character_key, staff=False)
+
+
+def can_ticket_read(entry, character_key, *, staff=False, game=None, character=None):
+    """Reporter may read their own ticket; staff may read any ticket."""
     if entry is None:
         return False
-    needle = (character_key or "").strip()
-    return bool(needle) and entry.get("reporter") == needle
+    if staff:
+        return True
+    return is_ticket_reporter(
+        entry, character_key, game=game, character=character,
+    )
+
+
+def can_ticket_comment(entry, character_key, *, staff=False, game=None, character=None):
+    """Reporter may comment on open/approved tickets they filed; staff on any."""
+    if entry is None:
+        return False
+    if staff:
+        return True
+    if not is_active_status(entry.get("status")):
+        return False
+    return is_ticket_reporter(
+        entry, character_key, game=game, character=character,
+    )
+
+
+def format_messages_for_webhook(entry):
+    """Plain-text comment thread for squash webhooks (automation-friendly)."""
+    messages = entry.get("messages") or []
+    if not messages:
+        return ""
+    lines = []
+    for msg in messages:
+        who = msg.get("from") or msg.get("author") or "?"
+        staff_bit = " [staff]" if msg.get("staff") else ""
+        stamp = msg.get("time") or msg.get("tick") or "?"
+        text = (msg.get("text") or "").strip()
+        lines.append(f"[{stamp}] {who}{staff_bit}: {text}")
+    return "\n".join(lines)
 
 
 def append_comment(

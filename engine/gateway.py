@@ -209,7 +209,24 @@ class ClientSlot:
         self.ws_recv_buf = b""  # incomplete WebSocket frames (WS clients only)
         self.ws_out_buf = b""  # incomplete telnet IAC from game (WS mux)
         self.gmcp_do_sent = False  # synthesized IAC DO GMCP for browsers
+        # Last client Core.Supports map (survives game-only reload).
+        self.gmcp_supports: dict[str, int] = {}
         self._ws_handshake_done = protocol != "websocket"
+
+
+def _note_client_gmcp_supports(slot: ClientSlot, package: str, payload) -> None:
+    """Remember client Supports across game-only reload (gateway reattach)."""
+    from engine import gmcp as gmcp_mod
+
+    if package == "Core.Supports.Set":
+        slot.gmcp_supports = gmcp_mod._parse_supports_list(payload)
+        return
+    if package == "Core.Supports.Add":
+        slot.gmcp_supports.update(gmcp_mod._parse_supports_list(payload))
+        return
+    if package == "Core.Supports.Remove":
+        for name in gmcp_mod._parse_supports_list(payload):
+            slot.gmcp_supports.pop(name, None)
 
 
 class Gateway:
@@ -251,6 +268,9 @@ class Gateway:
         self._stitch_histories: dict[str, deque[str]] = {}
         for spec in channel_history.gateway_stitch_channels():
             self._stitch_histories[spec.name] = deque(maxlen=spec.ring_max)
+        # Ring lengths when game IPC first dropped — limits copyover import to
+        # lines appended while stitch mode was active (not the whole mirror).
+        self._stitch_ipc_down_lens: Optional[dict[str, int]] = None
         # Last time any game→client DATA frame was forwarded (stitch detect).
         self._last_game_data_at = time.monotonic()
         # Game sets via CTRL boot_warming during deferred copyover boot --
@@ -416,6 +436,24 @@ class Gateway:
                 flush=True,
             )
 
+    def _snapshot_stitch_ipc_down_lens(self) -> None:
+        """Record stitch ring lengths at copyover start (once per outage).
+
+        ``chat_history`` import uses this watermark so only lines appended
+        while game IPC is down merge back — not the whole gateway mirror
+        (bug 1036). Planned reloads must stamp here on ``planned_restart``;
+        if the new game IPC connects before the old socket's finally runs,
+        waiting for IPC disconnect would leave the watermark unset and bare
+        wiznet/ooc replay resurrected ancient lines (bug 1088).
+        """
+        if self._stitch_ipc_down_lens is not None:
+            return
+        self._stitch_ipc_down_lens = {
+            name: len(buf)
+            for name, buf in self._stitch_histories.items()
+            if buf is not None
+        }
+
     def _mark_game_ipc_down(self, *, planned_restart: bool = False) -> None:
         """Start tracking downtime when IPC drops."""
         first_mark = self._hold_down_since_wall is None
@@ -423,6 +461,7 @@ class Gateway:
             self._hold_down_since = time.monotonic()
         if self._hold_down_since_wall is None:
             self._hold_down_since_wall = time.time()
+        self._snapshot_stitch_ipc_down_lens()
         if first_mark:
             try:
                 from engine import crash_recovery
@@ -565,6 +604,44 @@ class Gateway:
     async def _send_plain(self, session_id: str, text: str) -> None:
         await self.send_to_client(session_id, (text + "\r\n").encode("utf-8"))
 
+    async def _send_ws_gmcp(self, session_id: str, package: str, payload) -> None:
+        """Push one GMCP JSON frame to a browser client (no telnet IAC)."""
+        slot = self.clients.get(session_id)
+        if slot is None or not slot.alive or slot.protocol != "websocket":
+            return
+        from engine import websocket as ws_mod
+        from engine import ws_json
+
+        try:
+            frame = ws_json.encode_gmcp(package, payload)
+            slot.writer.write(ws_mod.encode_text_frame(frame))
+            await slot.writer.drain()
+        except (ConnectionError, OSError):
+            await self._drop_client(session_id, notify_game=True)
+
+    async def _relay_stitch_comm_gmcp(
+        self,
+        channel_name: str,
+        plain: str,
+        *,
+        slot_ok=None,
+    ) -> None:
+        """Mirror gateway stitch chat into websocket Comm.Channel panes."""
+        from engine import channels
+
+        spec = channels.get_channel(channel_name)
+        payload = channels.gateway_plain_comm_payload(channel_name, plain)
+        if not payload:
+            return
+        for sid, peer in list(self.clients.items()):
+            if not peer.alive or peer.protocol != "websocket":
+                continue
+            if spec is not None and not self._gateway_slot_may_hear(peer, spec):
+                continue
+            if slot_ok is not None and not slot_ok(peer):
+                continue
+            await self._send_ws_gmcp(sid, "Comm.Channel", payload)
+
     async def _broadcast_plain(self, text: str) -> None:
         payload = (text + "\r\n").encode("utf-8")
         for sid in list(self.clients.keys()):
@@ -606,15 +683,57 @@ class Gateway:
             return face
         return f"{face}(GM)"
 
+    def _stitch_copyover_start(self, channel_name: str) -> int:
+        """Index in a stitch ring where copyover-only lines begin (0 if unknown)."""
+        down_lens = self._stitch_ipc_down_lens
+        if not isinstance(down_lens, dict):
+            return 0
+        return max(0, int(down_lens.get(channel_name, 0)))
+
+    def _stitch_import_delta(self, snapshot: dict[str, list]) -> dict[str, list[str]]:
+        """Lines appended during copyover that the game snapshot does not have."""
+        out: dict[str, list[str]] = {}
+        for name, buf in self._stitch_histories.items():
+            if buf is None:
+                continue
+            known = {
+                line.strip()
+                for line in (snapshot or {}).get(name) or []
+                if isinstance(line, str) and line.strip()
+            }
+            extra: list[str] = []
+            start = self._stitch_copyover_start(name)
+            for line in list(buf)[start:]:
+                text = line.strip() if isinstance(line, str) else ""
+                if text and text not in known:
+                    extra.append(text)
+            if extra:
+                out[name] = extra
+        return out
+
     def _merge_chat_history(self, snapshot: dict[str, list]) -> None:
-        """Merge game-owned channel rings into gateway stitch buffers."""
+        """Rebuild gateway stitch buffers from game snapshot + copyover suffix."""
         for name, lines in (snapshot or {}).items():
             buf = self._stitch_histories.get(name)
             if buf is None:
                 continue
+            known = {
+                line.strip()
+                for line in (lines or [])
+                if isinstance(line, str) and line.strip()
+            }
+            start = self._stitch_copyover_start(name)
+            extra: list[str] = []
+            for line in list(buf)[start:]:
+                text = line.strip() if isinstance(line, str) else ""
+                if text and text not in known:
+                    extra.append(text)
+            buf.clear()
             for line in lines or []:
                 if isinstance(line, str) and line.strip():
                     buf.append(line.strip())
+            for line in extra:
+                buf.append(line)
 
     def _merge_chat_history_payload(self, payload: dict) -> None:
         """Accept ``channels`` dict or legacy per-channel keys on *payload*."""
@@ -678,6 +797,9 @@ class Gateway:
                 continue
             await self._send_plain(sid, plain)
             await self._send_plain(sid, "")
+        await self._relay_stitch_comm_gmcp(
+            "wiznet", plain, slot_ok=lambda peer: peer.staff_gm,
+        )
 
     async def _relay_gateway_ooc(self, slot: ClientSlot, message: str) -> None:
         """Broadcast one OOC line from the gateway while stitch mode is on."""
@@ -686,6 +808,7 @@ class Gateway:
         self._append_gateway_chat_line("ooc", plain)
         await self._broadcast_plain(plain)
         await self._broadcast_plain("")
+        await self._relay_stitch_comm_gmcp("ooc", plain)
         try:
             bridge = self._discord_bridge()
             bridge.schedule_ooc(plain)
@@ -716,6 +839,7 @@ class Gateway:
                     continue
                 await self._send_plain(sid, plain)
                 await self._send_plain(sid, "")
+            await self._relay_stitch_comm_gmcp(channel_name, plain)
 
     def _gateway_slot_may_hear(self, slot: ClientSlot, spec) -> bool:
         from engine import channels
@@ -727,8 +851,51 @@ class Gateway:
             return bool(slot.staff_gm)
         return True
 
+    async def _try_gateway_stitch_channel(
+        self, slot: ClientSlot, line: bytes,
+    ) -> bool:
+        """Relay OOC/wiznet at the gateway when IPC is down or boot is warming.
+
+        During copyover reattach the game IPC comes up while held sessions
+        still wait on the veil playable gate (``Session._wait_veil_world_ready``).
+        Forwarding OOC into the game reader queue made players see everyone
+        else's lines (outbound still flowed) but not their own for tens of
+        seconds until ``play()`` drained the backlog (bug report 1113).
+        """
+        if self._game_writer is not None and not self._boot_warming:
+            return False
+        try:
+            text = line.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return False
+        if not text:
+            return True
+        from engine import channel_history
+
+        channel_name = channel_history.stitch_channel_for_command(text)
+        if not channel_name:
+            return False
+        spec = channel_history.get_channel(channel_name)
+        if spec is None:
+            return False
+        aud = (getattr(spec, "audience", "") or "").lower()
+        if aud in ("staff", "gm") and not slot.staff_gm:
+            await self._send_plain(slot.session_id, "You aren't a GM.")
+            return True
+        body = self._channel_message_text(text, spec.verb)
+        if body is None:
+            await self._replay_gateway_channel(slot, channel_name)
+            return True
+        if not body:
+            await self._send_plain(slot.session_id, spec.usage_message)
+            return True
+        await self._relay_gateway_channel(slot, channel_name, body)
+        return True
+
     async def _handle_intercepted_line(self, slot: ClientSlot, line: bytes) -> bool:
         """Handle stitch-mode commands. Return True when consumed."""
+        if await self._try_gateway_stitch_channel(slot, line):
+            return True
         try:
             text = line.decode("utf-8", errors="replace").strip()
         except Exception:
@@ -736,29 +903,6 @@ class Gateway:
         if not text:
             return True
         lower = text.lower()
-        from engine import channel_history
-
-        channel_name = channel_history.stitch_channel_for_command(text)
-        if channel_name:
-            # Game IPC up: forward to authoritative game rings.
-            if self._game_writer is not None:
-                return False
-            spec = channel_history.get_channel(channel_name)
-            if spec is None:
-                return False
-            aud = (getattr(spec, "audience", "") or "").lower()
-            if aud in ("staff", "gm") and not slot.staff_gm:
-                await self._send_plain(slot.session_id, "You aren't a GM.")
-                return True
-            body = self._channel_message_text(text, spec.verb)
-            if body is None:
-                await self._replay_gateway_channel(slot, channel_name)
-                return True
-            if not body:
-                await self._send_plain(slot.session_id, spec.usage_message)
-                return True
-            await self._relay_gateway_channel(slot, channel_name, body)
-            return True
         from engine import gateway_outage_cmds as outage_cmds
 
         if lower in ("help outage", "help gm recover", "help recover"):
@@ -967,6 +1111,8 @@ class Gateway:
         kind = parsed.get("kind")
         if kind in ("cmd", "line"):
             line = (parsed.get("line") or "").encode("utf-8")
+            if await self._try_gateway_stitch_channel(slot, line):
+                return
             if self._should_intercept_commands():
                 if await self._handle_intercepted_line(slot, line):
                     return
@@ -977,6 +1123,7 @@ class Gateway:
             package = parsed.get("package")
             if not package:
                 return
+            _note_client_gmcp_supports(slot, package, parsed.get("payload"))
             raw = gmcp_mod.encode_package(package, parsed.get("payload"))
             await self.send_to_game(encode_data(slot.session_id, raw))
             return
@@ -1002,6 +1149,10 @@ class Gateway:
         slot.line_buffer += data
         lines, slot.line_buffer = _pop_complete_lines(slot.line_buffer)
         for line in lines:
+            # boot_warming suppresses full intercept but OOC must still echo
+            # instantly while reattached sessions wait on the veil gate.
+            if await self._try_gateway_stitch_channel(slot, line):
+                continue
             if self._should_intercept_commands():
                 if await self._handle_intercepted_line(slot, line):
                     continue
@@ -1194,6 +1345,8 @@ class Gateway:
                             entry = {"sid": c.session_id, "name": c.name}
                             if c.peer:
                                 entry["peer"] = c.peer
+                            if c.gmcp_supports:
+                                entry["gmcp_supports"] = dict(c.gmcp_supports)
                             sessions.append(entry)
                         await self.send_to_game(
                             encode_ctrl({
@@ -1210,6 +1363,17 @@ class Gateway:
                             s.ooc_face = (payload or {}).get("ooc_face") or s.name
                             s.head_gm = bool((payload or {}).get("head_gm"))
                             s.staff_gm = bool((payload or {}).get("staff_gm"))
+                            supports = (payload or {}).get("gmcp_supports")
+                            if isinstance(supports, dict):
+                                s.gmcp_supports = dict(supports)
+                    elif op == "gmcp_supports":
+                        s = self.clients.get((payload or {}).get("sid", ""))
+                        if s is not None:
+                            supports = (payload or {}).get("gmcp_supports")
+                            if isinstance(supports, dict):
+                                s.gmcp_supports = dict(supports)
+                            else:
+                                s.gmcp_supports = {}
                     elif op == "unbound":
                         s = self.clients.get((payload or {}).get("sid", ""))
                         if s is not None:
@@ -1227,6 +1391,9 @@ class Gateway:
                         # hold music still runs for clients, but WKNZ must
                         # not treat this as a crash/uncrash pair.
                         self._suppress_discord_outage = True
+                        # Stamp stitch watermarks now — the new game IPC can
+                        # connect before this writer's finally runs (bug 1088).
+                        self._snapshot_stitch_ipc_down_lens()
                         try:
                             from engine import crash_recovery
 
@@ -1253,7 +1420,34 @@ class Gateway:
                             flush=True,
                         )
                     elif op == "chat_history":
-                        self._merge_chat_history_payload(payload or {})
+                        payload = payload or {}
+                        channels = (payload.get("channels") or {})
+                        if not isinstance(channels, dict):
+                            channels = {}
+                        self._merge_chat_history_payload(payload)
+                        merged: dict[str, list[str]] = {}
+                        for name, buf in self._stitch_histories.items():
+                            if buf is None:
+                                continue
+                            lines = [
+                                line.strip()
+                                for line in buf
+                                if isinstance(line, str) and line.strip()
+                            ]
+                            if lines:
+                                merged[name] = lines
+                        if merged:
+                            await self.send_to_game(
+                                encode_ctrl(
+                                    {
+                                        "op": "chat_stitch_import",
+                                        "channels": merged,
+                                        "mode": "replace",
+                                    }
+                                )
+                            )
+                        # Consumed — next outage gets a fresh watermark.
+                        self._stitch_ipc_down_lens = None
                     elif op == "chat_append":
                         self._append_gateway_chat_line(
                             str((payload or {}).get("channel") or ""),

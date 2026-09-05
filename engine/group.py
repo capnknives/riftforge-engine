@@ -231,10 +231,14 @@ def format_group_sheet(character, game=None):
         for chunk in str(extra).replace("\r\n", "\n").split("\n"):
             if chunk != "":
                 lines.append(chunk)
+    focus_line = format_focus_line(leader, game)
+    if focus_line:
+        lines.append("")
+        lines.append(focus_line)
     lines.append("")
     lines.append(
-        "Set your row: group front | group back. "
-        "Room look tags groupmates with (Group). "
+        "Type group for the party menu. "
+        "group focus <name> sets who NPC and Echo mates attack. "
         "Only the leader moves the party -- others type "
         "'group leave confirm' to split off."
     )
@@ -258,6 +262,12 @@ def ensure_session_defaults(character):
     # escalation) so the short pause never eats into strike counting.
     if not isinstance(getattr(character, "group_regroup_pause_until", None), dict):
         character.group_regroup_pause_until = {}
+    # Leader-set combat focus (a character key). NPC / Echo followers
+    # attack this body, or the leader's live target when unset.
+    if not hasattr(character, "group_focus_key"):
+        character.group_focus_key = None
+    if not hasattr(character, "_group_focus_picks"):
+        character._group_focus_picks = []
 
 
 def group_seek_blocked(a, b, game=None):
@@ -908,3 +918,208 @@ def cadence_may_step(character, *, group_pulled=False):
     if not all_members_colocated(character):
         return True
     return False
+
+
+def is_cadence_grouped_follower(character):
+    """True when an NPC / Echo / idlemode body is grouped and not leading.
+
+    Live present players keep their own agency (they just cannot walk
+    without ``group leave confirm``). Cadence followers lose lifestyle
+    until they peel -- they glue-follow the leader and attack the group
+    focus (or whoever the leader is fighting).
+    """
+    if character is None:
+        return False
+    if not in_group(character) or is_leader(character):
+        return False
+    return not live_present(character)
+
+
+def get_focus_key(character):
+    """Leader's stored group-focus key, or empty string when unset."""
+    leader = resolve_leader(character)
+    if leader is None:
+        return ""
+    ensure_session_defaults(leader)
+    raw = getattr(leader, "group_focus_key", None)
+    key = str(raw or "").strip()
+    return key
+
+
+def set_focus_key(character, name):
+    """Stamp a focus key on the party leader. Returns True on success."""
+    leader = resolve_leader(character)
+    if leader is None:
+        return False
+    ensure_session_defaults(leader)
+    key = str(name or "").strip()
+    if not key:
+        leader.group_focus_key = None
+        return True
+    leader.group_focus_key = key
+    return True
+
+
+def clear_focus(character):
+    """Drop the party focus so followers fall back to the leader's fight."""
+    return set_focus_key(character, None)
+
+
+def format_focus_line(character, game=None):
+    """One roster line naming the group focus, or empty when solo."""
+    if character is None or not in_group(character):
+        return ""
+    leader = resolve_leader(character)
+    if leader is None:
+        return ""
+    key = get_focus_key(leader)
+    if key:
+        return f"Focus: {key} -- NPC and Echo mates attack this target."
+    fighting = getattr(leader, "target", None)
+    if fighting is not None:
+        face = (
+            getattr(fighting, "assumed_face", None)
+            or getattr(fighting, "husk_display_name", None)
+            or getattr(fighting, "key", "?")
+        )
+        return (
+            f"Focus: (none) -- mates attack {face} "
+            f"(whoever {getattr(leader, 'key', 'the leader')} is fighting)."
+        )
+    return (
+        "Focus: (none) -- mates attack whoever the leader fights. "
+        "Type group focus <name> to set one."
+    )
+
+
+def hub_options(character):
+    """Nested menu rows: ``(id, label, hint)`` for the group hub.
+
+    Numbered so a player can type ``group 2`` or ``group focus``. Solo
+    bodies still get a short form/invite list so the verb is never a
+    dead end.
+    """
+    if character is None or not in_group(character):
+        return [
+            ("form", "Form a group", "follow <name>, beckon, or party invite"),
+            ("invite", "Invite", "party invite <name>"),
+        ]
+    opts = [
+        ("roster", "Roster", "who is in the party"),
+        ("focus", "Focus", "who NPC and Echo mates attack"),
+        ("invite", "Invite", "ask someone in the room to join"),
+        ("merge", "Merge", "fold your group into theirs"),
+        ("row", "Row", "front or back (display)"),
+    ]
+    if is_leader(character):
+        opts.append(("disband", "Disband", "break the whole party"))
+    else:
+        opts.append(("leave", "Leave", "split off -- needs confirm"))
+    return opts
+
+
+def lookup_hub_option(character, token):
+    """Resolve a typed number or id to a hub option id, or None."""
+    raw = str(token or "").strip().lower()
+    if not raw:
+        return None
+    opts = hub_options(character)
+    if raw.isdigit():
+        index = int(raw) - 1
+        if 0 <= index < len(opts):
+            return opts[index][0]
+        return None
+    aliases = {
+        "form": "form",
+        "join": "form",
+        "follow": "form",
+        "roster": "roster",
+        "list": "roster",
+        "who": "roster",
+        "focus": "focus",
+        "target": "focus",
+        "invite": "invite",
+        "ask": "invite",
+        "merge": "merge",
+        "row": "row",
+        "stance": "row",
+        "leave": "leave",
+        "split": "leave",
+        "peel": "leave",
+        "disband": "disband",
+        "break": "disband",
+    }
+    return aliases.get(raw)
+
+
+def format_group_hub(character, game=None):
+    """Framed party menu: roster + numbered nested options.
+
+    Returns a single ``str`` (joined with ``\\r\\n``) so live
+    ``Session.send`` never sees a list. Screenreader path uses the same
+    ``format_sheet(..., screenreader=)`` family as score / gait.
+    """
+    from engine import style as style_mod
+    from engine import display_prefs as dprefs
+
+    dprefs.ensure_display_defaults(character)
+    sr = bool(getattr(character, "screenreader", False))
+    width = dprefs.sheet_width(character)
+    members = group_members(character) if character is not None else []
+    body = []
+    if len(members) < 2:
+        body.append("You are not in a group.")
+        body.append(
+            "Follow someone, accept a beckon, or party invite a name "
+            "in the room (see help group)."
+        )
+    else:
+        leader = members[0]
+        body.append("Your group:")
+        for member in members:
+            name = getattr(member, "key", "?")
+            face = (
+                getattr(member, "assumed_face", None)
+                or getattr(member, "husk_display_name", None)
+                or name
+            )
+            you = " (you)" if member is character else ""
+            role = " leader" if member is leader else ""
+            apart = (
+                member is not leader
+                and not mates_share_group_location(leader, member)
+            )
+            apart_tag = " (apart)" if apart else ""
+            hp, max_hp = member_hp_pair(member)
+            row = row_label(member)
+            body.append(
+                f"{face}  {hp}/{max_hp}hp  {row}{role}{you}{apart_tag}"
+            )
+        focus_line = format_focus_line(leader, game)
+        if focus_line:
+            body.append("")
+            body.append(focus_line)
+        try:
+            from engine import hooks
+            extra = hooks.group_sheet_extra(character, game)
+        except Exception:
+            extra = ""
+        if extra:
+            body.append("")
+            for chunk in str(extra).replace("\r\n", "\n").split("\n"):
+                if chunk != "":
+                    body.append(chunk)
+    body.append("")
+    body.append("Options")
+    for index, (_oid, label, hint) in enumerate(hub_options(character), start=1):
+        body.append(f"{index}. {label} -- {hint}")
+    body.append("")
+    body.append(
+        "Type group <number> or group <name>. "
+        "Example: group 2 or group focus."
+    )
+    title = "Your group" if len(members) >= 2 else "Group"
+    lines = style_mod.format_sheet(
+        title, body, width=width, screenreader=sr,
+    )
+    return "\r\n".join(str(line) for line in lines)

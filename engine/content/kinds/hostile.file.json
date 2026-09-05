@@ -4,9 +4,10 @@
   "writes_to": "supers/content/hostiles/*.json",
   "fields": {
     "templates": {
-      "type": "list",
+      "type": "object",
+      "also_list": true,
       "required": false,
-      "doc": "Flavor rows validated as hostile.template (key + description)."
+      "doc": "Flavor rows as templates[] list (vampire.json) or lane dict {court_fae: [...], ...} (fae.json, corpse_eaters.json). Validated as hostile.template (key + description)."
     },
     "name_pools": {
       "type": "object",

@@ -854,17 +854,18 @@ def reconcile_deployed_ticket_heals(game):
 
 
 def reconcile_open_suggestions_from_deployed_fixes(game):
-    """Close open ideas whose Ship subjects are already on the deployed tree.
+    """Close open/approved ideas whose Ship subjects are already deployed.
 
     Mirrors :func:`reconcile_open_bugs_from_deployed_fixes` for
     ``suggestions.log`` — heals tickets missed when squash subjects used
-    Oxford lists (``#154, #179, and #189``) or hash-free agent subjects.
+    Oxford lists (``#154, #179, and #189``), hash-free agent subjects, or
+    GitHub's Suggestion QoL PR title instead of Ship suggestion N.
     """
     directory = game.report_dir
     from engine import auto_deploy
 
     git_root = auto_deploy.git_root_for(directory)
-    open_ids = set(auto_deploy.open_suggestion_ids(directory))
+    open_ids = set(auto_deploy.unresolved_suggestion_ids(directory))
     if not open_ids:
         return False
 

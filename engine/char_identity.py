@@ -599,7 +599,7 @@ def legacy_surname_login_notice(char) -> str | None:
         "(see help namechange). "
         "Use surname on|off to show or hide it on who. "
         "See help surname. "
-        "Type config surname_alert off to silence this reminder."
+        "Type config surname alert off to silence this reminder."
     )
 
 

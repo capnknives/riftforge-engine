@@ -108,11 +108,10 @@ def breach_eject(character, room, target, *, game=None):
     if neighbor is None:
         return False
     old_room = room
-    mover = getattr(character, "move_to", None)
-    if callable(mover):
-        mover(neighbor)
-    else:
-        character.location = neighbor
+    from engine.world import safe_place
+
+    if not safe_place(character, neighbor):
+        return False
     from engine.systems import combat_pursuit as combat_pursuit_mod
     combat_pursuit_mod.notify_character_relocated(
         character, old_room, neighbor, game,

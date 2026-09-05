@@ -156,6 +156,17 @@ def format_template(
     )
 
 
+def _remember_room_social(game, room, others_line) -> None:
+    """Store the witness line on the room emote ring for bare ``emote`` recall.
+
+    Canned socials are not free-form emote templates, so we keep the
+    already-formatted third-person line as a plain string (what watchers saw).
+    """
+    from engine import channels as channels_mod
+
+    channels_mod.append_room_emote(game, room, others_line)
+
+
 def perform(character, catalog, verb_id, target_name, game, *, find_in_room):
     """Run one social. Returns (ok, actor_message_or_error).
 
@@ -192,6 +203,7 @@ def perform(character, catalog, verb_id, target_name, game, *, find_in_room):
         )
         others_line = format_template(solo["others"], character)
         room.broadcast(others_line, exclude=character)
+        _remember_room_social(game, room, others_line)
         return True, self_line
 
     targeted = spec.get("targeted")
@@ -217,6 +229,7 @@ def perform(character, catalog, verb_id, target_name, game, *, find_in_room):
     ):
         target.session.send(target_line)
     room.broadcast(others_line, exclude=(character, target))
+    _remember_room_social(game, room, others_line)
     return True, self_line
 
 

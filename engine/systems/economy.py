@@ -13,6 +13,12 @@ from __future__ import annotations
 # Ring buffer size for per-character cash audit (wallet + bank moves).
 WALLET_LEDGER_MAX = 40
 
+# Player-facing refusal when credit_wallet cannot place new loose bills.
+HANDS_FULL_CASH_MSG = (
+    "Your hands are full. Stow something or wear a pocket wallet "
+    "so the cash has somewhere to go."
+)
+
 # Optional listeners: ``register_wallet_ledger_listener(fn)`` where
 # ``fn(character, row)`` runs after each appended ledger row. Keeps the
 # engine free of game imports (SUPERS Echo journal hooks from bootstrap).
@@ -30,8 +36,16 @@ def _notify_wallet_ledger_listeners(character, row):
     for fn in list(_wallet_ledger_listeners):
         try:
             fn(character, row)
-        except Exception:
-            pass
+        except Exception as exc:
+            from engine import log_util
+
+            log_util.ops_once_per_tick(
+                getattr(getattr(character, "session", None), "game", None),
+                f"economy:ledger:{getattr(fn, '__name__', '?')}",
+                "economy",
+                "wallet_ledger_listener failed",
+                exc=exc,
+            )
 
 
 def _carry_cents(dollars, cents):
@@ -502,6 +516,26 @@ def set_bank(character, dollars, cents=0, *, reason=None, tick=None):
             )
 
 
+def can_receive_cash(character):
+    """True when a positive ``credit_wallet`` would not be blocked by full hands.
+
+    Worn pocket wallets always accept cash. Existing loose bills stack onto
+    the same virtual row. A brand-new loose-bill stack needs a free open
+    inventory slot.
+    """
+    migrate_wallet_fields(character)
+    if _pocket_wallet_item(character) is not None:
+        return True
+    d0, c0 = _loose_cash_parts(character)
+    if d0 or c0:
+        return True
+    from engine.systems.containers import (
+        OPEN_INVENTORY_CAPACITY,
+        open_stack_keys,
+    )
+    return len(open_stack_keys(character)) < OPEN_INVENTORY_CAPACITY
+
+
 def credit_wallet(character, dollars=0, cents=0, *, reason=None, tick=None):
     """Add dollars/cents to on-hand pocket cash. Returns False if hands are full."""
     migrate_wallet_fields(character)
@@ -757,6 +791,8 @@ def deposit(character, amount, *, tick=None):
     cents = _parse_deposit_amount(character, amount, bank=False)
     if cents is None:
         return False, "Deposit how much? (a positive number, or 'all')"
+    if cents <= 0:
+        return False, "Your wallet is empty."
     if carry_cash_total_cents(character) < cents:
         return False, f"You only have {format_carry_cash(character)} on you."
     debit_wallet(character, cents=cents)
@@ -776,14 +812,23 @@ def deposit(character, amount, *, tick=None):
 
 
 def withdraw(character, amount, *, tick=None):
-    """Move cash from bank to wallet. Returns (ok, message)."""
+    """Move cash from bank to wallet. Returns (ok, message).
+
+    Credits the pocket first. If hands are full and there is nowhere to
+    put new loose bills, the bank balance is left untouched.
+    """
     cents = _parse_deposit_amount(character, amount, bank=True)
     if cents is None:
         return False, "Withdraw how much? (a positive number, or 'all')"
+    if cents <= 0:
+        return False, "Your bank account is empty."
     if bank_total_cents(character) < cents:
         return False, f"You only have {format_bank(character)} in the bank."
+    d, c = divmod(cents, 100)
+    # Credit first so a full-hands miss cannot destroy banked cash.
+    if not credit_wallet(character, d, c, reason=None, tick=tick):
+        return False, HANDS_FULL_CASH_MSG
     debit_bank(character, cents=cents)
-    credit_wallet(character, cents=cents)
     record_wallet_ledger(
         character,
         delta_wallet_cents=cents,

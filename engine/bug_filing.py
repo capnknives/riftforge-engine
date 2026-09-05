@@ -95,6 +95,40 @@ def _bug_subject_candidates(reporter, game, history=None):
     return ordered
 
 
+# Leading prose tokens players type when starting a sentence -- not
+# ``bug <character>`` subject names (bug report 1061).  Without this,
+# ``I`` substring-matches The Vo**i**ce and ``the`` matches **The** Voice.
+_BUG_SUBJECT_STOPWORDS = frozenset({
+    "a", "an", "the", "about", "like", "as", "when", "if", "my", "i",
+    "me", "we", "it", "is", "was", "are", "be", "to", "at", "in", "on",
+    "for", "so", "or", "and", "but", "not", "no", "yes", "just", "also",
+    "this", "that", "with", "from", "have", "has", "had", "can", "cant",
+    "cannot", "could", "would", "should", "will", "wont", "won't", "im",
+    "i'm", "its", "it's", "they", "them", "their", "there", "then", "than",
+})
+
+
+def _bug_subject_prefix_allowed(token_slice):
+    """False when a prefix is plain English, not a deliberate name token.
+
+    Single stopwords (``the``, ``I``) and one-letter needles must not
+    resolve to a co-located NPC via substring identity matching.
+    Multi-word prefixes that include a real name token (``the voice``,
+    ``Max Booth``) stay allowed.
+    """
+    if not token_slice:
+        return False
+    lowered = [tok.lower() for tok in token_slice]
+    if len(lowered) == 1:
+        if len(lowered[0]) <= 1:
+            return False
+        if lowered[0] in _BUG_SUBJECT_STOPWORDS:
+            return False
+    elif all(tok in _BUG_SUBJECT_STOPWORDS for tok in lowered):
+        return False
+    return True
+
+
 def resolve_bug_subject_character(reporter, query, game, history=None):
     """Resolve a ``bug <name>`` subject with local context before world scan."""
     if reporter is None or game is None:
@@ -140,15 +174,11 @@ def resolve_bug_subject_character(reporter, query, game, history=None):
 def parse_bug_subject(reporter, args, game):
     """Split ``bug`` args into ``(subject_character, description)``.
 
-    When a leading name resolves to another character, the report is *about*
-    that body (their diagnostic context is snapshotted). Otherwise the full
-    args string is a self-report description -- e.g. ``bug the sword vanished``
-    stays about the reporter even when ``the`` is not a character name
-    (bug report 203).
-
-    Multi-word names and local context win over bare global lookup (bug
-    reports 816, 925): ``bug Max Booth was collared…`` prefers the crook
-  Pierre just ``collar``ed in-room over a homonym NPC across town.
+    A subject character is attached only when the reporter **tags** a name:
+    ``@Name`` / ``@Max Booth``, or a quoted ``'Name'`` / ``"Name"`` token from
+    ``split_shell_args``. Otherwise the full args string is a self-report --
+    e.g. ``bug Ash was stuck`` and ``bug the sword vanished`` stay about the
+    reporter even when a homonym NPC exists in the world.
     """
     text = (args or "").strip()
     if not text:
@@ -164,26 +194,37 @@ def parse_bug_subject(reporter, args, game):
         return None, text
 
     history = _history_for_bug_subject(reporter)
-    pool = _bug_subject_candidates(reporter, game, history)
-    world_fallback = None
 
-    for i in range(len(tokens), 0, -1):
-        prefix = " ".join(tokens[:i])
-        if is_self_name(prefix):
+    def _attach(name, rest):
+        """Resolve an explicit tag; None means fall back to a self-report."""
+        if is_self_name(name):
             return None, text
         subject = resolve_bug_subject_character(
-            reporter, prefix, game, history=history,
+            reporter, name, game, history=history,
         )
-        if subject is None or subject is reporter:
-            continue
-        rest = " ".join(tokens[i:])
-        if subject in pool:
+        if subject is not None and subject is not reporter:
             return subject, rest
-        if world_fallback is None:
-            world_fallback = (subject, rest)
+        return None, text
 
-    if world_fallback is not None:
-        return world_fallback
+    # @Name / @Max Booth … explicit tag (IDEA #393).
+    if text.startswith("@"):
+        remainder = text[1:].strip()
+        if not remainder:
+            return None, text
+        rem_tokens = split_shell_args(remainder)
+        for i in range(len(rem_tokens), 0, -1):
+            prefix = " ".join(rem_tokens[:i])
+            subject, rest = _attach(prefix, " ".join(rem_tokens[i:]))
+            if subject is not None:
+                return subject, rest
+        return None, text
+
+    # Quoted names: shlex already unwraps, so detect the quote on the raw line
+    # (bug report 816 -- ``bug "Earl Jacobs" wallet``).
+    if text[:1] in ("'", '"'):
+        inner = tokens[0].strip()
+        rest = " ".join(tokens[1:])
+        return _attach(inner, rest)
 
     return None, text
 

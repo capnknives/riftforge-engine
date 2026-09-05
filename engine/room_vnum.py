@@ -394,11 +394,9 @@ def stamp_hand_room(
             # Persistence may register a map_missing_stub under this VNUM
             # when characters load before runtime vehicle interiors exist.
             if getattr(existing, "map_missing_stub", False):
+                from engine.world import safe_place
                 for who in list(existing.characters()):
-                    try:
-                        who.move_to(room)
-                    except Exception:
-                        who.location = room
+                    safe_place(who, room)
                 for dk, dr in list(rooms.items()):
                     if dr is existing:
                         rooms.pop(dk, None)
@@ -580,12 +578,19 @@ def describe_room(room, *, staff: bool = False) -> str:
     # Defense in depth: if a caller stamped an opaque dig key as title,
     # scrub it rather than teach players storage ids.
     from engine.room_naming import (
+        derive_room_title_from_context,
         generic_title_from_flags,
+        is_internal_place_key,
         is_opaque_storage_key,
     )
+    if label and is_internal_place_key(label):
+        derived = derive_room_title_from_context(room)
+        if derived:
+            return derived
+        label = generic_title_from_flags(room) or ""
     if label and is_opaque_storage_key(label):
         label = generic_title_from_flags(room) or ""
-    if label and not is_opaque_storage_key(label):
+    if label and not is_opaque_storage_key(label) and not is_internal_place_key(label):
         if not staff and label_is_bare_vnum(label):
             if getattr(room, "private_home", False) or getattr(room, "is_home", False):
                 return "Private Home"
@@ -634,6 +639,9 @@ def describe_room_key(game, key, *, staff: bool = False, fallback="somewhere"):
     if is_opaque_storage_key(text):
         return fallback
     bare = bare_key(text)
+    # Missing room + VNUM-shaped key used to return RK00004 to players.
+    if not staff and bare and label_is_bare_vnum(bare):
+        return fallback
     return bare or fallback
 
 
@@ -675,20 +683,26 @@ def ensure_title_before_rekey(room) -> None:
     from engine.room_naming import (
         authored_title_is_usable,
         bare_key,
+        derive_room_title_from_context,
         generic_title_from_flags,
+        is_internal_place_key,
         is_opaque_storage_key,
     )
     title = getattr(room, "title", None)
     key = getattr(room, "key", "") or ""
     if authored_title_is_usable(title, key):
         return
-    if is_opaque_storage_key(key):
+    derived = derive_room_title_from_context(room)
+    if derived:
+        room.title = derived
+        return
+    if is_opaque_storage_key(key) or is_internal_place_key(key):
         generic = generic_title_from_flags(room)
         if generic:
             room.title = generic
         return
     face = bare_key(key) if key else ""
-    if face:
+    if face and not is_internal_place_key(face):
         room.title = face
 
 
@@ -1169,6 +1183,37 @@ def heal_hand_room_title_aliases(game) -> int:
             aliases[name] = vnum
             added += 1
     return added
+
+
+def heal_homestead_internal_room_titles(game) -> int:
+    """Boot heal: replace leaked homestead dig titles like ``tuck:living``.
+
+    VNUM stamp used to copy bare ``owner:room`` keys into ``room.title``
+    before rekey (bug report 1139). Idempotent -- skips rooms whose title
+    is already a real ROOM NAME.
+    """
+    if game is None:
+        return 0
+    from engine.room_naming import (
+        authored_title_is_usable,
+        derive_room_title_from_context,
+        is_internal_place_key,
+    )
+
+    healed = 0
+    for room in (getattr(game, "rooms", None) or {}).values():
+        if room is None or not is_hand_room(room):
+            continue
+        title = getattr(room, "title", None)
+        key = getattr(room, "key", "") or ""
+        if not is_internal_place_key(str(title or "")):
+            continue
+        derived = derive_room_title_from_context(room)
+        if not derived or not authored_title_is_usable(derived, key):
+            continue
+        room.title = derived
+        healed += 1
+    return healed
 
 
 def boot_duplicate_hand_room_titles(game, *, exclude_vehicles=True):

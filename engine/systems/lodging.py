@@ -99,12 +99,52 @@ def is_house_satellite_chamber(room):
     return False
 
 
+def _claim_hub_key(room):
+    """Best-effort deed hub for cluster bounding (``main_homeroom`` or hub room)."""
+    if room is None:
+        return None
+    # Use the stamped attribute only — ``main_homeroom_key`` falls back to
+    # ``room.key`` for unstamped interiors, which would treat every kitchen
+    # as its own compound hub and block BFS into the living room.
+    main = getattr(room, "main_homeroom", None)
+    if main:
+        return main
+    if getattr(room, "is_home", False):
+        return getattr(room, "key", None)
+    # Unstamped living hub before the first ``stamp_house_home_links`` pass.
+    key = (getattr(room, "key", None) or "").strip()
+    if key.endswith(" Living"):
+        return key
+    return None
+
+
+def _same_claim_compound(room, neighbor, *, hub_key=None):
+    """True when ``neighbor`` belongs to the same private-home compound.
+
+    Stops BFS from walking into the next house when a bad exit or shared
+    porch graph would otherwise merge half the town into one cluster
+    (``remodel garage`` then stamped thousands of rooms).
+    """
+    if room is None or neighbor is None:
+        return False
+    bound = hub_key or _claim_hub_key(room)
+    n_hub = _claim_hub_key(neighbor)
+    if bound and n_hub and bound != n_hub:
+        return False
+    seed_plot = getattr(room, "homestead_plot_id", None)
+    n_plot = getattr(neighbor, "homestead_plot_id", None)
+    if seed_plot or n_plot:
+        return seed_plot == n_plot
+    return True
+
+
 def house_interior_cluster(seed, game):
     """Every ``is_house`` room in the same interior compound as ``seed``."""
     if seed is None or game is None:
         return []
     if not getattr(seed, "is_house", False):
         return []
+    hub_key = _claim_hub_key(seed)
     seen = {seed.key: seed}
     stack = [seed]
     while stack:
@@ -115,9 +155,13 @@ def house_interior_cluster(seed, game):
                 continue
             if not getattr(neighbor, "is_house", False):
                 continue
+            if not _same_claim_compound(seed, neighbor, hub_key=hub_key):
+                continue
             key = getattr(neighbor, "key", None)
             if not key or key in seen:
                 continue
+            if not hub_key:
+                hub_key = _claim_hub_key(neighbor)
             seen[key] = neighbor
             stack.append(neighbor)
     return list(seen.values())
@@ -255,6 +299,10 @@ def _is_bed(obj):
 
     if not isinstance(obj, Item):
         return False
+    # Homestead ``install bed`` stamps ``is_bed`` without always carrying
+    # ``furniture`` + ``need=sleep`` (bug report 1046).
+    if getattr(obj, "is_bed", False):
+        return True
     if not getattr(obj, "furniture", False):
         return False
     return getattr(obj, "need", None) == "sleep"

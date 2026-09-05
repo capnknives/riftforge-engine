@@ -348,6 +348,18 @@
       "type": "string",
       "required": false,
       "doc": "Named inbound exit for remodel shells."
+    },
+    "neutral_treaty": {
+      "type": "bool",
+      "required": false,
+      "doc": "Limbo Separatio neutral ground: no_combat treaty ward; Angel/Demon teleport whitelist.",
+      "default": false
+    },
+    "limbo_annex": {
+      "type": "bool",
+      "required": false,
+      "doc": "Separatio party annex ambience (supers/limbo_ambience.py tick).",
+      "default": false
     }
   }
 }

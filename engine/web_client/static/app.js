@@ -10,6 +10,7 @@
   "use strict";
 
   const output = document.getElementById("output");
+  const liveOutput = document.getElementById("output-live");
   const statusEl = document.getElementById("status");
   const form = document.getElementById("input-row");
   const cmd = document.getElementById("cmd");
@@ -41,7 +42,13 @@
   const displayBtn = document.getElementById("show-display-prefs");
   const displayDialog = document.getElementById("display-dialog");
   const displayClose = document.getElementById("display-close");
+  const saveLogBtn = document.getElementById("save-log");
+  const vitalsAlertEl = document.getElementById("vitals-alert");
   const playRoot = document.getElementById("play");
+  const playMain = document.getElementById("play-main");
+  const splitComm = document.getElementById("split-comm");
+  const splitHud = document.getElementById("split-hud");
+  const hudEl = document.getElementById("hud");
   const roomCard = document.getElementById("room-card");
   const roomTitle = document.getElementById("room-title");
   const roomSub = document.getElementById("room-sub");
@@ -71,7 +78,7 @@
   // Bump this string with each shipped client change so bug reports about
   // "the web client" can be matched to a build (help/ops QoL, not a version
   // negotiation -- GMCP Core.Hello version above is the protocol number).
-  const CLIENT_BUILD = "2026-08-28d";
+  const CLIENT_BUILD = "2026-09-05c";
 
   const MAX_LINES = 8000;
   const MAX_COMM_LINES = 500;
@@ -81,14 +88,26 @@
   const FONTSIZE_KEY = "riftforge-fontsize";
   const THEME_KEY = "riftforge-theme";
   const PANE_COLLAPSE_KEY = "riftforge-pane-collapsed";
+  const PANE_SIZE_KEY = "riftforge-pane-sizes";
   const ZOOM_KEY = "riftforge-map-zoom";
   const PHONE_TAB_KEY = "riftforge-phone-tab";
+  const STORY_DB = "riftforge-play";
+  const STORY_STORE = "kv";
+  const STORY_KEY = "story-html";
+  const STORY_MAX_CHARS = 800000;
   const PASTE_LINES_CONFIRM = 3;
   const LONG_PRESS_MS = 480;
   const PRESS_MOVE_CANCEL_PX = 12;
   const ZOOM_MIN = 100;
   const ZOOM_MAX = 200;
   const ZOOM_STEP = 25;
+  const COMM_HEIGHT_DEFAULT_VH = 28;
+  const HUD_WIDTH_DEFAULT = 420;
+  const COMM_HEIGHT_MIN = 72;
+  const HUD_WIDTH_MIN = 240;
+  const COMM_HEIGHT_MAX_RATIO = 0.5;
+  const HUD_WIDTH_MAX_RATIO = 0.55;
+  const SPLIT_KEYBOARD_STEP = 16;
   const GMCP_SUPPORTS = [
     "Char 1",
     "Char.Name 1",
@@ -106,11 +125,19 @@
 
   let socket = null;
   let passwordMode = false;
+  // True after we sent the masked line -- only then may incoming text
+  // drop password mode. Extra banner lines after "Password:" must not
+  // unmask the field while the player is still typing.
+  let passwordSent = false;
+  let storyHydrated = false;
+  let persistStoryTimer = null;
   let rawTail = "";
   // Incomplete telnet line (no trailing newline yet). Re-painted as
   // .out-partial so a WebSocket split never becomes two stacked rows.
   let lineBuf = "";
   let partialEl = null;
+  // When false, new story lines do not yank scroll position (reader scrolled up).
+  let outputFollow = true;
   // SGR color carries across chunks so a split mid-line does not snap
   // back to silver. Committed only when a complete line is flushed.
   let sgrColor = "#e8e8e8";
@@ -119,6 +146,7 @@
   let hudResumeArmed = false;
   let history = [];
   let historyIdx = -1;
+  let historyDraft = "";
   let reconnectTimer = null;
   let reconnectDelay = 1000;
   let userClosed = false;
@@ -131,7 +159,10 @@
   let gagStored = false;
   let commTab = "public";
   let paneCollapsed = {};
+  let paneSizes = {};
   let mapZoom = { atlas: 100, zone: 100 };
+  let prevHpPct = null;
+  let vitalsAlertTimer = null;
 
   const ATLAS_GLYPH_BG = {
     "~": "#1a2848",
@@ -287,6 +318,264 @@
         togglePane(p.id);
       });
     }
+  });
+
+  // --- Drag-resize splitters (comm / log / HUD) -----------------------
+  // Desktop only: stacked + phone tabs keep CSS defaults. Sizes persist
+  // in localStorage as pixels so reload restores the player's layout.
+  function paneSplitEnabled() {
+    if (phoneShell()) {
+      return false;
+    }
+    return !window.matchMedia("(max-width: 720px)").matches;
+  }
+
+  function commHeightMax() {
+    if (!playMain) {
+      return 480;
+    }
+    return Math.max(COMM_HEIGHT_MIN, Math.floor(playMain.clientHeight * COMM_HEIGHT_MAX_RATIO));
+  }
+
+  function hudWidthMax() {
+    if (!playRoot) {
+      return 720;
+    }
+    return Math.max(HUD_WIDTH_MIN, Math.floor(playRoot.clientWidth * HUD_WIDTH_MAX_RATIO));
+  }
+
+  function clampCommHeight(px) {
+    return Math.max(COMM_HEIGHT_MIN, Math.min(commHeightMax(), Math.round(px)));
+  }
+
+  function clampHudWidth(px) {
+    return Math.max(HUD_WIDTH_MIN, Math.min(hudWidthMax(), Math.round(px)));
+  }
+
+  function currentCommHeightPx() {
+    if (commPane) {
+      const h = commPane.getBoundingClientRect().height;
+      if (h >= COMM_HEIGHT_MIN) {
+        return Math.round(h);
+      }
+    }
+    if (typeof paneSizes.commPx === "number" && paneSizes.commPx > 0) {
+      return clampCommHeight(paneSizes.commPx);
+    }
+    if (playMain) {
+      return clampCommHeight(playMain.clientHeight * (COMM_HEIGHT_DEFAULT_VH / 100));
+    }
+    return clampCommHeight(180);
+  }
+
+  function currentHudWidthPx() {
+    if (hudEl) {
+      const w = hudEl.getBoundingClientRect().width;
+      if (w >= HUD_WIDTH_MIN) {
+        return Math.round(w);
+      }
+    }
+    if (typeof paneSizes.hudPx === "number" && paneSizes.hudPx > 0) {
+      return clampHudWidth(paneSizes.hudPx);
+    }
+    return HUD_WIDTH_DEFAULT;
+  }
+
+  function paintCommHeight(px) {
+    document.documentElement.style.setProperty("--comm-height", clampCommHeight(px) + "px");
+  }
+
+  function paintHudWidth(px) {
+    document.documentElement.style.setProperty("--hud-width", clampHudWidth(px) + "px");
+  }
+
+  function updateSplitterAria() {
+    if (splitComm) {
+      const h = currentCommHeightPx();
+      splitComm.setAttribute("aria-valuemin", String(COMM_HEIGHT_MIN));
+      splitComm.setAttribute("aria-valuemax", String(commHeightMax()));
+      splitComm.setAttribute("aria-valuenow", String(h));
+    }
+    if (splitHud) {
+      const w = currentHudWidthPx();
+      splitHud.setAttribute("aria-valuemin", String(HUD_WIDTH_MIN));
+      splitHud.setAttribute("aria-valuemax", String(hudWidthMax()));
+      splitHud.setAttribute("aria-valuenow", String(w));
+    }
+  }
+
+  function persistPaneSizes() {
+    writeStoredJson(PANE_SIZE_KEY, paneSizes);
+  }
+
+  function applyPaneSizes() {
+    document.body.setAttribute("data-pane-split-off", paneSplitEnabled() ? "false" : "true");
+    if (!paneSplitEnabled()) {
+      document.documentElement.style.removeProperty("--comm-height");
+      document.documentElement.style.removeProperty("--hud-width");
+      updateSplitterAria();
+      return;
+    }
+    const commPx =
+      typeof paneSizes.commPx === "number" && paneSizes.commPx > 0
+        ? clampCommHeight(paneSizes.commPx)
+        : currentCommHeightPx();
+    const hudPx =
+      typeof paneSizes.hudPx === "number" && paneSizes.hudPx > 0
+        ? clampHudWidth(paneSizes.hudPx)
+        : HUD_WIDTH_DEFAULT;
+    paintCommHeight(commPx);
+    paintHudWidth(hudPx);
+    updateSplitterAria();
+  }
+
+  function clampStoredPaneSizes() {
+    let changed = false;
+    if (typeof paneSizes.commPx === "number") {
+      const next = clampCommHeight(paneSizes.commPx);
+      if (next !== paneSizes.commPx) {
+        paneSizes.commPx = next;
+        changed = true;
+      }
+    }
+    if (typeof paneSizes.hudPx === "number") {
+      const next = clampHudWidth(paneSizes.hudPx);
+      if (next !== paneSizes.hudPx) {
+        paneSizes.hudPx = next;
+        changed = true;
+      }
+    }
+    if (changed) {
+      persistPaneSizes();
+    }
+  }
+
+  function nudgeCommHeight(delta) {
+    const next = clampCommHeight(currentCommHeightPx() + delta);
+    paneSizes.commPx = next;
+    paintCommHeight(next);
+    persistPaneSizes();
+    updateSplitterAria();
+  }
+
+  function nudgeHudWidth(delta) {
+    const next = clampHudWidth(currentHudWidthPx() + delta);
+    paneSizes.hudPx = next;
+    paintHudWidth(next);
+    persistPaneSizes();
+    updateSplitterAria();
+    window.requestAnimationFrame(function () {
+      drawAtlas();
+      drawZone();
+    });
+  }
+
+  function bindPaneSplitter(splitEl, axis, onDelta) {
+    if (!splitEl) {
+      return;
+    }
+    let drag = null;
+
+    function finishDrag() {
+      if (!drag) {
+        return;
+      }
+      drag = null;
+      document.body.classList.remove("pane-split-dragging");
+      window.requestAnimationFrame(function () {
+        drawAtlas();
+        drawZone();
+      });
+    }
+
+    splitEl.addEventListener("pointerdown", function (ev) {
+      if (!paneSplitEnabled() || ev.button !== 0) {
+        return;
+      }
+      ev.preventDefault();
+      splitEl.setPointerCapture(ev.pointerId);
+      drag = { start: axis === "y" ? ev.clientY : ev.clientX };
+    });
+
+    splitEl.addEventListener("pointermove", function (ev) {
+      if (!drag) {
+        return;
+      }
+      const delta =
+        axis === "y" ? ev.clientY - drag.start : ev.clientX - drag.start;
+      if (delta === 0) {
+        return;
+      }
+      drag.start = axis === "y" ? ev.clientY : ev.clientX;
+      document.body.classList.add("pane-split-dragging");
+      onDelta(delta);
+    });
+
+    splitEl.addEventListener("pointerup", finishDrag);
+    splitEl.addEventListener("pointercancel", finishDrag);
+
+    splitEl.addEventListener("keydown", function (ev) {
+      if (!paneSplitEnabled()) {
+        return;
+      }
+      let delta = 0;
+      if (axis === "y") {
+        if (ev.key === "ArrowDown") {
+          delta = SPLIT_KEYBOARD_STEP;
+        } else if (ev.key === "ArrowUp") {
+          delta = -SPLIT_KEYBOARD_STEP;
+        } else if (ev.key === "Home") {
+          nudgeCommHeight(COMM_HEIGHT_MIN - currentCommHeightPx());
+          ev.preventDefault();
+          return;
+        } else if (ev.key === "End") {
+          nudgeCommHeight(commHeightMax() - currentCommHeightPx());
+          ev.preventDefault();
+          return;
+        }
+      } else {
+        if (ev.key === "ArrowRight") {
+          delta = SPLIT_KEYBOARD_STEP;
+        } else if (ev.key === "ArrowLeft") {
+          delta = -SPLIT_KEYBOARD_STEP;
+        } else if (ev.key === "Home") {
+          nudgeHudWidth(HUD_WIDTH_MIN - currentHudWidthPx());
+          ev.preventDefault();
+          return;
+        } else if (ev.key === "End") {
+          nudgeHudWidth(hudWidthMax() - currentHudWidthPx());
+          ev.preventDefault();
+          return;
+        }
+      }
+      if (delta !== 0) {
+        ev.preventDefault();
+        onDelta(delta);
+      }
+    });
+  }
+
+  paneSizes = readStoredJson(PANE_SIZE_KEY, {});
+  applyPaneSizes();
+
+  bindPaneSplitter(splitComm, "y", function (delta) {
+    const next = clampCommHeight(currentCommHeightPx() + delta);
+    paneSizes.commPx = next;
+    paintCommHeight(next);
+    persistPaneSizes();
+    updateSplitterAria();
+  });
+
+  bindPaneSplitter(splitHud, "x", function (delta) {
+    const next = clampHudWidth(currentHudWidthPx() + delta);
+    paneSizes.hudPx = next;
+    paintHudWidth(next);
+    persistPaneSizes();
+    updateSplitterAria();
+    window.requestAnimationFrame(function () {
+      drawAtlas();
+      drawZone();
+    });
   });
 
   // --- Map zoom (atlas / interior) ------------------------------------
@@ -672,9 +961,187 @@
     while (output.childNodes.length > MAX_LINES) {
       output.removeChild(output.firstChild);
     }
+    if (liveOutput) {
+      const liveCap = 400;
+      while (liveOutput.childNodes.length > liveCap) {
+        liveOutput.removeChild(liveOutput.firstChild);
+      }
+    }
     if (partialEl && !partialEl.parentNode) {
       partialEl = null;
     }
+  }
+
+  function divertingOutput() {
+    return !outputFollow && liveOutput;
+  }
+
+  function showLivePane() {
+    if (!liveOutput || !liveOutput.hidden) {
+      if (liveOutput && !liveOutput.hidden && output) {
+        output.setAttribute("aria-live", "off");
+      }
+      return;
+    }
+    liveOutput.hidden = false;
+    if (output) {
+      output.setAttribute("aria-live", "off");
+    }
+  }
+
+  function catchUpOutput() {
+    if (liveOutput) {
+      liveOutput.innerHTML = "";
+      liveOutput.hidden = true;
+    }
+    outputFollow = true;
+    if (output) {
+      output.setAttribute("aria-live", "polite");
+      output.scrollTop = output.scrollHeight;
+    }
+    if (partialEl && liveOutput && partialEl.parentNode === liveOutput && output) {
+      output.appendChild(partialEl);
+    }
+  }
+
+  function cloneToLive(el) {
+    if (!divertingOutput() || !el) {
+      return;
+    }
+    showLivePane();
+    const clone = el.cloneNode(true);
+    liveOutput.appendChild(clone);
+    liveOutput.scrollTop = liveOutput.scrollHeight;
+  }
+
+  function openStoryDb() {
+    return new Promise(function (resolve, reject) {
+      if (!window.indexedDB) {
+        reject(new Error("no indexedDB"));
+        return;
+      }
+      const req = window.indexedDB.open(STORY_DB, 1);
+      req.onupgradeneeded = function () {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(STORY_STORE)) {
+          db.createObjectStore(STORY_STORE);
+        }
+      };
+      req.onsuccess = function () {
+        resolve(req.result);
+      };
+      req.onerror = function () {
+        reject(req.error || new Error("indexedDB open failed"));
+      };
+    });
+  }
+
+  function storyHtmlForStore() {
+    if (!output) {
+      return "";
+    }
+    let html = output.innerHTML || "";
+    if (html.length <= STORY_MAX_CHARS) {
+      return html;
+    }
+    const lines = output.querySelectorAll(".out-line, .echo-line");
+    let start = 0;
+    if (lines.length > 400) {
+      start = lines.length - 400;
+    }
+    let packed = "";
+    for (let i = start; i < lines.length; i++) {
+      packed += lines[i].outerHTML;
+    }
+    return packed.slice(-STORY_MAX_CHARS);
+  }
+
+  function persistStoryNow() {
+    if (!storyHydrated || passwordMode || !output || !window.indexedDB) {
+      return;
+    }
+    const html = storyHtmlForStore();
+    if (!html) {
+      return;
+    }
+    openStoryDb()
+      .then(function (db) {
+        return new Promise(function (resolve, reject) {
+          const tx = db.transaction(STORY_STORE, "readwrite");
+          tx.oncomplete = function () {
+            db.close();
+            resolve();
+          };
+          tx.onerror = function () {
+            db.close();
+            reject(tx.error);
+          };
+          tx.objectStore(STORY_STORE).put(html, STORY_KEY);
+        });
+      })
+      .catch(function () {
+        /* local cache is optional */
+      });
+  }
+
+  function schedulePersistStory() {
+    if (passwordMode) {
+      return;
+    }
+    if (persistStoryTimer) {
+      window.clearTimeout(persistStoryTimer);
+    }
+    persistStoryTimer = window.setTimeout(persistStoryNow, 800);
+  }
+
+  function restoreStoryLog() {
+    return new Promise(function (resolve) {
+      function done() {
+        storyHydrated = true;
+        resolve();
+      }
+      if (!output || !window.indexedDB) {
+        done();
+        return;
+      }
+      if (output.querySelector(".out-line")) {
+        done();
+        return;
+      }
+      const timeout = window.setTimeout(done, 400);
+      openStoryDb()
+        .then(function (db) {
+          return new Promise(function (resolveGet, reject) {
+            const tx = db.transaction(STORY_STORE, "readonly");
+            const req = tx.objectStore(STORY_STORE).get(STORY_KEY);
+            req.onsuccess = function () {
+              db.close();
+              resolveGet(req.result || "");
+            };
+            req.onerror = function () {
+              db.close();
+              reject(req.error);
+            };
+          });
+        })
+        .then(function (html) {
+          window.clearTimeout(timeout);
+          if (
+            html &&
+            output &&
+            !output.querySelector(".out-line") &&
+            !output.querySelector(".echo-line")
+          ) {
+            output.innerHTML = html;
+            catchUpOutput();
+          }
+          done();
+        })
+        .catch(function () {
+          window.clearTimeout(timeout);
+          done();
+        });
+    });
   }
 
   function lastNonEmptyLine(text) {
@@ -689,8 +1156,10 @@
   }
 
   function looksLikePasswordPrompt(line) {
+    // Login prompts only — not arbitrary prose ending in "password:".
     return (
-      line.endsWith("password:") ||
+      line.endsWith("account password:") ||
+      line.endsWith("character password:") ||
       line.indexOf("new password:") !== -1 ||
       line.indexOf("password for ") !== -1
     );
@@ -701,6 +1170,7 @@
     line.className = "out-line";
     line.innerHTML = ansiToHtml(piece, true);
     output.appendChild(line);
+    cloneToLive(line);
   }
 
   function renderPartial() {
@@ -714,7 +1184,25 @@
     partialEl = document.createElement("span");
     partialEl.className = "out-partial";
     partialEl.innerHTML = ansiToHtml(lineBuf, false);
-    output.appendChild(partialEl);
+    const sink = divertingOutput() ? liveOutput : output;
+    if (divertingOutput()) {
+      showLivePane();
+    }
+    sink.appendChild(partialEl);
+  }
+
+  function isOutputAtBottom() {
+    if (!output) {
+      return true;
+    }
+    const top = output.scrollTop;
+    return output.scrollHeight - output.clientHeight - top < 24;
+  }
+
+  function scrollOutputIfFollowing() {
+    if (outputFollow && output) {
+      output.scrollTop = output.scrollHeight;
+    }
   }
 
   function appendOutput(text) {
@@ -731,15 +1219,23 @@
     });
     renderPartial();
     trimOutput();
-    output.scrollTop = output.scrollHeight;
+    scrollOutputIfFollowing();
 
     const lastLine = lastNonEmptyLine(rawTail);
     if (looksLikePasswordPrompt(lastLine)) {
       passwordMode = true;
+      passwordSent = false;
       cmd.type = "password";
-    } else if (passwordMode && lastLine) {
+      cmd.value = "";
+    } else if (passwordMode && passwordSent && lastLine) {
+      // Clear before flipping to text so a leftover secret never flashes.
+      cmd.value = "";
       passwordMode = false;
+      passwordSent = false;
       cmd.type = "text";
+    }
+    if (!passwordMode) {
+      schedulePersistStory();
     }
     noteHoldOrResume(text);
   }
@@ -752,7 +1248,7 @@
       return;
     }
     if (raw.indexOf("[WAIT]") !== -1) {
-      setStatus("World restarting — stay connected", "wait");
+      setStatus("World restarting. Hold the line.", "wait");
       // MSG_AFTER: socket stayed up, new Session exists, commands still wait.
       // Arm only — handshake on the next real game line (look / rewrite done).
       if (raw.indexOf("You are still here") !== -1) {
@@ -863,6 +1359,25 @@
     if (!v || typeof v !== "object" || !gaugesEl) {
       return;
     }
+    const hpNow = numericVital(v.hp);
+    if (hpNow != null) {
+      if (hpNow < 20 && prevHpPct != null && hpNow < prevHpPct) {
+        if (typeof navigator.vibrate === "function") {
+          navigator.vibrate(200);
+        }
+        if (vitalsAlertEl) {
+          vitalsAlertEl.textContent = "Lifeforce critical";
+          if (vitalsAlertTimer) {
+            clearTimeout(vitalsAlertTimer);
+          }
+          vitalsAlertTimer = setTimeout(function () {
+            vitalsAlertEl.textContent = "";
+            vitalsAlertTimer = null;
+          }, 3500);
+        }
+      }
+      prevHpPct = hpNow;
+    }
     // Empty / pre-attach payloads must leave the existing HUD alone.
     // Never wipe #gauges (no innerHTML = "").
     const painted = [];
@@ -888,7 +1403,7 @@
       }
     }
     const mom = parseFloat(v.momentum);
-    if (!Number.isNaN(mom) && mom !== 0) {
+    if (!Number.isNaN(mom)) {
       const shown = (mom + 100) / 2;
       if (upsertGauge("mo", "Momentum", shown, "momentum")) {
         painted.push("mo");
@@ -1012,7 +1527,10 @@
   }
 
   function phoneShell() {
-    return window.matchMedia("(max-width: 720px)").matches;
+    // Touch phones only -- a mouse desktop at 700px still keeps the HUD.
+    // Must stay in lockstep with the CSS `@media (max-width: 720px) and
+    // (pointer: coarse)` block (header hide + Log/Maps/Status/More tabs).
+    return window.matchMedia("(max-width: 720px) and (pointer: coarse)").matches;
   }
 
   function showMenu(x, y, verbs) {
@@ -1121,7 +1639,12 @@
     }
     const st = atlasState || {};
     const dpr = window.devicePixelRatio || 1;
-    const cssW = atlasCanvas.clientWidth || 260;
+    const cssW = atlasCanvas.clientWidth;
+    if (!cssW) {
+      // Hidden pane (phone Log tab) or a backgrounded tab -- a 260px
+      // fallback bitmap stretches into smear when the canvas is shown later.
+      return;
+    }
     const cssH = Math.max(72, Math.round(cssW * (h / w)));
     atlasCanvas.style.height = cssH + "px";
     atlasCanvas.width = Math.round(cssW * dpr);
@@ -1217,7 +1740,7 @@
     if (payload.mark !== undefined) {
       atlasState.mark = payload.mark;
     }
-    if (payload.marks) {
+    if (payload.marks !== undefined) {
       atlasState.marks = payload.marks;
     }
     if (payload.title) {
@@ -1344,7 +1867,10 @@
     const cellsH = maxY - minY + 1;
     zoneBounds = { minX: minX, maxX: maxX, minY: minY, maxY: maxY };
     const dpr = window.devicePixelRatio || 1;
-    const cssW = zoneCanvas.clientWidth || 260;
+    const cssW = zoneCanvas.clientWidth;
+    if (!cssW) {
+      return;
+    }
     const cssH = Math.min(
       220,
       Math.max(72, Math.round(cssW * (cellsH / cellsW)))
@@ -1521,37 +2047,63 @@
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
+    // Close a leftover socket first. Safari tab-sleep can leave
+    // readyState OPEN with a silent inbound path; opening a second
+    // socket without dropping the first is what flapped live :4080.
+    const previous = socket;
+    socket = null;
+    if (previous) {
+      try {
+        previous.close();
+      } catch (err) {
+        /* already closed */
+      }
+    }
     setStatus("Connecting…", "");
     setInputEnabled(false);
+    let opened;
     try {
-      socket = new WebSocket(wsUrl());
+      opened = new WebSocket(wsUrl());
     } catch (err) {
       setStatus("WebSocket failed: " + err.message, "error");
       scheduleReconnect();
       return;
     }
-    socket.addEventListener("open", function () {
+    socket = opened;
+    opened.addEventListener("open", function () {
+      if (socket !== opened) {
+        return;
+      }
       setStatus("Connected", "connected");
       setInputEnabled(true);
       reconnectDelay = 1000;
       handshakeHud();
     });
-    socket.addEventListener("message", function (ev) {
+    opened.addEventListener("message", function (ev) {
+      if (socket !== opened) {
+        return;
+      }
       if (typeof ev.data !== "string") {
         return;
       }
       handleFrame(ev.data);
     });
-    socket.addEventListener("close", function () {
-      setStatus("Disconnected — reconnecting…", "error");
+    opened.addEventListener("close", function () {
+      if (socket !== opened) {
+        return;
+      }
+      setStatus("Disconnected. Reconnecting…", "error");
       setInputEnabled(false);
       socket = null;
       if (!userClosed) {
         scheduleReconnect();
       }
     });
-    socket.addEventListener("error", function () {
-      setStatus("Connection error", "error");
+    opened.addEventListener("error", function () {
+      if (socket !== opened) {
+        return;
+      }
+      setStatus("Connection failed", "error");
     });
   }
 
@@ -1573,12 +2125,15 @@
     el.className = "echo-line";
     el.textContent = "> " + line;
     output.appendChild(el);
+    cloneToLive(el);
     trimOutput();
-    output.scrollTop = output.scrollHeight;
+    scrollOutputIfFollowing();
+    schedulePersistStory();
   }
 
   function submitLine(line) {
-    if (line !== "" && !passwordMode) {
+    const hidingSecret = passwordMode;
+    if (line !== "" && !hidingSecret) {
       history.push(line);
       if (history.length > HISTORY_MAX) {
         history.shift();
@@ -1592,13 +2147,17 @@
     }
     echoOwnInput(line);
     sendCmd(line);
+    if (hidingSecret) {
+      passwordSent = true;
+      cmd.value = "";
+      cmd.type = "password";
+    }
   }
 
   form.addEventListener("submit", function (ev) {
     ev.preventDefault();
     const line = cmd.value;
     submitLine(line);
-    cmd.value = "";
   });
 
   // Pasting a multi-line block (a saved macro, a sequence of directions,
@@ -1646,6 +2205,9 @@
         return;
       }
       ev.preventDefault();
+      if (historyIdx >= history.length) {
+        historyDraft = cmd.value;
+      }
       historyIdx = Math.max(0, historyIdx - 1);
       cmd.value = history[historyIdx] || "";
     } else if (ev.key === "ArrowDown") {
@@ -1654,9 +2216,12 @@
       }
       ev.preventDefault();
       historyIdx = Math.min(history.length, historyIdx + 1);
-      cmd.value = historyIdx >= history.length ? "" : history[historyIdx];
+      cmd.value = historyIdx >= history.length ? historyDraft : history[historyIdx];
     } else if (ev.key === "Escape") {
       hideMenu();
+      cmd.value = "";
+      ev.preventDefault();
+      ev.stopPropagation();
     }
   });
 
@@ -1815,20 +2380,155 @@
     }
   });
   window.addEventListener("resize", function () {
+    if (document.hidden) {
+      return;
+    }
+    syncVisualViewport();
+    clampStoredPaneSizes();
+    applyPaneSizes();
     drawAtlas();
     drawZone();
   });
 
-  function syncVisualViewport() {
-    const vv = window.visualViewport;
-    const height = vv ? vv.height : window.innerHeight;
-    document.documentElement.style.setProperty("--app-height", height + "px");
+  function pinDocumentScroll() {
+    if (window.scrollY || window.scrollX) {
+      window.scrollTo(0, 0);
+    }
+    if (document.documentElement) {
+      document.documentElement.scrollTop = 0;
+    }
+    if (document.body) {
+      document.body.scrollTop = 0;
+    }
   }
+
+  function syncVisualViewport() {
+    // Chrome fires visualViewport resize with height 0 (or a stub) when
+    // the tab is backgrounded. Stamping that onto --app-height crushes
+    // the flex shell; on return the log and maps smear until a refresh.
+    if (document.hidden) {
+      return;
+    }
+    const vv = window.visualViewport;
+    let height = window.innerHeight || 0;
+    if (vv && vv.height >= 120) {
+      height = Math.round(vv.height);
+    }
+    if (window.innerHeight >= 120) {
+      height = Math.min(height, Math.round(window.innerHeight));
+    }
+    if (height < 120) {
+      return;
+    }
+    document.documentElement.style.setProperty("--app-height", height + "px");
+    pinDocumentScroll();
+  }
+
+  function bustCanvas(canvas) {
+    if (!canvas) {
+      return;
+    }
+    canvas.width = 0;
+    canvas.height = 0;
+  }
+
+  function webkitStoryPaint() {
+    // Safari and iOS browsers (including Chrome-on-iOS) paint with WebKit.
+    // Desktop Chrome/Edge/Chromium keep the display:none compositor bust.
+    const ua = String(navigator.userAgent || "");
+    return /AppleWebKit/i.test(ua) && !/Chrome\/|Chromium\/|Edg\//i.test(ua);
+  }
+
+  function socketIsOpen() {
+    return !!(socket && socket.readyState === WebSocket.OPEN);
+  }
+
+  function ensureOpenSocket() {
+    // Never close an OPEN socket from a wake handler -- that drops a live
+    // play session to the login prompt. Only open one when this tab has none.
+    if (userClosed || socketIsOpen()) {
+      return;
+    }
+    connect();
+  }
+
+  function wakeStoryLog() {
+    catchUpOutput();
+    if (output) {
+      output.scrollTop = output.scrollHeight;
+    }
+  }
+
+  function repaintStoryLog() {
+    if (!output) {
+      return;
+    }
+    if (webkitStoryPaint()) {
+      // Safari: taking #output out of flow with display:none freezes the
+      // compositor tile. Commands still send; incoming lines never paint.
+      wakeStoryLog();
+      return;
+    }
+    const top = output.scrollTop;
+    const atBottom = output.scrollHeight - output.clientHeight - top < 24;
+    // Drop Chrome's stale compositor tile by taking the scroller out of
+    // flow for a frame -- transform:translateZ on a scrolling pane is what
+    // smeared rows after a long tab-away.
+    output.style.display = "none";
+    void output.offsetHeight;
+    output.style.display = "";
+    output.scrollTop = atBottom ? output.scrollHeight : top;
+    if (atBottom) {
+      outputFollow = true;
+    }
+  }
+
+  function refreshForeground() {
+    if (document.visibilityState && document.visibilityState !== "visible") {
+      return;
+    }
+    pinDocumentScroll();
+    syncVisualViewport();
+    bustCanvas(atlasCanvas);
+    bustCanvas(zoneCanvas);
+    repaintStoryLog();
+    window.requestAnimationFrame(function () {
+      window.requestAnimationFrame(function () {
+        drawAtlas();
+        drawZone();
+        pinDocumentScroll();
+      });
+    });
+  }
+
+  function onPageShow(ev) {
+    // bfcache restore: inbound WS events may be dead even when readyState
+    // still says OPEN. Reconnect only when the socket is actually gone.
+    if (ev && ev.persisted) {
+      ensureOpenSocket();
+      wakeStoryLog();
+    }
+    refreshForeground();
+  }
+
   if (window.visualViewport) {
     window.visualViewport.addEventListener("resize", syncVisualViewport);
     window.visualViewport.addEventListener("scroll", syncVisualViewport);
   }
-  window.addEventListener("orientationchange", syncVisualViewport);
+  window.addEventListener(
+    "scroll",
+    function () {
+      pinDocumentScroll();
+    },
+    { passive: true }
+  );
+  window.addEventListener("orientationchange", function () {
+    window.setTimeout(refreshForeground, 50);
+  });
+  document.addEventListener("visibilitychange", refreshForeground);
+  window.addEventListener("pageshow", onPageShow);
+  // Do not redraw on window focus -- Mac Safari fires that on every
+  // click back into the tab, and display:none there freezes the log.
   syncVisualViewport();
 
   function applyPhoneTab(name, persist) {
@@ -1869,16 +2569,168 @@
   }
   applyPhoneTab(readStoredString(PHONE_TAB_KEY, "log"), false);
 
-  document.addEventListener("keydown", function (ev) {
-    if (ev.key !== "Escape") {
+  function exportSessionLog() {
+    if (!output) {
       return;
     }
-    if (shortcutsDialog && !shortcutsDialog.hidden) {
-      closeShortcuts();
+    const text = output.textContent || "";
+    const date = new Date().toISOString().slice(0, 10);
+    const blob = new Blob([text], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "riftforge-session-" + date + ".txt";
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }
+
+  if (saveLogBtn) {
+    saveLogBtn.addEventListener("click", exportSessionLog);
+  }
+
+  function dialogOpen() {
+    return (
+      (shortcutsDialog && !shortcutsDialog.hidden) ||
+      (displayDialog && !displayDialog.hidden)
+    );
+  }
+
+  function screenreaderOn() {
+    return document.body.classList.contains("screenreader");
+  }
+
+  function isTypingField(el) {
+    if (!el) {
+      return false;
     }
-    if (displayDialog && !displayDialog.hidden) {
-      closeDisplayPrefs();
+    const tag = (el.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select") {
+      return true;
     }
+    return !!el.isContentEditable;
+  }
+
+  function hasTextSelection() {
+    const sel = window.getSelection();
+    return !!(sel && String(sel).length);
+  }
+
+  function focusCommand() {
+    if (!cmd || cmd.disabled) {
+      return false;
+    }
+    cmd.focus();
+    return document.activeElement === cmd;
+  }
+
+  function clickShouldFocusCmd(ev) {
+    if (dialogOpen() || !ev.target || !ev.target.closest) {
+      return false;
+    }
+    if (
+      ev.target.closest(
+        "button, a, input, select, textarea, label, canvas, .pane-split, #ctx-menu, #phone-nav, #input-row, header"
+      )
+    ) {
+      return false;
+    }
+    if (!ev.target.closest("#output, #room-card, .comm-log, #play-main, #more-sheet")) {
+      return false;
+    }
+    return !hasTextSelection();
+  }
+
+  function insertTypedChar(ch) {
+    const start = cmd.selectionStart == null ? cmd.value.length : cmd.selectionStart;
+    const end = cmd.selectionEnd == null ? cmd.value.length : cmd.selectionEnd;
+    cmd.value = cmd.value.slice(0, start) + ch + cmd.value.slice(end);
+    const pos = start + ch.length;
+    cmd.setSelectionRange(pos, pos);
+  }
+
+  if (output) {
+    output.addEventListener(
+      "scroll",
+      function () {
+        const atBottom = isOutputAtBottom();
+        if (atBottom) {
+          catchUpOutput();
+        } else {
+          outputFollow = false;
+        }
+      },
+      { passive: true }
+    );
+  }
+  if (liveOutput) {
+    liveOutput.addEventListener("click", function () {
+      catchUpOutput();
+    });
+  }
+
+  document.addEventListener("click", function (ev) {
+    if (!clickShouldFocusCmd(ev)) {
+      return;
+    }
+    focusCommand();
+  });
+
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key === "Escape") {
+      if (shortcutsDialog && !shortcutsDialog.hidden) {
+        closeShortcuts();
+        ev.preventDefault();
+        ev.stopPropagation();
+        return;
+      }
+      if (displayDialog && !displayDialog.hidden) {
+        closeDisplayPrefs();
+        ev.preventDefault();
+        ev.stopPropagation();
+        return;
+      }
+      if (cmd && !cmd.disabled) {
+        if (document.activeElement !== cmd) {
+          focusCommand();
+        }
+        cmd.value = "";
+        ev.preventDefault();
+        ev.stopPropagation();
+      }
+      return;
+    }
+    if (ev.key === "Tab") {
+      if (dialogOpen() || screenreaderOn()) {
+        return;
+      }
+      ev.preventDefault();
+      focusCommand();
+      return;
+    }
+    if (ev.key === "End" && document.activeElement !== cmd && output) {
+      ev.preventDefault();
+      catchUpOutput();
+      return;
+    }
+    if (dialogOpen() || ev.ctrlKey || ev.metaKey || ev.altKey || ev.isComposing) {
+      return;
+    }
+    if (isTypingField(document.activeElement)) {
+      return;
+    }
+    if (ev.key === "Unidentified" || ev.key === "Process" || ev.key === "Dead") {
+      return;
+    }
+    if (ev.key.length !== 1) {
+      return;
+    }
+    if (!focusCommand()) {
+      return;
+    }
+    ev.preventDefault();
+    insertTypedChar(ev.key);
   });
 
   if (commTabPublic) {
@@ -1979,5 +2831,15 @@
     gagCheckbox.checked = storedGag === true;
   }
 
-  connect();
+  restoreStoryLog().then(function () {
+    connect();
+  });
+
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", function () {
+      navigator.serviceWorker.register("./service-worker.js").catch(function () {
+        /* offline shell optional */
+      });
+    });
+  }
 })();

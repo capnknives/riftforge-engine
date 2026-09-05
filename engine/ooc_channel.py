@@ -19,6 +19,10 @@ _AUTHOR_NUDGE_VERB_RE = re.compile(r"\b(bug|suggest)\b", re.IGNORECASE)
 def speaker_face_for_character(character, game, viewer=None):
     """OOC label: account display name when pref says account, else character.
 
+    God bilocate twins borrow the owning Mantle's account + OOC pref (bug
+    report 1149) so channel traffic does not leak the husk's character face
+    while act focus is on the twin body.
+
     OOC always shows account or character legal name — never viewer-relative
     short-desc / hood / unintroduced appearance (bug #253).
 
@@ -33,6 +37,12 @@ def speaker_face_for_character(character, game, viewer=None):
     storage key, Echo body login name, or a redundant ``(Account)`` seeaccounts
     suffix (``CapnKnives(GM)(CapnKnives)``).
     """
+    try:
+        from engine import hooks as hooks_mod
+
+        character = hooks_mod.resolve_account_character(character, game)
+    except Exception:
+        pass
     try:
         from command_support import _presence_face, _staff_form_label
 

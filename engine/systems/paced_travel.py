@@ -30,9 +30,9 @@ PACE_HOPS_PER_ADVANCE = {
 }
 WALK_STEP_EVERY = PACE_STEP_EVERY["walk"]
 
-_COORD_RE = re.compile(r"^(-?\d+)\s*[, ]\s*(-?\d+)$")
-# Four space-separated ints: macro tile + foot micro (drive placement).
-_COORD_FOUR_RE = re.compile(r"^(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)$")
+# Stamp junk around the numbers: parens, quotes, commas, spaces.
+# Leftover letters mean this is a place name, not a coordinate.
+_COORD_PUNCT_RE = re.compile(r"[\d,()'\"`.\s/-]+")
 
 _RESOURCE_HINTS = {
     "clinic": ("clinic",),
@@ -133,35 +133,36 @@ def parse_coordinates(raw):
 
     Discrimination uses ``len`` on the returned tuple:
 
-    * ``len == 2`` -- macro atlas tile ``(mx, my)`` from ``20 20``,
-      ``20,20``, or ``20 5`` (comma or single space between the pair).
+    * ``len == 2`` -- macro atlas tile ``(mx, my)`` from ``20 5``,
+      ``35,11``, or ``(35,11)``.
     * ``len == 4`` -- macro tile plus foot micro ``(mx, my, ux, uy)``
-      from exactly four space-separated integers (e.g. ``44 32 3 7``).
+      from four integers in any common stamp: ``44 32 3 7``,
+      ``35,11 5,0``, ``(35,11) 5,0``, or ``'35 11' '5,0'``.
       Micro ``ux`` / ``uy`` must lie in ``0`` through ``9`` (the 10-by-10
       foot grid inside each atlas tile); out-of-range micro values are a
       parse failure (``None``), same as unmatched text.
 
-    No parentheses. Three-token strings like ``1 2 3`` do not match.
+    Leftover letters fail (so ``lebanon`` and ``build (35,11) 5,7``
+    stay names, not coords). Three numbers like ``1 2 3`` do not match.
     """
     text = (raw or "").strip()
     if not text:
         return None
-    four = _COORD_FOUR_RE.match(text)
-    if four is not None:
-        mx = int(four.group(1))
-        my = int(four.group(2))
-        ux = int(four.group(3))
-        uy = int(four.group(4))
+    leftover = _COORD_PUNCT_RE.sub("", text)
+    if leftover:
+        return None
+    nums = [int(tok) for tok in re.findall(r"-?\d+", text)]
+    if len(nums) == 2:
+        return (nums[0], nums[1])
+    if len(nums) == 4:
+        mx, my, ux, uy = nums
         # MICRO_SIZE is 10 on the America dual-layer atlas (0..9 cells).
         from engine.systems.overland import MICRO_SIZE
 
         if not (0 <= ux < MICRO_SIZE and 0 <= uy < MICRO_SIZE):
             return None
         return (mx, my, ux, uy)
-    match = _COORD_RE.match(text)
-    if not match:
-        return None
-    return int(match.group(1)), int(match.group(2))
+    return None
 
 
 def format_atlas_coords(x, y):
@@ -245,8 +246,9 @@ def _room_tokens(room):
 
 def _alias_candidates_for_room(room, zone_rooms):
     """Short walk labels for one room."""
+    from engine.room_vnum import describe_room
     key = getattr(room, "key", "") or ""
-    title = room.look_title() if hasattr(room, "look_title") else key
+    title = describe_room(room) if room is not None else key
     norm_key = normalize_query(key)
     norm_title = normalize_query(title)
     aliases = []
@@ -284,10 +286,9 @@ def _alias_candidates_for_room(room, zone_rooms):
 
 def _score_room_match(needle, room):
     """Higher is a better match for ``needle`` against ``room``."""
+    from engine.room_vnum import describe_room
     key_n = normalize_query(getattr(room, "key", "") or "")
-    title_n = normalize_query(
-        room.look_title() if hasattr(room, "look_title") else key_n
-    )
+    title_n = normalize_query(describe_room(room) if room is not None else key_n)
     tokens = _room_tokens(room)
     score = 0
     if needle == key_n:
@@ -421,10 +422,9 @@ def match_zone_room(needle, zone_rooms):
     candidates = []
     for room in zone_rooms:
         aliases = _alias_candidates_for_room(room, zone_rooms)
+        from engine.room_vnum import describe_room
         key_n = normalize_query(room.key)
-        title_n = normalize_query(
-            room.look_title() if hasattr(room, "look_title") else key_n
-        )
+        title_n = normalize_query(describe_room(room))
         desc_n = normalize_query(getattr(room, "description", "") or "")
         tags = set(getattr(room, "resources", None) or [])
         if getattr(room, "hospital", False):
@@ -760,12 +760,29 @@ def format_walk_focus_status(actor, game=None):
     focus = get_walk_focus(actor)
     if focus is None:
         return "Walk focus: (none)."
-    label = focus.get("dest_label") or focus.get("dest_room_key") or "?"
+    label = focus.get("dest_label") or "your destination"
     mode = focus.get("mode") or "room"
     steps = int(focus.get("steps", 0) or 0)
     pace = pace_of_focus(focus)
     verb = pace_gerund(pace)
-    stop_hint = f"{pace} stop" if pace != "walk" else "walk stop"
+    stop_hint = focus.get("stop_verb") or (
+        f"{pace} stop" if pace != "walk" else "walk stop"
+    )
+    if mode == "eta":
+        until = int(focus.get("arrive_until_tick") or 0)
+        now = 0
+        if game is not None:
+            now = int(getattr(game, "game_time_ticks", 0) or 0)
+        remain = max(0, until - now)
+        from engine import game_clock_tuning as clock_mod
+
+        span = clock_mod.format_player_tick_span(remain, game)
+        # SUPERS stamps eta_lead (smoke vs seep). Never interpolate dest keys.
+        lead = focus.get("eta_lead") or "On the way toward"
+        return (
+            f"{lead} {label} ({span}). "
+            f"Type {stop_hint} to cancel."
+        )
     return (
         f"{verb} toward {label} ({mode}, {steps} steps so far). "
         f"Type {stop_hint} to cancel."
@@ -1052,6 +1069,10 @@ def tick_walks(game, *, advance_overland=None, engaged_check=None):
         focus = get_walk_focus(character)
         if focus is None:
             continue
+        # ETA skip-road (Demon smoke): Cadence / Echoes also finish.
+        if (focus.get("mode") or "") == "eta":
+            hooks_mod.paced_travel_eta_tick(character, game, focus, now)
+            continue
         sess = getattr(character, "session", None)
         if sess is None or isinstance(sess, SilentSession):
             continue
@@ -1066,6 +1087,13 @@ def tick_walks(game, *, advance_overland=None, engaged_check=None):
         if now - last < step_every:
             continue
         hops = int(PACE_HOPS_PER_ADVANCE.get(pace, 1) or 1)
+        # Game hook may raise hops for Origin biology (vampire run, …).
+        override = hooks_mod.paced_travel_hops_of(character, pace)
+        if override is not None:
+            try:
+                hops = max(1, int(override))
+            except (TypeError, ValueError):
+                pass
         mode = focus.get("mode") or "room"
         for _ in range(max(1, hops)):
             focus = get_walk_focus(character)

@@ -20,6 +20,7 @@ import os
 BASE_COMPLETE_WHEN_TYPES = frozenset({
     "start",
     "talk_npc",
+    "call_npc",
     "verb",
     "any_verbs",
     "any_of",
@@ -217,11 +218,29 @@ def load_quests():
     return _CACHE
 
 
-def get_quest(quest_id):
-    """Return one quest dict or None."""
+def resolve_quest_id(quest_id):
+    """Canonical catalog id for a player-typed quest token, or None.
+
+    ``quests take combat drill`` matches ``combat_drill``. Storage keys
+    stay the snake_case catalog id.
+    """
     if not quest_id:
         return None
-    return load_quests().get(quest_id)
+    catalog = load_quests()
+    raw = str(quest_id).strip()
+    if raw in catalog:
+        return raw
+    from engine.player_input import match_catalog_id
+
+    return match_catalog_id(raw, catalog)
+
+
+def get_quest(quest_id):
+    """Return one quest dict or None."""
+    qid = resolve_quest_id(quest_id)
+    if not qid:
+        return None
+    return load_quests().get(qid)
 
 
 def list_quest_ids():

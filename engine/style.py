@@ -666,15 +666,15 @@ def moral_tide_caption(balance, lean=""):
     if lean:
         return f"{lean} ({bal:+d})"
     if bal == 0:
-        return f"The town hangs in balance ({bal:+d})"
+        return f"The world hangs in balance ({bal:+d})"
     if bal > 0:
-        return f"The town leans toward the light ({bal:+d})"
-    return f"The town leans toward darkness ({bal:+d})"
+        return f"The world leans toward the light ({bal:+d})"
+    return f"The world leans toward darkness ({bal:+d})"
 
 
 def format_moral_meter(balance, *, lean="", eclipse=False, width=WHO_WIDTH,
-                       screenreader=False):
-    """Aesthetic Good/Evil world-tide bar (who-list footer / world sheets).
+                       screenreader=False, title=None, sr_title=None):
+    """Aesthetic Good/Evil signed meter (who-list footer / world / town sheets).
 
     Scale is -100..+100 (positive = good). Fill grows from the center `|`
     toward EVIL (left) or GOOD (right) -- empty track stays at the outer
@@ -682,18 +682,24 @@ def format_moral_meter(balance, *, lean="", eclipse=False, width=WHO_WIDTH,
     signed number -- so color-off clients still read the meter (section 8
     a11y). Color is decoration only.
 
-    ``screenreader=True`` drops the ASCII bar and spaced ``W O R L D``
-    title; emits semantic Tide lines for TTS (same policy as needs meters).
+    Default title is the World Tide banner (who / world). Pass ``title`` /
+    ``sr_title`` when the same bar is reused for a town's morals so
+    screenreader users do not hear "World Tide" twice.
+
+    ``screenreader=True`` drops the ASCII bar and spaced banner; emits
+    semantic Tide lines for TTS (same policy as needs meters).
     """
     w = max(40, int(width))
     bal = max(-100, min(100, int(balance)))
     caption = moral_tide_caption(bal, lean)
+    sighted_title = title if title is not None else "W O R L D   T I D E"
+    spoken_title = sr_title if sr_title is not None else "World Tide"
 
     if screenreader:
         # No [#-|] glyphs / letter-spaced banner -- phrase + signed balance.
         # _tts_period lives below in this module; fine at call time.
         out = [
-            _tts_period("World Tide"),
+            _tts_period(spoken_title),
             _tts_period(f"Balance: {bal:+d}"),
             _tts_period(caption),
         ]
@@ -741,7 +747,7 @@ def format_moral_meter(balance, *, lean="", eclipse=False, width=WHO_WIDTH,
     cap_line = paint("muted", pad(caption, w, "center"))
 
     out = [
-        paint("dark_purple", pad("W O R L D   T I D E", w, "center")),
+        paint("dark_purple", pad(sighted_title, w, "center")),
         meter_line,
         cap_line,
     ]
@@ -1033,13 +1039,18 @@ def _tts_period(text):
     return text
 
 
-def format_tome(title, body_lines, *, related=None, syntax=None,
+def format_tome(title, body_lines, *, related=None, continued=None, syntax=None,
                 width=TOME_WIDTH, screenreader=False):
     """Blood & Velvet help / sheet frame (plan section 2).
 
     `body_lines` is an iterable of plain or already-painted lines.
     Optional `syntax` (string) and `related` (string or list) get labeled
-    sections under the header / above the footer.
+    sections under the header / above the footer. `continued` (string or
+    list) is the same shape as `related` but for a page's own overflow
+    child(ren) -- `help_chunk_pass.py`'s "<topic> more" / "<topic> lore" /
+    "<topic> extra" split -- rendered with a distinct "CONTINUED:" label
+    so it reads as part 2 of *this* page instead of just another
+    cross-reference lost in the RELATED list (suggestion 317).
 
     ``screenreader=True`` drops equals borders and hard-wrap; emits
     ``Title.`` then body lines with TTS-friendly periods (prefs #30–#32).
@@ -1055,10 +1066,15 @@ def format_tome(title, body_lines, *, related=None, syntax=None,
                 lines.append("")
                 continue
             lines.append(_tts_period(text))
+        if continued or related:
+            lines.append("")
+        if continued:
+            if isinstance(continued, (list, tuple)):
+                continued = ", ".join(continued)
+            lines.append(_tts_period(f"Continued: {continued}"))
         if related:
             if isinstance(related, (list, tuple)):
                 related = ", ".join(related)
-            lines.append("")
             lines.append(_tts_period(f"Related: {related}"))
         lines.append("")
         return lines
@@ -1088,6 +1104,10 @@ def format_tome(title, body_lines, *, related=None, syntax=None,
             lines.extend(_wrap_plain(text, w, color="slate_grey"))
     lines.append("")
     lines.append(light)
+    if continued:
+        if isinstance(continued, (list, tuple)):
+            continued = ", ".join(continued)
+        lines.append(render(f"<dark_grey> CONTINUED: <dark_magenta>{continued}"))
     if related:
         if isinstance(related, (list, tuple)):
             related = ", ".join(related)
@@ -1173,12 +1193,25 @@ def format_help_alphabetical_index(
     title="Help Index",
     width=TOME_WIDTH,
     screenreader=False,
+    hint=None,
+    tts_hint=None,
 ):
     """Flat A-Z help catalog -- ``help topics`` / ``help gmtopics``.
 
     ``entries`` is ``[(name, blurb), ...]`` already sorted. No category
     headers -- one long list so staff can skim letter-by-letter.
+    ``hint`` / ``tts_hint`` override the grey how-to line so ``oldhelp``
+    can point at archived lookups without copying this formatter.
     """
+    if hint is None:
+        hint = (
+            " A-Z catalog.  Type 'help <name>' for a page.  "
+            "'commands' for verbs."
+        )
+    if tts_hint is None:
+        tts_hint = (
+            "Type help for Start Here. Type help followed by a name for one page"
+        )
     if screenreader:
         lines = [
             "",
@@ -1187,9 +1220,7 @@ def format_help_alphabetical_index(
                 "Warning: long listen -- this is the full topic catalog sorted "
                 "A through Z"
             ),
-            _tts_period(
-                "Type help for Start Here. Type help followed by a name for one page"
-            ),
+            _tts_period(tts_hint),
             _tts_period("Type commands for verbs"),
             "",
         ]
@@ -1207,10 +1238,7 @@ def format_help_alphabetical_index(
         heavy,
         render(f"<gold> TOME: <dark_magenta>{title}"),
         heavy,
-        paint(
-            "dark_grey",
-            " A-Z catalog.  Type 'help <name>' for a page.  'commands' for verbs.",
-        ),
+        paint("dark_grey", hint),
         "",
     ]
     for name, blurb in entries:
@@ -1225,7 +1253,8 @@ def format_help_alphabetical_index(
     return lines
 
 
-def format_help_index(categories, *, width=TOME_WIDTH, screenreader=False):
+def format_help_index(categories, *, width=TOME_WIDTH, screenreader=False,
+                      title="Help Index", hint=None, tts_hint=None):
     """Bare `help` grimoire index: category tomes with topic blurbs.
 
     `categories` is HELP_CATEGORIES shape: [(category, [(name, blurb), ...])].
@@ -1234,18 +1263,24 @@ def format_help_index(categories, *, width=TOME_WIDTH, screenreader=False):
     Screenreader bare ``help`` uses :func:`format_help_start_here` instead;
     categorized index stays on bare ``help``; ``help topics`` uses
     :func:`format_help_alphabetical_index` instead.
+    ``title`` / ``hint`` / ``tts_hint`` let ``oldhelp`` reuse this frame
+    for the frozen archive index.
     """
+    if hint is None:
+        hint = " Type 'help <name>' for a page.  'commands' for verbs."
+    if tts_hint is None:
+        tts_hint = (
+            "Type help for Start Here. Type help followed by a name for one page"
+        )
     if screenreader:
         lines = [
             "",
-            _tts_period("Help Index"),
+            _tts_period(title),
             _tts_period(
                 "Warning: long listen -- this is the full topic catalog, "
                 "not the short Start Here list"
             ),
-            _tts_period(
-                "Type help for Start Here. Type help followed by a name for one page"
-            ),
+            _tts_period(tts_hint),
             _tts_period("Type commands for verbs"),
             "",
         ]
@@ -1260,9 +1295,9 @@ def format_help_index(categories, *, width=TOME_WIDTH, screenreader=False):
     heavy = paint("dark_red", rule_equals(w))
     lines = [
         heavy,
-        render("<gold> TOME: <dark_magenta>Help Index"),
+        render(f"<gold> TOME: <dark_magenta>{title}"),
         heavy,
-        paint("dark_grey", " Type 'help <name>' for a page.  'commands' for verbs."),
+        paint("dark_grey", hint),
         "",
     ]
     for category, topics in categories:
@@ -2298,6 +2333,7 @@ BADGE_COLORS = {
     # Human Backgrounds -----------------------------------------------------
     "detective": "dark_cyan",
     "scientist": "pale_blue",
+    "hacker": "teal",
     "procurer": "slate_grey",
     "witch": "violet",
     "medic": "teal",

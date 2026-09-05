@@ -193,6 +193,15 @@ def find_character_by_key(game, key):
             if getattr(ch, "key", None) == key:
                 return ch
         return None
+    # Smoke stubs and some tests wire a name→Character dict, not a set.
+    if isinstance(chars, dict):
+        hit = chars.get(key)
+        if hit is not None and getattr(hit, "key", None) == key:
+            return hit
+        for ch in chars.values():
+            if getattr(ch, "key", None) == key:
+                return ch
+        return None
     from engine.world import Character
     for room in (getattr(game, "rooms", None) or {}).values():
         for obj in room.contents:
@@ -239,6 +248,41 @@ def iter_characters(game):
     return capture_character_snapshot(game)
 
 
+def iter_online_characters(game):
+    """Yield bodies that have a client Session -- O(sessions), not O(roster).
+
+    Live heartbeats used to walk every town NPC and Echo just to skip
+    them (``character.session is None``). With ~500 bodies that walk
+    showed up as ``rest_online`` 80–400 ms every tick while only five
+    people were actually logged in (2026-08-31 gist 934d887b).
+
+    When ``game.sessions`` has at least one bound character, yield those
+    only. Smokes that stamp ``character.session = FakeSession()`` without
+    listing the Session still fall back to the roster scan so existing
+    tests keep accruing.
+    """
+    seen = set()
+    found = False
+    # ``list(...)`` so a disconnect mid-loop cannot change the walk.
+    sessions = list(getattr(game, "sessions", None) or ())
+    for sess in sessions:
+        char = getattr(sess, "character", None)
+        if char is None:
+            continue
+        cid = id(char)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        found = True
+        yield char
+    if found:
+        return
+    for character in iter_characters(game):
+        if getattr(character, "session", None) is None:
+            continue
+        yield character
+
+
 def register_character(game, character):
     """Add ``character`` to the live roster (idempotent)."""
     chars = getattr(game, "characters", None)
@@ -262,6 +306,54 @@ def unregister_character(game, character):
         chars.discard(character)
     from engine import hooks as hooks_mod
     hooks_mod.fuel_loop_roster_notify(game, character, op="remove")
+
+
+def ensure_room_characters_registered(game, room):
+    """Register every Character in ``room.contents`` missing from the roster.
+
+    Ephemeral pockets (mission strongholds, procedural dungeons) used to
+    spawn hostiles before ``game.rooms[...] = room`` stamped ``room.game``,
+    so ``move_to`` never reached ``Room.add``'s roster hook (bug report
+    1131). Call after pocket rooms are registered, or from boot heal for
+    live pockets opened before the producer fix.
+    """
+    if game is None or room is None:
+        return 0
+    chars = getattr(game, "characters", None)
+    if not isinstance(chars, set):
+        return 0
+    from engine.world import Character
+
+    added = 0
+    for obj in list(getattr(room, "contents", []) or []):
+        if isinstance(obj, Character) and obj not in chars:
+            register_character(game, obj)
+            added += 1
+    return added
+
+
+def heal_ephemeral_pocket_roster_gaps(game):
+    """Register fightable hostiles left out of ``game.characters`` at spawn.
+
+    Scans live mission stronghold and wilderness procedural dungeon rooms
+    only -- not the full ~12k room map. Idempotent; no-op when the producer
+    already registered occupants.
+    """
+    if game is None:
+        return 0
+    from engine import hooks as hooks_mod
+
+    healed = 0
+    for room in (getattr(game, "rooms", None) or {}).values():
+        if room is None:
+            continue
+        if not (
+            getattr(room, "mission_instance", False)
+            or hooks_mod.is_ephemeral_instance_room(room)
+        ):
+            continue
+        healed += ensure_room_characters_registered(game, room)
+    return healed
 
 
 def rebuild_character_index(game):

@@ -3,15 +3,19 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0a0a0a">
   <title>Mortals and Monsters — play in browser</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <link rel="stylesheet" href="style.css?v=2026-09-05c">
 </head>
 <body>
   <a class="skip" href="#cmd">Skip to command</a>
   <header>
     <h1>Mortals and Monsters</h1>
     <p class="meta">
-      Supernatural telnet MUD &middot;
+      Supernatural MUD &middot; telnet or here &middot;
       <a href="https://play.riftforge.me" target="_blank" rel="noopener noreferrer">site</a>
       &middot;
       <a data-discord-invite href="https://discord.com/invite/KZbeRd389" target="_blank" rel="noopener noreferrer">Discord</a>
@@ -19,6 +23,7 @@
       &middot; <button type="button" id="help-browser" class="hint">help browser</button>
       &middot; <button type="button" id="show-shortcuts" class="hint">shortcuts</button>
       &middot; <button type="button" id="show-display-prefs" class="hint">display</button>
+      &middot; <button type="button" id="save-log" class="hint">save log</button>
       &middot; <span id="client-build" class="build-stamp"></span>
     </p>
     <p id="status" role="status" aria-live="polite">Connecting…</p>
@@ -76,10 +81,20 @@
           ></div>
         </div>
       </section>
+      <div
+        id="split-comm"
+        class="pane-split pane-split-h"
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="Resize chat capture height"
+        aria-controls="comm-pane"
+        tabindex="0"
+      ></div>
       <div id="room-card" hidden>
         <div id="room-title"></div>
         <div id="room-sub"></div>
       </div>
+      <div id="output-split">
       <div
         id="output"
         role="log"
@@ -87,7 +102,25 @@
         aria-relevant="additions"
         aria-label="Game output"
       ></div>
+      <div
+        id="output-live"
+        hidden
+        role="log"
+        aria-live="polite"
+        aria-relevant="additions"
+        aria-label="New game output while you review history"
+      ></div>
+      </div>
     </div>
+    <div
+      id="split-hud"
+      class="pane-split pane-split-v"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize map and status column width"
+      aria-controls="hud"
+      tabindex="0"
+    ></div>
     <aside id="hud" aria-label="Gauges and atlas">
       <div id="atlas-panel">
         <div class="pane-head">
@@ -163,6 +196,7 @@
   </div>
 
   <div id="prompt-mirror" aria-hidden="true"></div>
+  <div id="vitals-alert" class="sr-only" aria-live="assertive" aria-atomic="true"></div>
 
   <form id="input-row" autocomplete="off">
     <label for="cmd" class="sr-only">Command</label>
@@ -190,18 +224,22 @@
 
   <div id="shortcuts-dialog" hidden role="dialog" aria-modal="true" aria-labelledby="shortcuts-title">
     <div id="shortcuts-panel">
-      <h2 id="shortcuts-title">Keyboard &amp; click shortcuts</h2>
+      <h2 id="shortcuts-title">Keys and clicks</h2>
       <dl>
-        <dt>Enter</dt><dd>Send the command</dd>
-        <dt>&uarr; / &darr;</dt><dd>Recall earlier commands (while typing)</dd>
-        <dt>Esc</dt><dd>Close a menu or this dialog</dd>
+        <dt>Enter</dt><dd>Send what you typed</dd>
+        <dt>&uarr; / &darr;</dt><dd>Earlier commands while the input is focused</dd>
+        <dt>Esc</dt><dd>Close a menu or panel; otherwise clear the command line</dd>
+        <dt>Click story / Tab / type</dt><dd>Focus the command bar. Screen reader keeps Tab for moving between controls</dd>
+        <dt>End</dt><dd>Jump to the newest line and close the live split (when not typing)</dd>
         <dt>Right-click atlas</dt><dd>Walk, drive, atlas, or enter a landmark</dd>
         <dt>Tap or long-press atlas</dt><dd>Same travel list on a phone</dd>
-        <dt>Phone tabs</dt><dd>Log, Maps, Status, More (narrow screens)</dd>
-        <dt>Left-click interior map</dt><dd>Name a room (does not move you)</dd>
-        <dt>&minus; / &plus; buttons</dt><dd>Zoom a map pane out or in</dd>
+        <dt>Phone tabs</dt><dd>Log, Maps, Status, More on touch phones</dd>
+        <dt>Left-click interior map</dt><dd>Name a room; does not move you</dd>
+        <dt>&minus; / &plus;</dt><dd>Zoom a map pane out or in</dd>
         <dt>&#9662; chevron</dt><dd>Collapse or expand a pane</dd>
-        <dt>Paste multiple lines</dt><dd>Offers to send them as separate commands</dd>
+        <dt>Drag splitters</dt><dd>Resize chat capture height and the maps or status column on desktop</dd>
+        <dt>Paste multiple lines</dt><dd>Ask to send each line as its own command</dd>
+        <dt>save log</dt><dd>Download the visible transcript as a text file (this browser also keeps a local copy)</dd>
       </dl>
       <button type="button" id="shortcuts-close">Close</button>
     </div>
@@ -209,9 +247,9 @@
 
   <div id="display-dialog" hidden role="dialog" aria-modal="true" aria-labelledby="display-title">
     <div id="display-panel">
-      <h2 id="display-title">Display preferences</h2>
+      <h2 id="display-title">Display</h2>
       <label class="display-pref">
-        Text size
+        Type size
         <select id="pref-fontsize" aria-label="Text size">
           <option value="small">Small</option>
           <option value="normal" selected>Normal</option>
@@ -220,7 +258,7 @@
         </select>
       </label>
       <label class="display-pref">
-        Theme
+        Colors
         <select id="pref-theme" aria-label="Color theme">
           <option value="gothic" selected>Dark gothic</option>
           <option value="contrast">High contrast</option>
@@ -231,6 +269,6 @@
   </div>
 
   <script src="discord-invite.js"></script>
-  <script src="app.js"></script>
+  <script src="app.js?v=2026-09-05c"></script>
 </body>
 </html>

@@ -14,14 +14,6 @@ import uuid
 import engine.systems.economy as economy_wallet
 
 JOB_ID = "news_reporter"
-DESK_KEYS = frozenset({
-    "lebanon:Lebanon Gazette",
-    "Lebanon Gazette",
-    "LG00001",
-    "notbigville:News Office",
-    "News Office",
-    "NB00013",
-})
 
 MAX_PHOTOS = 8
 PHOTO_PAY_PER_POINT = 2
@@ -67,7 +59,7 @@ _STORY_TEMPLATES = (
 _GENERIC_INTERVIEW_LINES = (
     '"I do not want my name in the paper," they say, then talk anyway.',
     '"You should have been here ten minutes ago," they shrug.',
-    '"Lebanon is quieter than it looks," they insist -- unconvincingly.',
+    '"This town is quieter than it looks," they insist -- unconvincingly.',
     '"Off the record? Fine. On the record? Still fine," they mutter.',
     '"Write that the coffee is bad and I will deny everything," they offer.',
 )
@@ -97,13 +89,16 @@ def has_story(character):
 
 
 def is_news_desk_room(room):
-    """True when room is a Gazette / news desk (job site + board)."""
+    """True when room is a news desk (job site + board)."""
     if room is None:
         return False
-    if room.key in DESK_KEYS:
+    from engine import hooks as hooks_mod
+
+    desk_keys = hooks_mod.press_beat_desk_keys()
+    if room.key in desk_keys:
         return True
     legacy = getattr(room, "legacy_key", None)
-    if legacy and legacy in DESK_KEYS:
+    if legacy and legacy in desk_keys:
         return True
     jobs = tuple(getattr(room, "jobs", None) or ())
     return JOB_ID in jobs
@@ -141,7 +136,7 @@ def refuse_press(character, game=None):
             "You need the Reporter path or the news desk gig. "
             "Type 'help reporter'."
         )
-    return "Start at the Gazette news desk for storyboard and sellphoto."
+    return "Start at the news desk for storyboard and sellphoto."
 
 
 def _default_room_excitement(room, game):
@@ -221,7 +216,7 @@ def snap(character, game):
     if len(roll) >= MAX_PHOTOS:
         return (
             False,
-            f"Film roll full ({MAX_PHOTOS}). sellphoto at the Gazette first.",
+            f"Film roll full ({MAX_PHOTOS}). sellphoto at the news desk first.",
             None,
         )
 
@@ -260,7 +255,7 @@ def photos_lines(character):
     roll = _ensure_photo_roll(character)
     if not roll:
         return ["You have no unsold photos."]
-    lines = ["Held photos (sellphoto at the Gazette):"]
+    lines = ["Held photos (sellphoto at the news desk):"]
     for i, photo in enumerate(roll, start=1):
         lines.append(
             f"  {i}. {photo.get('label', '?')} "
@@ -275,7 +270,7 @@ def sellphoto(character, game, index=None):
         return False, refuse_press(character, game), None
     room = getattr(character, "location", None)
     if not is_news_desk_room(room):
-        return False, "Sell photos at the Gazette news desk.", None
+        return False, "Sell photos at the news desk.", None
 
     roll = _ensure_photo_roll(character)
     if not roll:
@@ -316,8 +311,8 @@ def rewrite(character, game):
     """On-duty desk fluff pay (storm research analogue)."""
     if not is_on_duty_reporter(character, game):
         return False, (
-            "Rewrite copy at the Gazette while on duty "
-            "(work as news_reporter)."
+            "Rewrite copy at the news desk while on duty "
+            "(work as news reporter)."
         ), None
     from engine import hooks
 
@@ -335,7 +330,7 @@ def rewrite(character, game):
 
 def board_lines(game, character=None):
     """Preview story opportunities at the desk."""
-    lines = ["Gazette storyboard:"]
+    lines = ["News-desk storyboard:"]
     ticks = int(getattr(game, "game_time_ticks", 0) or 0)
     for i, tmpl in enumerate(_STORY_TEMPLATES, start=1):
         lines.append(f"  {i}. {tmpl['title']} -- {tmpl['blurb']}")
@@ -358,10 +353,10 @@ def board_lines(game, character=None):
 
 
 def takestory(character, game, pick=None):
-    """Accept a story brief at the Gazette."""
+    """Accept a story brief at the news desk."""
     room = getattr(character, "location", None)
     if not is_news_desk_room(room):
-        return False, "Claim stories at the Gazette news desk.", None
+        return False, "Claim stories at the news desk.", None
     if not can_use_press_kit(character, game):
         return False, refuse_press(character, game), None
     if has_story(character):
@@ -415,7 +410,7 @@ def interview(character, target, game):
     if not can_use_press_kit(character, game):
         return False, refuse_press(character, game), None
     if not has_story(character):
-        return False, "storyboard take at the Gazette first.", None
+        return False, "storyboard take at the news desk first.", None
     if target is None or target is character:
         return False, "Interview whom?", None
     room = getattr(character, "location", None)
@@ -435,7 +430,7 @@ def interview(character, target, game):
     if len(done) >= need:
         return (
             False,
-            "Enough interviews for this brief. storyboard report at the Gazette.",
+            "Enough interviews for this brief. storyboard report at the news desk.",
             None,
         )
 
@@ -473,10 +468,10 @@ def _story_ready(character):
 def reportstory(character, game):
     """File a completed story at the desk."""
     if not has_story(character):
-        return False, "No open story. storyboard take at the Gazette.", None
+        return False, "No open story. storyboard take at the news desk.", None
     room = getattr(character, "location", None)
     if not is_news_desk_room(room):
-        return False, "File stories at the Gazette news desk.", None
+        return False, "File stories at the news desk.", None
     if not _story_ready(character):
         brief = getattr(character, "press_story_brief", None) or {}
         flags = getattr(character, "press_story_flags", None) or {}

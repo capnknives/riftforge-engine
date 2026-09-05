@@ -68,14 +68,14 @@ briefs, body parts, content kinds, travel, economy, …). Game-specific lore,
 catalogs, and prose live in a **separate** consumer repo and pin **tagged
 releases** of this package.
 
-**Current release: [`v0.6.2`](https://github.com/capnknives/riftforge-engine/releases/tag/v0.6.2)** — engine liquid-flavor kernels (skill ranks, gather nodes, vendor stock, claim boards, wage curves, status conditions, prose-pool loader) plus flavor-neutral room/item kind stamps. Pin `@v0.6.2` until the next semver tag ships from `main`.
+**Current release: [`v0.7.0`](https://github.com/capnknives/riftforge-engine/releases/tag/v0.7.0)** — Phase 2 purity restore (engine never imports a game package), journal / rumor / job-catalog kernels, and flavor-neutral news/storm desks. Pin `@v0.7.0` until the next semver tag ships from `main`.
 
 ## Install
 
 ```bash
 pip install -e .
 # or pin from another project:
-#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.6.2
+#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.7.0
 ```
 
 Requires **Python 3.11+**.
@@ -124,6 +124,16 @@ python tools/scaffold_game_mode.py --slug mygame --label "My Game"
 ```
 
 See [`docs/GAME_MODE_SCHEMA_CHECKLIST.md`](docs/GAME_MODE_SCHEMA_CHECKLIST.md).
+
+## What's new in v0.7.0
+
+- **Phase 2 purity restore** — live `engine/` modules no longer import a game package (account login chargen sentinel, account-face mapping, group focus, quest mentor reach, zone visit, ephemeral rooms, persist-helper gap names, profession/weave bags, overlay checks). Games register the same hooks from bootstrap.
+- **Journal kernel** — `engine/systems/journal.py` owns cap / list / write / erase. Games keep share, theft, and echo-diary policy.
+- **Rumor board kernel** — `engine/systems/rumor_board.py` owns room-tagged posts + SQLite meta round-trip. Games keep verbs and GM wipe.
+- **Jobs lookup table** — `engine/systems/job_catalog.py` (`install_table` / `get` / `title`). Games still validate Cadence behavior enums and own `jobs.json`.
+- **Flavor-neutral desks** — press-beat and storm-chase desk keys default empty; games register Gazette / Storm Watch / Notbigville keys. Room-trigger load no longer assumes a SUPERS content path.
+- **Chargen cancel sentinel** — `engine/chargen_menu.py` so account login can vault a draft without importing chargen.
+- **Lean Game boot** — `server.py` skips the cultivator rival index when SUPERS is absent (`RIFTFORGE_GAME=none`).
 
 ## What's new in v0.6.2
 
@@ -265,7 +275,7 @@ CI runs all three on every push.
 
 ## Building your own game
 
-1. `pip install -e .` (or pin `@v0.6.2`).
+1. `pip install -e .` (or pin `@v0.7.0`).
 2. Read [`docs/ENGINE_CONSUMER.md`](docs/ENGINE_CONSUMER.md) — hooks for chargen, persist, help, `register_all_hooks()`.
 3. Copy `basegame/` or `classic/` as a skeleton, or register your package via `RIFTFORGE_GAME=yourgame`.
 4. Put catalogs in your repo (`content/kinds/`, maps, NPCs); register kind dirs with `set_content_kinds_dirs`. Run `tools/scaffold_game_mode.py` for a fresh tree.

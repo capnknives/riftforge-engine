@@ -88,6 +88,9 @@ _PERSIST_SLOW_CHAR_LOG_MS = 20.0
 # is diagnostic breadcrumbs, not a full profile; a handful of names is
 # enough to point a GM at the right character with ``gm cadence why``.
 _PERSIST_SLOW_CHAR_LOG_CAP = 8
+# Lag U2: floor-room collect profiling (P12 sibling for ~10k room walk).
+_PERSIST_SLOW_FLOOR_LOG_MS = 10.0
+_PERSIST_SLOW_FLOOR_LOG_CAP = 8
 
 
 def persist_save_wall_budget_ms():
@@ -239,8 +242,10 @@ def note_collect_started(game):
         return
     try:
         _collect_idle_event(game).clear()
-    except Exception:
-        pass
+    except Exception as exc:
+        from engine import log_util
+
+        log_util.ops("persistence", "collect_idle start failed", exc=exc)
 
 
 def note_collect_finished(game):
@@ -249,8 +254,10 @@ def note_collect_finished(game):
         return
     try:
         _collect_idle_event(game).set()
-    except Exception:
-        pass
+    except Exception as exc:
+        from engine import log_util
+
+        log_util.ops("persistence", "collect_idle finish failed", exc=exc)
 
 
 async def wait_collect_idle_async(game, *, timeout=None):
@@ -314,6 +321,12 @@ def _persist_schedule_world_full_if_due(game):
     """
     if game is None:
         return
+    if getattr(game, "_persist_force_full", False):
+        # A chunked chars-only verify may span several autosaves (CPU
+        # followon 2026-09) -- never stack a second scheduled arm on top
+        # of one already in progress, or the next collect would reset
+        # ``_persist_force_full_verified_chars`` and throw away progress.
+        return
     count = int(getattr(game, "_persist_autosave_count", 0) or 0)
     every = persist_full_every()
     if every > 0 and count % every == 0:
@@ -326,7 +339,82 @@ def _persist_apply_scheduled_world_full(game):
         return
     if getattr(game, "_persist_world_full_scheduled", False):
         game._persist_force_full = True
+        # Lag U2: periodic full-verify rewrites the character roster only.
+        # Floor loot stays on dirty/fingerprint incremental collect so
+        # autosave does not walk every indexed room (~10k on live).
+        game._persist_force_full_chars_only = True
         game._persist_world_full_scheduled = False
+        _persist_reset_force_full_verify_progress(game)
+
+
+def _persist_force_full_collect_flags(game):
+    """Split full-verify into character vs floor collect (lag U2).
+
+    Cold boot (hash cache not warm) still rewrites every character and
+    every indexed floor room. Scheduled ``persist_full_every()`` ticks
+    only rewrite characters -- floor loot stays on the dirty fast path.
+    """
+    cold = not _persist_snapshot_hashes_ready(game)
+    armed = bool(getattr(game, "_persist_force_full", False))
+    chars_only = bool(getattr(game, "_persist_force_full_chars_only", False))
+    force_full_chars = cold or armed
+    force_full_floor = cold or (armed and not chars_only)
+    return force_full_chars, force_full_floor
+
+
+def _persist_chars_only_chunked_verify(game, force_full_chars, force_full_floor):
+    """Scheduled char-only verify can apply incrementally across autosaves.
+
+    Cold-boot full verify still needs one atomic wipe pass; only the warm
+    ``persist_full_every()`` chars-only path may chunk on wall budget. Without
+    this, a slow roster (~700+ live characters) hitting the 5s collect wall
+    budget discards the entire pass and re-arms ``force_full`` -- CPU
+    followon 2026-09: this looped forever, ~5s collect back-to-back,
+    pegging one core at ~100% because ``_save_pending_after_current``
+    bypasses the normal 180s autosave gate on a wall-budget skip.
+    """
+    if not force_full_chars or force_full_floor:
+        return False
+    if not _persist_snapshot_hashes_ready(game):
+        return False
+    return bool(getattr(game, "_persist_force_full_chars_only", False))
+
+
+def _persist_force_full_verified_chars(game):
+    """Names already rewritten in the current chars-only verify cycle."""
+    verified = getattr(game, "_persist_force_full_verified_chars", None)
+    if verified is None:
+        verified = set()
+        game._persist_force_full_verified_chars = verified
+    return verified
+
+
+def _persist_reset_force_full_verify_progress(game):
+    if game is None:
+        return
+    game._persist_force_full_verified_chars = set()
+
+
+def _persist_count_live_characters(game):
+    from engine.char_index import iter_characters
+
+    n = 0
+    for obj in iter_characters(game):
+        name = (getattr(obj, "key", None) or getattr(obj, "name", None) or "")
+        if str(name):
+            n += 1
+    return n
+
+
+def _persist_finish_force_full_if_due(game, meta):
+    """Clear armed full-verify once a chunked chars-only pass completes."""
+    if game is None or not meta:
+        return
+    if not meta.get("force_full_complete"):
+        return
+    game._persist_force_full = False
+    game._persist_force_full_chars_only = False
+    _persist_reset_force_full_verify_progress(game)
 
 
 def persist_dirty_char_cap(game=None):
@@ -525,6 +613,25 @@ def _resolve_saved_room(game, room_key, character_name):
     wild_room = resolve_virtual_overland_room_key(game, room_key)
     if wild_room is not None:
         return wild_room
+    # Stable synthetic mouth keys (HomesteadSite:mx,my:ux,uy) — materialize
+    # the live virtual cell; never map_missing_stub (homestead hygiene).
+    if str(room_key).startswith("HomesteadSite:"):
+        try:
+            rest = str(room_key)[len("HomesteadSite:"):]
+            macro_part, micro_part = rest.split(":", 1)
+            mx_s, my_s = macro_part.split(",", 1)
+            ux_s, uy_s = micro_part.split(",", 1)
+            from engine.systems.overland import get_virtual_room
+
+            site_cell = get_virtual_room(
+                game,
+                (int(mx_s), int(my_s)),
+                (int(ux_s), int(uy_s)),
+            )
+            if site_cell is not None:
+                return site_cell
+        except (ValueError, TypeError):
+            pass
     from engine.systems.mine_rooms import resolve_mine_saved_room_key
 
     mine_room = resolve_mine_saved_room_key(game, room_key)
@@ -535,9 +642,11 @@ def _resolve_saved_room(game, room_key, character_name):
         room_key,
         "The space you remember is thin here -- the map that held this "
         "place is not loaded. You have not moved; the world around you "
-        "has not finished reforming. Staff: restore the missing map "
-        f"file that defines {room_key!r}.",
+        "has not finished reforming.",
     )
+    # Raw storage keys stay off player look (HB-26). Staff see the key
+    # on gm where / staff look via map_missing_stub + staff_room_label.
+    stub.staff_missing_map_key = room_key
     # Mark so look / GM where can tell authored rooms from recovery stubs.
     stub.map_missing_stub = True
     stub.no_combat = True
@@ -610,9 +719,19 @@ def heal_map_missing_stub_occupants(game):
         if dest is None:
             continue
         try:
-            character.move_to(dest)
-        except Exception:
-            character.location = dest
+            from engine.world import safe_place
+            if not safe_place(character, dest):
+                character.move_to(dest)
+        except Exception as exc:
+            from engine import log_util
+            from engine.world import safe_place
+
+            log_util.ops(
+                "persistence",
+                f"stub_heal place failed key={getattr(character, 'key', '?')}",
+                exc=exc,
+            )
+            safe_place(character, dest)
         moved += 1
         if stub_key and stub_key not in emptied_stub_keys:
             emptied_stub_keys.append(stub_key)
@@ -919,7 +1038,10 @@ def maybe_wal_checkpoint_after_save(conn, db_path, *, reason="save"):
         return sqlite_wal_mod.maybe_checkpoint_after_save(
             conn, db_path, reason=reason,
         )
-    except Exception:
+    except Exception as exc:
+        from engine import log_util
+
+        log_util.ops("persistence", "wal_checkpoint failed", exc=exc)
         return {}
 
 
@@ -1367,6 +1489,9 @@ def load_moral_state(conn):
     # Only 'evil' / 'good' are valid hold sides.
     if maxed_side not in ("evil", "good"):
         maxed_side = None
+    roadtrip_mode = str(_str_meta("roadtrip_mode", "wall") or "wall").strip().lower()
+    if roadtrip_mode not in ("wall", "real", "half"):
+        roadtrip_mode = "wall"
 
     return {
         "moral_balance": _int_meta("moral_balance", 0),
@@ -1396,6 +1521,7 @@ def load_moral_state(conn):
         # Rank flavor on score (gm titles); 1=on 0=off. Default off.
         "rank_titles_visible": bool(_int_meta("rank_titles_visible", 0)),
         "roadtrip_minutes": _float_meta("roadtrip_minutes", 30.0),
+        "roadtrip_mode": roadtrip_mode,
         "vehicle_pvp_enabled": bool(_int_meta("vehicle_pvp_enabled", 0)),
         "tow_dispatch_enabled": bool(_int_meta("tow_dispatch_enabled", 1)),
     }
@@ -1494,6 +1620,14 @@ def save_moral_state(conn, game):
             "('roadtrip_minutes', ?)",
             (str(road_min),),
         )
+        road_mode = str(getattr(game, "roadtrip_mode", "wall") or "wall").strip().lower()
+        if road_mode not in ("wall", "real", "half"):
+            road_mode = "wall"
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES "
+            "('roadtrip_mode', ?)",
+            (road_mode,),
+        )
         vpvp = 1 if bool(getattr(game, "vehicle_pvp_enabled", False)) else 0
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES "
@@ -1510,7 +1644,7 @@ def save_moral_state(conn, game):
 
 
 def load_plane_soul_counts(conn):
-    """Load heaven_soul_count / hell_soul_count from meta (default 0)."""
+    """Load heaven/hell soul banks + Heaven Stability from meta."""
     def _int_meta(key, default=0):
         row = conn.execute(
             "SELECT value FROM meta WHERE key = ?", (key,)
@@ -1522,18 +1656,31 @@ def load_plane_soul_counts(conn):
         except (TypeError, ValueError):
             return default
 
+    def _float_meta(key, default=0.0):
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (key,)
+        ).fetchone()
+        if not row:
+            return default
+        try:
+            return float(row[0])
+        except (TypeError, ValueError):
+            return default
+
     return {
         "heaven_soul_count": _int_meta("heaven_soul_count", 0),
         "hell_soul_count": _int_meta("hell_soul_count", 0),
         "next_phone_seq": _int_meta("next_phone_seq", 1000),
+        "heaven_stability": _float_meta("heaven_stability", 100.0),
     }
 
 
 def save_plane_soul_counts(conn, game):
-    """Persist plane soul banks on Game (no SUPERS import)."""
+    """Persist plane soul banks + Heaven Stability on Game (no SUPERS import)."""
     heaven = int(getattr(game, "heaven_soul_count", 0) or 0)
     hell = int(getattr(game, "hell_soul_count", 0) or 0)
     phone_seq = int(getattr(game, "next_phone_seq", 1000) or 1000)
+    stability = float(getattr(game, "heaven_stability", 100.0) or 100.0)
     with conn:
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES "
@@ -1549,6 +1696,11 @@ def save_plane_soul_counts(conn, game):
             "INSERT OR REPLACE INTO meta (key, value) VALUES "
             "('next_phone_seq', ?)",
             (str(phone_seq),),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES "
+            "('heaven_stability', ?)",
+            (str(stability),),
         )
 
 
@@ -1849,20 +2001,75 @@ def _account_row_digest(name, display, password_hash, blob):
     return zlib.adler32(payload) & 0xFFFFFFFF
 
 
-def save_accounts(conn, game, *, force_full=False):
-    """Write accounts; full wipe on first save, then dirty/hash incremental.
+def collect_accounts_persist_packet(game, *, force_full=False):
+    """Build immutable account SQL rows on the asyncio loop (Class C).
 
-    Live autosave used to ``DELETE FROM accounts`` every minute -- that alone
-    was multi-second under load. After the first successful save, only
-    changed / dirty accounts are rewritten and removed names are deleted.
+    Returns a packet the writer can apply without walking live ``Account``
+    objects, or None when the in-memory dict is empty while SQLite still
+    has rows (boot-order safety -- same skip as the old inline save).
     """
     from engine.accounts import Account, ensure_accounts_dict
 
     accounts = ensure_accounts_dict(game)
-    with conn:
-        if not accounts:
-            # Safety: never wipe persisted accounts when the in-memory dict
-            # was not loaded yet (boot-order bug) or was accidentally cleared.
+    if not accounts:
+        return {
+            "skip_empty_guard": True,
+            "force_full": False,
+            "rows": (),
+            "removed": (),
+            "new_hashes": {},
+            "n_changed": 0,
+            "n_removed": 0,
+            "n_accounts": 0,
+        }
+
+    warm = bool(getattr(game, "_accounts_persist_warm", False))
+    do_full = force_full or not warm
+    prev = getattr(game, "_account_snapshot_hashes", None) or {}
+    dirty = set(getattr(game, "_persist_dirty_accounts", None) or set())
+    new_hashes = {}
+    alive = set()
+    rows = []
+    for account in accounts.values():
+        if not isinstance(account, Account):
+            continue
+        name = (account.name or "").strip()
+        if not name:
+            continue
+        display = (account.display_name or name).strip() or name
+        blob = json.dumps(account.to_blob())
+        key = name.lower()
+        alive.add(key)
+        digest = _account_row_digest(
+            name, display, account.password_hash or "", blob,
+        )
+        new_hashes[key] = digest
+        if not do_full and key not in dirty and prev.get(key) == digest:
+            continue
+        rows.append((name, display, account.password_hash or "", blob, key))
+
+    removed = []
+    if not do_full:
+        for old_key in prev:
+            if old_key not in alive:
+                removed.append(old_key)
+
+    return {
+        "skip_empty_guard": False,
+        "force_full": do_full,
+        "rows": tuple(rows),
+        "removed": tuple(removed),
+        "new_hashes": new_hashes,
+        "n_changed": len(rows),
+        "n_removed": len(removed),
+        "n_accounts": len(alive),
+    }
+
+
+def apply_accounts_persist_packet(conn, packet):
+    """SQL-only account rewrite from a frozen packet."""
+    if not packet or packet.get("skip_empty_guard"):
+        if packet and packet.get("skip_empty_guard"):
             try:
                 row = conn.execute(
                     "SELECT COUNT(*) FROM accounts"
@@ -1876,39 +2083,14 @@ def save_accounts(conn, game, *, force_full=False):
                     f"empty but {existing} row(s) remain in SQLite",
                     flush=True,
                 )
-                return
-
-        warm = bool(getattr(game, "_accounts_persist_warm", False))
-        do_full = force_full or not warm
-        prev = getattr(game, "_account_snapshot_hashes", None) or {}
-        dirty = set(getattr(game, "_persist_dirty_accounts", None) or set())
-        new_hashes = {}
-        alive = set()
-        changed = 0
-        removed = 0
-
+        return
+    do_full = bool(packet.get("force_full"))
+    with conn:
         if do_full:
             conn.execute("DELETE FROM accounts")
-
-        for account in accounts.values():
-            if not isinstance(account, Account):
-                continue
-            name = (account.name or "").strip()
-            if not name:
-                continue
-            display = (account.display_name or name).strip() or name
-            blob = json.dumps(account.to_blob())
-            key = name.lower()
-            alive.add(key)
-            digest = _account_row_digest(
-                name, display, account.password_hash or "", blob,
-            )
-            new_hashes[key] = digest
+        for name, display, password_hash, blob, key in packet.get("rows") or ():
             if not do_full:
-                if key not in dirty and prev.get(key) == digest:
-                    continue
                 conn.execute("DELETE FROM accounts WHERE name=?", (name,))
-                # Also try lowercase key variants that might differ in case.
                 if key != name:
                     conn.execute(
                         "DELETE FROM accounts WHERE lower(name)=?", (key,),
@@ -1917,28 +2099,41 @@ def save_accounts(conn, game, *, force_full=False):
                 "INSERT INTO accounts "
                 "(name, display_name, password_hash, data) "
                 "VALUES (?, ?, ?, ?)",
-                (name, display, account.password_hash or "", blob),
+                (name, display, password_hash, blob),
             )
-            changed += 1
-
         if not do_full:
-            for old_key in prev:
-                if old_key in alive:
-                    continue
+            for old_key in packet.get("removed") or ():
                 conn.execute(
                     "DELETE FROM accounts WHERE lower(name)=?", (old_key,),
                 )
-                removed += 1
 
-        game._account_snapshot_hashes = new_hashes
-        game._accounts_persist_warm = True
-        game._persist_dirty_accounts = set()
-        game._last_accounts_save_stats = {
-            "force_full": do_full,
-            "n_changed": changed,
-            "n_removed": removed,
-            "n_accounts": len(alive),
-        }
+
+def ack_accounts_persist_packet(game, packet):
+    """Stamp account hashes after SQL committed (loop, not writer)."""
+    if game is None or not packet or packet.get("skip_empty_guard"):
+        return
+    game._account_snapshot_hashes = dict(packet.get("new_hashes") or {})
+    game._accounts_persist_warm = True
+    game._persist_dirty_accounts = set()
+    game._last_accounts_save_stats = {
+        "force_full": bool(packet.get("force_full")),
+        "n_changed": int(packet.get("n_changed") or 0),
+        "n_removed": int(packet.get("n_removed") or 0),
+        "n_accounts": int(packet.get("n_accounts") or 0),
+    }
+
+
+def save_accounts(conn, game, *, force_full=False):
+    """Write accounts; full wipe on first save, then dirty/hash incremental.
+
+    Live autosave used to ``DELETE FROM accounts`` every minute -- that alone
+    was multi-second under load. After the first successful save, only
+    changed / dirty accounts are rewritten and removed names are deleted.
+    Background-writer autosave collects the packet on the loop.
+    """
+    packet = collect_accounts_persist_packet(game, force_full=force_full)
+    apply_accounts_persist_packet(conn, packet)
+    ack_accounts_persist_packet(game, packet)
 
 
 def load_accounts(conn, game):
@@ -2055,6 +2250,17 @@ def save_taxi_mode(conn, game):
     """Persist game.taxi_mode onto the meta table."""
     from engine import hooks
     hooks.save_taxi_mode_meta(conn, game)
+
+
+def load_help_overlay_mode(conn):
+    """Load GM help overlay resolution mode from meta (default hedit)."""
+    return _load_meta_dict(conn, "help_overlay_mode")
+
+
+def save_help_overlay_mode(conn, game):
+    """Persist game.help_overlay_mode onto the meta table."""
+    from engine import hooks
+    hooks.save_help_overlay_mode_meta(conn, game)
 
 
 def load_pet_adoption(conn):
@@ -2414,7 +2620,7 @@ def _bag_contents_for_json(item):
             "description": _persist_item_field(
                 sub, "description", fallback=_persist_item_field(sub, "key"),
             ),
-            "container": json.loads(_item_container_blob(sub)),
+            "container": _item_container_dict(sub),
         })
     return out
 
@@ -2431,7 +2637,24 @@ def _wallet_contents_for_json(item):
             "description": _persist_item_field(
                 sub, "description", fallback=_persist_item_field(sub, "key"),
             ),
-            "container": json.loads(_item_container_blob(sub)),
+            "container": _item_container_dict(sub),
+        })
+    return out
+
+
+def _clothing_contents_for_json(item):
+    """Serialize items tucked in a garment's pockets."""
+    contents = getattr(item, "clothing_contents", None) or []
+    out = []
+    for sub in contents:
+        if not isinstance(sub, Item):
+            continue
+        out.append({
+            "key": _persist_item_field(sub, "key"),
+            "description": _persist_item_field(
+                sub, "description", fallback=_persist_item_field(sub, "key"),
+            ),
+            "container": _item_container_dict(sub),
         })
     return out
 
@@ -2442,6 +2665,31 @@ def _restore_bag_fields(item, state):
         item.is_bag = True
     if state.get("is_gear_bag"):
         item.is_gear_bag = True
+    if state.get("is_profession_bag"):
+        item.is_profession_bag = True
+    if state.get("is_generalist_bag"):
+        item.is_generalist_bag = True
+    if state.get("is_extradim"):
+        item.is_extradim = True
+    if state.get("is_pocket_weave"):
+        item.is_pocket_weave = True
+    if state.get("outfit_bundle"):
+        item.outfit_bundle = True
+    for outfit_field in ("outfit_set_id", "outfit_set_name", "outfit_set_tag"):
+        raw_outfit = state.get(outfit_field)
+        if isinstance(raw_outfit, str) and raw_outfit.strip():
+            setattr(item, outfit_field, raw_outfit.strip())
+    profession = state.get("profession")
+    if isinstance(profession, str) and profession.strip():
+        item.profession = profession.strip().lower()
+    pref = state.get("preferred_slot")
+    if pref in ("back", "shoulder", "hip"):
+        item.preferred_slot = pref
+    pstow = state.get("profession_stow")
+    if isinstance(pstow, str) and pstow.strip():
+        item.profession_stow = pstow.strip().lower()
+    if state.get("important"):
+        item.important = True
     if state.get("is_wallet"):
         item.is_wallet = True
     if state.get("is_id_card"):
@@ -2470,7 +2718,7 @@ def _restore_bag_fields(item, state):
         except (TypeError, ValueError):
             pass
     worn = state.get("container_worn")
-    if worn in ("back", "shoulder", "pocket"):
+    if worn in ("back", "shoulder", "hip", "pocket"):
         item.container_worn = worn
     raw_contents = state.get("bag_contents") or []
     restored = []
@@ -2496,6 +2744,23 @@ def _restore_bag_fields(item, state):
         )
         wallet_restored.append(sub)
     item.wallet_contents = wallet_restored
+    if state.get("pocket_capacity") is not None:
+        try:
+            item.pocket_capacity = int(state["pocket_capacity"])
+        except (TypeError, ValueError):
+            pass
+    raw_pockets = state.get("clothing_contents") or []
+    pocket_restored = []
+    for row in raw_pockets:
+        if not isinstance(row, dict):
+            continue
+        sub = item_from_saved_container(
+            row.get("key") or "item",
+            row.get("description") or row.get("key") or "item",
+            row.get("container") or {},
+        )
+        pocket_restored.append(sub)
+    item.clothing_contents = pocket_restored
 
 
 def _restore_body_harvest_fields(item, state):
@@ -2581,6 +2846,86 @@ def _restore_body_harvest_fields(item, state):
         item.evidence_tampered = True
 
 
+def _phone_media_fields_for_json(item):
+    """Tech-media handset fields (PR1+) beside phone_number / is_phone."""
+    return {
+        "uid": getattr(item, "uid", None),
+        "nickname": getattr(item, "nickname", None),
+        "is_smartphone": bool(getattr(item, "is_smartphone", False)),
+        "is_pager": bool(getattr(item, "is_pager", False)),
+        "is_landline": bool(getattr(item, "is_landline", False)),
+        "is_ham": bool(getattr(item, "is_ham", False)),
+        "is_dashcam": bool(getattr(item, "is_dashcam", False)),
+        "sms_threads": list(getattr(item, "sms_threads", None) or []),
+        "voicemail": list(getattr(item, "voicemail", None) or []),
+        "protect_rating": getattr(item, "protect_rating", None),
+        "protect_signature": getattr(item, "protect_signature", None),
+        "protect_until": getattr(item, "protect_until", None),
+        "warren_nick_until": getattr(item, "warren_nick_until", None),
+        "protect_quality": getattr(item, "protect_quality", None),
+        "installed_apps": list(getattr(item, "installed_apps", None) or []),
+        "ringtone": getattr(item, "ringtone", None),
+        "text_tone": getattr(item, "text_tone", None),
+        "wallpaper": getattr(item, "wallpaper", None),
+        "backup_on": bool(getattr(item, "backup_on", False)),
+        "battery_ticks": getattr(item, "battery_ticks", None),
+        "bug_planter_key": getattr(item, "bug_planter_key", None),
+        "dashcam_buffer": getattr(item, "dashcam_buffer", None),
+        "answering_tape": list(getattr(item, "answering_tape", None) or []),
+        "answering_machine": bool(getattr(item, "answering_machine", False)),
+    }
+
+
+def _restore_phone_media_fields(item, state):
+    """Restore tech-media handset fields from a container blob."""
+    uid = state.get("uid") or state.get("item_uid")
+    if uid:
+        item.uid = str(uid).strip()
+    nick = state.get("nickname")
+    if nick:
+        item.nickname = str(nick).strip()
+    if state.get("is_smartphone"):
+        item.is_smartphone = True
+    if state.get("is_pager"):
+        item.is_pager = True
+    if state.get("is_landline"):
+        item.is_landline = True
+        item.furniture = True
+    if state.get("is_ham"):
+        item.is_ham = True
+    if state.get("is_dashcam"):
+        item.is_dashcam = True
+    if state.get("answering_machine"):
+        item.answering_machine = True
+    for list_field in (
+        "sms_threads", "voicemail", "installed_apps", "answering_tape",
+    ):
+        raw = state.get(list_field)
+        if isinstance(raw, list):
+            setattr(item, list_field, list(raw))
+    for field in (
+        "protect_rating",
+        "protect_until",
+        "protect_quality",
+        "battery_ticks",
+        "warren_nick_until",
+    ):
+        if state.get(field) is not None:
+            setattr(item, field, state[field])
+    if state.get("protect_signature") is not None:
+        item.protect_signature = state["protect_signature"]
+    if state.get("bug_planter_key"):
+        item.bug_planter_key = str(state["bug_planter_key"]).strip()
+    if state.get("dashcam_buffer") is not None:
+        item.dashcam_buffer = state["dashcam_buffer"]
+    if state.get("backup_on"):
+        item.backup_on = True
+    for cosmetic in ("ringtone", "text_tone", "wallpaper"):
+        val = state.get(cosmetic)
+        if isinstance(val, str) and val.strip():
+            setattr(item, cosmetic, val.strip())
+
+
 def _item_container_blob(item):
     """JSON for the items.container column: an Item's locked/loot state (a
     dungeon lockbox's whole reward, world.make_lockbox), same reasoning as
@@ -2613,6 +2958,9 @@ def _item_container_blob(item):
         "need": getattr(item, "need", None),
         "provides_light": bool(getattr(item, "provides_light", False)),
         "catalog_id": getattr(item, "catalog_id", None),
+        "magic_focus_id": getattr(item, "magic_focus_id", "") or "",
+        "magic_focus_kind": getattr(item, "magic_focus_kind", "") or "",
+        "magic_focus_target_key": getattr(item, "magic_focus_target_key", "") or "",
         "aliases": list(getattr(item, "aliases", None) or []),
         # GM where item (newest copy) -- monotonic stamp from Item.__init__.
         "created_seq": int(getattr(item, "created_seq", 0) or 0),
@@ -2671,6 +3019,8 @@ def _item_container_blob(item):
         ),
         "dirty": bool(getattr(item, "dirty", False))
         if hasattr(item, "dirty") else None,
+        "wet": bool(getattr(item, "wet", False))
+        if hasattr(item, "wet") else None,
         # Home grocery stock window (fridge furniture); None / absent = empty.
         "stock_until_tick": getattr(item, "stock_until_tick", None),
         # Vampire blood-pantry window (separate from mortal food stock).
@@ -2717,6 +3067,7 @@ def _item_container_blob(item):
         "phone_number": getattr(item, "phone_number", None),
         "is_phone": bool(getattr(item, "is_phone", False)),
         "is_payphone": bool(getattr(item, "is_payphone", False)),
+        **_phone_media_fields_for_json(item),
         "is_ethereal": bool(getattr(item, "is_ethereal", False)),
         "is_spirit_mirror": bool(getattr(item, "is_spirit_mirror", False)),
         "spirit_mirror_source_key": getattr(item, "spirit_mirror_source_key", None),
@@ -2803,6 +3154,18 @@ def _item_container_blob(item):
         ),
         "is_bag": bool(getattr(item, "is_bag", False)),
         "is_gear_bag": bool(getattr(item, "is_gear_bag", False)),
+        "is_profession_bag": bool(getattr(item, "is_profession_bag", False)),
+        "is_generalist_bag": bool(getattr(item, "is_generalist_bag", False)),
+        "is_extradim": bool(getattr(item, "is_extradim", False)),
+        "is_pocket_weave": bool(getattr(item, "is_pocket_weave", False)),
+        "outfit_bundle": bool(getattr(item, "outfit_bundle", False)),
+        "outfit_set_id": getattr(item, "outfit_set_id", None),
+        "outfit_set_name": getattr(item, "outfit_set_name", None),
+        "outfit_set_tag": getattr(item, "outfit_set_tag", None),
+        "profession": getattr(item, "profession", None),
+        "preferred_slot": getattr(item, "preferred_slot", None),
+        "profession_stow": getattr(item, "profession_stow", None),
+        "important": bool(getattr(item, "important", False)),
         "bag_capacity": (
             int(item.bag_capacity)
             if getattr(item, "bag_capacity", None) is not None
@@ -2828,6 +3191,12 @@ def _item_container_blob(item):
             else None
         ),
         "wallet_contents": _wallet_contents_for_json(item),
+        "pocket_capacity": (
+            int(item.pocket_capacity)
+            if getattr(item, "pocket_capacity", None) is not None
+            else None
+        ),
+        "clothing_contents": _clothing_contents_for_json(item),
         "legal_id": (
             dict(item.legal_id)
             if isinstance(getattr(item, "legal_id", None), dict)
@@ -2838,7 +3207,37 @@ def _item_container_blob(item):
             if getattr(item, "gear_condition", None) is not None
             else None
         ),
+        "laptop_battery_ticks": (
+            int(item.laptop_battery_ticks)
+            if getattr(item, "laptop_battery_ticks", None) is not None
+            else None
+        ),
+        "virus_bricked_until": (
+            int(item.virus_bricked_until)
+            if getattr(item, "virus_bricked_until", None) is not None
+            else None
+        ),
     })
+
+
+def _item_container_dict(item):
+    """JSON-ready container dict for save rows.
+
+    Callers used to ``json.loads(_item_container_blob(item))``. One nested
+    item that cannot dump (or that dumps as junk) must not abort a whole
+    character snapshot -- fail-soft to ``{}`` and log, matching load-world
+    skip of a corrupt items row.
+    """
+    try:
+        return json.loads(_item_container_blob(item))
+    except (TypeError, ValueError, OverflowError) as exc:
+        from engine import log_util
+        log_util.ops(
+            "persistence",
+            "skip corrupt item container at save "
+            f"key={getattr(item, 'key', None)!r} ({exc!r})",
+        )
+        return {}
 
 
 _CHAR_INSERT_SQL = (
@@ -2975,7 +3374,16 @@ def _should_skip_character_save(obj, game, seen_names):
                     if want.lower() == key_low:
                         permanent = True
                         break
-            except Exception:
+            except Exception as exc:
+                from engine import log_util
+
+                log_util.ops_once_per_tick(
+                    None,
+                    f"persistence:gm_spirit:{key_low}",
+                    "persistence",
+                    f"gm-spirit stamp failed key={key_low}",
+                    exc=exc,
+                )
                 permanent = False
         if not permanent:
             return True
@@ -3033,11 +3441,28 @@ def _character_save_rows(game, obj, seen_names):
                     alt = accounts_mod.gm_spirit_key_for_account(acct)
                     if alt and callable(finder):
                         spirit = finder(alt)
-            except Exception:
+            except Exception as exc:
+                from engine import log_util
+
+                log_util.ops(
+                    "persistence",
+                    f"gm-spirit stamp failed key={save_name}",
+                    exc=exc,
+                )
                 spirit = None
         spirit_room = getattr(spirit, "location", None) if spirit else None
         if spirit_room is not None and getattr(spirit_room, "key", None):
             obj.gm_spirit_room_key = spirit_room.key
+    # Ordinary save_world used to write "{}" when the blob codec was
+    # unregistered (partial reload) and wipe every character (HB-02).
+    # Copyover already aborts; match that bar here.
+    from engine import hooks as hooks_mod
+    if not hooks_mod.blob_codec_registered():
+        raise RuntimeError(
+            "blob codec not registered; refusing character save "
+            "(would write empty blobs)"
+        )
+    hooks_mod.sync_equipped_flags_from_equipment(obj)
     blob = json.dumps(character_to_blob(obj))
     save_room = room
     if getattr(obj, "djinn_captive", False):
@@ -3152,6 +3577,60 @@ def _iter_floor_item_rooms(game):
     for room in hooks.demesne_iter_micro_rooms(game):
         if room.contents:
             yield room
+
+
+def _floor_item_room_key_set(game):
+    """Indexed floor-loot room keys, or None when collect must fall back."""
+    keys = getattr(game, "_floor_item_room_keys", None)
+    if keys is None:
+        return None
+    return set(keys)
+
+
+def _resolve_floor_item_room(game, room_key):
+    """Lookup one indexed floor room (main graph + demesne micro)."""
+    if not room_key:
+        return None
+    rooms = getattr(game, "rooms", None) or {}
+    room = rooms.get(room_key)
+    if room is not None:
+        return room
+    from engine import hooks
+    return hooks.demesne_lookup_room_for_persist(game, room_key)
+
+
+def _floor_collect_visit_keys(game, prev_floor_hashes, force_full, dirty_rooms):
+    """Room keys that still need a live snapshot this collect pass.
+
+    Lag U2: when the floor index exists and every indexed room already has
+    a fingerprint and none are dirty, return an empty set so callers can
+    copy ``prev_floor_hashes`` without walking thousands of rooms.
+    """
+    keys = _floor_item_room_key_set(game)
+    if keys is None:
+        return None
+    if force_full:
+        return keys
+    prev = prev_floor_hashes or {}
+    dirty = set(dirty_rooms or ())
+    missing = keys - set(prev.keys())
+    if not dirty and not missing:
+        return set()
+    return dirty & keys | missing
+
+
+def _floor_collect_preamble_hashes(keys, prev_floor_hashes, dirty_rooms):
+    """Copy clean fingerprints for rooms we are not visiting this pass."""
+    prev = prev_floor_hashes or {}
+    dirty = set(dirty_rooms or ())
+    out = {}
+    for key in keys or ():
+        if key in dirty:
+            continue
+        digest = prev.get(key)
+        if digest is not None:
+            out[key] = digest
+    return out
 
 
 def _room_floor_item_rows(game):
@@ -3397,6 +3876,7 @@ def _persist_clear_dirty(game):
     game._persist_dirty_characters = set()
     game._persist_dirty_floor_rooms = set()
     game._persist_force_full = False
+    game._persist_force_full_chars_only = False
 
 
 def _persist_drop_acked_dirty(dirty, written, gens, ack_epoch):
@@ -3471,8 +3951,11 @@ def _persist_ack_written_dirty(game, meta, char_rows):
             getattr(game, "_persist_dirty_floor_write_gen", None),
             ack_epoch,
         )
-    if meta.get("force_full"):
+    if meta.get("force_full_complete"):
+        _persist_finish_force_full_if_due(game, meta)
+    elif meta.get("force_full") and not meta.get("force_full_chunked_apply"):
         game._persist_force_full = False
+        game._persist_force_full_chars_only = False
 
 
 def _persist_should_skip_world_save(game):
@@ -3539,6 +4022,7 @@ def seed_snapshot_hashes_after_load(game):
     game._persist_floor_room_hashes = floor_hashes
     game._persist_warm = True
     game._persist_force_full = False
+    game._persist_force_full_chars_only = False
 
 
 def _persist_store_snapshot_hashes(game, meta):
@@ -3613,15 +4097,40 @@ def _collect_floor_save_pass(game, prev_floor_hashes, force_full, dirty_rooms):
     """Build floor-item rows for rooms whose loose loot changed."""
     item_rows = []
     changed_floor_rooms = []
-    new_floor_hashes = {}
-    for room in _iter_floor_item_rooms(game):
+    visit_keys = _floor_collect_visit_keys(
+        game, prev_floor_hashes, force_full, dirty_rooms,
+    )
+    if visit_keys is not None:
+        indexed = _floor_item_room_key_set(game) or set()
+        new_floor_hashes = _floor_collect_preamble_hashes(
+            indexed, prev_floor_hashes, dirty_rooms,
+        )
+        rooms_hash_skip = len(new_floor_hashes)
+        if not visit_keys:
+            return item_rows, changed_floor_rooms, new_floor_hashes
+        room_iter = (
+            _resolve_floor_item_room(game, key)
+            for key in visit_keys
+        )
+    else:
+        new_floor_hashes = {}
+        rooms_hash_skip = 0
+        room_iter = _iter_floor_item_rooms(game)
+    for room in room_iter:
+        if room is None:
+            continue
         room_key = getattr(room, "key", None)
         if not room_key:
             continue
-        if not force_full and room_key not in dirty_rooms:
+        if (
+            visit_keys is None
+            and not force_full
+            and room_key not in dirty_rooms
+        ):
             prev_digest = (prev_floor_hashes or {}).get(room_key)
             if prev_digest is not None:
                 new_floor_hashes[room_key] = prev_digest
+                rooms_hash_skip += 1
                 continue
         room_rows = []
         for obj in room.contents:
@@ -3650,25 +4159,71 @@ async def _collect_floor_save_pass_async(
 ):
     """Cooperative floor-item snapshot -- yield while scanning many rooms."""
     import asyncio
+    import time as _time
 
     if yield_every is None:
         yield_every = persist_save_yield_every()
     item_rows = []
     changed_floor_rooms = []
-    new_floor_hashes = {}
+    visit_keys = _floor_collect_visit_keys(
+        game, prev_floor_hashes, force_full, dirty_rooms,
+    )
+    indexed = _floor_item_room_key_set(game)
+    if visit_keys is not None and indexed is not None:
+        new_floor_hashes = _floor_collect_preamble_hashes(
+            indexed, prev_floor_hashes, dirty_rooms,
+        )
+        rooms_hash_skip = len(new_floor_hashes)
+        floor_collect_fast_skip = 1 if not visit_keys else 0
+        if not visit_keys:
+            floor_stats = {
+                "floor_rooms_scanned": 0,
+                "floor_rooms_hash_skip": rooms_hash_skip,
+                "floor_collect_fast_skip": floor_collect_fast_skip,
+                "floor_yield_count": 0,
+                "floor_build_total_ms": 0.0,
+                "floor_build_count": 0,
+                "floor_build_avg_ms": 0.0,
+                "slow_floor_rooms": [],
+            }
+            return item_rows, changed_floor_rooms, new_floor_hashes, floor_stats
+        room_iter = (
+            _resolve_floor_item_room(game, key)
+            for key in visit_keys
+        )
+    else:
+        new_floor_hashes = {}
+        rooms_hash_skip = 0
+        floor_collect_fast_skip = 0
+        room_iter = _iter_floor_item_rooms(game)
     n = 0
-    for room in _iter_floor_item_rooms(game):
+    rooms_scanned = 0
+    yield_count = 0
+    floor_build_total_ms = 0.0
+    floor_build_count = 0
+    slow_rooms = []
+    for room in room_iter:
+        if room is None:
+            continue
         room_key = getattr(room, "key", None)
         if not room_key:
             continue
-        if not force_full and room_key not in dirty_rooms:
+        rooms_scanned += 1
+        if (
+            visit_keys is None
+            and not force_full
+            and room_key not in dirty_rooms
+        ):
             prev_digest = (prev_floor_hashes or {}).get(room_key)
             if prev_digest is not None:
                 new_floor_hashes[room_key] = prev_digest
+                rooms_hash_skip += 1
                 n += 1
                 if yield_every and n % yield_every == 0:
                     await asyncio.sleep(0)
+                    yield_count += 1
                 continue
+        t_room = _time.perf_counter()
         room_rows = []
         for obj in room.contents:
             if not _persistable_floor_item(obj):
@@ -3679,6 +4234,11 @@ async def _collect_floor_save_pass_async(
             ))
         digest = _floor_room_snapshot_hash(room_rows)
         new_floor_hashes[room_key] = digest
+        room_ms = (_time.perf_counter() - t_room) * 1000.0
+        floor_build_total_ms += room_ms
+        floor_build_count += 1
+        if room_ms >= _PERSIST_SLOW_FLOOR_LOG_MS:
+            slow_rooms.append((room_key, round(room_ms, 2)))
         if force_full:
             item_rows.extend(room_rows)
         elif (
@@ -3690,7 +4250,23 @@ async def _collect_floor_save_pass_async(
         n += 1
         if yield_every and n % yield_every == 0:
             await asyncio.sleep(0)
-    return item_rows, changed_floor_rooms, new_floor_hashes
+            yield_count += 1
+    slow_rooms.sort(key=lambda pair: pair[1], reverse=True)
+    floor_stats = {
+        "floor_rooms_scanned": rooms_scanned,
+        "floor_rooms_hash_skip": rooms_hash_skip,
+        "floor_collect_fast_skip": floor_collect_fast_skip,
+        "floor_yield_count": yield_count,
+        "floor_build_total_ms": round(floor_build_total_ms, 2),
+        "floor_build_count": floor_build_count,
+        "floor_build_avg_ms": (
+            round(floor_build_total_ms / floor_build_count, 2)
+            if floor_build_count
+            else 0.0
+        ),
+        "slow_floor_rooms": slow_rooms[:_PERSIST_SLOW_FLOOR_LOG_CAP],
+    }
+    return item_rows, changed_floor_rooms, new_floor_hashes, floor_stats
 
 
 def _persist_dirty_priority_key(game, char_key):
@@ -3713,17 +4289,19 @@ def _persist_dirty_priority_key(game, char_key):
     return (2, char_key)
 
 
-def _persist_cap_dirty_sets(game, force_full):
+def _persist_cap_dirty_sets(game, force_full, *, force_full_floor=None):
     """Return (dirty_chars, dirty_rooms, deferred_chars, deferred_rooms).
 
     When not force_full, take only the first N dirty keys (priority-sorted
     for characters, alphabetical for rooms) and leave the rest queued for
     the next autosave. Full verify passes ignore the cap -- they rewrite
-    everything.
+    everything (characters only when ``force_full_floor`` is false).
     """
     dirty_chars = set(getattr(game, "_persist_dirty_characters", None) or set())
     dirty_rooms = set(getattr(game, "_persist_dirty_floor_rooms", None) or set())
-    if force_full:
+    if force_full_floor is None:
+        force_full_floor = force_full
+    if force_full and force_full_floor:
         return dirty_chars, dirty_rooms, set(), set()
     char_cap = persist_dirty_char_cap(game)
     room_cap = persist_dirty_room_cap(game)
@@ -3771,26 +4349,26 @@ def _collect_world_save_snapshot(game):
     _persist_apply_scheduled_world_full(game)
     prev_char = getattr(game, "_persist_char_snapshot_hashes", None)
     prev_floor = getattr(game, "_persist_floor_room_hashes", None)
-    force_full = (
-        not _persist_snapshot_hashes_ready(game)
-        or bool(getattr(game, "_persist_force_full", False))
-    )
+    force_full_chars, force_full_floor = _persist_force_full_collect_flags(game)
     dirty_chars, dirty_rooms, deferred_chars, deferred_rooms = (
-        _persist_cap_dirty_sets(game, force_full)
+        _persist_cap_dirty_sets(
+            game, force_full_chars, force_full_floor=force_full_floor,
+        )
     )
 
     seen_names = set()
     char_rows, item_rows, changed_chars, removed_chars, new_char_hashes = (
         _collect_character_save_pass(
-            game, seen_names, prev_char or {}, force_full, dirty_chars,
+            game, seen_names, prev_char or {}, force_full_chars, dirty_chars,
         )
     )
     floor_rows, changed_floor, new_floor_hashes = _collect_floor_save_pass(
-        game, prev_floor or {}, force_full, dirty_rooms,
+        game, prev_floor or {}, force_full_floor, dirty_rooms,
     )
     item_rows.extend(floor_rows)
     meta = {
-        "force_full": force_full,
+        "force_full": force_full_chars,
+        "force_full_chars_only": force_full_chars and not force_full_floor,
         "changed_chars": changed_chars,
         "removed_chars": removed_chars,
         "changed_floor_rooms": changed_floor,
@@ -3804,8 +4382,8 @@ def _collect_world_save_snapshot(game):
         "n_dirty_rooms_queued": len(
             getattr(game, "_persist_dirty_floor_rooms", None) or ()
         ),
-        "n_dirty_chars_this_pass": len(dirty_chars) if not force_full else -1,
-        "n_dirty_rooms_this_pass": len(dirty_rooms) if not force_full else -1,
+        "n_dirty_chars_this_pass": len(dirty_chars) if not force_full_chars else -1,
+        "n_dirty_rooms_this_pass": len(dirty_rooms) if not force_full_floor else -1,
     }
     return char_rows, item_rows, meta
 
@@ -3823,12 +4401,17 @@ async def _collect_world_save_snapshot_async(
     _persist_apply_scheduled_world_full(game)
     prev_char = getattr(game, "_persist_char_snapshot_hashes", None)
     prev_floor = getattr(game, "_persist_floor_room_hashes", None)
-    force_full = (
-        not _persist_snapshot_hashes_ready(game)
-        or bool(getattr(game, "_persist_force_full", False))
-    )
+    force_full_chars, force_full_floor = _persist_force_full_collect_flags(game)
     dirty_chars, dirty_rooms, deferred_chars, deferred_rooms = (
-        _persist_cap_dirty_sets(game, force_full)
+        _persist_cap_dirty_sets(
+            game, force_full_chars, force_full_floor=force_full_floor,
+        )
+    )
+    chunked_chars_only = _persist_chars_only_chunked_verify(
+        game, force_full_chars, force_full_floor,
+    )
+    verified_chars = (
+        _persist_force_full_verified_chars(game) if chunked_chars_only else set()
     )
 
     # Yielding collect: walk characters in slices so a full-verify pass
@@ -3852,35 +4435,40 @@ async def _collect_world_save_snapshot_async(
     slow_chars = []
     char_build_total_ms = 0.0
     char_build_count = 0
-    # Incremental removed_chars is prev_hashes - alive_names. That is only
-    # safe after a complete roster walk. Breaking mid-loop leaves unvisited
-    # live bodies out of alive_names; treating them as deleted then wipes
-    # their SQLite rows. A later crash / game-only restart loads the hole.
-    scan_incomplete = False
     for obj in iter_characters(game):
         if wall_start is not None and _persist_save_over_wall_budget(
             wall_start, wall_budget_ms,
         ):
             wall_budget_hit = True
-            if force_full:
+            if force_full_chars and not chunked_chars_only:
                 # Never apply a partial full-verify wipe.
                 game._persist_force_full = True
                 meta = {
                     "skipped_wall_budget": True,
-                    "force_full": force_full,
+                    "force_full": force_full_chars,
+                    "force_full_chars_only": (
+                        force_full_chars and not force_full_floor
+                    ),
                     "deferred_chars": sorted(dirty_chars | deferred_chars),
                     "deferred_rooms": sorted(dirty_rooms | deferred_rooms),
-                    "scan_incomplete": True,
                 }
                 return [], [], meta
-            deferred_chars.update(dirty_chars - set(changed_chars))
-            scan_incomplete = True
+            if not force_full_chars:
+                deferred_chars.update(dirty_chars - set(changed_chars))
             break
         name = (getattr(obj, "key", None) or getattr(obj, "name", None) or "")
         name = str(name)
         if not name:
             continue
-        if not force_full and name not in dirty_chars:
+        if chunked_chars_only and name in verified_chars:
+            # Already rewritten in this multi-pass verify cycle -- cheap
+            # hash carry-forward, same shape as the warm dirty-skip path.
+            alive_names.add(name)
+            prev_hash = (prev_char or {}).get(name)
+            if prev_hash is not None:
+                new_char_hashes[name] = prev_hash
+            continue
+        if not force_full_chars and name not in dirty_chars:
             prev_hash = (prev_char or {}).get(name)
             if prev_hash is not None:
                 alive_names.add(name)
@@ -3904,7 +4492,7 @@ async def _collect_world_save_snapshot_async(
         new_char_hashes[name] = digest
         char_rows.append(char_row)
         item_rows.extend(owned_items)
-        if not force_full:
+        if not force_full_chars or chunked_chars_only:
             changed_chars.append(name)
         n += 1
         due_count = yield_every and n % yield_every == 0
@@ -3917,7 +4505,23 @@ async def _collect_world_save_snapshot_async(
             last_yield = time.perf_counter()
     slow_chars.sort(key=lambda pair: pair[1], reverse=True)
     removed_chars = []
-    if not force_full and prev_char and not scan_incomplete:
+    if chunked_chars_only and changed_chars:
+        verified_chars.update(changed_chars)
+    force_full_complete = False
+    if chunked_chars_only and force_full_chars:
+        # Only trust removed-character detection once one uninterrupted
+        # pass has walked every live body -- a wall-budget cutoff mid-pass
+        # means alive_names is incomplete and would falsely "remove" the
+        # tail of the roster it never reached.
+        live_count = _persist_count_live_characters(game)
+        force_full_complete = (
+            not wall_budget_hit
+            and live_count > 0
+            and len(verified_chars) >= live_count
+        )
+        if force_full_complete and prev_char:
+            removed_chars = sorted(set(prev_char.keys()) - alive_names)
+    elif not force_full_chars and prev_char:
         removed_chars = sorted(set(prev_char.keys()) - alive_names)
 
     if (
@@ -3926,21 +4530,24 @@ async def _collect_world_save_snapshot_async(
         and _persist_save_over_wall_budget(wall_start, wall_budget_ms)
     ):
         wall_budget_hit = True
-        if not force_full:
+        if not force_full_chars:
             deferred_chars.update(dirty_chars - set(changed_chars))
 
-    floor_rows, changed_floor, new_floor_hashes = (
+    floor_rows, changed_floor, new_floor_hashes, floor_stats = (
         await _collect_floor_save_pass_async(
-            game, prev_floor or {}, force_full, dirty_rooms,
+            game, prev_floor or {}, force_full_floor, dirty_rooms,
             yield_every=yield_every,
         )
         if not wall_budget_hit
-        else ([], [], {})
+        else ([], [], {}, {})
     )
     item_rows.extend(floor_rows)
     await asyncio.sleep(0)
     meta = {
-        "force_full": force_full,
+        "force_full": force_full_chars,
+        "force_full_chars_only": force_full_chars and not force_full_floor,
+        "force_full_chunked_apply": chunked_chars_only,
+        "force_full_complete": force_full_complete,
         "changed_chars": changed_chars,
         "removed_chars": removed_chars,
         "changed_floor_rooms": changed_floor,
@@ -3949,15 +4556,14 @@ async def _collect_world_save_snapshot_async(
         "deferred_chars": deferred_chars,
         "deferred_rooms": deferred_rooms,
         "wall_budget_hit": wall_budget_hit,
-        "scan_incomplete": scan_incomplete,
         "n_dirty_chars_queued": len(
             getattr(game, "_persist_dirty_characters", None) or ()
         ),
         "n_dirty_rooms_queued": len(
             getattr(game, "_persist_dirty_floor_rooms", None) or ()
         ),
-        "n_dirty_chars_this_pass": len(dirty_chars) if not force_full else -1,
-        "n_dirty_rooms_this_pass": len(dirty_rooms) if not force_full else -1,
+        "n_dirty_chars_this_pass": len(dirty_chars) if not force_full_chars else -1,
+        "n_dirty_rooms_this_pass": len(dirty_rooms) if not force_full_floor else -1,
         # Lag P12 breadcrumbs -- see _PERSIST_SLOW_CHAR_LOG_MS above.
         "slow_chars": slow_chars[:_PERSIST_SLOW_CHAR_LOG_CAP],
         "char_build_total_ms": round(char_build_total_ms, 2),
@@ -3967,28 +4573,45 @@ async def _collect_world_save_snapshot_async(
             if char_build_count
             else 0.0
         ),
+        **(floor_stats or {}),
     }
     return char_rows, item_rows, meta
 
 
 def _apply_world_save_snapshot(conn, char_rows, item_rows, meta=None):
-    """Bulk-insert snapshot rows (full wipe or incremental dirty pass)."""
+    """Bulk-insert snapshot rows (full wipe or incremental dirty pass).
+
+    Runs on the P30 background writer thread (default live path -- see
+    ``RIFTFORGE_PERSIST_BACKGROUND_WRITER``) as well as the sync fallback.
+    """
     meta = meta or {"force_full": True}
     force_full = bool(meta.get("force_full"))
+    if force_full and meta.get("force_full_chunked_apply"):
+        # CPU followon 2026-09: scheduled chars-only verify commits each
+        # wall-budget chunk as per-name DELETE+INSERT instead of an atomic
+        # wipe of the whole ``characters`` table -- the atomic wipe only
+        # ever fires once collect finishes the *entire* live roster, which
+        # a slow/large roster (~700+ characters) never did inside the 5s
+        # budget. That discarded every chunk's work every autosave and
+        # re-armed force_full forever, pegging a core at ~100% CPU.
+        meta = dict(meta)
+        meta["force_full"] = False
+        force_full = False
     last_err = None
     for attempt in range(2):
         try:
             with conn:
                 if force_full:
                     conn.execute("DELETE FROM characters")
-                    conn.execute("DELETE FROM items")
+                    if meta.get("force_full_chars_only"):
+                        conn.execute(
+                            "DELETE FROM items WHERE holder_type IN "
+                            "('character', 'gear')",
+                        )
+                    else:
+                        conn.execute("DELETE FROM items")
                 else:
-                    # Incomplete incremental walks must never DELETE
-                    # unvisited bodies (see scan_incomplete in collect).
-                    removed = () if meta.get("scan_incomplete") else meta.get(
-                        "removed_chars", (),
-                    )
-                    for name in removed:
+                    for name in meta.get("removed_chars", ()):
                         conn.execute(
                             "DELETE FROM characters WHERE name=?", (name,),
                         )
@@ -4029,54 +4652,55 @@ def _apply_world_save_snapshot(conn, char_rows, item_rows, meta=None):
 
 
 async def _apply_force_full_snapshot_async(
-    conn, char_rows, item_rows, *, yield_every,
+    conn, char_rows, item_rows, *, yield_every, chars_only=False,
 ):
     """Cooperative full-verify apply for ``save_world_async`` only.
 
     Fires on the *first* autosave after every game-only restart (hash
     cache is cold, so ``force_full`` is true) and every
-    ``persist_full_every()`` passes after that. Yields every ``ye``
-    (``yield_every``, default 2) rows for responsiveness, but -- lag
-    P11.3 continued -- used to also *commit* (fsync) every ``ye`` rows,
-    which for a live-sized world (~400 characters + ~5,000+ items) meant
-    roughly (400+5000)/2 ~= 2,700 individual commits in one pass, clocked
-    at 62s on live right after the 2026-08-20 P11.3 deploy (this path
-    fires on every restart, so it wasn't covered by the incremental-path
-    fix above). Commits now batch at ``persist_apply_commit_batch()``
-    (default 25) independently of the yield cadence, matching the
-    incremental path.
+    ``persist_full_every()`` passes after that. Scheduled full-verify
+    passes set ``chars_only`` so floor loot rows are not wiped wholesale
+    (lag U2). Yields every ``ye`` (``yield_every``, default 2) rows for
+    responsiveness, but -- lag P11.3 continued -- used to also *commit*
+    (fsync) every ``ye`` rows, which for a live-sized world (~400
+    characters + ~5,000+ items) meant roughly (400+5000)/2 ~= 2,700
+    individual commits in one pass, clocked at 62s on live right after
+    the 2026-08-20 P11.3 deploy (this path fires on every restart, so
+    it wasn't covered by the incremental-path fix above). Commits now
+    batch at ``persist_apply_commit_batch()`` (default 25) independently
+    of the yield cadence, matching the incremental path.
     """
     import asyncio
 
     ye = max(1, int(yield_every or 1))
-    commit_batch = max(1, persist_apply_commit_batch())
-    with conn:
-        conn.execute("DELETE FROM characters")
-        conn.execute("DELETE FROM items")
-    await asyncio.sleep(0)
-
-    async def _apply_rows(rows, insert_sql):
-        n_since_commit = 0
-        for i in range(0, len(rows), ye):
-            batch = rows[i : i + ye]
-            if not batch:
-                continue
-            conn.executemany(insert_sql, batch)
-            n_since_commit += len(batch)
-            if n_since_commit >= commit_batch:
-                conn.commit()
-                n_since_commit = 0
-            await asyncio.sleep(0)
-        if n_since_commit:
-            conn.commit()
-
+    # Lag E1: never COMMIT a table wipe before INSERTs land. The old
+    # ``with conn: DELETE`` block committed deletes, then yielded, so a
+    # kill mid-pass could leave empty characters/items. One transaction
+    # for the whole force-full apply; yields only serve the asyncio loop.
+    conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute("DELETE FROM characters")
+        if chars_only:
+            conn.execute(
+                "DELETE FROM items WHERE holder_type IN ('character', 'gear')",
+            )
+        else:
+            conn.execute("DELETE FROM items")
+
+        async def _apply_rows(rows, insert_sql):
+            for i in range(0, len(rows), ye):
+                batch = rows[i : i + ye]
+                if not batch:
+                    continue
+                conn.executemany(insert_sql, batch)
+                await asyncio.sleep(0)
+
         await _apply_rows(char_rows, _CHAR_INSERT_SQL)
         await _apply_rows(item_rows, _ITEM_INSERT_SQL)
-    finally:
-        # Best-effort flush of anything left uncommitted on an exception
-        # mid-pass -- mirrors the incremental path's safety net.
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 async def _apply_world_save_snapshot_async(
@@ -4105,12 +4729,24 @@ async def _apply_world_save_snapshot_async(
 
     meta = meta or {"force_full": True}
     force_full = bool(meta.get("force_full"))
+    if force_full and meta.get("force_full_chunked_apply"):
+        # CPU followon 2026-09: a scheduled chars-only verify applies each
+        # chunk as per-body DELETE+INSERT (like the incremental path)
+        # instead of one atomic wipe-then-reinsert. This lets a wall-budget
+        # cutoff commit real progress -- the old atomic apply only ran once
+        # the *entire* roster had been collected, so a slow/large roster
+        # that never finished collecting inside the budget never applied
+        # anything and the next autosave started the same walk over again.
+        meta = dict(meta)
+        meta["force_full"] = False
+        force_full = False
     yield_every = (
         persist_save_yield_every() if yield_every is None else int(yield_every)
     )
     if force_full:
         await _apply_force_full_snapshot_async(
             conn, char_rows, item_rows, yield_every=yield_every,
+            chars_only=bool(meta.get("force_full_chars_only")),
         )
         return
 
@@ -4133,10 +4769,7 @@ async def _apply_world_save_snapshot_async(
     pending_commit = False
 
     try:
-        removed = () if meta.get("scan_incomplete") else meta.get(
-            "removed_chars", (),
-        )
-        for name in removed:
+        for name in meta.get("removed_chars", ()):
             conn.execute("DELETE FROM characters WHERE name=?", (name,))
             conn.execute(
                 "DELETE FROM items WHERE holder_key=? "
@@ -4287,7 +4920,9 @@ async def save_world_async(
         # World snapshot already captured force_full. Clear the live flag
         # before writer meta so save_supers_meta does not rewrite every
         # slice on the GIL (P23.3 hitch, now on the writer thread).
-        if meta.get("force_full"):
+        if meta.get("force_full_complete"):
+            _persist_finish_force_full_if_due(game, meta)
+        elif meta.get("force_full") and not meta.get("force_full_chunked_apply"):
             game._persist_force_full = False
         return
     t_apply = time.perf_counter()
@@ -4313,6 +4948,7 @@ def _persist_provisional_world_stats(
         "apply_ms": 0.0,
         "writer_pending": True,
         "force_full": bool(meta.get("force_full")),
+        "force_full_chars_only": bool(meta.get("force_full_chars_only")),
         "n_char_rows": len(char_rows),
         "n_item_rows": len(item_rows),
         "n_changed_chars": len(meta.get("changed_chars") or ()),
@@ -4325,6 +4961,13 @@ def _persist_provisional_world_stats(
         "char_build_total_ms": meta.get("char_build_total_ms"),
         "char_build_count": meta.get("char_build_count"),
         "char_build_avg_ms": meta.get("char_build_avg_ms"),
+        "floor_rooms_scanned": meta.get("floor_rooms_scanned"),
+        "floor_rooms_hash_skip": meta.get("floor_rooms_hash_skip"),
+        "floor_yield_count": meta.get("floor_yield_count"),
+        "floor_build_total_ms": meta.get("floor_build_total_ms"),
+        "floor_build_count": meta.get("floor_build_count"),
+        "floor_build_avg_ms": meta.get("floor_build_avg_ms"),
+        "slow_floor_rooms": meta.get("slow_floor_rooms"),
     }
 
 
@@ -4357,6 +5000,7 @@ def _persist_ack_world_save(
         "collect_ms": round(collect_ms, 2),
         "apply_ms": round(float(apply_ms or 0.0), 2),
         "force_full": bool(meta.get("force_full")),
+        "force_full_chars_only": bool(meta.get("force_full_chars_only")),
         "n_char_rows": len(char_rows),
         "n_item_rows": len(item_rows),
         "n_changed_chars": len(meta.get("changed_chars") or ()),
@@ -4374,6 +5018,13 @@ def _persist_ack_world_save(
         "char_build_total_ms": meta.get("char_build_total_ms"),
         "char_build_count": meta.get("char_build_count"),
         "char_build_avg_ms": meta.get("char_build_avg_ms"),
+        "floor_rooms_scanned": meta.get("floor_rooms_scanned"),
+        "floor_rooms_hash_skip": meta.get("floor_rooms_hash_skip"),
+        "floor_yield_count": meta.get("floor_yield_count"),
+        "floor_build_total_ms": meta.get("floor_build_total_ms"),
+        "floor_build_count": meta.get("floor_build_count"),
+        "floor_build_avg_ms": meta.get("floor_build_avg_ms"),
+        "slow_floor_rooms": meta.get("slow_floor_rooms"),
     }
 
 
@@ -4384,6 +5035,15 @@ def save_world_before_process_exit(conn, game, *, reason="shutdown"):
     the post-deploy autosave window; a terminating save must rewrite every
     live character or inventory and wallet drift apart after restart (bug
     report 690).
+
+    Must clear a stale ``_persist_force_full_chars_only`` before calling
+    ``save_world`` -- a scheduled chars-only verify (lag U2 / CPU followon
+    2026-09) can leave that flag set for several autosaves while it chunks
+    across the wall budget. Leaving it set here would make
+    ``_persist_force_full_collect_flags`` skip the floor-room full-verify
+    on a terminating save (``force_full_floor`` computes False), silently
+    dropping any floor items past the incremental dirty cap right before
+    the process exits.
     """
     if conn is None or game is None:
         return
@@ -4391,6 +5051,7 @@ def save_world_before_process_exit(conn, game, *, reason="shutdown"):
         from engine.persistence_writer import shutdown_persistence_writer
         shutdown_persistence_writer(timeout=persist_writer_drain_timeout_s())
     game._persist_force_full = True
+    game._persist_force_full_chars_only = False
     save_world(conn, game)
 
 
@@ -4471,6 +5132,7 @@ def save_world(conn, game):
         "collect_ms": round(collect_ms, 2),
         "apply_ms": round(apply_ms, 2),
         "force_full": bool(meta.get("force_full")),
+        "force_full_chars_only": bool(meta.get("force_full_chars_only")),
         "n_char_rows": len(char_rows),
         "n_item_rows": len(item_rows),
         "n_changed_chars": len(meta.get("changed_chars") or ()),
@@ -4546,9 +5208,27 @@ def load_world(conn, game):
             from engine import metrics as metrics_mod
             log_util.ops(
                 "persistence",
-                f"skip corrupt blob key={name!r} ({exc!r})",
+                f"quarantine corrupt blob key={name!r} ({exc!r})",
             )
             metrics_mod.bump(game, "load_corrupt_blob")
+            # Keep a stub Echo so the name is not silently gone (HB-25).
+            # Do not apply the corrupt JSON. Place on the start / safe room
+            # after the loop via pending list.
+            char.corrupt_blob_quarantine = True
+            char.description = (
+                "This body is here, but the memory that held it would "
+                "not reform. Staff: a corrupt save blob was quarantined."
+            )
+            pending_link = None
+            # Fall through to room placement -- still an Echo, no blob.
+            room = _safe_relocation_room(game, char) or _resolve_saved_room(
+                game, room_key, name
+            )
+            try:
+                from engine.world import safe_place
+                safe_place(char, room)
+            except Exception:
+                char.move_to(room)
             continue
         # Restore every SUPERS field (stat spine, Origin/Path/Disciplines,
         # Cadence needs, every Path's fuel/faith/blood/instinct/soul
@@ -4566,7 +5246,22 @@ def load_world(conn, game):
         # pending-links list here and gets resolved in the fixup pass after
         # that loop -- see supers/persist_blob.py's module docstring for why
         # that hand-off is the cleanest split.
-        pending_link = apply_character_blob(char, saved)
+        try:
+            pending_link = apply_character_blob(char, saved)
+        except Exception as exc:
+            from engine import log_util
+            from engine import metrics as metrics_mod
+            log_util.ops(
+                "persistence",
+                f"quarantine apply_character_blob key={name!r} ({exc!r})",
+            )
+            metrics_mod.bump(game, "load_corrupt_blob")
+            char.corrupt_blob_quarantine = True
+            char.description = (
+                "This body is here, but the memory that held it would "
+                "not reform. Staff: a corrupt save blob was quarantined."
+            )
+            pending_link = None
         # Keep the saved room_key even when map JSON is stale -- stub rather
         # than silently dumping onto start_room / North Avenue (no_loiter).
         room = _resolve_saved_room(game, room_key, name)
@@ -4582,7 +5277,19 @@ def load_world(conn, game):
         # .get(..., default) means an items row saved before the 'container'
         # column existed (container == '{}', the column's DEFAULT) loads as
         # a plain, unlocked flavor item -- exactly what it was before.
-        state = json.loads(container)
+        # One corrupt row must not abort load_world (HB-01) -- character
+        # blobs already fail-soft; items must match.
+        try:
+            state = json.loads(container)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            from engine import log_util
+            from engine import metrics as metrics_mod
+            log_util.ops(
+                "persistence",
+                f"skip corrupt item container key={key!r} ({exc!r})",
+            )
+            metrics_mod.bump(game, "load_corrupt_item")
+            continue
         item = Item(
             key, description,
             locked=state.get("locked", False),
@@ -4618,6 +5325,12 @@ def load_world(conn, game):
             item.provides_light = True
         if state.get("catalog_id"):
             item.catalog_id = state["catalog_id"]
+        if state.get("magic_focus_id"):
+            item.magic_focus_id = state["magic_focus_id"]
+        if state.get("magic_focus_kind"):
+            item.magic_focus_kind = state["magic_focus_kind"]
+        if state.get("magic_focus_target_key"):
+            item.magic_focus_target_key = state["magic_focus_target_key"]
         aliases = state.get("aliases") or []
         if isinstance(aliases, list) and aliases:
             item.aliases = [str(a) for a in aliases if a]
@@ -4685,9 +5398,21 @@ def load_world(conn, game):
             ]
         if state.get("dirty") is not None:
             item.dirty = bool(state["dirty"])
+        if state.get("wet") is not None:
+            item.wet = bool(state["wet"])
         if state.get("gear_condition") is not None:
             try:
                 item.gear_condition = int(state["gear_condition"])
+            except (TypeError, ValueError):
+                pass
+        if state.get("laptop_battery_ticks") is not None:
+            try:
+                item.laptop_battery_ticks = int(state["laptop_battery_ticks"])
+            except (TypeError, ValueError):
+                pass
+        if state.get("virus_bricked_until") is not None:
+            try:
+                item.virus_bricked_until = int(state["virus_bricked_until"])
             except (TypeError, ValueError):
                 pass
         # Fridge pantry timer (home grocery stock); absent on older saves.
@@ -4730,6 +5455,7 @@ def load_world(conn, game):
         if state.get("is_payphone"):
             item.is_payphone = True
             item.furniture = True
+        _restore_phone_media_fields(item, state)
         if state.get("is_ethereal"):
             item.is_ethereal = True
         if state.get("is_spirit_mirror"):
@@ -5026,7 +5752,17 @@ def item_from_saved_container(key, description, container):
     drift.
     """
     if isinstance(container, str):
-        state = json.loads(container or "{}")
+        try:
+            state = json.loads(container or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            # HB extra: corrupt vault/stash container must not abort
+            # character load the way HB-01 used to abort boot.
+            print(
+                f"[persistence] corrupt saved container for {key!r} -- "
+                "loading as empty state",
+                flush=True,
+            )
+            state = {}
     else:
         state = dict(container or {})
     item = Item(
@@ -5053,6 +5789,12 @@ def item_from_saved_container(key, description, container):
         item.provides_light = True
     if state.get("catalog_id"):
         item.catalog_id = state["catalog_id"]
+    if state.get("magic_focus_id"):
+        item.magic_focus_id = state["magic_focus_id"]
+    if state.get("magic_focus_kind"):
+        item.magic_focus_kind = state["magic_focus_kind"]
+    if state.get("magic_focus_target_key"):
+        item.magic_focus_target_key = state["magic_focus_target_key"]
     aliases = state.get("aliases") or []
     if isinstance(aliases, list) and aliases:
         item.aliases = [str(a) for a in aliases if a]
@@ -5118,6 +5860,8 @@ def item_from_saved_container(key, description, container):
         ]
     if state.get("dirty") is not None:
         item.dirty = bool(state["dirty"])
+    if state.get("wet") is not None:
+        item.wet = bool(state["wet"])
     if state.get("stock_until_tick") is not None:
         try:
             item.stock_until_tick = int(state["stock_until_tick"])
@@ -5146,11 +5890,22 @@ def item_from_saved_container(key, description, container):
             pass
     if state.get("phone_number"):
         item.phone_number = str(state["phone_number"]).strip()
+    if state.get("laptop_battery_ticks") is not None:
+        try:
+            item.laptop_battery_ticks = int(state["laptop_battery_ticks"])
+        except (TypeError, ValueError):
+            pass
+    if state.get("virus_bricked_until") is not None:
+        try:
+            item.virus_bricked_until = int(state["virus_bricked_until"])
+        except (TypeError, ValueError):
+            pass
     if state.get("is_phone"):
         item.is_phone = True
     if state.get("is_payphone"):
         item.is_payphone = True
         item.furniture = True
+    _restore_phone_media_fields(item, state)
     if state.get("is_ethereal"):
         item.is_ethereal = True
     if state.get("_contract_id"):
@@ -5205,7 +5960,7 @@ def snapshot_held_items(character):
             "description": _persist_item_field(
                 item, "description", fallback=_persist_item_field(item, "key"),
             ),
-            "container": json.loads(_item_container_blob(item)),
+            "container": _item_container_dict(item),
         })
     for item in list(getattr(character, "gear_bag", None) or []):
         rows.append({
@@ -5214,7 +5969,7 @@ def snapshot_held_items(character):
             "description": _persist_item_field(
                 item, "description", fallback=_persist_item_field(item, "key"),
             ),
-            "container": json.loads(_item_container_blob(item)),
+            "container": _item_container_dict(item),
         })
     return rows
 
@@ -5297,6 +6052,15 @@ def compress_vault_envelope(envelope):
 
 
 def decompress_vault_envelope(payload_bytes):
-    """Inverse of ``compress_vault_envelope``."""
-    raw = zlib.decompress(payload_bytes)
-    return json.loads(raw.decode("utf-8"))
+    """Inverse of ``compress_vault_envelope``.
+
+    Junk bytes used to raise raw zlib/JSON errors mid-restore. Log and
+    raise a single ValueError so callers can refuse the vault row.
+    """
+    try:
+        raw = zlib.decompress(payload_bytes)
+        return json.loads(raw.decode("utf-8"))
+    except (TypeError, ValueError, OverflowError, OSError, zlib.error) as exc:
+        from engine import log_util
+        log_util.ops("persistence", f"vault envelope corrupt ({exc!r})")
+        raise ValueError("corrupt vault envelope") from exc

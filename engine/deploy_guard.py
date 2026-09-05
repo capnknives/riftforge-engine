@@ -136,8 +136,9 @@ def check_integrations():
 
     # persist_blob calls cuff blob_fragment / load_fragment; overlay drift
     # without copyover cuff reload broke gm on + autosave (bug 739).
-    from engine import hooks
-    warnings.extend(hooks.post_overlay_game_checks())
+    from engine import hooks as hooks_mod
+    warnings.extend(hooks_mod.post_overlay_game_checks())
+    warnings.extend(hooks_mod.report_persist_helper_gaps())
 
     return warnings
 

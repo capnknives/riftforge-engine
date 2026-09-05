@@ -22,6 +22,7 @@ from engine.systems.quests_loader import (
     get_quest as loader_get_quest,
     list_quest_ids as loader_list_quest_ids,
     load_quests as loader_load_quests,
+    resolve_quest_id as loader_resolve_quest_id,
     validate_quest as loader_validate_quest,
 )
 import engine.systems.economy as economy_wallet
@@ -42,10 +43,19 @@ class _LoaderMod:
     get_quest = staticmethod(loader_get_quest)
     load_quests = staticmethod(loader_load_quests)
     list_quest_ids = staticmethod(loader_list_quest_ids)
+    resolve_quest_id = staticmethod(loader_resolve_quest_id)
     validate_quest = staticmethod(loader_validate_quest)
 
 
 loader_mod = _LoaderMod()
+
+
+def _spaced_quest_id(quest_id):
+    """Player-facing quest token: spaces, never underscores."""
+    from engine.player_input import spaced_catalog_id
+
+    return spaced_catalog_id(quest_id)
+
 
 # ---------------------------------------------------------------------------
 # Game hook slots (SUPERS / basegame register at boot)
@@ -223,7 +233,17 @@ def giver_needles_for(npc):
         return []
     try:
         return [str(label).lower() for label in (_quest_giver_needles_handler(npc) or ())]
-    except Exception:
+    except Exception as exc:
+        game = getattr(getattr(npc, "session", None), "game", None)
+        if game is None:
+            loc = getattr(npc, "location", None)
+            game = getattr(loc, "game", None)
+        _quest_ops(
+            game,
+            f"giver_needles_{getattr(npc, 'key', '?')}",
+            f"giver needles failed npc={getattr(npc, 'key', '?')}",
+            exc=exc,
+        )
         return []
 
 
@@ -235,7 +255,14 @@ def office_match_for(npc, giver_name, *, quest_data=None, game=None):
         return _quest_office_match_handler(
             npc, giver_name, quest_data=quest_data, game=game,
         )
-    except Exception:
+    except Exception as exc:
+        _quest_ops(
+            game,
+            f"office_match_{getattr(npc, 'key', '?')}",
+            f"office match failed npc={getattr(npc, 'key', '?')} "
+            f"giver={giver_name!r}",
+            exc=exc,
+        )
         return None
 
 
@@ -503,8 +530,13 @@ def _npc_matches_giver(npc, giver_name, *, quest_data=None, game=None):
             full = f"{given} {sur}"
             if giver in full or full in giver:
                 return True
-    except Exception:
-        pass
+    except Exception as exc:
+        _quest_ops(
+            None,
+            f"giver_identity_{getattr(npc, 'key', '?')}",
+            f"giver identity match failed npc={getattr(npc, 'key', '?')}",
+            exc=exc,
+        )
     return False
 
 
@@ -1326,6 +1358,11 @@ def begin(character, quest_id, game=None, *, force=False, defer_step=False):
     and ``restartquest`` pass ``force=True``. Chargen openers refuse a
     plain ``takequest`` -- they are not case folders.
     """
+    if quest_id:
+        resolved = loader_mod.resolve_quest_id(quest_id)
+        if resolved is None:
+            return False, f"Unknown quest '{quest_id}'."
+        quest_id = resolved
     data = loader_mod.get_quest(quest_id)
     if data is None:
         return False, f"Unknown quest '{quest_id}'."
@@ -1349,8 +1386,13 @@ def begin(character, quest_id, game=None, *, force=False, defer_step=False):
     if giver and game is not None:
         try:
             quest_ensure_giver(game, giver)
-        except Exception:
-            pass
+        except Exception as exc:
+            _quest_ops(
+                game,
+                f"ensure_giver_{quest_id}",
+                f"ensure giver failed quest={quest_id} giver={giver!r}",
+                exc=exc,
+            )
     if giver and not force:
         for other_id in active_quest_ids(character):
             if other_id == quest_id:
@@ -1455,20 +1497,25 @@ def abandon(character, quest_id=None, game=None, *, confirm=False):
             return False, "You have no active authored quest to abandon."
         else:
             return False, (
-                "Several cases are open -- abandonquest <id> confirm. "
-                f"Active: {', '.join(ids)}"
+                "Several cases are open -- quests abandon <id> confirm. "
+                f"Active: {', '.join(_spaced_quest_id(i) for i in ids)}"
             )
+    if quest_id:
+        resolved = loader_mod.resolve_quest_id(quest_id)
+        if resolved is not None:
+            quest_id = resolved
     entry = _entry(character, quest_id)
     if not entry or entry.get("status") != "active":
-        return False, f"No active quest '{quest_id}'."
+        return False, f"No active quest '{_spaced_quest_id(quest_id)}'."
     data = loader_mod.get_quest(quest_id) or {}
     # Soft openers with gates ask for confirm (Family Business).
     if data.get("auto_start") and not confirm:
+        shown = _spaced_quest_id(quest_id)
         return (
             False,
             f"Abandon '{data.get('title', quest_id)}'? Type "
-            f"'abandonquest {quest_id} confirm' (or 'abandonquest confirm' "
-            "when it is your only open case).",
+            f"'quests abandon {shown} confirm' "
+            "(or 'quests abandon confirm' when it is your only open case).",
         )
     pin_map = _get_flag(character, quest_id, "pin_map") or data.get("pin_npcs")
     if pin_map and game is not None:
@@ -1607,6 +1654,16 @@ def _match_when(character, when, event, payload, *, quest_id=None, game=None):
             quest_id=quest_id,
             game=game,
         )
+    if kind == "call_npc" and event == "call_npc":
+        # Fires when a phone call connects to that NPC -- lets a step
+        # complete for a giver who is a real drive away without forcing
+        # the trip (docs/plans/men_of_letters_path.md "call Bobby" beat).
+        return _payload_npc_matches(
+            when.get("npc"),
+            payload,
+            quest_id=quest_id,
+            game=game,
+        )
     if kind == "kill_tag" and event == "kill_tag":
         return bool(when.get("tag")) and when.get("tag") == payload.get("tag")
     if kind == "flag" and (event == "flag" or state_check):
@@ -1630,16 +1687,17 @@ def _match_when(character, when, event, payload, *, quest_id=None, game=None):
         or event in ("talk_npc", "has_item", "verb", "enter_room", "buy", "gear")
     ):
         return _inventory_has(character, when.get("item"))
-    if kind == "give_item" and event in ("talk_npc", "give"):
+    if kind == "give_item" and event in ("talk_npc", "give", "mail_ship"):
         # ``talk_npc``: hand over while holding (consume from pack).
         # ``give``: ``cmd_give`` already transferred the item -- only match.
+        # ``mail_ship``: Post Office already removed the item from sender.
         want_npc = when.get("npc") or ""
         if want_npc and not _payload_npc_matches(
             want_npc, payload, quest_id=quest_id, game=game,
         ):
             return False
         item = when.get("item")
-        if event == "give":
+        if event in ("give", "mail_ship"):
             return _payload_item_matches(item, payload)
         if not _inventory_has(character, item):
             return False
@@ -1672,6 +1730,8 @@ def _match_when(character, when, event, payload, *, quest_id=None, game=None):
     if kind == "reporthunt" and event == "reporthunt":
         return True
     if kind == "reportdungeon" and event == "reportdungeon":
+        return True
+    if kind == "hack_scan" and event == "hack_scan":
         return True
     return False
 
@@ -2013,17 +2073,17 @@ NUDGE_COOLDOWN_SECONDS = 75.0
 
 
 def heal_active_quest_pins(game):
-    """Boot heal: re-apply opener mentor pins after roster home relocates.
+    """Boot heal: ensure quest mentor handsets after roster moves.
 
-    ``cadence_boot.heal_roster_fixture_positions`` parks Bobby in Overflow;
-    active Family Business (and similar) quests need him back on the board.
-    Idempotent every restart.
+    Mentors stay on Cadence hunts; players reach them by phone or mail
+    (``supers.quest_reach``). Idempotent every restart.
     """
     if game is None:
         return 0
     from engine.char_index import iter_characters
+    from engine import hooks as hooks_mod
 
-    pinned = 0
+    ensured = 0
     seen = set()
     for char in iter_characters(game):
         if getattr(char, "is_npc", False):
@@ -2042,70 +2102,30 @@ def heal_active_quest_pins(game):
             if sig in seen:
                 continue
             seen.add(sig)
-            _pin_mentors(game, pin_map)
-            pinned += 1
-    return pinned
+            ensured += hooks_mod.ensure_quest_mentor_reach(game, pin_map)
+    return ensured
 
 
 def _pin_mentors(game, pin_map):
-    """Park named NPCs in pin rooms and mark stay_home so talk cannot soft-lock."""
+    """Ensure quest mentors are phone/mail reachable (no physical park)."""
     if not game or not pin_map:
         return
-    for npc_key, room_key in pin_map.items():
-        room = lookup_room(game, room_key)
-        if room is None:
-            continue
-        npc = None
-        # Prefer a copy already standing in the pin room (Emberwake has one
-        # per Reach hub). Global find_character would steal Cinder's copy.
-        for obj in room.characters():
-            if _npc_matches_giver(obj, npc_key):
-                npc = obj
-                break
-        if npc is None:
-            find = getattr(game, "find_character", None)
-            if callable(find):
-                npc = find(npc_key)
-        if npc is None:
-            continue
-        # Remember prior park so abandon/complete can restore.
-        if not getattr(npc, "_quest_pin_restore", None):
-            npc._quest_pin_restore = {
-                "home_room_key": getattr(npc, "home_room_key", None),
-                "stay_home": bool(getattr(npc, "stay_home", False)),
-                "room_key": getattr(
-                    getattr(npc, "location", None), "key", None
-                ),
-            }
-        npc.stay_home = True
-        npc.home_room_key = room_key
-        if getattr(npc, "location", None) is not room:
-            npc.move_to(room)
+    from engine import hooks as hooks_mod
+
+    hooks_mod.ensure_quest_mentor_reach(game, pin_map)
 
 
 def _unpin_mentors(game, pin_map):
-    """Restore mentors after quest complete / abandon / restart wipe."""
+    """Clear mentor post hints after quest complete / abandon."""
     if not game or not pin_map:
         return
-    rooms = getattr(game, "rooms", None) or {}
     for npc_key in pin_map:
         find = getattr(game, "find_character", None)
         npc = find(npc_key) if callable(find) else None
         if npc is None:
             continue
-        restore = getattr(npc, "_quest_pin_restore", None)
-        if not isinstance(restore, dict):
-            continue
-        npc.stay_home = bool(restore.get("stay_home", False))
-        home_key = restore.get("home_room_key")
-        npc.home_room_key = home_key
-        dest_key = home_key or restore.get("room_key")
-        dest = lookup_room(game, dest_key) if dest_key else None
-        if dest is None and dest_key:
-            dest = rooms.get(dest_key)
-        if dest is not None and getattr(npc, "location", None) is not dest:
-            npc.move_to(dest)
-        npc._quest_pin_restore = None
+        if hasattr(npc, "_quest_mentor_post_key"):
+            npc._quest_mentor_post_key = None
 
 
 def active_gate_step(character):
@@ -2168,21 +2188,26 @@ def restart(character, quest_id=None, game=None, *, confirm=False):
         elif not ids:
             return False, (
                 "No active case to restart. "
-                "Type 'restartquest <id> confirm' (e.g. family_business)."
+                "Type 'quests restart <id> confirm' (e.g. family business)."
             )
         else:
             return False, (
-                "Several cases are open -- restartquest <id> confirm. "
-                f"Active: {', '.join(ids)}"
+                "Several cases are open -- quests restart <id> confirm. "
+                f"Active: {', '.join(_spaced_quest_id(i) for i in ids)}"
             )
+    if quest_id:
+        resolved = loader_mod.resolve_quest_id(quest_id)
+        if resolved is not None:
+            quest_id = resolved
     data = loader_mod.get_quest(quest_id)
     if data is None:
-        return False, f"Unknown quest '{quest_id}'."
+        return False, f"Unknown quest '{_spaced_quest_id(quest_id)}'."
     if not confirm:
+        shown = _spaced_quest_id(quest_id)
         return (
             False,
             f"Restart '{data.get('title', quest_id)}' from the top? Type "
-            f"'restartquest {quest_id} confirm'.",
+            f"'quests restart {shown} confirm'.",
         )
     entry = _entry(character, quest_id)
     if entry and entry.get("status") == "active":

@@ -101,10 +101,35 @@
       "required": false,
       "doc": "Compact atlas: height strings of width terrain glyphs (y=0 south). Space void, ~ ocean, o lake, . plains, ^ mountains, T forest, ' wetland, , desert. Named mouths stay in cell_overrides."
     },
+    "water_view_rows": {
+      "type": "list",
+      "required": false,
+      "doc": "HUD-only water paint on America void margins (earth_america). Height strings of width glyphs (y=0 south): ~ ocean-view, o lake-view, space none. Cosmetic minimap tint only — does not change sim area_type when terrain is void and does not create walkable ocean on America. Great Lakes follow shore rings, not a lat/lon rectangle."
+    },
+    "land_view_rows": {
+      "type": "list",
+      "required": false,
+      "doc": "HUD-only Canada land paint on America void margins (earth_america). Height strings of width glyphs (y=0 south): T timber, . prairie, space none. Cosmetic only — sim stays void. Sibling earth_canada.json holds real Canada grid coords for a later hop."
+    },
+    "river_rows": {
+      "type": "list",
+      "required": false,
+      "doc": "Inland river overlay on land atlases. Height strings of width glyphs (y=0 south); space none. Does not replace land area_type; expand may set map_glyph and fishing tags later."
+    },
     "road_rows": {
       "type": "list",
       "required": false,
       "doc": "Compact atlas: matching route overlay (= | / \\ + or space). grid.route_kind trail paints wagon ruts (not interstate gold). City letters still win via cell_overrides map_glyph."
+    },
+    "highland_rows": {
+      "type": "list",
+      "required": false,
+      "doc": "Compact atlas: matching mining-country mask (H or space). Visual biome stays in terrain_rows; only ridge cells are mountains. Room.highland + mine mouths follow this flag."
+    },
+    "depth_rows": {
+      "type": "list",
+      "required": false,
+      "doc": "Water maps only (earth_gulf, earth_great_lakes, future offshore ids). Height strings of width chars (y=0 south): one digit or char per cell for max depth band index (0/1/2). Lakes: surface|mid|lakebed. Offshore: inshore|slope|abyss. Consumed by water endurance (PR 2)."
     },
     "cell_overrides": {
       "type": "object",

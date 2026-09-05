@@ -54,10 +54,14 @@ _TICK_SOFT_BUDGET_MS_DEFAULT = 300.0
 # While SQLite collect/apply is in flight, defer almost all tick handlers so
 # a 4s "handler swarm" heartbeat cannot stack on top of autosave (live 2026-08).
 _TICK_SAVE_BUSY_BUDGET_MS_DEFAULT = 0.0
-# Handlers that still run during save_busy (combat fairness).
+# Handlers that still run during save_busy (combat fairness + player montages).
 _TICK_SAVE_BUSY_ALLOW = frozenset({
     "combat",
     "combat_ko",
+    "training_montage",
+    "attune_montage",
+    "god_channel_attune",
+    "leviathan_corpse_feast",
 })
 _TICK_FAIL_LOG_SECONDS_DEFAULT = 60.0
 _TICK_DISABLE_THRESHOLD_DEFAULT = 5
@@ -446,8 +450,10 @@ def _finalize_tick_run(
     if _tick_finalize_cadence_clear is not None:
         try:
             _tick_finalize_cadence_clear(game)
-        except Exception:
-            pass
+        except Exception as exc:
+            from engine import log_util
+
+            log_util.ops("tick", "cadence_clear failed", exc=exc)
     _record_tick_sample(game, total_ms, slow_handlers, skipped=skipped)
     from engine import boot_stability
 
@@ -517,6 +523,14 @@ def _finalize_tick_run(
             payload["cadence_wall_ms"] = last_cad.get("wall_ms")
             payload["slow_actor_key"] = last_cad.get("slow_actor_key")
             payload["slow_actor_ms"] = last_cad.get("slow_actor_ms")
+            # Setup/roster/zone_snap run before _cpu_ms starts. Without
+            # these names, a 1 s Cadence wall with 190 ms CPU looks like
+            # "AI" (2026-08-31 gist 934d887b, 1138 ms wall / 193 ms cpu).
+            top = last_cad.get("top_phases") or ()
+            if top:
+                payload["cadence_top_phases"] = [
+                    {"name": key, "ms": val} for key, val in top[:6]
+                ]
         if diag_export.append_auto_capture_event(
             game, payload, reason=auto_reason,
         ):
@@ -614,8 +628,16 @@ def _run_ticks_sync_body(
         try:
             from engine import lag_watch
             lag_watch.note_handler_stall(game, name, h_ms)
-        except Exception:
-            pass
+        except Exception as exc:
+            from engine import log_util
+
+            log_util.ops_once_per_tick(
+                game,
+                f"lag_watch:{name}",
+                "lag_watch",
+                f"note_handler_stall failed handler={name}",
+                exc=exc,
+            )
         _note_handler_cpu(game, name, h_ms, cpu_ms)
 
 
@@ -708,8 +730,16 @@ async def _run_ticks_async_body(
         try:
             from engine import lag_watch
             lag_watch.note_handler_stall(game, name, h_ms)
-        except Exception:
-            pass
+        except Exception as exc:
+            from engine import log_util
+
+            log_util.ops_once_per_tick(
+                game,
+                f"lag_watch:{name}",
+                "lag_watch",
+                f"note_handler_stall failed handler={name}",
+                exc=exc,
+            )
         _note_handler_cpu(game, name, h_ms, cpu_ms)
 
 

@@ -211,9 +211,19 @@ def load_doc(path):
     return _normalize_doc(data)
 
 
-def _normalize_doc(data):
-    """Ensure rooms/pockets/grid containers exist (deep copy)."""
-    data = copy.deepcopy(data) if data else {}
+def load_doc_for_edit(path):
+    """Load map JSON for a single in-process edit/save (no deepcopy).
+
+    Player ``remodel`` mutates the dict and writes it back immediately.
+    Avoiding ``copy.deepcopy`` on large zone files (Lebanon, Lawrence)
+    removes multi-second stalls on live.
+    """
+    data = load_json(path)
+    return _normalize_doc_inplace(data if data else {})
+
+
+def _normalize_doc_inplace(data):
+    """Ensure rooms/pockets/grid containers exist (mutates ``data``)."""
     if data.get("rooms") is None:
         data["rooms"] = []
     if data.get("pockets") is None:
@@ -224,6 +234,12 @@ def _normalize_doc(data):
         if "portals" not in grid or grid["portals"] is None:
             grid["portals"] = []
     return data
+
+
+def _normalize_doc(data):
+    """Ensure rooms/pockets/grid containers exist (deep copy)."""
+    data = copy.deepcopy(data) if data else {}
+    return _normalize_doc_inplace(data)
 
 
 def save_doc_validated(path, doc, *, full_world_reload=True):

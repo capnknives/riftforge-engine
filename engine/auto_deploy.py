@@ -167,10 +167,11 @@ DEFAULT_FETCH_TIMEOUT = 60
 # Examples that do NOT: "Merge origin/main: ... with bug #25."
 #                       "Enhance auto-deploy (#5)"  (PR number, not bug id)
 #                       "Fix overnight Cadence… (#63-#67)" (parenthetical only)
-# Comma / Oxford-list tails on Fix and Ship subjects:
-# ``#79, #80``, ``#154, #179, and #189``, ``179, 154, and 189``.
-_TICKET_ID_COMMA_TAIL_RE = r"((?:\s*,\s*(?:and\s+)?#?\d+)*)"
-_TICKET_ID_COMMA_TAIL_BARE_RE = r"((?:\s*,\s*(?:and\s+)?\d+)*)"
+# Comma / Oxford-list / "and" tails on Fix and Ship subjects:
+# ``#79, #80``, ``#154, #179, and #189``, ``179, 154, and 189``,
+# ``1017 and 1018`` (GitHub PR titles often skip the comma).
+_TICKET_ID_COMMA_TAIL_RE = r"((?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)#?\d+)*)"
+_TICKET_ID_COMMA_TAIL_BARE_RE = r"((?:(?:\s*,\s*(?:and\s+)?|\s+and\s+)\d+)*)"
 _FIX_SUBJECT_RE = re.compile(
     r"^(?:fix(?:es|ed)?)\s+"
     r"(?:(?:in-game\s+)?bugs?|bug_reports\.log)\s*#?"
@@ -188,6 +189,14 @@ _FIX_BUG_REPORT_SUBJECT_RE = re.compile(
     r"(?:\s*[-–—]\s*#?(\d+))?"
     rf"{_TICKET_ID_COMMA_TAIL_RE}"
     r"(?:\b|:)",
+    re.IGNORECASE,
+)
+# Parenthetical / mid-sentence ship notes that omit a Fix header:
+# ``Fix leave after exit … (bug report 1026). (#3637)``
+# ``Fixes bug report 1024. Fixes bug report 941.``
+# Must not steal GitHub PR numbers (those stay in ``(#NNNN)`` tails).
+_BUG_REPORT_INLINE_RE = re.compile(
+    r"\bbug\s+reports?\s+#?(\d+)\b",
     re.IGNORECASE,
 )
 # When a Fix subject closes bug #N, also close these duplicate filings.
@@ -246,6 +255,11 @@ _SHIP_PLAYER_SUGGESTIONS_SLASH_RE = re.compile(
 )
 # Squash-merge subjects often end with the GitHub PR number, not the bug id.
 _MERGED_PR_REF_RE = re.compile(r"\(#(\d+)\)\s*$")
+# GitHub "Create a merge commit" default subject (not a squash).
+_MERGE_PULL_REQUEST_RE = re.compile(
+    r"^merge(?:d)?\s+pull\s+request\s+#(\d+)\b",
+    re.IGNORECASE,
+)
 _GITHUB_PULL_API = "https://api.github.com/repos/capnknives/RiftForge/pulls"
 _PR_TEXT_CACHE: dict[int, str] = {}
 # Cap range expansion so a typo like #1-9999 cannot flood resolve.
@@ -2276,9 +2290,9 @@ def _commit_message(sha, root):
 def _commit_parent_count(sha, root):
     """How many parents a commit has (1 = normal, 2+ = merge).
 
-    Used to skip announce/overlay for merge tips -- git diff-tree without
-    -m often returns no files for merges, and merge subjects frequently
-    mention bug ids without being the fix itself.
+    ``should_ship_bug_fix`` uses this so empty merge diffs can still ship
+    when the subject (or ticket map) lists Fix/Ship ids. Incidental merge
+    subjects with no parsed tickets still advance silently.
     """
     parents = _git("rev-list", "--parents", "-n", "1", sha, cwd=root)
     # Format: "<sha> <parent1> [parent2 ...]" -- first token is the commit.
@@ -2323,11 +2337,15 @@ def _parse_line_deploy_ids(line: str) -> tuple[list[int], list[int], str]:
     match = _FIX_SUBJECT_RE.match(text)
     if match:
         bug_ids, summary = _ids_from_fix_match(match)
+        _merge_ticket_ids(bug_ids, _inline_bug_report_ids(text))
         return bug_ids, [], summary
 
     match = _FIX_BUG_REPORT_SUBJECT_RE.match(text)
     if match:
         bug_ids, summary = _ids_from_fix_match(match)
+        # Same line may list a second ticket: ``Fixes bug report 1024.
+        # Fixes bug report 941.`` -- the header regex only takes the first.
+        _merge_ticket_ids(bug_ids, _inline_bug_report_ids(text))
         return bug_ids, [], summary
 
     match = _SHIP_SUGGESTION_SUBJECT_RE.match(text)
@@ -2367,7 +2385,28 @@ def _parse_line_deploy_ids(line: str) -> tuple[list[int], list[int], str]:
         summary = _parse_subject_ticket_tail(text, match)
         return [], suggestion_ids, summary
 
+    # Last resort: mid-sentence ``bug report N`` (cloud squash subjects that
+    # never started with ``Fix bug N`` still need to close the ticket).
+    inline = _inline_bug_report_ids(text)
+    if inline:
+        return inline, [], ""
+
     return [], [], ""
+
+
+def _inline_bug_report_ids(text: str) -> list[int]:
+    """Collect ``bug report N`` ids from free prose (not a Fix header).
+
+    Cloud agents often squash with a descriptive subject plus
+    ``(bug report 1026)`` instead of ``Fix bug 1026:``. Live then cannot
+    close the ticket unless the ticket map or GitHub fallback fires.
+    """
+    ids: list[int] = []
+    for match in _BUG_REPORT_INLINE_RE.finditer(text or ""):
+        n = int(match.group(1))
+        if n not in ids:
+            ids.append(n)
+    return ids
 
 
 def _first_subject_line(text: str) -> str:
@@ -2408,7 +2447,15 @@ def _parse_deploy_text_lines(text: str) -> tuple[list[int], list[int], str]:
 
 
 def _merged_pr_number_from_subject(subject: str) -> int | None:
-    match = _MERGED_PR_REF_RE.search((subject or "").strip())
+    """PR number from a squash ``(#N)`` tail or ``Merge pull request #N``."""
+    text = (subject or "").strip()
+    match = _MERGED_PR_REF_RE.search(text)
+    if match:
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+    match = _MERGE_PULL_REQUEST_RE.match(text)
     if not match:
         return None
     try:
@@ -2462,7 +2509,9 @@ def _fetch_merged_pr_text_via_gh(pr_number: int) -> str:
     return f"{title}\n{body}".strip() if body else title
 
 
-def _fetch_merged_pr_text(pr_number: int, *, allow_network: bool = True) -> str:
+def _fetch_merged_pr_text(
+    pr_number: int, *, allow_network: bool = True, root=None,
+) -> str:
     """Fetch PR title + body for squash commits that omit the bug id."""
     pr_number = int(pr_number)
     cached = _PR_TEXT_CACHE.get(pr_number)
@@ -2471,7 +2520,9 @@ def _fetch_merged_pr_text(pr_number: int, *, allow_network: bool = True) -> str:
     # Local map first — live may lack GITHUB_TOKEN or hit API rate limits.
     from engine import deploy_pr_ticket_map
 
-    mapped = deploy_pr_ticket_map.synthetic_pr_text(pr_number, root=_repo_root())
+    mapped = deploy_pr_ticket_map.synthetic_pr_text(
+        pr_number, root=root or _repo_root(),
+    )
     if mapped:
         _PR_TEXT_CACHE[pr_number] = mapped
         return mapped
@@ -2534,13 +2585,18 @@ def parse_deploy_metadata(
     *,
     pr_fallback: bool = True,
     pr_network: bool = True,
+    commit_sha: str | None = None,
+    root: str | None = None,
 ) -> tuple[list[int], list[int], str]:
     """Extract bug/suggestion ids + short summary from deploy text.
 
-    ``ops/deploy_pr_ticket_map.json`` (written by ``tools/open_pr.py`` at
-    PR-open time) is the **primary** source when the squash subject carries
-    a merged PR number: it is a structured row an agent wrote deliberately,
-    not free text regex has to guess at. Regex-parsing the commit
+    ``ops/deploy_tickets/<pr>.json`` (written by ``tools/open_pr.py`` at
+    PR-open time) is the **primary** source when the squash/merge subject
+    carries a merged PR number: it is a structured row an agent wrote
+    deliberately, not free text regex has to guess at. When ``commit_sha``
+    is set, the map is read from **that commit's tree** so a ticket row
+    that ships in the same merge is visible *before* overlay (live's
+    working tree is still the previous SHA). Regex-parsing the commit
     subject/body/PR-title text is a **fallback** for pushes with no PR
     number (direct-to-main hotfixes) or a PR that predates the manifest —
     every time that fallback actually contributes an id the manifest did
@@ -2549,20 +2605,25 @@ def parse_deploy_metadata(
     never-auto-closed ticket.
 
     Mixed Fix + Ship bundles collect both id lists. Recognized regex
-    headers include ``Fix bug #N:``, ``Fix in-game bug N:``, and agent PR
-    prose ``Fixes bug report N`` / ``Ships suggestion report N`` (no ``#``).
+    headers include ``Fix bug #N:``, ``Fix in-game bug N:``, ``Fix in-game
+    bugs N and M:``, and agent PR prose ``Fixes bug report N`` /
+    ``Ships suggestion report N`` (no ``#``). GitHub merge-commit subjects
+    ``Merge pull request #N from …`` resolve via the ticket map.
 
     Returns ``(bug_ids, suggestion_ids, summary)``.
     """
+    repo = root or _repo_root()
     subject_line = _first_subject_line(text)
     bug_ids, suggestion_ids, summary = _parse_deploy_text_lines(text)
     regex_found_any = bool(bug_ids or suggestion_ids)
 
     pr_number = _merged_pr_number_from_subject(subject_line) if pr_fallback else None
+    manifest_row = None
     if pr_number:
-        from engine import deploy_pr_ticket_map
-
-        manifest_row = deploy_pr_ticket_map.lookup(pr_number, root=_repo_root())
+        ticket_map = _fresh_ticket_map()
+        manifest_row = _lookup_ticket_row(
+            ticket_map, pr_number, root=repo, commit_sha=commit_sha,
+        )
         if manifest_row:
             manifest_bugs = [
                 int(x) for x in (manifest_row.get("bug_ids") or []) if str(x).isdigit()
@@ -2575,7 +2636,7 @@ def parse_deploy_metadata(
             _merge_ticket_ids(suggestion_ids, manifest_sugs)
             if not summary:
                 summary = (manifest_row.get("summary") or "").strip()
-        elif not regex_found_any:
+        elif not regex_found_any and pr_network:
             print(
                 f"[auto_deploy] no ops/deploy_pr_ticket_map.json row for merged "
                 f"PR #{pr_number} — falling back to regex/GitHub text parsing "
@@ -2585,7 +2646,9 @@ def parse_deploy_metadata(
             )
 
     if pr_fallback and (not bug_ids or not suggestion_ids) and pr_number:
-        pr_text = _fetch_merged_pr_text(pr_number, allow_network=pr_network)
+        pr_text = _fetch_merged_pr_text(
+            pr_number, allow_network=pr_network, root=repo,
+        )
         if pr_text:
             pr_bugs, pr_sugs, pr_summary = _parse_deploy_text_lines(
                 pr_text,
@@ -2616,25 +2679,41 @@ def parse_deploy_metadata(
     return bug_ids, suggestion_ids, summary or default
 
 
-def should_ship_bug_fix(subject: str, *, parent_count: int, file_count: int):
+def should_ship_bug_fix(
+    subject: str,
+    *,
+    parent_count: int,
+    file_count: int,
+    commit_sha: str | None = None,
+    root: str | None = None,
+):
     """Decide whether this tip commit should announce + overlay.
 
     Pure helper (easy to smoke-test). Returns (ship: bool, reason: str).
 
-    Ship only when ALL of:
-      - not a merge commit (parent_count <= 1)
-      - subject parses to at least one Fix bug #N id
-      - the commit actually touches at least one file to overlay
-    Otherwise the caller should advance origin/main silently.
+    Ship when the subject (or ticket map for a merged PR number) parses
+    to at least one Fix/Ship ticket id. Merge commits (parent_count > 1)
+    used to skip unconditionally: ``git diff-tree`` without ``-m`` lists
+    no files, and GitHub merge subjects often mention bug ids in passing.
+    That skipped in-game resolve and the Discord checkmark even when the
+    merge subject *was* a Fix/Ship title (or ``Merge pull request #N``
+    with a ticket-map row). Incidental ``Merge origin/main: … bug #25``
+    still stays silent because it does not parse as a Fix/Ship header.
+
+    Empty single-parent commits still skip (nothing to overlay). Merge
+    tips with ticket ids may ship with file_count 0 — the poll then
+    full-syncs HEAD so resolve/checkmarks still fire.
     """
-    if parent_count > 1:
-        return False, "merge commit -- advance silently"
-    if subject.strip().lower().startswith("merge "):
-        return False, "merge subject -- advance silently"
-    bug_ids, suggestion_ids, _summary = parse_deploy_metadata(subject)
+    bug_ids, suggestion_ids, _summary = parse_deploy_metadata(
+        subject, commit_sha=commit_sha, root=root,
+    )
     if not bug_ids and not suggestion_ids:
+        if parent_count > 1:
+            return False, "merge commit -- advance silently"
+        if subject.strip().lower().startswith("merge "):
+            return False, "merge subject -- advance silently"
         return False, "not a Fix/Ship ticket subject -- advance silently"
-    if file_count <= 0:
+    if file_count <= 0 and parent_count <= 1:
         return False, "no files to overlay -- advance silently"
     if bug_ids:
         if len(bug_ids) == 1:
@@ -2926,6 +3005,8 @@ def _fix_commits_from_shas(root, shas, *, pr_network: bool = True):
         bug_ids, suggestion_ids, summary = parse_deploy_metadata(
             message or subject,
             pr_network=pr_network,
+            commit_sha=sha,
+            root=root,
         )
         if not bug_ids and not suggestion_ids:
             continue
@@ -2970,6 +3051,10 @@ def _deployed_tip_sha(root):
 
 
 BUG_RESOLVE_CACHE_NAME = ".bug_resolve_cache.json"
+# Bump when the heal scan gains a new source (ticket-map union, title
+# parsers). Live caches at the current tip otherwise never rescan, so
+# shipped ideas stay ``open`` forever.
+BUG_RESOLVE_CACHE_VERSION = 3
 
 # ``git log --grep`` terms for fast Fix/Ship scans (not full ``rev-list``).
 _FIX_SHIP_GREP_TERMS = (
@@ -2978,10 +3063,12 @@ _FIX_SHIP_GREP_TERMS = (
     "Fix in-game",
     "Fixes bug",
     "Fixes bug report",
+    "bug report",
     "Ship suggestion",
     "Ship suggestions",
     "Ship player suggestions",
     "Ships suggestion report",
+    "Suggestion QoL",
     "Stop nest dens",
 )
 
@@ -3009,6 +3096,9 @@ def _load_bug_resolve_cache(directory):
             data = json.load(f)
     except (OSError, ValueError, json.JSONDecodeError):
         return {"tip_sha": "", "bug_ids": [], "suggestion_ids": []}
+    # Do not wipe ids when cache_v lags. That forced a full-history Fix/Ship
+    # scan at Game() boot (minutes) and hung boot_probe / copyover. Ticket-map
+    # union on the short-circuit path closes shipped stragglers.
     bug_ids = data.get("bug_ids") or []
     suggestion_ids = data.get("suggestion_ids") or []
     return {
@@ -3025,6 +3115,7 @@ def _save_bug_resolve_cache(
 ):
     path = _bug_resolve_cache_path(directory)
     payload = {
+        "cache_v": BUG_RESOLVE_CACHE_VERSION,
         "tip_sha": tip_sha,
         "bug_ids": sorted({int(x) for x in bug_ids}),
         "suggestion_ids": sorted(
@@ -3052,9 +3143,12 @@ def _collect_merged_pr_ref_shas(git_root, to_sha, *, from_sha=None):
     """Commits whose squash subject ends with ``(#NNNN)`` (PR title may hold bug id)."""
     if not to_sha:
         return []
-    rev_range = to_sha
-    if from_sha and from_sha != to_sha:
-        rev_range = f"{from_sha}..{to_sha}"
+    # Walking every commit subject is minutes on this repo. Ticket maps
+    # cover squash lines that only carry (#PR). Incremental scans still
+    # pick up new messy squashes after the last cached tip.
+    if not from_sha or from_sha == to_sha:
+        return []
+    rev_range = f"{from_sha}..{to_sha}"
     try:
         out = _git(
             "log",
@@ -3161,13 +3255,24 @@ def open_bug_ids(directory="."):
 
 
 def open_suggestion_ids(directory="."):
-    """Return sorted ids of still-open rows in ``suggestions.log``."""
+    """Return sorted ids of still-open (inbox) rows in ``suggestions.log``."""
     from engine import reports
 
     return sorted(
         entry["id"]
         for entry in reports.recent(reports.SUGGEST, None, directory=directory)
         if entry.get("status", "open") == "open"
+    )
+
+
+def unresolved_suggestion_ids(directory="."):
+    """Open or approved idea ids (still in play until shipped or rejected)."""
+    from engine import reports
+
+    return sorted(
+        entry["id"]
+        for entry in reports.recent(reports.SUGGEST, None, directory=directory)
+        if reports.is_active_status(entry.get("status", "open"))
     )
 
 
@@ -3210,6 +3315,11 @@ def refresh_deployed_ticket_id_cache(
     if not tip:
         return bug_ids, suggestion_ids
 
+    from engine import deploy_pr_ticket_map
+
+    mapped_bugs = deploy_pr_ticket_map.all_mapped_bug_ids(git_root)
+    mapped_sugs = deploy_pr_ticket_map.all_mapped_suggestion_ids(git_root)
+
     if cached_tip == tip and bug_ids and not full_rebuild:
         try:
             with open(
@@ -3218,6 +3328,14 @@ def refresh_deployed_ticket_id_cache(
             ) as f:
                 raw = json.load(f)
             if "suggestion_ids" in raw:
+                bug_ids = _merge_bug_id_list(bug_ids, mapped_bugs)
+                suggestion_ids = _merge_bug_id_list(suggestion_ids, mapped_sugs)
+                _save_bug_resolve_cache(
+                    report_directory,
+                    tip_sha=tip,
+                    bug_ids=bug_ids,
+                    suggestion_ids=suggestion_ids,
+                )
                 return bug_ids, suggestion_ids
         except (OSError, ValueError, json.JSONDecodeError):
             pass
@@ -3237,6 +3355,8 @@ def refresh_deployed_ticket_id_cache(
             suggestion_ids, fix.get("suggestion_ids"),
         )
     bug_ids = _merge_bug_id_list(bug_ids, _hook_bug_ids_from_shas(git_root, shas))
+    bug_ids = _merge_bug_id_list(bug_ids, mapped_bugs)
+    suggestion_ids = _merge_bug_id_list(suggestion_ids, mapped_sugs)
     _save_bug_resolve_cache(
         report_directory,
         tip_sha=tip,
@@ -3268,6 +3388,36 @@ def _fresh_deploy_notify():
     import engine.deploy_notify as deploy_notify
 
     return importlib.reload(deploy_notify)
+
+
+def _fresh_ticket_map():
+    """Reload ``engine.deploy_pr_ticket_map`` from disk before lookup.
+
+    Same chicken-and-egg as ``_fresh_deploy_notify``: a long-lived watcher
+    can reload this module (new ``lookup(..., commit_sha=)`` call) while
+    still holding the old ticket-map function (no ``commit_sha`` kwarg).
+    That TypeError aborted catch-up and left shipped tickets open.
+    """
+    import engine.deploy_pr_ticket_map as ticket_map
+
+    return importlib.reload(ticket_map)
+
+
+def _lookup_ticket_row(ticket_map, pr_number, *, root, commit_sha=None):
+    """Call ``lookup`` even when the in-memory function is pre-commit_sha.
+
+    Overlay can land ``auto_deploy.py`` a poll before
+    ``deploy_pr_ticket_map.py``. ``TypeError`` on the new kwarg must not
+    kill the watcher poll -- fall back to the old positional signature.
+    """
+    try:
+        return ticket_map.lookup(
+            pr_number, root=root, commit_sha=commit_sha,
+        )
+    except TypeError as exc:
+        if "commit_sha" not in str(exc):
+            raise
+        return ticket_map.lookup(pr_number, root=root)
 
 
 def _apply_catchup_fix_resolves(root, state, missed_fixes):
@@ -3564,7 +3714,9 @@ def try_auto_deploy():
 
     subject = _commit_subject(remote_sha, root)
     message = _commit_message(remote_sha, root)
-    bug_ids, suggestion_ids, summary = parse_deploy_metadata(message or subject)
+    bug_ids, suggestion_ids, summary = parse_deploy_metadata(
+        message or subject, commit_sha=remote_sha, root=root,
+    )
     countdown = _countdown_seconds()
     missed_fixes = collect_missed_fix_commits(root, prev_sha, remote_sha)
 
@@ -3586,6 +3738,8 @@ def try_auto_deploy():
         message or subject,
         parent_count=parent_count,
         file_count=len(files),
+        commit_sha=remote_sha,
+        root=root,
     )
     if not ship:
         # Feature / non-Fix pushes: Veil countdown, then sync the tree.

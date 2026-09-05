@@ -38,6 +38,35 @@ _OPAQUE_CADENCE_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Personal afterlife pocket keys -- ``Realm:pierre:hub``. Players must
+# never see these as look headers (bug report 1182).
+_REALM_KEY_PREFIX_RE = re.compile(r"^Realm:", re.IGNORECASE)
+
+# Runtime homestead dig keys -- ``Homestead:owner:porch`` or bare
+# ``owner:porch`` after one scope strip. Players must never see these
+# as look headers (bug report 1139: ``tuck:living``, ``tuck:porch``).
+_HOMESTEAD_KEY_PREFIX_RE = re.compile(r"^Homestead:", re.IGNORECASE)
+_PLOT_ZONE_KEY_RE = re.compile(r"^plot:", re.IGNORECASE)
+_HOMESTEAD_SLUG_SUFFIX_RE = re.compile(
+    r"^[a-z0-9][a-z0-9_-]*:[a-z0-9][a-z0-9_-]+$",
+    re.IGNORECASE,
+)
+
+# Common homestead chamber suffixes / remodel_type ids → ROOM NAME.
+_HOMESTEAD_SUFFIX_LABELS = {
+    "living": "Living Room",
+    "living_room": "Living Room",
+    "bedroom": "Bedroom",
+    "porch": "Porch",
+    "kitchen": "Kitchen",
+    "bathroom": "Bathroom",
+    "garage": "Garage",
+    "backyard": "Backyard",
+    "den": "Den",
+    "yard-shop": "Yard Shop",
+    "yard-garage": "Garage",
+}
+
 # Job id → generic Main segment when no authored title is set.
 # Keep ids as plain strings so the engine never imports supers.jobs.
 _JOB_GENERIC_MAIN = {
@@ -95,6 +124,101 @@ def is_opaque_storage_key(key: str) -> bool:
     if not text:
         return False
     return bool(_OPAQUE_CADENCE_KEY_RE.match(text))
+
+
+def is_internal_place_key(text: str) -> bool:
+    """True when ``text`` is a graph id players must never see as ROOM NAME.
+
+    Covers Cadence opaque keys, personal realm dig keys
+    (``Realm:owner:hub``), homestead runtime dig keys
+    (``Homestead:owner:porch``, ``tuck:living``), and plot zone ids
+    (``plot:tuck``). Authored titles like ``Lebanon - Main`` return False.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    if is_opaque_storage_key(raw):
+        return True
+    if _REALM_KEY_PREFIX_RE.match(raw):
+        return True
+    if _HOMESTEAD_KEY_PREFIX_RE.match(raw):
+        return True
+    if _PLOT_ZONE_KEY_RE.match(raw):
+        return True
+    if _HOMESTEAD_SLUG_SUFFIX_RE.match(raw):
+        return True
+    return False
+
+
+def _homestead_suffix_label(suffix: str) -> str | None:
+    """Map a homestead chamber suffix to a short ROOM NAME."""
+    token = str(suffix or "").strip().lower()
+    if not token:
+        return None
+    # Strip numeric collision suffixes (``bedroom-2``).
+    base = token.split("-", 1)[0] if token[0].isalpha() else token
+    label = _HOMESTEAD_SUFFIX_LABELS.get(token) or _HOMESTEAD_SUFFIX_LABELS.get(base)
+    if label:
+        return label
+    # Title-case unknown suffixes (``workshop`` → ``Workshop``).
+    if token.replace("_", " ").replace("-", " ").isalpha():
+        return token.replace("_", " ").replace("-", " ").title()
+    return None
+
+
+def _parse_homestead_suffix(key: str) -> str | None:
+    """Return the chamber suffix from a homestead storage key, if any."""
+    text = str(key or "").strip()
+    if not text:
+        return None
+    if _HOMESTEAD_KEY_PREFIX_RE.match(text):
+        parts = text.split(":", 2)
+        if len(parts) >= 3:
+            return parts[2].strip()
+        return None
+    if _HOMESTEAD_SLUG_SUFFIX_RE.match(text):
+        return text.split(":", 1)[1].strip()
+    return None
+
+
+def derive_room_title_from_context(room) -> str | None:
+    """Invent a player ROOM NAME when dig/VNUM left only internal keys.
+
+    Prefers the room description's first sentence, then ``remodel_type``,
+    then a parsed homestead legacy key suffix. Returns None when nothing
+    useful is stamped on ``room``.
+    """
+    if room is None:
+        return None
+    # Personal Heaven / Hell hubs stamp ``personal_realm_owner`` + plane.
+    owner = str(getattr(room, "personal_realm_owner", None) or "").strip()
+    if owner:
+        plane = str(getattr(room, "plane", None) or "").strip().lower()
+        if plane == "heaven":
+            return f"{owner}'s Heaven"
+        if plane == "hell":
+            return f"{owner}'s Hell"
+        return f"{owner}'s Afterlife"
+    desc = str(getattr(room, "description", "") or "").strip()
+    if desc:
+        first = desc.split(".", 1)[0].strip()
+        if first and not is_internal_place_key(first) and len(first) >= 3:
+            return first
+    rtype = str(getattr(room, "remodel_type", "") or "").strip().lower()
+    if rtype:
+        label = _homestead_suffix_label(rtype)
+        if label:
+            return label
+    for candidate in (
+        getattr(room, "legacy_key", None),
+        getattr(room, "key", None),
+    ):
+        suffix = _parse_homestead_suffix(str(candidate or ""))
+        if suffix:
+            label = _homestead_suffix_label(suffix)
+            if label:
+                return label
+    return None
 
 
 def generic_main_from_flags(room) -> str | None:
@@ -170,7 +294,7 @@ def authored_title_is_usable(title: str, key: str = "") -> bool:
     text = str(title or "").strip()
     if not text:
         return False
-    if is_opaque_storage_key(text):
+    if is_internal_place_key(text):
         return False
     key_s = str(key or "").strip()
     if key_s and text == key_s and is_opaque_storage_key(key_s):

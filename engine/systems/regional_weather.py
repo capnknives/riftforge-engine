@@ -1327,6 +1327,26 @@ def clear_tornadoes(game, *, here_xy=None, clear_all=False):
     return cleared
 
 
+def clear_tornadoes_in_region(game, region_id):
+    """Drop funnels currently sitting in ``region_id``. Returns count cleared."""
+    if not region_id:
+        return 0
+    tracks = _ensure_tornadoes(game)
+    keep = []
+    cleared = 0
+    for t in tracks:
+        mx, my = t.get("macro_xy") or (None, None)
+        if mx is None:
+            keep.append(t)
+            continue
+        if _region_for_macro(game, mx, my) == region_id:
+            cleared += 1
+        else:
+            keep.append(t)
+    game.weather_tornadoes = keep
+    return cleared
+
+
 def _region_for_macro(game, mx, my):
     """Climate region for an atlas cell."""
     pack = get_pack()
@@ -1664,13 +1684,10 @@ def _maybe_flee_indoors(game, track):
 
                     npc_do(ch, f"{_dir}", game)
                 except Exception:
-                    # Fail soft — flee is nice immersion, not required.
-                    try:
-                        room.contents.remove(ch)
-                        dest.contents.append(ch)
-                        ch.location = dest
-                    except Exception:
-                        pass
+                    # HB-13: never assign .location without contents.
+                    from engine.world import safe_place
+
+                    safe_place(ch, dest)
                 break
 
 
@@ -1891,14 +1908,20 @@ def _atmos_line(condition, tornado_near=False):
     return random.choice(pools.get(condition, pools["cloudy"]))
 
 
+def _live_session_characters(game):
+    """Online characters for atmosphere/tornado sweeps (char_index roster)."""
+    from engine.char_index import iter_characters
+
+    return [
+        ch for ch in iter_characters(game)
+        if getattr(ch, "session", None)
+    ]
+
+
 def _tick_atmosphere(game):
     """Sparse per-player outdoor (and severe indoor) weather tells."""
-    world = getattr(game, "world", None)
-    chars = getattr(world, "characters", None) if world else None
-    if not isinstance(chars, dict):
-        return
     ticks = int(getattr(game, "game_time_ticks", 0) or 0)
-    for ch in chars.values():
+    for ch in _live_session_characters(game):
         if not getattr(ch, "session", None):
             continue
         room = getattr(ch, "location", None)

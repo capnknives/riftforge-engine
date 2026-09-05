@@ -16,6 +16,8 @@ from engine import map_ui
 # Player-facing atlas titles (never show raw map_id like earth_america).
 _MAP_TITLES = {
     "earth_america": "America",
+    "earth_gulf": "Gulf",
+    "earth_great_lakes": "Great Lakes",
 }
 
 # SGR 16-color codes used by ATLAS_BG / ATLAS_TOPO_FG / ATLAS_LAYER_FG
@@ -65,7 +67,8 @@ def _sgr_hex(code) -> str:
     return _SGR_HEX.get(n, "#1a1a1a")
 
 
-def _cell_style(area_type, map_glyph, map_layer, *, glyph_set="atlas"):
+def _cell_style(area_type, map_glyph, map_layer, *, glyph_set="atlas",
+                terrain_base=None):
     """Return (glyph, fg_hex, bg_hex) for one atlas cell."""
     area = area_type or "plains"
     glyph = None
@@ -76,14 +79,10 @@ def _cell_style(area_type, map_glyph, map_layer, *, glyph_set="atlas"):
     if not glyph:
         glyph = map_ui._cell_glyph(area, glyph_set=glyph_set)
     if glyph_set == "atlas":
-        bg = _sgr_hex(map_ui.ATLAS_BG.get(area, "40"))
-        layer = str(map_layer or "").strip().lower()
-        if layer:
-            fg_code = map_ui.ATLAS_LAYER_FG.get(layer) or map_ui.ATLAS_TOPO_FG.get(
-                area, "37"
-            )
-        else:
-            fg_code = map_ui.ATLAS_TOPO_FG.get(area, "37")
+        fg_code, bg_code = map_ui.atlas_overlay_sgr(
+            area, map_layer, terrain_base, glyph,
+        )
+        bg = _sgr_hex(bg_code)
         fg = _sgr_hex(fg_code)
     else:
         bg = "#0a0a0a"
@@ -201,6 +200,7 @@ def build_map_payload(character, game, *, include_grid=True):
                     cell.get("map_glyph"),
                     cell.get("map_layer"),
                     glyph_set=glyph_set,
+                    terrain_base=cell.get("terrain_base"),
                 )
                 key = (fg, bg)
                 if key not in pal_index:

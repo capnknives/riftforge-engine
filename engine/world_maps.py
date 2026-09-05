@@ -192,6 +192,8 @@ KNOWN_RESOURCE_TAGS = frozenset({
 PLANES = frozenset({
     "earth", "fire", "water", "air", "stone",
     "heaven", "hell", "purgatory", "dream",
+    "limbo",
+    "avalon",
     "coalescence",
     "riftcrash",
     "stellar", "umbral", "empty",
@@ -212,6 +214,8 @@ REALM_FOR_PLANE = {
     "hell": "spirit",
     "purgatory": "spirit",
     "dream": "spirit",
+    "limbo": "spirit",
+    "avalon": "void",
     "coalescence": "spirit",
     "riftcrash": "pocket",
     "earth_frontierland_1861": "prime",
@@ -408,6 +412,21 @@ def _room_keys_for_map_document(data):
             for y in range(height):
                 keys.add(f"{prefix} ({x}, {y})")
     return keys
+
+
+def _map_document_is_required(filename, data):
+    """True when a link failure must fail boot instead of dropping rooms.
+
+    Start-room files and the America atlas are required geography. WIP
+    optional maps may keep rooms with a broken exit rather than vanish.
+    """
+    base = os.path.basename(filename or "")
+    if base in ("earth_america.json",):
+        return True
+    for room_data in data.get("rooms") or []:
+        if isinstance(room_data, dict) and room_data.get("is_start"):
+            return True
+    return False
 
 
 def _purge_map_document_from_world(
@@ -796,6 +815,22 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
     if map_layer is not None:
         layer = str(map_layer).strip().lower()
         room.map_layer = layer or None
+    # Land under a highway / trail overlay (atlas fill color).
+    if game_fields and game_fields.get("terrain_base"):
+        base = str(game_fields.get("terrain_base") or "").strip().lower()
+        room.terrain_base = base or None
+    # HUD-only void-margin water tint (earth_america); sim area_type stays void.
+    if game_fields and game_fields.get("water_view"):
+        room.water_view = True
+    if game_fields and game_fields.get("land_view"):
+        room.land_view = True
+    if game_fields and game_fields.get("max_water_band") is not None:
+        try:
+            room.max_water_band = int(game_fields["max_water_band"])
+        except (TypeError, ValueError):
+            pass
+    if game_fields and game_fields.get("highland"):
+        room.highland = True
     if glyph_set is not None:
         gs = str(glyph_set).strip().lower()
         room.glyph_set = gs or None
@@ -1044,7 +1079,16 @@ def validate_grid_block(grid, *, where):
         raise ValueError(f"{where}: grid.width must be a positive int")
     if not isinstance(height, int) or isinstance(height, bool) or height <= 0:
         raise ValueError(f"{where}: grid.height must be a positive int")
-    from engine.atlas_layers import ROAD_GLYPHS, TERRAIN_GLYPH_TO_AREA, validate_layer_rows
+    from engine.atlas_layers import (
+        DEPTH_BAND_GLYPHS,
+        HIGHLAND_GLYPHS,
+        LAND_VIEW_GLYPHS,
+        RIVER_GLYPHS,
+        ROAD_GLYPHS,
+        TERRAIN_GLYPH_TO_AREA,
+        WATER_VIEW_GLYPHS,
+        validate_layer_rows,
+    )
     validate_layer_rows(
         grid.get("terrain_rows"), width, height,
         name="terrain_rows", where=where,
@@ -1054,6 +1098,31 @@ def validate_grid_block(grid, *, where):
         grid.get("road_rows"), width, height,
         name="road_rows", where=where,
         allowed=set(ROAD_GLYPHS) | {" "},
+    )
+    validate_layer_rows(
+        grid.get("water_view_rows"), width, height,
+        name="water_view_rows", where=where,
+        allowed=set(WATER_VIEW_GLYPHS) | {" "},
+    )
+    validate_layer_rows(
+        grid.get("land_view_rows"), width, height,
+        name="land_view_rows", where=where,
+        allowed=set(LAND_VIEW_GLYPHS) | {" "},
+    )
+    validate_layer_rows(
+        grid.get("river_rows"), width, height,
+        name="river_rows", where=where,
+        allowed=set(RIVER_GLYPHS) | {" "},
+    )
+    validate_layer_rows(
+        grid.get("depth_rows"), width, height,
+        name="depth_rows", where=where,
+        allowed=set(DEPTH_BAND_GLYPHS) | {" "},
+    )
+    validate_layer_rows(
+        grid.get("highland_rows"), width, height,
+        name="highland_rows", where=where,
+        allowed=set(HIGHLAND_GLYPHS) | {" "},
     )
 
 
@@ -1186,6 +1255,13 @@ def _build_grid(rooms, filename, grid, plane=None, realm=None, map_id=None):
                         x, y,
                         default_description,
                     )
+            from engine.systems.mine_graph import with_mine_country_tell
+
+            description = with_mine_country_tell(
+                description,
+                cell_area_type,
+                highland=bool(override.get("highland")),
+            )
             # Per-cell cover / flag stamps (Area Studio + hand JSON): when
             # a cell_overrides entry sets wilderness/outdoor/resources/
             # spawn_nest/… those punch through the grid-wide defaults the
@@ -1991,9 +2067,14 @@ def load_all_maps(*, include_deferred=False):
             _link_pockets(rooms, filename, data)
         except ValueError as exc:
             print(f"[boot] SKIP {filename}: {exc}", flush=True)
-            _purge_map_document_from_world(
-                rooms, registry, seed_items, start_room_holder,
-                filename, data,
+            # Do not delete every room in the file (HB-03). Required maps
+            # fail boot; others keep rooms and leave the bad exit unlinked.
+            if _map_document_is_required(filename, data):
+                raise
+            print(
+                f"[boot] keeping rooms from {filename} after link error "
+                f"(no whole-file purge)",
+                flush=True,
             )
     start_room = start_room_holder[0]
 

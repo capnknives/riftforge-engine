@@ -1,9 +1,10 @@
 """
 containers.py -- worn kit/loot bags, open-inventory stack cap, home stash.
 
-Players wear up to two bag Items (back + shoulder): one designated gear
-bag (job kit) and one general loot bag. Open inventory holds at most
-OPEN_INVENTORY_CAPACITY distinct *stacks* (ammo piles count as one).
+Players wear up to three bag Items (back + shoulder + hip): one designated
+gear bag (job kit), one general loot bag, and one profession satchel.
+Open inventory holds at most OPEN_INVENTORY_CAPACITY distinct *stacks*
+(ammo piles count as one).
 
 Pure logic: no networking.
 """
@@ -16,7 +17,8 @@ from engine.style import strip_ansi
 from engine import hooks as hooks_mod
 
 OPEN_INVENTORY_CAPACITY = 20
-CONTAINER_SLOTS = ("back", "shoulder")
+CONTAINER_SLOTS = ("back", "shoulder", "hip")
+HIP_SLOT = "hip"
 STARTER_KIT_BAG_ID = "starter_kit_bag"
 CANVAS_LOOT_BAG_ID = "canvas_loot_bag"
 DEFAULT_BAG_CAPACITY = 20
@@ -36,8 +38,8 @@ AMMO_GEAR_IDS = frozenset({
 
 OPEN_FULL = (
     "Your hands are full "
-    f"({OPEN_INVENTORY_CAPACITY} stacks). Stow something, wear a backpack, "
-    "or drop gear."
+    f"({OPEN_INVENTORY_CAPACITY} stacks). Stow something, wear a backpack "
+    "or satchel, or drop gear."
 )
 LOOT_BAG_HANDS_FULL = (
     "Your hands are full "
@@ -66,9 +68,9 @@ NO_GEAR_BAG = (
     "You need a kit bag on your back or shoulder for that "
     "(see 'help gear')."
 )
-BAG_SLOT_FULL = "That shoulder is already taken by another bag."
+BAG_SLOT_FULL = "That slot is already taken by another bag."
 BAG_NOT_WORN = "You aren't wearing that bag."
-BAG_WRONG_SLOT = "Bags only go on your back or shoulder."
+BAG_WRONG_SLOT = "Bags go on your back, shoulder, or hip."
 STOW_NOT_CARRIED = "You aren't carrying that."
 STOW_NOT_IN_LOOT_BAG = "That isn't in your backpack."
 STOW_NOT_GEAR_LOOT = (
@@ -93,13 +95,18 @@ _ARMOR_SLOTS = frozenset({
 })
 
 
+def empty_containers_map():
+    """Fresh back / shoulder / hip map (wallet pocket is separate)."""
+    return {slot: None for slot in CONTAINER_SLOTS}
+
+
 def ensure_containers_map(character):
-    """Return ``character.containers`` as a back/shoulder dict."""
+    """Return ``character.containers`` as a back/shoulder/hip dict."""
     if character is None:
-        return {"back": None, "shoulder": None}
+        return empty_containers_map()
     raw = getattr(character, "containers", None)
     if not isinstance(raw, dict):
-        character.containers = {"back": None, "shoulder": None}
+        character.containers = empty_containers_map()
         return character.containers
     for slot in CONTAINER_SLOTS:
         raw.setdefault(slot, None)
@@ -394,11 +401,26 @@ def bag_would_add_slot(contents, item, viewer, capacity):
 
 
 def designated_loot_bag(character):
-    """Worn general loot/backpack Item (not the job kit bag), or None."""
+    """Worn general loot/backpack Item (not kit or hip satchel), or None."""
     for slot in CONTAINER_SLOTS:
         bag = ensure_containers_map(character).get(slot)
-        if bag is not None and not is_gear_bag_item(bag):
-            return bag
+        if bag is None:
+            continue
+        if is_gear_bag_item(bag):
+            continue
+        try:
+            satchel_item = hooks_mod.containers_is_profession_bag_item(bag)
+        except Exception:
+            satchel_item = False
+        if satchel_item:
+            continue
+        try:
+            weave_item = hooks_mod.containers_is_weave_bag_item(bag)
+        except Exception:
+            weave_item = False
+        if weave_item:
+            continue
+        return bag
     return None
 
 
@@ -423,6 +445,8 @@ def resolve_loot_bag(character, query):
     if character is None:
         return None
     raw = (query or "").strip()
+    if hooks_mod.containers_is_generic_weave_query(raw):
+        return hooks_mod.containers_active_weave_bag(character)
     if not raw or is_generic_loot_bag_query(raw):
         return designated_loot_bag(character)
     inv = list(getattr(character, "inventory", None) or [])
@@ -482,8 +506,6 @@ def stow_all_in_loot_bag(character, *, loot_bag=None, predicate=None):
     if bag is None:
         return False, NO_LOOT_BAG
     inv = getattr(character, "inventory", None) or []
-    from engine import hooks as hooks_mod
-
     candidates = [
         piece
         for piece in list(inv)
@@ -503,7 +525,48 @@ def stow_all_in_loot_bag(character, *, loot_bag=None, predicate=None):
             names.append(piece.key)
     if not names:
         return False, "Nothing in your inventory fits in your backpack."
-    return True, f"You stow in {bag.key}: " + ", ".join(names) + "."
+    from command_support import format_item_tally
+
+    return True, f"You stow in {bag.key}: {format_item_tally(names)}."
+
+
+def stow_count_in_loot_bag(character, count, *, loot_bag=None, predicate=None):
+    """Stow up to *count* loose inventory rows into the loot backpack.
+
+    Same gates as ``stow_all_in_loot_bag``. ``predicate(item)`` limits
+    which rows count (name match). Used by ``put 10 salt in backpack``.
+    """
+    try:
+        want = int(count)
+    except (TypeError, ValueError):
+        want = 1
+    want = max(1, want)
+    bag = loot_bag if loot_bag is not None else designated_loot_bag(character)
+    if bag is None:
+        return False, NO_LOOT_BAG
+    inv = getattr(character, "inventory", None) or []
+    candidates = [
+        piece
+        for piece in list(inv)
+        if not hooks_mod.containers_item_worn_on_body(character, piece)
+        and not is_bag_item(piece)
+    ]
+    if predicate is not None:
+        candidates = [piece for piece in candidates if predicate(piece)]
+    if not candidates:
+        if predicate is not None:
+            return False, "You aren't carrying anything like that to stow."
+        return False, "You aren't carrying anything to stow."
+    names = []
+    for piece in candidates[:want]:
+        ok, _msg = stow_in_loot_bag(character, piece, loot_bag=bag)
+        if ok:
+            names.append(piece.key)
+    if not names:
+        return False, "Nothing in your inventory fits in your backpack."
+    from command_support import format_item_tally
+
+    return True, f"You stow in {bag.key}: {format_item_tally(names)}."
 
 
 def unstow_from_loot_bag(character, item, *, loot_bag=None):
@@ -544,7 +607,48 @@ def unstow_all_from_loot_bag(character, *, loot_bag=None):
             names.append(piece.key)
     if not names:
         return False, "Your backpack is empty."
-    return True, f"You pull from {bag.key}: " + ", ".join(names) + "."
+    from command_support import format_item_tally
+
+    return True, f"You pull from {bag.key}: {format_item_tally(names)}."
+
+
+def unstow_count_from_loot_bag(character, count, *, loot_bag=None, needle=""):
+    """Pull up to *count* items from the loot backpack onto open inventory.
+
+    ``needle`` is a name fragment (``salt``). Empty needle takes the first
+    rows in bag order. Used by ``get 10 from backpack``.
+    """
+    try:
+        want = int(count)
+    except (TypeError, ValueError):
+        want = 1
+    want = max(1, want)
+    bag = loot_bag if loot_bag is not None else designated_loot_bag(character)
+    if bag is None:
+        return False, NO_LOOT_BAG
+    frag = (needle or "").strip()
+    names = []
+    for _attempt in range(want):
+        if frag:
+            piece = find_in_loot_bag(character, frag, loot_bag=bag)
+        else:
+            contents = bag_contents(bag)
+            piece = contents[0] if contents else None
+        if piece is None:
+            break
+        ok, msg = unstow_from_loot_bag(character, piece, loot_bag=bag)
+        if not ok:
+            if not names:
+                return False, msg
+            break
+        names.append(piece.key)
+    if not names:
+        if frag:
+            return False, f"You don't find that in {bag.key}."
+        return False, "Your backpack is empty."
+    from command_support import format_item_tally
+
+    return True, f"You pull from {bag.key}: {format_item_tally(names)}."
 
 
 def loot_bag_refusal(character, item, *, loot_bag=None):
@@ -617,13 +721,13 @@ def _item_stack_merge_eligible(item):
 
     Reagents and gather crumbs stack. Weapons and armor never merge -- even
     when catalog metadata is thin after map spawn (bug reports 329 / 350).
-    Locked containers with their own loot tables (dungeon / pit strongboxes)
-    must stay separate rows -- merging folds ``stack_charges`` onto one Item
-    and discards the merged copy's loot (bug report 488).
+    Reward containers with loot tables (locked pit strongboxes, lockpicked
+    boxes, corpses) must stay separate rows -- merging folds ``stack_charges``
+    onto one Item and discards the merged copy's loot (bug reports 488 / 1058).
     """
     if item is None:
         return False
-    if getattr(item, "locked", False) and getattr(item, "loot", None):
+    if getattr(item, "loot", None):
         return False
     if item_carry_size(item) != "small":
         return False
@@ -667,6 +771,17 @@ def route_acquired_item(character, item):
     if inv is None:
         character.inventory = []
         inv = character.inventory
+    if dest == "profession":
+        bag_item = hooks_mod.containers_matching_profession_bag(character, item)
+        if bag_item is None:
+            _ensure_open_inventory_holds(character, item)
+            return None
+        if item in inv:
+            inv.remove(item)
+        bag_contents(bag_item).append(item)
+        return (
+            f"You tuck {item.key} into your satchel. Type 'satchel' to look."
+        )
     if dest == "gear":
         bag_item = designated_gear_bag(character)
         if bag_item is None:
@@ -698,9 +813,11 @@ def route_acquired_item(character, item):
 
 
 def placement_destination(character, item):
-    """Where a pickup would land: ``gear``, ``hands``, ``loot``, or None."""
+    """Where a pickup would land: profession, gear, hands, loot, or None."""
     if character is None or item is None:
         return None
+    if hooks_mod.containers_matching_profession_bag(character, item) is not None:
+        return "profession"
     if hooks_mod.containers_is_gear_item(item):
         if designated_gear_bag(character) is None:
             return None
@@ -831,8 +948,6 @@ def _remove_carried_item(character, item):
 
 def _plain_carried_item_text(item, attr, fallback):
     """Return a safe plain string for stack peels and persistence."""
-    from engine import hooks as hooks_mod
-
     val = getattr(item, attr, None)
     if isinstance(val, str):
         text = val.strip()
@@ -895,6 +1010,25 @@ def _spawn_single_stack_unit(item):
     return unit
 
 
+def return_carried_unit(character, item):
+    """Put a peeled unit back after a failed sell or payout.
+
+    Prefers merging into an existing stack (hands or worn bags). If nothing
+    matches, appends to open inventory even when the stack cap is full --
+    destroying the ware is worse than a temporary overflow.
+    """
+    if character is None or item is None:
+        return
+    if try_merge_carried_stack(character, item):
+        return
+    inv = getattr(character, "inventory", None)
+    if inv is None:
+        character.inventory = []
+        inv = character.inventory
+    if item not in inv:
+        inv.append(item)
+
+
 def peel_one_carried_unit(character, item):
     """Remove one logical unit from a carried row; return the detached Item.
 
@@ -933,12 +1067,23 @@ def try_merge_carried_stack(character, item, *, dest=None):
     # Open-inventory slot math applies only to surface ``hands`` routing.
     # Gear and loot bags merge against their own contents — otherwise every
     # reagent/ammo pickup spawns a new row (Dean's kit bag bloat).
-    if dest not in ("gear", "loot") and open_inventory_would_add_stack(
+    if dest not in ("gear", "loot", "profession") and open_inventory_would_add_stack(
         character, item,
     ):
         return False
     if dest == "gear":
         bag = designated_gear_bag(character)
+        if bag is None:
+            return False
+        existing = _find_matching_stack_item(
+            bag_contents(bag), item, character,
+        )
+        if existing is None:
+            return False
+        _merge_stack_items(existing, item)
+        return True
+    if dest == "profession":
+        bag = hooks_mod.containers_matching_profession_bag(character, item)
         if bag is None:
             return False
         existing = _find_matching_stack_item(
@@ -1037,7 +1182,7 @@ def designated_gear_bag(character):
 
 
 def worn_bags(character):
-    """List of worn bag Items (back then shoulder)."""
+    """List of worn bag Items (back, shoulder, then hip)."""
     out = []
     for slot in CONTAINER_SLOTS:
         bag = ensure_containers_map(character).get(slot)
@@ -1073,7 +1218,10 @@ def make_starter_kit_bag(where="kit"):
 
 
 def wear_bag(character, bag_item, slot):
-    """Wear ``bag_item`` on ``slot`` ('back' or 'shoulder').
+    """Wear ``bag_item`` on ``slot`` ('back', 'shoulder', or 'hip').
+
+    Profession satchels belong on hip. Kit bags stay back/shoulder.
+    Permanent bound-pocket bags may use any of the three slots.
 
     Returns (ok, message).
     """
@@ -1087,12 +1235,27 @@ def wear_bag(character, bag_item, slot):
     inv = getattr(character, "inventory", None) or []
     if bag_item not in inv:
         return False, "You aren't carrying that."
+    is_satchel = hooks_mod.containers_is_profession_bag_item(bag_item)
+    is_extradim = hooks_mod.containers_is_extradim_bag_item(bag_item)
+    if is_satchel and slot != HIP_SLOT and not is_extradim:
+        return False, (
+            "Profession satchels sling on your hip. Try 'wear <satchel>' "
+            "or 'restring hip' (help satchels)."
+        )
+    if is_gear_bag_item(bag_item) and slot == HIP_SLOT:
+        return False, (
+            "Kit bags stay on your back or shoulder (help gear)."
+        )
     containers = ensure_containers_map(character)
     # Only one gear bag per character.
     if is_gear_bag_item(bag_item):
         other = designated_gear_bag(character)
         if other is not None and other is not bag_item:
             return False, "You already wear a kit bag -- remove it first."
+    if is_satchel:
+        other = satchel_mod.designated_profession_bag(character)
+        if other is not None and other is not bag_item:
+            return False, "You already wear a satchel -- remove it first."
     occupied = containers.get(slot)
     if occupied is not None and occupied is not bag_item:
         return False, BAG_SLOT_FULL
@@ -1102,6 +1265,8 @@ def wear_bag(character, bag_item, slot):
             containers[name] = None
     containers[slot] = bag_item
     bag_item.container_worn = slot
+    if slot == HIP_SLOT:
+        return True, f"You sling {bag_item.key} at your hip."
     return True, f"You sling {bag_item.key} over your {slot}."
 
 
@@ -1122,7 +1287,7 @@ def remove_bag(character, bag_item):
 
 
 def move_bag_slot(character, bag_item, slot):
-    """Restring a worn bag between back and shoulder."""
+    """Restring a worn bag between back, shoulder, and hip."""
     if bag_item is None:
         return False, BAG_NOT_WORN
     if getattr(bag_item, "container_worn", None) is None:
@@ -1135,7 +1300,7 @@ def rebind_containers_from_inventory(character):
     """Rebuild ``character.containers`` from ``container_worn`` flags."""
     if character is None:
         return
-    containers = {"back": None, "shoulder": None}
+    containers = empty_containers_map()
     for piece in list(getattr(character, "inventory", None) or []):
         if not is_bag_item(piece):
             continue
@@ -1450,8 +1615,325 @@ def stash_list_lines(character):
     consolidate_home_stash_stacks(character)
     lines = ["Home stash (claimed residence only)."]
     if not stash:
+        lines.append("Loose pile: empty.")
+    else:
+        lines.append("Loose pile:")
+        lines.extend(hooks_mod.containers_stacked_carry_lines(stash, character))
+    boxes = ensure_home_boxes(character)
+    if not boxes:
+        lines.append(
+            "No labeled crates yet. Type stash label <name> to start one "
+            "(help stash)."
+        )
+        return lines
+    lines.append(f"Labeled crates ({len(boxes)}/{MAX_HOME_BOXES}):")
+    for box in boxes:
+        label = box_label(box)
+        count = len(box_contents(box))
+        lines.append(f"  {label} -- {count} item(s)")
+    lines.append("Type stash list <crate> to look inside one crate.")
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Labeled home crates + important-tag routing (Slice 3+ leftover)
+# ---------------------------------------------------------------------------
+
+MAX_HOME_BOXES = 8
+HOME_BOX_CAPACITY = 100
+
+
+def ensure_home_boxes(character):
+    """Mutable list of labeled crate dicts on the character."""
+    if character is None:
+        return []
+    boxes = getattr(character, "home_boxes", None)
+    if boxes is None or not isinstance(boxes, list):
+        character.home_boxes = []
+        return character.home_boxes
+    # Mutate in place -- callers may keep this list and append after a
+    # find_home_box pass, which also calls ensure. Replacing the list
+    # would drop those appends.
+    kept = []
+    for raw in list(boxes):
+        if not isinstance(raw, dict):
+            continue
+        raw.setdefault("key", f"box_{len(kept) + 1}")
+        raw.setdefault("label", "crate")
+        contents = raw.get("contents")
+        if contents is None or not isinstance(contents, list):
+            raw["contents"] = []
+        kept.append(raw)
+    boxes[:] = kept
+    return boxes
+
+
+def box_label(box):
+    """Player-facing crate name."""
+    if not isinstance(box, dict):
+        return "crate"
+    text = str(box.get("label") or "crate").strip()
+    return text or "crate"
+
+
+def box_contents(box):
+    """Mutable item list inside one crate dict."""
+    if not isinstance(box, dict):
+        return []
+    contents = box.get("contents")
+    if contents is None or not isinstance(contents, list):
+        box["contents"] = []
+    return box["contents"]
+
+
+def _fold_box_label(text):
+    """Fold spaces and hyphens so players can type crate names aloud."""
+    raw = " ".join(str(text or "").strip().lower().split())
+    return raw.replace("-", " ")
+
+
+def find_home_box(character, needle):
+    """Match a crate by label (spaces and hyphens fold the same)."""
+    want = _fold_box_label(needle)
+    if not want:
+        return None
+    for box in ensure_home_boxes(character):
+        if _fold_box_label(box_label(box)) == want:
+            return box
+    for box in ensure_home_boxes(character):
+        label = _fold_box_label(box_label(box))
+        if label.startswith(want) or want in label.split():
+            return box
+    return None
+
+
+def create_home_box(character, label):
+    """Start a new labeled crate. Returns (ok, message, box)."""
+    text = " ".join(str(label or "").strip().split())
+    if not text:
+        return False, "Name the crate -- try stash label hunt kit.", None
+    if len(text) > 24:
+        return False, "Crate names stay short (24 letters or fewer).", None
+    boxes = ensure_home_boxes(character)
+    if find_home_box(character, text) is not None:
+        return False, f"You already have a crate labeled {text}.", None
+    if len(boxes) >= MAX_HOME_BOXES:
+        return False, (
+            f"You only have room for {MAX_HOME_BOXES} labeled crates. "
+            "Empty and drop one before starting another."
+        ), None
+    box = {
+        "key": f"box_{len(boxes) + 1}",
+        "label": text,
+        "contents": [],
+    }
+    boxes.append(box)
+    return True, f"You set aside a crate and label it {text}.", box
+
+
+def relabel_home_box(character, needle, new_label):
+    """Rename an existing crate."""
+    box = find_home_box(character, needle)
+    if box is None:
+        return False, "You do not have a crate by that name."
+    text = " ".join(str(new_label or "").strip().split())
+    if not text:
+        return False, "Rename it to what?"
+    if len(text) > 24:
+        return False, "Crate names stay short (24 letters or fewer)."
+    other = find_home_box(character, text)
+    if other is not None and other is not box:
+        return False, f"You already have a crate labeled {text}."
+    old = box_label(box)
+    box["label"] = text
+    return True, f"You scratch out {old} and write {text}."
+
+
+def is_important_item(item):
+    """True when the player tagged this piece to send home first."""
+    return bool(item is not None and getattr(item, "important", False))
+
+
+def set_item_important(item, flagged):
+    """Stamp or clear the important tag on a live Item."""
+    if item is None:
+        return False
+    item.important = bool(flagged)
+    return True
+
+
+def _iter_markable_items(character):
+    """Carried, bagged, equipped, and loose-stash pieces the player can tag."""
+    seen = []
+    for piece in list(getattr(character, "inventory", None) or []):
+        if piece is not None and piece not in seen:
+            seen.append(piece)
+            yield piece
+    for bag in worn_bags(character):
+        for piece in list(bag_contents(bag)):
+            if piece is not None and piece not in seen:
+                seen.append(piece)
+                yield piece
+    equipment = getattr(character, "equipment", None) or {}
+    if isinstance(equipment, dict):
+        for piece in equipment.values():
+            if piece is not None and piece not in seen:
+                seen.append(piece)
+                yield piece
+    for piece in list(ensure_home_stash(character)):
+        if piece is not None and piece not in seen:
+            seen.append(piece)
+            yield piece
+    for box in ensure_home_boxes(character):
+        for piece in list(box_contents(box)):
+            if piece is not None and piece not in seen:
+                seen.append(piece)
+                yield piece
+
+
+def find_markable_item(character, needle):
+    """Resolve a mark/unmark target from carry, bags, wear, or home crates."""
+    from command_support import _find_item
+
+    pool = list(_iter_markable_items(character))
+    return _find_item(needle, pool, character=character)
+
+
+def mark_item_important(character, needle, flagged=True):
+    """Tag or untag a piece the player can currently reach."""
+    item = find_markable_item(character, needle)
+    if item is None:
+        return False, "You do not have that to mark."
+    set_item_important(item, flagged)
+    if flagged:
+        return True, f"You mark {item.key} as important -- stash important sends it home first."
+    return True, f"You clear the important mark from {item.key}."
+
+
+def stash_in_box(character, item, box, game):
+    """Move one carried or loose-stash item into a labeled crate."""
+    if character is None or item is None or box is None:
+        return False, "You aren't carrying that."
+    room = getattr(character, "location", None)
+    if not hooks_mod.containers_room_is_character_home(character, room, game):
+        return False, "You can only stash things at your claimed home."
+    refuse = hooks_mod.containers_on_body_carry_refusal(character, item)
+    if refuse:
+        return False, refuse
+    if getattr(item, "container_worn", None):
+        return False, "Remove the bag from your shoulder first."
+    contents = box_contents(box)
+    if len(contents) >= HOME_BOX_CAPACITY:
+        return False, f"The {box_label(box)} crate is full."
+    removed = False
+    inv = getattr(character, "inventory", None) or []
+    if item in inv:
+        inv.remove(item)
+        removed = True
+    if not removed:
+        for bag in worn_bags(character):
+            if is_gear_bag_item(bag):
+                continue
+            bag_list = bag_contents(bag)
+            if item in bag_list:
+                bag_list.remove(item)
+                removed = True
+                break
+    if not removed:
+        loose = ensure_home_stash(character)
+        if item in loose:
+            loose.remove(item)
+            removed = True
+    if not removed:
+        bag_list = hooks_mod.containers_ensure_gear_bag(character)
+        if item in bag_list:
+            bag_list.remove(item)
+            removed = True
+    if not removed:
+        return False, "You aren't carrying that."
+    contents.append(item)
+    consolidate_item_list_stacks(contents, character)
+    return True, f"You tuck {item.key} into the {box_label(box)} crate."
+
+
+def retrieve_from_box(character, needle, box, game):
+    """Pull one item from a labeled crate into open inventory."""
+    from command_support import _find_item
+
+    room = getattr(character, "location", None)
+    if not hooks_mod.containers_room_is_character_home(character, room, game):
+        return False, "You can only retrieve stash at your claimed home."
+    contents = box_contents(box)
+    item = _find_item(needle, contents)
+    if item is None:
+        return False, f"That is not in the {box_label(box)} crate."
+    refusal = acquire_refusal(character, item)
+    if refusal:
+        return False, refusal
+    contents.remove(item)
+    inv = getattr(character, "inventory", None)
+    if inv is None:
+        character.inventory = []
+        inv = character.inventory
+    inv.append(item)
+    from engine import hooks
+    stow_msg = hooks.after_acquire_item(character, item)
+    msg = f"You retrieve {item.key} from the {box_label(box)} crate."
+    if stow_msg:
+        msg = f"{msg} {stow_msg}"
+    return True, msg
+
+
+def box_list_lines(character, box):
+    """Lines for ``stash list <crate>``."""
+    consolidate_item_list_stacks(box_contents(box), character)
+    contents = box_contents(box)
+    lines = [f"Crate: {box_label(box)} ({len(contents)}/{HOME_BOX_CAPACITY})."]
+    if not contents:
         lines.append("Empty.")
         return lines
     lines.append("Contents:")
-    lines.extend(hooks_mod.containers_stacked_carry_lines(stash, character))
+    lines.extend(hooks_mod.containers_stacked_carry_lines(contents, character))
     return lines
+
+
+def stash_important_at_home(character, game):
+    """Send tagged pieces from hands and loot bag into the loose home pile."""
+    room = getattr(character, "location", None)
+    if not hooks_mod.containers_room_is_character_home(character, room, game):
+        return False, "You can only stash things at your claimed home."
+    moved = 0
+    skipped = 0
+    candidates = []
+    for piece in list(getattr(character, "inventory", None) or []):
+        if is_important_item(piece):
+            candidates.append(piece)
+    for bag in worn_bags(character):
+        if is_gear_bag_item(bag):
+            continue
+        for piece in list(bag_contents(bag)):
+            if is_important_item(piece):
+                candidates.append(piece)
+    for piece in candidates:
+        refuse = hooks_mod.containers_on_body_carry_refusal(character, piece)
+        if refuse:
+            skipped += 1
+            continue
+        ok, _msg = stash_at_home(character, piece, game)
+        if ok:
+            moved += 1
+        else:
+            skipped += 1
+    if moved and skipped:
+        return True, (
+            f"You stash {moved} important thing(s) at home "
+            f"({skipped} still on you -- unequip or unstow first)."
+        )
+    if moved:
+        return True, f"You stash {moved} important thing(s) at home."
+    if skipped:
+        return False, (
+            "Those important pieces are still on your body. "
+            "Unequip or unstow them, then try stash important again."
+        )
+    return False, "Nothing marked important is loose in your hands or backpack."

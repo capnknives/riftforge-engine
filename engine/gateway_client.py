@@ -306,6 +306,7 @@ class GatewayBridge:
         ooc_face: Optional[str] = None,
         head_gm: bool = False,
         staff_gm: bool = False,
+        gmcp_supports: Optional[dict] = None,
     ) -> None:
         """Tell the gateway this sid is logged in as name (for reattach)."""
         msg = {"op": "bound", "sid": session_id, "name": name}
@@ -315,7 +316,22 @@ class GatewayBridge:
             msg["head_gm"] = True
         if staff_gm:
             msg["staff_gm"] = True
+        if isinstance(gmcp_supports, dict) and gmcp_supports:
+            msg["gmcp_supports"] = dict(gmcp_supports)
         await self.send_frame(encode_ctrl(msg))
+
+    async def notify_gmcp_supports(
+        self, session_id: str, gmcp_supports: dict
+    ) -> None:
+        """Stash telnet Core.Supports on the gateway slot (copyover reattach)."""
+        mapping = dict(gmcp_supports or {})
+        await self.send_frame(
+            encode_ctrl({
+                "op": "gmcp_supports",
+                "sid": session_id,
+                "gmcp_supports": mapping,
+            })
+        )
 
     async def notify_unbound(self, session_id: str) -> None:
         """Clear the bound name (logout / mid-login reset)."""
@@ -531,8 +547,12 @@ class GatewayBridge:
                     continue
                 name = entry.get("name")
                 peer = entry.get("peer")
+                gmcp_supports = entry.get("gmcp_supports")
                 await self._open_session(
-                    sid, reattach_name=name, peer_host=peer
+                    sid,
+                    reattach_name=name,
+                    peer_host=peer,
+                    gmcp_supports=gmcp_supports,
                 )
             if held:
                 await self._wait_gateway_copyover_sessions()
@@ -562,12 +582,42 @@ class GatewayBridge:
                 await self._close_session(sid, client_gone=True)
         elif op == "pong":
             pass
+        elif op == "chat_stitch_import":
+            from engine import channels
+
+            payload = msg.get("channels") or {}
+            mode = str(msg.get("mode") or "").strip().lower()
+            if isinstance(payload, dict) and payload:
+                count = channels.sync_gateway_stitch_channels(
+                    self.game, payload, mode=mode,
+                )
+                if count:
+                    print(
+                        f"[gateway_client] synced {count} gateway stitch "
+                        f"channel line(s) after copyover ({mode or 'append'})",
+                        flush=True,
+                    )
+                    try:
+                        self.game.save()
+                    except Exception as exc:
+                        print(
+                            f"[gateway_client] stitch import save retrying: {exc!r}",
+                            flush=True,
+                        )
+                        try:
+                            self.game.save()
+                        except Exception as exc2:
+                            print(
+                                f"[gateway_client] stitch import save failed: {exc2!r}",
+                                flush=True,
+                            )
 
     async def _open_session(
         self,
         session_id: str,
         reattach_name: Optional[str],
         peer_host: Optional[str] = None,
+        gmcp_supports: Optional[dict] = None,
     ) -> None:
         """Create a Session for a held client (new or reattach)."""
         if session_id in self._sessions:
@@ -585,6 +635,8 @@ class GatewayBridge:
         # Reattach: skip login if we have a name and the character exists.
         if reattach_name:
             session._gateway_reattach_name = reattach_name
+        if isinstance(gmcp_supports, dict) and gmcp_supports:
+            session._gateway_reattach_gmcp_supports = dict(gmcp_supports)
         task = asyncio.create_task(
             self._run_session(session_id, session),
             name=f"gateway-session-{session_id[:8]}",

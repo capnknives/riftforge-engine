@@ -32,15 +32,21 @@ def diagnose_help_lookup(character, game, query):
         return out
 
     if verb == "gmtopics":
-        out["stage"] = "index" if is_gm_viewer else "miss"
-        out["title"] = "help gmtopics (A-Z)" if is_gm_viewer else verb
+        out["stage"] = "gmhelp_redirect" if is_gm_viewer else "miss"
+        out["title"] = "gmhelp topics" if is_gm_viewer else verb
         return out
 
+    topics = get_help_topics() or {}
     db = getattr(game, "db", None) if game is not None else None
+    from engine import help_overlay_mode as help_overlay_mode_mod
     if db is not None:
         try:
             db_entry = help_db.get_entry(db, verb, is_gm=is_gm_viewer)
         except Exception:
+            db_entry = None
+        if db_entry and help_overlay_mode_mod.skip_overlay_at_help_lookup(
+            db_entry.get("body_text"), topics.get(verb), game=game,
+        ):
             db_entry = None
         if db_entry:
             out["stage"] = "db_overlay"
@@ -49,8 +55,30 @@ def diagnose_help_lookup(character, game, query):
             if first:
                 out["first_line"] = first[:200]
             return out
-
-    topics = get_help_topics() or {}
+        parent = None
+        low = verb
+        for suffix in (" more", " lore", " extra"):
+            if low.endswith(suffix) and len(low) > len(suffix):
+                parent = low[: -len(suffix)].strip()
+                break
+        if parent:
+            try:
+                parent_entry = help_db.get_entry(
+                    db, parent, is_gm=is_gm_viewer,
+                )
+            except Exception:
+                parent_entry = None
+            if parent_entry and help_overlay_mode_mod.skip_overlay_at_help_lookup(
+                parent_entry.get("body_text"), topics.get(parent), game=game,
+            ):
+                parent_entry = None
+            if parent_entry:
+                out["stage"] = "db_overlay"
+                out["title"] = parent_entry.get("primary_keyword") or parent
+                first = (parent_entry.get("body_text") or "").strip().split("\n", 1)[0]
+                if first:
+                    out["first_line"] = first[:200]
+                return out
     topic = topics.get(verb)
     if topic and is_gm_only_help(verb) and not is_gm_viewer:
         topic = None

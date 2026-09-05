@@ -2,7 +2,7 @@
 
 The sidecar bot (``tools/discord_staff_ops_bot.py``) drops JSON requests under
 ``.discord_staff_ops_inbox/`` (gitignored). ``tick_discord_staff_ops_inbox``
-runs on the game heartbeat, applies GM restore / squashbug logic, and writes a
+runs on the game heartbeat, applies GM restore / squashbug / unction logic, and writes a
 short result to ``.discord_staff_ops_outbox/`` for the bot to reply.
 
 Restart / revert SHA are handled in the bot via ``watcher_request`` (no game
@@ -19,6 +19,7 @@ from pathlib import Path
 
 INBOX_DIR_NAME = ".discord_staff_ops_inbox"
 OUTBOX_DIR_NAME = ".discord_staff_ops_outbox"
+DISCORD_STAFF_OPS_PER_TICK_ENV = "RIFTFORGE_DISCORD_STAFF_OPS_PER_TICK"
 
 
 def _repo_root() -> Path:
@@ -139,15 +140,32 @@ def execute_op(game, op: str, args: str) -> tuple[bool, str]:
     return hooks_mod.discord_staff_op_executor(game, op, args)
 
 
+def _ops_per_tick_cap() -> int:
+    """Max inbox files to drain per heartbeat (0 = unlimited)."""
+    raw = (os.environ.get(DISCORD_STAFF_OPS_PER_TICK_ENV) or "1").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 1
+
+
 def tick_discord_staff_ops_inbox(game) -> None:
-    """Process every pending Discord ops file (sync tick handler)."""
+    """Process pending Discord ops files (sync tick handler).
+
+    Default cap is one op per tick so a burst of Discord restore/revive
+  requests cannot stall the asyncio heartbeat for seconds at a time.
+    """
     directory = inbox_dir()
     if not directory.is_dir():
         return
     paths = sorted(directory.glob("ops-*.json"))
     if not paths:
         return
+    cap = _ops_per_tick_cap()
+    processed = 0
     for path in paths:
+        if cap > 0 and processed >= cap:
+            break
         payload = _load_request(path)
         try:
             path.unlink(missing_ok=True)
@@ -169,6 +187,7 @@ def tick_discord_staff_ops_inbox(game) -> None:
         )
         if rid:
             write_result(rid, ok=ok, message=msg)
+        processed += 1
 
 
 def register_tick(game) -> None:

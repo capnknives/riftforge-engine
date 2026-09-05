@@ -61,6 +61,8 @@ DEFAULT_DELAY_TICKS = {
     "farm": 16,
     "hunt": 18,
     "butcher": 12,
+    # Leviathan corpse feast -- gym-peer (3 beats at stock 3s heartbeat).
+    "consume": 3,
     "smoke": 20,
     "apothecary": 24,
     "ferment": 36,
@@ -106,6 +108,7 @@ VERB_LABELS = {
     "farm": "farm work",
     "hunt": "hunting",
     "butcher": "butchering",
+    "consume": "a corpse feast",
     "smoke": "smoking",
     "apothecary": "apothecary work",
     "ferment": "fermenting",

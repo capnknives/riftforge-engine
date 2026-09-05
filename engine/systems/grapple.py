@@ -91,11 +91,20 @@ def break_grapple(character):
     if character is None:
         return
     victim = get_held_victim(character)
-    if victim is not None:
-        break_hold(character, victim)
     holder = getattr(character, HELD_BY_ATTR, None)
+    partner = None
+    if victim is not None:
+        partner = getattr(victim, "key", None)
+        break_hold(character, victim)
     if holder is not None:
+        partner = partner or getattr(holder, "key", None)
         break_hold(holder, character)
+    # Session-only breadcrumb for bug tickets (grapple arity / stuck hold).
+    character._last_break_grapple = {
+        "partner": partner,
+        "was_holder": victim is not None,
+        "was_held": holder is not None,
+    }
 
 
 def _resolve_direction(room, game, raw):
@@ -191,11 +200,9 @@ def throw_held(holder, args, game, *, now_fn=None):
         )
     if dest is not None:
         old_room = room
-        mover = getattr(victim, "move_to", None)
-        if callable(mover):
-            mover(dest)
-        else:
-            victim.location = dest
+        from engine.world import safe_place
+        if not safe_place(victim, dest):
+            return False, f"{_name(victim)} stays put -- the throw fails."
         from engine.systems import combat_pursuit as combat_pursuit_mod
         combat_pursuit_mod.notify_character_relocated(
             victim, old_room, dest, game,

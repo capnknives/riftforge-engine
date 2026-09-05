@@ -228,3 +228,14 @@ def broadcast_emote(actor, raw_args, game, *, mode="emote"):
             transcript_mod.capture(watcher, line)
         except Exception:
             pass
+    from engine import channels as channels_mod
+
+    channels_mod.append_room_emote(
+        game,
+        room,
+        {
+            "speaker": getattr(actor, "key", "") or "",
+            "raw": raw_args,
+            "mode": mode,
+        },
+    )

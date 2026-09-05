@@ -60,6 +60,8 @@ SKIP_DEFERRED_NAME = ".copyover_skip_deferred"
 # installed + veil open). Cleared on spawn so a previous process cannot
 # look "ready".
 READY_NAME = ".copyover_ready"
+# Last failed rewrite after MSG_BEFORE (gm copyover last / MCP).
+ABORT_LOG_NAME = ".copyover_last_abort.json"
 
 
 def _stamp_root(root=None):
@@ -78,6 +80,11 @@ def _skip_deferred_path(root=None):
 
 def _ready_path(root=None):
     return os.path.join(_stamp_root(root), READY_NAME)
+
+
+def abort_log_path(root=None):
+    """Checkout file for the last cancelled Veil rewrite."""
+    return os.path.join(_stamp_root(root), ABORT_LOG_NAME)
 
 
 def mark_skip_deferred_boot(*, root=None):
@@ -140,6 +147,102 @@ def copyover_ready_since(spawn_wall, *, root=None):
         return True
     return mtime >= (float(spawn_wall) - 1.0)
 
+
+def record_last_abort(reason, *, detail="", traceback_text=""):
+    """Persist why a rewrite stopped after MSG_BEFORE (best-effort)."""
+    payload = {
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "reason": str(reason or "unknown"),
+        "detail": str(detail or "")[:4000],
+        "traceback": str(traceback_text or "")[:8000],
+    }
+    path = abort_log_path()
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        print(
+            f"[copyover] abort log write failed path={path!r}: {exc!r}",
+            flush=True,
+        )
+    try:
+        from engine import diag_export
+
+        diag_export.append_copyover_abort_event(payload)
+    except Exception as exc:
+        print(f"[copyover] abort diag append failed: {exc!r}", flush=True)
+    return payload
+
+
+def format_last_abort(*, root=None):
+    """Staff-facing dump for ``gm copyover last``."""
+    path = abort_log_path(root)
+    if not os.path.isfile(path):
+        return (
+            "No rewrite abort on file. Either the last Veil rewrite "
+            "finished, or this checkout has not cancelled one yet.\n"
+            "On live after a cancel, type gm copyover last in that game."
+        )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"Could not read rewrite abort log: {exc!r}"
+    if not isinstance(data, dict):
+        return "Rewrite abort log is not an object."
+    at = data.get("at") or "?"
+    reason = data.get("reason") or "unknown"
+    detail = (data.get("detail") or "").strip()
+    tb = (data.get("traceback") or "").strip()
+    lines = [
+        f"Last rewrite cancel: {at}",
+        f"Reason: {reason}",
+    ]
+    if detail:
+        lines.append("Detail:")
+        lines.append(detail)
+    if tb:
+        lines.append("Trace:")
+        lines.append(tb)
+    return "\n".join(lines)
+
+
+def _notify_staff_abort(game, reason, detail):
+    """One-line [GM] ping so staff do not have to grep docker logs."""
+    if game is None:
+        return
+    try:
+        from world import Character
+        from engine import gm_notify
+    except Exception:
+        return
+    short = (detail or "").split("\n", 1)[0].strip()[:160]
+    msg = f"rewrite cancelled ({reason}) -- gm copyover last"
+    if short:
+        msg = f"rewrite cancelled ({reason}: {short}) -- gm copyover last"
+    for session in list(getattr(game, "sessions", None) or ()):
+        body = getattr(session, "character", None)
+        if body is None or not isinstance(body, Character):
+            continue
+        if getattr(body, "gm_rank", None) != "head_gm":
+            continue
+        gm_notify.send_gm_player_line(body, msg)
+
+
+def _cancel_rewrite(game, reason, detail=""):
+    """Record + staff-ping + player MSG_CANCEL (HB-19)."""
+    import traceback as traceback_mod
+
+    tb = traceback_mod.format_exc()
+    if tb and tb.strip() == "NoneType: None":
+        tb = ""
+    record_last_abort(reason, detail=detail, traceback_text=tb)
+    _notify_staff_abort(game, reason, detail)
+    _announce_cancel(game)
+
 # Player-facing lines (plain tags -- never color alone). Shared by classic
 # execv copyover, gateway graceful restart, and gateway reattach.
 # Player-facing arc (keep in sync with deploy_notify / gateway hold music):
@@ -155,6 +258,18 @@ MSG_AFTER = (
     "*** [WAIT] You are still here — hold still; commands wait while "
     "the world stitches. ***"
 )
+MSG_CANCEL = (
+    "*** Rewrite cancelled — you can keep playing. ***"
+)
+
+
+def _announce_cancel(game):
+    """Tell every session the Veil rewrite did not finish (HB-19)."""
+    for session in _iter_copyover_sessions(game):
+        try:
+            session.send(MSG_CANCEL)
+        except Exception:
+            pass
 
 
 def install_signal_handler(game):
@@ -273,7 +388,21 @@ def reload_world_save_modules():
     from engine import hooks
     from engine import persistence as ep
 
-    clear_content_caches_for_copyover()
+    # Catalog rebuild must not abort the rewrite. A vocab mismatch here
+    # means overlays landed new JSON before this process imported the new
+    # validators -- the child is about to reload hooks and exit; the next
+    # Game() loads catalogs from disk. Swallow, log, keep going.
+    try:
+        clear_content_caches_for_copyover()
+    except Exception as exc:
+        import traceback
+
+        print(
+            f"[copyover] catalog cache rebuild failed (continuing; "
+            f"next process loads fresh): {exc!r}",
+            flush=True,
+        )
+        traceback.print_exc()
 
     # Hooks first: persistence's top-level ``from engine.hooks import …``
     # must see the on-disk hooks module, not the pre-overlay cache.
@@ -336,6 +465,9 @@ async def _perform(game):
                 f"failure: {restore_exc!r}",
                 flush=True,
             )
+        _cancel_rewrite(
+            game, "module_reload", detail=repr(exc),
+        )
         return
     from engine import hooks as _hooks
 
@@ -362,6 +494,11 @@ async def _perform(game):
                 f"[copyover] failed to restore hooks after abort: {exc!r}",
                 flush=True,
             )
+        _cancel_rewrite(
+            game,
+            "blob_codec",
+            detail="blob codec not registered after module reload",
+        )
         return
     try:
         from engine import account_chargen_draft as draft_mod
@@ -379,7 +516,28 @@ async def _perform(game):
             flush=True,
         )
     try:
-        game.save(copyover=True)
+        # SQLite busy/locked during a laggy rewrite used to cancel the
+        # Veil after one try. Retry a couple of times before aborting.
+        last_save_exc = None
+        for attempt in range(3):
+            try:
+                game.save(copyover=True)
+                last_save_exc = None
+                break
+            except Exception as save_exc:
+                last_save_exc = save_exc
+                msg = str(save_exc).lower()
+                busy = "busy" in msg or "locked" in msg
+                if not busy or attempt >= 2:
+                    raise
+                print(
+                    f"[copyover] save busy (attempt {attempt + 1}/3) -- retrying: "
+                    f"{save_exc!r}",
+                    flush=True,
+                )
+                await asyncio.sleep(0.4 * (attempt + 1))
+        if last_save_exc is not None:
+            raise last_save_exc
     except Exception as exc:
         import traceback
 
@@ -404,8 +562,10 @@ async def _perform(game):
                 f"{restore_exc!r}",
                 flush=True,
             )
+        _cancel_rewrite(
+            game, "save", detail=repr(exc),
+        )
         return
-    # New Game() must skip town re-seed; SQLite already has this snapshot.
     mark_skip_deferred_boot()
 
     if gateway_enabled():
@@ -425,6 +585,7 @@ async def _perform(game):
         return  # unreachable after _exit; kept for tests that stub _exit
 
     entries = []
+    inheritable_fds = []
     for session in _iter_copyover_sessions(game):
         if not session.character:
             # Still on the name/password prompt -- nothing to reattach to.
@@ -434,6 +595,7 @@ async def _perform(game):
             continue
         fd = sock.fileno()
         os.set_inheritable(fd, True)   # survive the execv() below
+        inheritable_fds.append(fd)
         # Freeze the login body name -- never gmspirit:Key -- so resume
         # finds the corporeal Character; after_session_attach restores
         # gm on when gm_staff_form is set.
@@ -448,11 +610,18 @@ async def _perform(game):
 
     with open(STATE_PATH, "w") as f:
         json.dump(entries, f)
+        f.flush()
+        os.fsync(f.fileno())
 
     try:
         os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0]),
                                    "--copyover", STATE_PATH])
     except OSError as e:
+        for fd in inheritable_fds:
+            try:
+                os.set_inheritable(fd, False)
+            except OSError:
+                pass
         # execv failed to even start (should be very rare) -- the current
         # process is still fully intact at this point, so keep running on
         # the old code rather than losing the whole server.
@@ -477,6 +646,36 @@ async def _perform(game):
             os.remove(STATE_PATH)
         except OSError:
             pass
+        _cancel_rewrite(game, "execv", detail=repr(e))
+
+
+def sanitize_copyover_entries(entries):
+    """Keep only classic-copyover rows with a usable name and integer fd.
+
+    One malformed state row used to abort the whole resume loop (missing
+    ``name`` returned early; missing or string ``fd`` KeyError/TypeError
+    after the state file was already deleted). Skip the bad row instead.
+    """
+    if not isinstance(entries, list):
+        return []
+    usable = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        try:
+            fileno = int(entry.get("fd"))
+        except (TypeError, ValueError):
+            continue
+        if fileno < 0:
+            continue
+        row = dict(entry)
+        row["name"] = name.strip()
+        row["fd"] = fileno
+        usable.append(row)
+    return usable
 
 
 async def resume(game):
@@ -493,11 +692,25 @@ async def resume(game):
     try:
         with open(path) as f:
             entries = json.load(f)
-        os.remove(path)
     except (OSError, ValueError):
         # Missing or corrupt state file -- nothing we can do but boot
         # normally, same fail-soft spirit as persistence.py's .get(...,
         # default) fallbacks elsewhere in this codebase.
+        return
+
+    if not isinstance(entries, list):
+        return
+    entries = sanitize_copyover_entries(entries)
+    if not entries:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+
+    try:
+        os.remove(path)
+    except OSError:
         return
 
     # Imported here (not at module level) to avoid a circular import:
@@ -516,7 +729,7 @@ async def resume(game):
             try:
                 sock = socket.socket(fileno=entry["fd"])
                 reader, writer = await asyncio.open_connection(sock=sock)
-            except OSError:
+            except (OSError, TypeError, ValueError):
                 continue
             session = Session(reader, writer, game)
             session.character = chargen_char
@@ -524,9 +737,12 @@ async def resume(game):
             session._set_creating()
             session.reset_gmcp()
             from engine import gmcp
-            from engine import mssp
+
+            # No MSSP re-offer here (bug report 1219 class): this socket
+            # already negotiated MSSP once at original connect; the classic
+            # execv copyover keeps the same fd, so re-sending WILL MSSP is
+            # pure re-negotiation noise a client should never see twice.
             gmcp.offer_gmcp(session)
-            mssp.offer_mssp(session)
             session.send(MSG_AFTER)
             asyncio.create_task(_resume_chargen(session))
             continue
@@ -537,23 +753,23 @@ async def resume(game):
         else:
             char = game.find_character(name)
         if not char:
-            # Unfinished homezone lesson: boot heal vaulted the body; do not
-            # drop the socket -- send them through login instead.
-            if hooks.is_tutorial_incomplete_vault(game, name) or want_chargen:
-                try:
-                    sock = socket.socket(fileno=entry["fd"])
-                    reader, writer = await asyncio.open_connection(sock=sock)
-                except OSError:
-                    continue
-                session = Session(reader, writer, game)
-                game.sessions.append(session)
-                session.send(MSG_AFTER)
-                asyncio.create_task(_resume_login(session))
+            # Missing body (vaulted, deleted, or heal): never orphan the
+            # inherited FD (HB-04). Gateway reattach already falls through
+            # to login; classic copyover must match.
+            try:
+                sock = socket.socket(fileno=entry["fd"])
+                reader, writer = await asyncio.open_connection(sock=sock)
+            except (OSError, TypeError, ValueError):
+                continue
+            session = Session(reader, writer, game)
+            game.sessions.append(session)
+            session.send(MSG_AFTER)
+            asyncio.create_task(_resume_login(session))
             continue
         try:
             sock = socket.socket(fileno=entry["fd"])
             reader, writer = await asyncio.open_connection(sock=sock)
-        except OSError:
+        except (OSError, TypeError, ValueError):
             continue   # the client hung up during the reload window
 
         session = Session(reader, writer, game)
@@ -564,12 +780,14 @@ async def resume(game):
         detach_stale_sessions(char, game, session)
         if session not in game.sessions:
             game.sessions.append(session)
-        # Sockets survive copyover; GMCP/MSSP negotiation does not -- re-offer.
+        # Socket survives copyover; GMCP state does not -- re-offer once.
+        # MSSP is deliberately NOT re-offered: it was already negotiated on
+        # this same fd at original connect, and resending WILL MSSP on an
+        # already-negotiated socket every copyover crashed a screenreader
+        # TinTin++ client (bug report 1219).
         session.reset_gmcp()
         from engine import gmcp
-        from engine import mssp
         gmcp.offer_gmcp(session)
-        mssp.offer_mssp(session)
         # Same post-attach hook as a normal login (pending Tier break, mail
         # notify, GMCP Char vitals/status). Without this, copyover resumes
         # skip mail/GMCP that login would have pushed. Also restores

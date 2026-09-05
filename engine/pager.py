@@ -18,6 +18,11 @@ PAGE_LINES_MAX = 100
 
 # Attribute holding remaining lines (list of str, no trailing CR).
 _QUEUE_ATTR = "_pager_queue"
+# When True, each page is one session.send (joined with CRLF) instead of
+# one send per line. Help uses this so a framed tome is not chopped into
+# hundreds of telnet writes, and so FakeSession smokes can still read the
+# first page as sent[-1] / sent[-2] (footer).
+_BLOCK_ATTR = "_pager_block"
 
 
 def page_size(character):
@@ -42,11 +47,23 @@ def pending_count(character):
     return len(getattr(character, _QUEUE_ATTR, None) or [])
 
 
-def page(character, lines, *, note=None):
+def _send_slice(character, chunk, *, block):
+    """Send one pager slice -- per line, or one joined block."""
+    if block:
+        character.session.send("\r\n".join(chunk))
+        return
+    for ln in chunk:
+        character.session.send(ln)
+
+
+def page(character, lines, *, note=None, block=False):
     """Send *lines* through the pager (list of strings, or one multi-line str).
 
     If everything fits in one page, send it all with no footer. Otherwise
     send the first page and stash the rest for ``more`` / ``stop``.
+
+    ``block=True`` joins each slice into one ``session.send`` (help tomes).
+    ``cmd_more`` reuses the last block flag so later pages match.
     """
     if character is None or getattr(character, "session", None) is None:
         return
@@ -59,6 +76,7 @@ def page(character, lines, *, note=None):
 
     # Starting a new dump replaces any unfinished pager.
     clear(character)
+    setattr(character, _BLOCK_ATTR, bool(block))
 
     if note:
         character.session.send(note)
@@ -68,14 +86,12 @@ def page(character, lines, *, note=None):
 
     size = page_size(character)
     if len(lines) <= size:
-        for ln in lines:
-            character.session.send(ln)
+        _send_slice(character, lines, block=block)
         return
 
     first = lines[:size]
     rest = lines[size:]
-    for ln in first:
-        character.session.send(ln)
+    _send_slice(character, first, block=block)
     setattr(character, _QUEUE_ATTR, rest)
     character.session.send(
         f"-- More: {len(rest)} line(s) left. Type 'more' or 'stop'. --"
@@ -91,8 +107,9 @@ def cmd_more(character, args, game):
             "(Long lists page automatically -- see 'help more'.)"
         )
         return
+    block = bool(getattr(character, _BLOCK_ATTR, False))
     # Re-enter page() with the remainder (it clears then re-queues).
-    page(character, rest)
+    page(character, rest, block=block)
 
 
 def cmd_stop(character, args, game):

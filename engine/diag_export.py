@@ -89,6 +89,7 @@ _CADENCE_PHASE_STAT_KEYS = (
     "echo_prep_ms",
     "echo_decay_ms",
     "echo_priority_ms",
+    "echo_priority_chain_ms",
     "echo_lifestyle_ms",
     "town_ms",
     "town_prep_ms",
@@ -121,6 +122,7 @@ AUTO_CAPTURE_MESSAGE = "auto_tick_overrun"
 # rows so the next ``gm diaglog analyze`` can prove/falsify I/O contention
 # without a manual GitHub commit-log cross-reference.
 DEPLOY_RESET_MESSAGE = "auto_deploy_reset"
+COPYOVER_ABORT_MESSAGE = "copyover_abort"
 # Autosave pulses within this many seconds of a deploy reset/overlay count
 # as "near" in tick_summary / summarize_ndjson.
 DEPLOY_AUTOSAVE_WINDOW_S = 120.0
@@ -214,7 +216,10 @@ def _append_ndjson_line(payload):
         with open(log_path(), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, default=str) + "\n")
         return True
-    except Exception:
+    except Exception as exc:
+        from engine import log_util
+
+        log_util.ops("diag_export", "ndjson append failed", exc=exc)
         return False
 
 
@@ -274,6 +279,28 @@ def maybe_notify_auto_capture(game, total_ms):
         if getattr(body, "gm_rank", None) != "head_gm":
             continue
         gm_notify.send_gm_player_line(body, msg)
+
+
+def append_copyover_abort_event(payload):
+    """Always-on NDJSON row when a Veil rewrite cancels after MSG_BEFORE.
+
+    ``gm copyover last`` reads the sidecar JSON; this row lets
+    ``gm diaglog analyze`` see the same abort without a second log.
+    """
+    data = dict(payload or {})
+    row = {
+        "sessionId": DEFAULT_SESSION_ID,
+        "runId": "copyover-abort",
+        "hypothesisId": "COPYOVER",
+        "location": "copyover.py:abort",
+        "message": COPYOVER_ABORT_MESSAGE,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        return _append_ndjson_line(row)
+    except Exception:
+        return False
 
 
 def append_deploy_event(
@@ -707,8 +734,10 @@ def build_tick_summary(game, *, log_text=None):
         if summary:
             lines.append("analyze_summary:")
             lines.extend(summary.splitlines())
-    except Exception:
-        pass
+    except Exception as exc:
+        from engine import log_util
+
+        log_util.ops("diag_export", "summarize failed", exc=exc)
     return "\n".join(lines)
 
 
@@ -727,10 +756,10 @@ def tick_save_overlap_hint(game, slow_handlers=None):
     )
     if not cadence_slow:
         return None
+    # Lag U3: only flag overlap when a save is in-flight on *this* tick,
+    # not merely because the last autosave was slow (mislabels Cadence).
     running = bool(getattr(game, "_autosave_running", False))
-    autosave = getattr(game, "_last_autosave_stats", None) or {}
-    save_ms = float(autosave.get("save_ms") or 0)
-    if running or save_ms >= 500.0:
+    if running:
         return "cadence_wall_includes_save_overlap=1"
     return None
 

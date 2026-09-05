@@ -4,13 +4,14 @@ Game writes ``.ash_help_jobs/*.json`` (no networking). The sidecar answers
 and drops ``.ash_help_outbox/*.json``. A tick handler broadcasts those as
 Ash [Helper AI] on the questions channel.
 
-Stdlib only. Sidecar owns Groq/Gemini HTTP.
+Stdlib only. Sidecar owns Grok/Groq HTTP.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -21,6 +22,18 @@ ASH_SPEAKER_KEY = "ash-help"
 RATE_SECONDS = 20
 JOB_MAX_AGE_S = 600
 QUESTION_MAX = 400
+# Chatter on the questions net ("guessing ash only works for u") should not
+# spend an API call. Real how-to asks usually have ? or a question word.
+_ASK_RE = re.compile(
+    r"\?|\b(how|what|where|why|which|who|when|can|could|do|does|did|"
+    r"is|are|should|help|command|syntax|type)\b",
+    re.I,
+)
+
+
+def looks_like_question(text: str) -> bool:
+    """True when the line looks like a how-to ask, not room chatter."""
+    return bool(_ASK_RE.search(str(text or "")))
 
 
 def _repo_root() -> Path:
@@ -80,6 +93,8 @@ def enqueue_question(game, speaker, question: str, *, root=None) -> Path | None:
     """Drop one sidecar job. None when rate-limited or empty."""
     text = str(question or "").strip()
     if len(text) < 4:
+        return None
+    if not looks_like_question(text):
         return None
     token = _account_token(game, speaker)
     if not _rate_ok(game, token):

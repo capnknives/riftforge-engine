@@ -39,6 +39,7 @@ Design:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -312,12 +313,79 @@ def _dir_signature(root: str) -> tuple:
 # disk has changed. Keyed by absolute root path so tests using a temp root
 # never collide with the real repo.
 _SCAN_SIGNATURE_CACHE: dict[str, tuple] = {}
+# Same fingerprint persisted in the ledger ``meta`` table so a *new*
+# game-child process (every copyover) can skip ``_scan_bullets`` too.
+# The in-process cache is empty after ``os._exit`` / watcher respawn;
+# without this, Game() re-read every CHANGELOG.d fragment on each Veil.
+_SCAN_SIGNATURE_META_KEY = "dir_scan_signature_v1"
 
 
 def reset_source_listing_memo() -> None:
     """Drop in-process listing / scan-signature memos (targeted smokes)."""
     _SOURCE_LISTING_MEMO.clear()
     _SCAN_SIGNATURE_CACHE.clear()
+
+
+def _encode_scan_signature(sig: tuple) -> str:
+    """Stable JSON for the dir fingerprint (tuples become lists)."""
+    return json.dumps(sig, separators=(",", ":"))
+
+
+def _read_persisted_scan_signature(root: str) -> str | None:
+    """Ledger-meta copy of the last successful scan fingerprint, or None."""
+    conn = connect(root)
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (_SCAN_SIGNATURE_META_KEY,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    value = row["value"]
+    return str(value) if value else None
+
+
+def _write_persisted_scan_signature(root: str, encoded: str) -> None:
+    """Remember the fingerprint so the next Game() process can skip."""
+    conn = connect(root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_SCAN_SIGNATURE_META_KEY, encoded),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def _clear_persisted_scan_signature(root: str) -> None:
+    """Drop the persisted fingerprint (reclaim forced a remint)."""
+    conn = connect(root)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM meta WHERE key = ?",
+            (_SCAN_SIGNATURE_META_KEY,),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.close()
 
 # One row per sequence. Player-visible bullets vs. staff-only (``[ops]`` /
 # ``[docs]`` / ``[easter]``) bullets are numbered independently.
@@ -684,9 +752,10 @@ def assign_new_slugs(
     they take the next ids in line (after ships that already displayed).
 
     Skips the scan entirely (returning 0) when ``CHANGELOG.d`` and
-    ``CHANGELOG.md`` look unchanged since the last call *in this process* —
-    with thousands of fragments, unconditionally re-reading every one on
-    every ~30s idle poll was itself a source of host-visible lag.
+    ``CHANGELOG.md`` look unchanged since the last successful mint —
+    in this process *or* (via ledger ``meta``) the previous game child.
+    Copyover respawns a fresh interpreter, so the in-process cache alone
+    could not save Veil reloads from re-reading thousands of fragments.
     """
     root = root or _repo_root_from_here()
     reclaimed = reclaim_unpublished_mixed_case_slugs(
@@ -696,14 +765,30 @@ def assign_new_slugs(
     if reclaimed:
         # Dir mtime did not change; force a rescan so dropped slugs remint.
         _SCAN_SIGNATURE_CACHE.pop(cache_key, None)
+        try:
+            _clear_persisted_scan_signature(root)
+        except sqlite3.Error:
+            pass
 
     sig = _dir_signature(root)
     if _SCAN_SIGNATURE_CACHE.get(cache_key) == sig:
+        return 0
+    encoded = _encode_scan_signature(sig)
+    try:
+        persisted = _read_persisted_scan_signature(root)
+    except sqlite3.Error:
+        persisted = None
+    if persisted == encoded:
+        _SCAN_SIGNATURE_CACHE[cache_key] = sig
         return 0
 
     plans = plan_new_assignments(root)
     minted = apply_assignments(root, plans)
     _SCAN_SIGNATURE_CACHE[cache_key] = sig
+    try:
+        _write_persisted_scan_signature(root, encoded)
+    except sqlite3.Error:
+        pass
 
     if log_prefix and minted:
         for sequence, rows in plans.items():

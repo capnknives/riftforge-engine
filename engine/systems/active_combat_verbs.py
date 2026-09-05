@@ -77,8 +77,14 @@ def _ensure_active_fight(character, target, game=None):
 
 def _require_active_fight(character, target, game):
     """Return the Fight or send a mode error and return None."""
+    was_in = fight_mod.get_fight(character) is not None
     fight = _ensure_active_fight(character, target, game)
     if fight is None or fight.combat_mode != fight_mod.MODE_ACTIVE:
+        # HB-51 leftover: join_fight then refuse left a ghost bout.
+        if not was_in:
+            leftover = fight_mod.get_fight(character)
+            if leftover is not None:
+                leftover.discard(character)
         _send(
             character,
             "This bout isn't using active combat. "

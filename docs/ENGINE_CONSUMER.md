@@ -128,6 +128,15 @@ Call these **before** constructing `Character`s or loading a save:
 | Quest giver cast ensure | `engine.systems.quests.set_quest_ensure_giver` | no-op | `supers.quests.policy.register_quest_hooks` → `require_for_needed` + `maybe_restore_for_cast_key` |
 | Vault folded_by tag | `set_vault_folded_by(fn)` | `None` | `supers.fold_vault.vault_folded_by` |
 | Post-overlay game checks | `set_post_overlay_game_checks(fn)` | `[]` | `supers.bootstrap._post_overlay_cuff_checks` (cuff `blob_fragment` / `load_fragment` probe) |
+| Account-owning body | `set_resolve_account_character(fn)` | identity | God-twin → Mantle via `register_all_hooks` |
+| After group focus change | `set_after_group_focus_change(fn)` | no-op | `supers.cadence_group.sync_all_grouped_follower_targets` |
+| Quest mentor phone/mail reach | `set_ensure_quest_mentor_reach(fn)` | `0` | `supers.quest_reach.ensure_pin_map_reach` |
+| Zone visit note | `set_note_zone_visit(fn)` | no-op | `supers.cultivator_qi_sites.maybe_note_visit` |
+| Ephemeral instance room | `set_is_ephemeral_instance_room(fn)` | `False` | `supers.world_ext.is_procedural_dungeon_room` |
+| Persist-helper gap names | `set_report_persist_helper_gaps(fn)` | `[]` | taxi + training blob helpers |
+| Profession / weave bags | `set_containers_is_profession_bag_item` / `matching_profession_bag` / weave + extradim bag hooks | `False` / `None` | `supers.profession_bags` + `supers.pocket_bind` |
+| News desk room keys | `set_press_beat_desk_keys(keys)` | empty | Lebanon Gazette keys via `press_beat_hooks` |
+| Storm Watch desk keys | `set_storm_chase_desk_keys(keys)` | empty | Lebanon Storm Watch keys via `register_all_hooks` |
 
 SUPERS auto-registers attach + blob when the `supers` package is imported
 (`supers.bootstrap.register_core_hooks`). Everything else (chargen, help,
@@ -313,9 +322,11 @@ The engine owns sheet **schema**, **assembly**, and **framing**:
 |-------|----------|
 | Field catalog | `engine/content/sheet_profile.json` |
 | Engine wallet rows | `engine:cash`, `engine:bank` in the catalog — resolved in `engine/systems/sheet.py`; games must not duplicate Cash/Bank strings |
-| Resolve API | `resolve_field_by_id`, `resolve_profile_slot`, `append_profile_slots` |
+| Resolve API | `resolve_field_by_id`, `resolve_profile_slot`, `append_layout_band`, `append_unclaimed_slots` |
+| Layout bands | `layout.bands` in the catalog (`life`, `resources`, `standing`, `lifetime`) plus overflow for new slots |
 | Assembly | `engine/systems/sheet.py` (`SheetContext`, `render_score`, `format_assembled`) |
-| Game rows | `hooks.register_sheet_field(id, fn)` — `fn(ctx) -> str \| None` |
+| Game rows | `hooks.register_sheet_field(id, fn)` — `fn(ctx) -> str \| list \| None` |
+| Auto-add | `hooks.register_sheet_field(id, fn, slot="origin_meters")` — appears even before a catalog row |
 | Game sections | `hooks.register_sheet_contributor(id, fn, priority=…)` — `fn(ctx) -> SheetSection \| list \| None` |
 
 Basegame registers Path + HP field hooks in `basegame/sheet_score.py`.
@@ -323,14 +334,23 @@ Wallet lines come from the engine catalog (`engine:cash`, `engine:bank`), not
 hand-rolled in game contributors. SUPERS body rows assemble in
 `supers/sheet_score.py` (`format_score`, pane filter registry, Origin
 contributors in `supers/sheet_score_hooks.py`); wallet and resource rows merge
-via `resolve_profile_slot` / `append_profile_slots`. World Tide / eclipse
-never belong on `score` or `time` — see `.cursor/rules/score-sheet-schema.mdc`.
+via `resolve_profile_slot` / `append_layout_band`. A new Origin meter should
+add a `hook:*` row (or `register_auto_field`) — do not append strings only
+inside `format_score`. World Tide / eclipse never belong on `score` or
+`time` — see `.cursor/rules/score-sheet-schema.mdc`.
 
 ```python
 from engine.systems.sheet import SheetContext, render_score
 from engine import hooks
 
 hooks.register_sheet_field("hp", lambda ctx: f"  HP: {ctx.target.hp}/…")
+# Future-proof: a meter with no catalog row still lands in overflow / slot.
+hooks.register_sheet_field(
+    "my_meter",
+    lambda ctx: f"  My meter: {ctx.target.my_meter}",
+    slot="origin_meters",
+    panes=["default", "vitals", "full"],
+)
 text = render_score(SheetContext(target=character, game=game, viewer=character))
 ```
 
@@ -382,6 +402,7 @@ table above is unchanged.
 | **SUPERS narrative combat** | `supers/combat.py` → `supers/combat_prose.py` | Stays in SUPERS (not swing/active backends) |
 | **Civic shops** | `engine/systems/civic_shop.py` (ware shell) | Shell shipped; deep `player_shops` → `civic_shop` wiring **deferred** (Phase 6b / H-track) |
 | **Lifestyle / civic kernels** | `skill_ranks`, `gather_nodes`, `vendor_stock`, `claim_board`, `wage_curve` | Shipped **v0.6.2** — games keep catalogs and job titles |
+| **Journal / rumor / jobs lookup** | `journal`, `rumor_board`, `job_catalog` | Shipped **v0.7.0** — games keep share/theft, verbs, Cadence job validation |
 | **Combat status / prose loader** | `status_conditions`, `prose_pool_loader` | Shipped **v0.6.2** — catalog + JSON pools stay in the game |
 | **Clinic** | `engine/systems/clinic.py` | Framework shipped + wired (H4); Town Clinic room keys stay SUPERS-branded |
 | **Justice** | `engine/systems/justice.py` | Framework shipped + wired (H4); crime catalog stays SUPERS |
@@ -397,8 +418,9 @@ Phases **H1–H7** landed on `feature/purity-h-track-remaining` (see
 `engine/map_ui.py`, `engine/systems/{vehicles,lodging,paced_travel,phone,appearance,persona_registry,relationships}`,
 `engine/map_store.py`, plus **H4** wiring (`hospital`→`clinic`, `crime`→`justice`).
 **Deep `player_shops` → `civic_shop`** remains DEFERRED. **H8** (kind
-grandparents) and **H9** (`v0.5.0` tag) **landed**; SUPERS pin is **`@v0.6.2`**
-(2026-08-29; liquid-flavor kernels. Prior **`v0.6.1`** 2026-08-27; **`v0.6.0`** 2026-08-21).
+grandparents) and **H9** (`v0.5.0` tag) **landed**; SUPERS pin is **`@v0.7.0`**
+(2026-09-05; purity restore + journal/rumor/job kernels. Prior **`v0.6.2`**
+2026-08-29; **`v0.6.1`** 2026-08-27; **`v0.6.0`** 2026-08-21).
 
 
 ## Hook bundles (engine mudlib unification)

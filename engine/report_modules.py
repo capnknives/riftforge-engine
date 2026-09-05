@@ -59,12 +59,12 @@ _VERB_DOMAINS = {
     "yield": ("combat", "spirit_death"),
     "mercy": ("combat", "spirit_death"),
     "haul": ("combat", "spirit_death"),
-    "admit": ("spirit_death",),
-    "admitpatient": ("spirit_death",),
-    "checkin": ("spirit_death",),
-    "treat": ("spirit_death",),
-    "clinic": ("spirit_death",),
-    "hospital": ("spirit_death",),
+    "admit": ("spirit_death", "accord_clinic"),
+    "admitpatient": ("spirit_death", "accord_clinic"),
+    "checkin": ("spirit_death", "accord_clinic"),
+    "treat": ("spirit_death", "accord_clinic"),
+    "clinic": ("spirit_death", "accord_clinic"),
+    "hospital": ("spirit_death", "accord_clinic"),
     # Lifestyle / Cadence
     "needs": ("needs_lifestyle",),
     "buy": ("needs_lifestyle",),
@@ -90,7 +90,7 @@ _VERB_DOMAINS = {
     "clear": ("craft_contracts",),
     "case": ("craft_contracts",),
     "bleed": ("craft_contracts",),
-    # Crime
+    # Crime / containers (lockpick / open strongbox class)
     "rob": ("crime",),
     "steal": ("crime",),
     "warrant": ("crime",),
@@ -100,6 +100,11 @@ _VERB_DOMAINS = {
     "hotwire": ("crime", "vehicle_travel"),
     "book": ("crime",),
     "lockup": ("crime",),
+    "lockpick": ("crime", "stealth", "containers"),
+    "open": ("containers", "crime"),
+    "close": ("containers",),
+    "unlock": ("containers", "crime"),
+    "pick": ("crime", "stealth", "containers"),
     # Vessel
     "possess": ("vessel",),
     "ride": ("vessel", "vehicle_travel"),
@@ -199,7 +204,13 @@ _VERB_DOMAINS = {
     "who": ("who_roster",),
     "whofull": ("who_roster",),
     # Help lookup
-    "help": ("help_lookup",),
+    "help": ("help_lookup", "session_ui"),
+    "more": ("session_ui", "help_lookup"),
+    "stop": ("session_ui",),
+    # Skills / mastery (partial-overlay window)
+    "skills": ("skills_training",),
+    "skill": ("skills_training",),
+    "disciplines": ("skills_training",),
     # Changelog unread cursor
     "changes": ("changelog",),
     "unread": ("changelog",),
@@ -215,6 +226,14 @@ _VERB_DOMAINS = {
     "radio": ("comms",),
     "mail": ("comms",),
     "oocmail": ("comms",),
+    "text": ("comms",),
+    "sms": ("comms",),
+    # Clinic / Accord / DoorDash (ward courier + cleaner camping)
+    "doordash": ("accord_clinic", "needs_lifestyle"),
+    # Hold / pin already on combat via grapple; keep struggle/hold explicit
+    "hold": ("combat",),
+    "pin": ("combat",),
+    "struggle": ("combat",),
     # Origin kit (hellhound / trickster)
     "leash": ("origin_kit",),
     "releasehound": ("origin_kit",),

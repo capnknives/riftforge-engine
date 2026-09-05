@@ -68,7 +68,9 @@ def parse_speak_set(args):
     raw = (args or "").strip()
     if not raw:
         return None, None
-    lang_id = raw.lower().replace(" ", "_")
+    # Fold spaces and hyphens so "old english" / "old-english" match
+    # old_english (same fold as learn language -- suggestion report 165).
+    lang_id = raw.lower().replace(" ", "_").replace("-", "_")
     if lang_id in ("clear", "reset", "default"):
         return _DEFAULT_LANG, None
     if lang_id not in valid_ids():

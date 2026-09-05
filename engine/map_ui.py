@@ -419,7 +419,7 @@ ATLAS_BG = {                        # background fill per terrain
     "furnace": "41",
     "desert": "43",                 # yellow-tan scrub
     "wetland": "42",                # green bayou (glyph distinguishes)
-    "highway": "43",                # yellow-tan asphalt (browser HUD + filled atlas)
+    "highway": "43",                # unused for overlay cells (terrain_base fill instead)
     "road": "43",
     "trail": "43",                  # dusty tan ruts
 }
@@ -600,7 +600,8 @@ AREA_TYPE_DESCRIPTIONS = {
     ),
     "highway": (
         "Asphalt ribbon cuts the continent. A faded mile marker reads "
-        "({x}, {y}). Drive the cardinals; cities wait at the hubs."
+        "({x}, {y}). Drive n/ne/e/se/s/sw/w/nw -- one tile is the whole "
+        "highway through this cell."
     ),
     "desert": (
         "Sun-blasted scrub and hardpan. Heat shimmers off the road "
@@ -1020,10 +1021,70 @@ def _cell_glyph(area_type, *, glyph_set=None):
     return table.get(area_type, "?")
 
 
+def atlas_overlay_sgr(area_type, map_layer=None, terrain_base=None,
+                      map_glyph=None):
+    """SGR fg + bg codes for one filled atlas cell.
+
+    Highways and wagon trails are a yellow overlay on the land underneath.
+    Filling the whole 30-mile tile as asphalt (ATLAS_BG highway) made the
+    CONUS camera look like a megalopolis of roads.
+
+    ``water_view`` paints void-margin HUD cells as ocean/lake fill without
+    changing sim ``area_type`` (still void on America).
+    ``land_view`` paints Canada land the same way (timber/prairie glyphs).
+    """
+    from engine.atlas_layers import ROAD_OVERLAY_LAYERS
+
+    layer = str(map_layer or "").strip().lower()
+    area = area_type or "plains"
+    if layer == "water_view":
+        glyph = str(map_glyph or "~").strip()[:1] or "~"
+        paint_as = "lake" if glyph == "o" else "ocean"
+        bg = ATLAS_BG.get(paint_as, "44")
+        fg = ATLAS_TOPO_FG.get(paint_as, "96")
+        return fg, bg
+    if layer == "land_view":
+        glyph = str(map_glyph or "T").strip()[:1] or "T"
+        paint_as = {
+            "T": "forest",
+            ".": "plains",
+            ",": "desert",
+            "^": "mountains",
+        }.get(glyph, "forest")
+        bg = ATLAS_BG.get(paint_as, "42")
+        fg = ATLAS_TOPO_FG.get(paint_as, "32")
+        return fg, bg
+    if layer == "river":
+        under = str(terrain_base or area or "plains").strip().lower()
+        if under in ("highway", "trail", "road", "void"):
+            under = "plains"
+        bg = ATLAS_BG.get(under, "42")
+        fg = ATLAS_TOPO_FG.get("lake", "96")
+        return fg, bg
+    if layer in ROAD_OVERLAY_LAYERS:
+        under = str(terrain_base or "").strip().lower()
+        if not under or under in ("highway", "trail", "road", "city"):
+            if layer == "mountain_highway" or area == "mountains":
+                under = "mountains"
+            elif area in ATLAS_BG and area not in ("highway", "trail", "road"):
+                under = area
+            else:
+                under = "plains"
+        bg = ATLAS_BG.get(under, "42")
+        fg = ATLAS_LAYER_FG.get(layer, "93")
+        return fg, bg
+    bg = ATLAS_BG.get(area, "40")
+    if layer:
+        fg = ATLAS_LAYER_FG.get(layer) or ATLAS_TOPO_FG.get(area, "37")
+    else:
+        fg = ATLAS_TOPO_FG.get(area, "37")
+    return fg, bg
+
+
 def _room_display_glyph(room):
     """Pick the ASCII glyph for one room on minimap / full atlas.
 
-    Priority: authored ``map_glyph`` (city letter, highway =/|/+) >
+    Priority: authored ``map_glyph`` (city letter, highway =) >
     glyph_set / area_type table. Always a single printable character.
     """
     authored = getattr(room, "map_glyph", None)
@@ -1051,16 +1112,12 @@ def _room_display_color(room):
     primary signal (section 8 a11y); color only accents.
     """
     if getattr(room, "glyph_set", None) == "atlas":
-        area = getattr(room, "area_type", "plains") or "plains"
-        bg = ATLAS_BG.get(area, "40")            # default black fill
-        layer = getattr(room, "map_layer", None)
-        if layer:
-            # A road / city overlay: bright foreground on the terrain fill.
-            fg = ATLAS_LAYER_FG.get(str(layer).strip().lower())
-            if fg is None:
-                fg = ATLAS_TOPO_FG.get(area, "37")
-        else:
-            fg = ATLAS_TOPO_FG.get(area, "37")
+        fg, bg = atlas_overlay_sgr(
+            getattr(room, "area_type", "plains"),
+            getattr(room, "map_layer", None),
+            getattr(room, "terrain_base", None),
+            getattr(room, "map_glyph", None),
+        )
         return f"\x1b[{fg};{bg}m"
     # Non-atlas maps: original foreground-only behavior.
     layer = getattr(room, "map_layer", None)

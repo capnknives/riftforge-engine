@@ -106,6 +106,8 @@ _DIR_DELTA = {
     "southeast": (1, -1),
     "southwest": (-1, -1),
 }
+# King-move steps for vehicle pathfind (n/ne/e/se/s/sw/w/nw).
+_VEHICLE_STEPS = tuple(_DIR_DELTA.values())
 
 # Terrain pools for virtual look (plain labels; color is decoration only).
 _TERRAIN_BLURBS = {
@@ -227,6 +229,10 @@ def _is_foreign_overland_grid(room):
         return True
     map_id = str(getattr(room, "map_id", None) or "").strip().lower()
     if map_id == FRONTIERLAND_MAP_ID:
+        return True
+    from engine.systems.water_atlas import is_water_map_id
+
+    if is_water_map_id(map_id) or bool(getattr(room, "water_atlas", False)):
         return True
     prefix = str(getattr(room, "grid_prefix", None) or "").strip()
     if prefix == FRONTIERLAND_PREFIX:
@@ -421,8 +427,13 @@ class OverlandAtlas:
                         "description": override.get("description"),
                         "map_glyph": override.get("map_glyph"),
                         "map_layer": override.get("map_layer"),
+                        "terrain_base": override.get("terrain_base"),
+                        "highland": bool(override.get("highland")),
                         "title": override.get("title"),
                         "bestiary_categories": list(cats or []),
+                        "water_view": bool(override.get("water_view")),
+                        "land_view": bool(override.get("land_view")),
+                        "max_water_band": override.get("max_water_band"),
                     }
         else:
             for key, override in (grid.get("cell_overrides") or {}).items():
@@ -442,8 +453,13 @@ class OverlandAtlas:
                     "description": override.get("description"),
                     "map_glyph": override.get("map_glyph"),
                     "map_layer": override.get("map_layer"),
+                    "terrain_base": override.get("terrain_base"),
+                    "highland": bool(override.get("highland")),
                     "title": override.get("title"),
                     "bestiary_categories": list(cats or []),
+                    "water_view": bool(override.get("water_view")),
+                    "land_view": bool(override.get("land_view")),
+                    "max_water_band": override.get("max_water_band"),
                 }
         # macro (x,y) -> landmark dict
         self.landmarks = {}
@@ -481,13 +497,21 @@ class OverlandAtlas:
 
     def description_at(self, mx, my):
         """Return authored cell description or a terrain pool blurb."""
-        cell = self.terrain.get((mx, my))
-        if cell and cell.get("description"):
-            return cell["description"]
-        area = self.terrain_at(mx, my)
-        return _TERRAIN_BLURBS.get(
-            area,
-            f"American overland at ({mx}, {my}).",
+        cell = self.terrain.get((mx, my)) or {}
+        if cell.get("description"):
+            blurb = cell["description"]
+        else:
+            area = self.terrain_at(mx, my)
+            blurb = _TERRAIN_BLURBS.get(
+                area,
+                f"American overland at ({mx}, {my}).",
+            )
+        from engine.systems.mine_graph import with_mine_country_tell
+
+        return with_mine_country_tell(
+            blurb,
+            self.terrain_at(mx, my),
+            highland=bool(cell.get("highland")),
         )
 
     def landmark_at(self, mx, my):
@@ -513,6 +537,31 @@ class OverlandAtlas:
         return None
 
 
+def _is_paved_road_cell(atlas, mx, my, road_areas=None):
+    """True when a macro cell counts as on-road for vehicle routing."""
+    if road_areas is None:
+        road_areas = _DEFAULT_ROAD_AREAS
+    if not clamp_macro(mx, my):
+        return False
+    if not _vehicle_can_enter(atlas, mx, my):
+        return False
+    cell = atlas.terrain.get((mx, my)) or {}
+    area = atlas.terrain_at(mx, my)
+    layer = str(cell.get("map_layer") or "").lower()
+    return area in road_areas or layer in road_areas
+
+
+def heal_vehicle_road_connectivity(atlas):
+    """No-op: 8-way driving made diagonal/cardinal asphalt fillers obsolete.
+
+    The old stamps filled every diagonal pair (and every 2-apart parallel
+    pair) with extra highway cells -- a 30-mile tile became a 60-mile smear.
+    Cars now step n/ne/e/se/s/sw/w/nw on the painted overlay.
+    Kept so boot and smokes that still call this helper stay import-safe.
+    """
+    return 0
+
+
 def load_earth_america_atlas():
     """Load OverlandAtlas from content/maps/earth_america.json.
 
@@ -525,6 +574,7 @@ def load_earth_america_atlas():
     with open(path, encoding="utf-8") as fh:
         data = json.load(fh)
     atlas = OverlandAtlas(data)
+    heal_vehicle_road_connectivity(atlas)
     MACRO_WIDTH = int(atlas.width)
     MACRO_HEIGHT = int(atlas.height)
     return atlas
@@ -822,10 +872,12 @@ def get_virtual_room(game, macro, micro):
     room.realm = "prime"
     room.map_id = atlas.map_id
     room.zone = None
+    room.highland = bool((atlas.terrain.get((mx, my)) or {}).get("highland"))
     room.bestiary_categories = atlas.bestiary_at(mx, my)
-    # Cardinal exits are virtual markers -- move handler ignores them and
-    # recomputes from coords. Still listed so look / screenreader show paths.
-    for direction in ("north", "south", "east", "west"):
+    # Compass exits are virtual markers -- move handler ignores them and
+    # recomputes from coords. Eight-way so look / screenreader list ne/nw
+    # as well as n/s/e/w; blocked terrain still refuses at step time.
+    for direction in _DIR_DELTA:
         room.exits[direction] = room  # placeholder; try_overland_move wins
     if landmark and (ux, uy) == LANDMARK_MICRO:
         hub_key = landmark.get("hub_room")
@@ -878,7 +930,14 @@ def resolve_wilderness_saved_room_key(game, room_key):
     macro, micro = parsed
     try:
         return get_virtual_room(game, macro, micro)
-    except Exception:
+    except Exception as exc:
+        from engine import log_util
+
+        log_util.ops(
+            "overland",
+            f"materialize failed key={room_key!r}",
+            exc=exc,
+        )
         return None
 
 
@@ -908,7 +967,14 @@ def resolve_virtual_overland_room_key(game, room_key):
                 if visible and visible == needle:
                     try:
                         return get_virtual_room(game, macro, LANDMARK_MICRO)
-                    except Exception:
+                    except Exception as exc:
+                        from engine import log_util
+
+                        log_util.ops(
+                            "overland",
+                            f"materialize failed key={room_key!r}",
+                            exc=exc,
+                        )
                         return None
     overland_rooms = getattr(game, "overland_rooms", None) or {}
     for candidate in overland_rooms.values():
@@ -959,6 +1025,7 @@ def get_aerial_room(game, macro):
     room.realm = "prime"
     room.map_id = atlas.map_id
     room.zone = None
+    room.highland = bool((atlas.terrain.get((mx, my)) or {}).get("highland"))
     room.bestiary_categories = atlas.bestiary_at(mx, my)
     for direction in ("north", "south", "east", "west"):
         room.exits[direction] = room
@@ -1137,17 +1204,19 @@ def _vehicle_can_enter(atlas, mx, my):
 def pathfind_vehicle_macro(atlas, start, goal, *, cost_fn=None, max_steps=4000):
     """Find a driveable America-macro path from ``start`` to ``goal``.
 
-    Cardinal steps only (n/s/e/w). Skips ocean/lake/void/water via
+    Eight directions (n/ne/e/se/s/sw/w/nw). Skips ocean/lake/void/water via
     ``_vehicle_can_enter``. Returns a list of ``(x, y)`` tiles **after**
     start through and including goal, or ``None`` when unreachable /
-    inputs invalid.
+    inputs invalid. A diagonal interstate is one NE step -- not a cardinal
+    detour through the fields.
 
     When ``cost_fn`` is ``None`` (default), uses unweighted BFS — fewest
-    hops, identical to the original v1 behavior so existing callers
-    (dispatch, taxi, charter legs, vehicle kit smokes) stay stable.
+    hops, identical hop-count policy to the original v1 behavior so existing
+    callers (dispatch, taxi, charter legs, vehicle kit smokes) stay stable
+    aside from the new diagonal steps.
 
     When ``cost_fn`` is provided, uses Dijkstra's algorithm (``heapq`` min-
-    heap) so each cardinal step onto neighbor ``(nx, ny)`` adds
+    heap) so each 8-way step onto neighbor ``(nx, ny)`` adds
     ``cost_fn(atlas.terrain_at(nx, ny))`` to the path total. BFS always
     treats every hop as equal cost; Dijkstra is needed when terrain types
     have different weights (highway cheap, forest expensive, etc.).
@@ -1174,7 +1243,7 @@ def pathfind_vehicle_macro(atlas, start, goal, *, cost_fn=None, max_steps=4000):
     if start == goal:
         return []
 
-    cardinals = ((0, 1), (0, -1), (1, 0), (-1, 0))
+    neighbors = _VEHICLE_STEPS
     came_from = {start: None}
 
     if cost_fn is None:
@@ -1189,7 +1258,7 @@ def pathfind_vehicle_macro(atlas, start, goal, *, cost_fn=None, max_steps=4000):
             if cur == goal:
                 break
             cx, cy = cur
-            for dx, dy in cardinals:
+            for dx, dy in neighbors:
                 nx, ny = cx + dx, cy + dy
                 nxt = (nx, ny)
                 if nxt in came_from:
@@ -1219,7 +1288,7 @@ def pathfind_vehicle_macro(atlas, start, goal, *, cost_fn=None, max_steps=4000):
             if cur == goal:
                 break
             cx, cy = cur
-            for dx, dy in cardinals:
+            for dx, dy in neighbors:
                 nx, ny = cx + dx, cy + dy
                 nxt = (nx, ny)
                 if not clamp_macro(nx, ny):
@@ -1327,6 +1396,10 @@ def classic_zone_room_blocks_overland_move(character):
         return False
     parsed = map_ui.parse_grid_key(getattr(room, "key", "") or "")
     if parsed and parsed[0] in _AMERICA_PREFIXES:
+        return False
+    # Aboard on open America: vehicle cabins are classic zone rooms but
+    # drivers steer via macro hops, not Room.exits (bug report 993).
+    if getattr(character, "in_vehicle", None) and overland_mode(character) == "vehicle":
         return False
     return True
 
@@ -1468,6 +1541,48 @@ def try_overland_move(character, direction, game):
         _send(character, block_msg)
         return True
 
+    from engine.systems import water_atlas as water_atlas_mod
+
+    seam = water_atlas_mod.seam_dest_for_america_cell(game, mx, my)
+    if seam is not None:
+        map_id, wx, wy = seam
+        import time as _time
+        from engine import lag_watch
+
+        lag_watch.stamp_move_phase(game, "ov_setup", t_ov)
+        old_room = character.location
+        from command_support import _presence_face, is_staff_stealth_presence
+
+        face = _presence_face(character)
+        stealth = is_staff_stealth_presence(character)
+        if old_room is not None and not stealth:
+            old_room.broadcast(
+                f"{face} wades toward the open water.",
+                exclude=character,
+            )
+        was_working = _apply_relocate_hooks_before(character)
+        if water_atlas_mod.place_on_water(character, game, map_id, wx, wy):
+            new_room = character.location
+            _apply_relocate_hooks_after(
+                character, new_room, game, was_working,
+            )
+            if new_room is not None and not stealth:
+                new_room.broadcast(
+                    f"{face} arrives from the {_opposite(direction)}.",
+                    exclude=character,
+                )
+            _overland_auto_look(character, game, after_move=True)
+            from engine.npc_act import is_live_session
+
+            if is_live_session(getattr(character, "session", None)):
+                hooks.encounter_check(game, new_room)
+            _prune_after_overland_hop(game, old_room)
+            hooks.after_move_step(character, direction, new_room, game)
+            lag_watch.stamp_move_phase(game, "ov_place", t_ov)
+            return True
+        _send(character, "The water will not take you.")
+        return True
+
     import time as _time
     from engine import lag_watch
     lag_watch.stamp_move_phase(game, "ov_setup", t_ov)
@@ -1607,14 +1722,21 @@ def try_enter_landmark(character, args, game):
         return True
     from engine.verbs.basic import _do_transition, stamp_zone_entry
     from command_support import _presence_face
+    from engine.room_vnum import describe_room
     clear_overland_coords(character)
     stamp_zone_entry(character, hub)
     face = _presence_face(character)
     _do_transition(
         character, hub, game,
-        f"{face} enters {hub.key}.",
+        f"{face} enters {describe_room(hub)}.",
         f"{face} arrives.",
     )
+    from engine import hooks as hooks_mod
+
+    try:
+        hooks_mod.note_zone_visit(character, game, room=hub)
+    except Exception:
+        pass
     hooks_mod.overland_notify_dungeon_hub(character, game, hub)
     return True
 
@@ -1755,6 +1877,10 @@ def home_return_room_key(actor, game):
     if actor is None or game is None:
         return None
     rooms = getattr(game, "rooms", None) or {}
+    # Echo dest lock (scheduled city stay) outranks the claimed house.
+    dest_park = getattr(actor, "echo_dest_anchor_park", None)
+    if dest_park and dest_park in rooms:
+        return dest_park
     home_key = getattr(actor, "home_room_key", None)
     if home_key and home_key in rooms:
         return home_key
@@ -1790,8 +1916,11 @@ def home_hub_macro(game, actor):
     rooms = getattr(game, "rooms", None) or {}
     _plaza_key, _hub_key, bunker_overland_key = _starter_keys()
 
-    zone = getattr(actor, "home_zone", None)
-    # Prefer the zone_exit mouth that matches home_zone.
+    zone = (
+        getattr(actor, "echo_dest_anchor_zone", None)
+        or getattr(actor, "home_zone", None)
+    )
+    # Prefer the zone_exit mouth that matches home_zone (or dest lock).
     for room in rooms.values():
         if not getattr(room, "zone_exit", False):
             continue
@@ -1919,21 +2048,31 @@ def cadence_homeward_from_overland(game, actor, dest_room_key=None):
     loc = getattr(actor, "location", None)
     on_virtual_foot = is_virtual_room(loc)
 
+    # Live hub taxi on an atlas cell: tick_taxis owns the Echo body until
+    # landing. Homeward cadence must not wipe stamps on logout (bug 1167).
+    taxi_until = getattr(actor, "_taxi_until", None)
+    taxi_scenic = getattr(actor, "_taxi_scenic_path", None)
+    if taxi_until is not None and isinstance(taxi_scenic, list):
+        return False
+
     # Hub taxi montages cannot pick up on ephemeral wilderness cells -- they
     # re-stamp ``_taxi_until`` every Cadence tick without ever landing.
-    if on_virtual_foot and getattr(actor, "_taxi_until", None) is not None:
+    if on_virtual_foot and taxi_until is not None:
         actor._taxi_until = None
         actor._taxi_dest_key = None
         actor._taxi_kind = None
         actor._taxi_scenic_path = None
         actor._taxi_scenic_last_step = None
 
-    # Drive / taxi only from settlement rooms; virtual foot always hikes.
-    if (
+    # Drive / board first when a ride is usable. Settlement rooms may
+    # taxi; virtual foot cannot complete a hub montage, but boarding a
+    # colocated owned car must still beat hiking (vehicle_seek leftover).
+    # Accept the hook only when mode or position actually changed -- a
+    # taxi stamp on a wilderness cell is a no-op (cleared above).
+    if dest_key and (
         not on_virtual_foot
-        and dist is not None
-        and dist > WILD_ROAM_MACRO_RADIUS
-        and dest_key
+        or dist is None
+        or dist > WILD_ROAM_MACRO_RADIUS
     ):
         before_far = (macro, micro)
         mode_before = overland_mode(actor)
@@ -1947,6 +2086,13 @@ def cadence_homeward_from_overland(game, actor, dest_room_key=None):
                 or overland_mode(actor) != mode_before
             ):
                 return True
+            # Virtual-foot taxi montage re-stamps forever -- drop it and hike.
+            if on_virtual_foot and getattr(actor, "_taxi_until", None) is not None:
+                actor._taxi_until = None
+                actor._taxi_dest_key = None
+                actor._taxi_kind = None
+                actor._taxi_scenic_path = None
+                actor._taxi_scenic_last_step = None
 
     # Local or virtual far hike: one dual-layer step toward the home hub.
     if macro == home_macro and micro == LANDMARK_MICRO:

@@ -10,21 +10,44 @@ hook API details grow in [`../ENGINE_CONSUMER.md`](../ENGINE_CONSUMER.md).
 **complete** — Stages **1–10**, A1/A2, Plan B, Stage G, and public tags
 `v0.2.0`–`v0.5.0`. Public
 [`riftforge-engine`](https://github.com/capnknives/riftforge-engine) Latest
-**`v0.6.2`** (2026-08-29, liquid-flavor kernels + kind stamps; prior **`v0.6.1`**
-2026-08-27 purity restore + monorepo engine since **`v0.6.0`**
-2026-08-21); private `capnknives/RiftForge` (SUPERS) pins **`@v0.6.2`**.
+**`v0.7.0`** (2026-09-05, Phase 2 purity restore + journal / rumor / job-catalog
+kernels + flavor-neutral news/storm desks; prior **`v0.6.2`** 2026-08-29
+liquid-flavor kernels; **`v0.6.1`** 2026-08-27 purity restore; **`v0.6.0`**
+2026-08-21); private `capnknives/RiftForge` (SUPERS) pins **`@v0.7.0`**.
 **Post–`v0.4.0` hygiene track (H1–H10)** **complete** (2026-08-05) —
 execution SoT: [`two_repo_purity_extractions_plan.md`](two_repo_purity_extractions_plan.md);
 closeout inventory: [`two_repo_purity_audit_2026-08-05.md`](two_repo_purity_audit_2026-08-05.md).
 **P0** engine purity regression (mine/chargen hooks) **merged** (PR 2386,
 2026-08-16). **P1/P2 shipped:** **`v0.5.2`** maps peel (#2388) then **`v0.5.3`**
 strangler E/D/D (#2394/#2396). **Phase 2 gate** was red on 2026-08-26
-(15 `engine/` → `supers` imports); **PR 3266** restored it. Ongoing: export discipline when engine
+(15 `engine/` → `supers` imports); **PR 3266** restored it; **`v0.7.0`**
+cleared a later live-import regression. Ongoing: export discipline when engine
 APIs change; dual-mount hack when editing both trees. Gateway:
 [`connection_gateway.md`](connection_gateway.md) (shipped).
 T3 hygiene peels (`persistence-api` / `lean-demo` / dirty-saves **bench**)
 are done in [`refactor_plan.md`](refactor_plan.md); full incremental
 dirty-saves stay parked until measured GO.
+
+## v0.7.0 (2026-09-05)
+
+Phase 2 purity was red again on `main` (live `from supers` under `engine/`).
+This tag restores the gate and peels a small kernel set that was still
+game-flavored:
+
+| Piece | Engine | Game keeps |
+|-------|--------|------------|
+| Chargen cancel sentinel | `engine/chargen_menu.py` | `supers/chargen.py` re-export |
+| Account-face / group focus / quest reach / zone visit / ephemeral rooms / persist-helper gaps | `engine.hooks` setters | `supers/bootstrap.py` |
+| Profession / weave bag lookups | container hooks | satchel / pocket_bind |
+| Journal cap/list/write/erase | `engine/systems/journal.py` | share / theft / echo-diary |
+| Rumor board kernel | `engine/systems/rumor_board.py` | verbs + GM wipe |
+| Jobs lookup table | `engine/systems/job_catalog.py` | Cadence `_KNOWN_BEHAVIORS` + JSON validate |
+| News / storm desks | empty desk-key defaults | Lebanon Gazette / Storm Watch keys via hooks |
+| Room triggers | `load_triggers(directory=None)` no-ops | `supers/content/triggers` path at bootstrap |
+
+**Still SUPERS (not this tag):** Cadence lifestyle enums, combat brief+prose,
+Origins/fuel, training Track-B, deep `player_shops`, hospital/crime fiction,
+fishing / cooking / lockpick leftovers.
 
 **Follow-on expansion (done 2026-08-04):** phased engine framework promotion
 (planes/gates, schemas/OLC, needs/Cadence/combat peels, body parts, slam/breach,

@@ -1,11 +1,11 @@
 """Local PR number → in-game bug/suggestion ids (no GitHub API on live).
 
-When a squash-merge subject ends with ``(#NNNN)`` but omits ``Fix bug #N``,
-auto-deploy falls back to PR title/body via GitHub. Live often lacks API auth
-or hits rate limits. Agents record ticket ids when opening PRs
-(``tools/open_pr.py``) under ``ops/deploy_tickets/<pr>.json`` — one file per
-PR so parallel bug-fix branches do not fight over a shared JSON tail. Legacy
-rows in ``ops/deploy_pr_ticket_map.json`` are still read.
+When a squash-merge or GitHub merge-commit subject ends with ``(#NNNN)``
+(or is ``Merge pull request #N``) but omits ``Fix bug #N``, auto-deploy
+reads ``ops/deploy_tickets/<pr>.json`` from the **incoming commit** so the
+row is visible before overlay. Live often lacks API auth or hits rate
+limits. Agents record ticket ids when opening PRs (``tools/open_pr.py``).
+Legacy rows in ``ops/deploy_pr_ticket_map.json`` are still read.
 
 Map keys are GitHub PR numbers (strings). Values hold bug_ids, suggestion_ids,
 and an optional short summary for announce copy.
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import time
 
 _MAP_BASENAME = "deploy_pr_ticket_map.json"
@@ -47,6 +48,36 @@ def _read_json(path: str) -> dict | None:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _read_json_from_commit(
+    commit_sha: str, relpath: str, root: str | None = None,
+) -> dict | None:
+    """Parse a JSON blob from ``commit_sha:relpath`` (empty if missing).
+
+    Auto-deploy looks up ticket maps *before* overlay, so the working tree
+    is still the previous SHA. The row for this PR lives in the incoming
+    commit — ``git show`` is how we read it.
+    """
+    sha = (commit_sha or "").strip()
+    path = (relpath or "").replace("\\", "/").lstrip("/")
+    if not sha or not path:
+        return None
+    cwd = root or _repo_root()
+    try:
+        raw = subprocess.check_output(
+            ["git", "show", f"{sha}:{path}"],
+            cwd=cwd,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
 
@@ -122,14 +153,63 @@ def save_ticket_row(pr_number: int, row: dict, root: str | None = None) -> str:
     return rel
 
 
-def lookup(pr_number: int, root: str | None = None) -> dict | None:
-    """Return a row dict for ``pr_number``, or None."""
+def lookup(
+    pr_number: int,
+    root: str | None = None,
+    commit_sha: str | None = None,
+) -> dict | None:
+    """Return a row dict for ``pr_number``, or None.
+
+    When ``commit_sha`` is set, prefer the blob in that commit (the ticket
+    file that ships with the merge) over the live working tree.
+    """
     key = str(int(pr_number))
+    if commit_sha:
+        row = _read_json_from_commit(
+            commit_sha, f"ops/{_TICKETS_DIRNAME}/{key}.json", root,
+        )
+        if row:
+            return row
+        mono = _read_json_from_commit(
+            commit_sha, f"ops/{_MAP_BASENAME}", root,
+        )
+        if isinstance(mono, dict):
+            pulls = mono.get("pulls")
+            if isinstance(pulls, dict):
+                mapped = pulls.get(key)
+                if isinstance(mapped, dict):
+                    return mapped
     row = _read_json(ticket_path(pr_number, root=root))
     if row:
         return row
     row = _load_monolithic(root).get(key)
     return row if isinstance(row, dict) else None
+
+
+def _all_mapped_ids(field: str, root: str | None = None) -> list[int]:
+    """Collect ticket ids from every deployed map row."""
+    ids: list[int] = []
+    seen: set[int] = set()
+    for row in load(root).values():
+        for raw in row.get(field) or []:
+            try:
+                n = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if n not in seen:
+                seen.add(n)
+                ids.append(n)
+    return ids
+
+
+def all_mapped_bug_ids(root: str | None = None) -> list[int]:
+    """Bug ids recorded on the deployed ticket map (merged PR rows)."""
+    return _all_mapped_ids("bug_ids", root)
+
+
+def all_mapped_suggestion_ids(root: str | None = None) -> list[int]:
+    """Suggestion ids recorded on the deployed ticket map (merged PR rows)."""
+    return _all_mapped_ids("suggestion_ids", root)
 
 
 def synthetic_pr_text(pr_number: int, root: str | None = None) -> str:

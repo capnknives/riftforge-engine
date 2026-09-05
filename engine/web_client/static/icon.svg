@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Mortals and Monsters">
+  <rect width="512" height="512" fill="#0a0a0a"/>
+  <rect x="56" y="56" width="400" height="400" fill="none" stroke="#c9a227" stroke-width="28"/>
+  <path fill="#c9a227" d="M128 372 V140 h64 l64 148 64-148 h64 v232 h-56 V214 L264 372 h-16 L184 214 v158 z"/>
+  <rect x="128" y="400" width="256" height="20" fill="#7ec8a8"/>
+</svg>

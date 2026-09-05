@@ -1,25 +1,65 @@
 {
   "id": "sheet.engine",
-  "version": 2,
+  "version": 3,
   "title": "SCORE",
-  "description": "Engine character-sheet field catalog. Games register hook providers for hook:* sources; engine:* rows are generic. SUPERS custom layout merges rows by slot via resolve_profile_slot.",
+  "description": "Engine character-sheet field catalog. Games register hook providers for hook:* sources; engine:* rows are generic. Custom layouts merge rows by slot via resolve_profile_slot / append_layout_band. New meters: add a hook:* (or engine:*) row here, or call register_auto_field so the overflow band picks it up.",
+  "layout": {
+    "bands": [
+      {
+        "id": "life",
+        "label": "life",
+        "slots": ["life"],
+        "compact": true,
+        "band": true
+      },
+      {
+        "id": "resources",
+        "label": "resources",
+        "slots": ["path_resource", "vessel", "deal_urgent", "origin_meters"],
+        "compact": true,
+        "band": true
+      },
+      {
+        "id": "standing",
+        "label": "standing",
+        "slots": ["standing"],
+        "compact": true,
+        "band": true
+      },
+      {
+        "id": "lifetime",
+        "label": "ledger",
+        "slots": ["lifetime"],
+        "compact": false,
+        "band": true
+      }
+    ],
+    "overflow": {
+      "label": "more",
+      "band": true,
+      "skip_slots": ["header", "body"]
+    }
+  },
   "fields": [
     {
       "id": "header",
       "slot": "header",
       "source": "hook:header",
+      "optional": true,
       "panes": ["default", "vitals", "combat", "full"]
     },
     {
       "id": "primaries_row1",
       "slot": "body",
       "source": "hook:primaries_row1",
+      "optional": true,
       "panes": ["default", "combat", "full"]
     },
     {
       "id": "primaries_row2",
       "slot": "body",
       "source": "hook:primaries_row2",
+      "optional": true,
       "panes": ["default", "combat", "full"]
     },
     {
@@ -29,27 +69,10 @@
       "panes": ["default", "vitals", "full"]
     },
     {
-      "id": "supers_edges",
-      "slot": "body",
-      "source": "hook:supers_edges",
-      "panes": ["default", "full"]
-    },
-    {
-      "id": "supers_god_hunt_intel",
-      "slot": "body",
-      "source": "hook:supers_god_hunt_intel",
-      "panes": ["default", "full"]
-    },
-    {
-      "id": "supers_cult_reach",
-      "slot": "body",
-      "source": "hook:supers_cult_reach",
-      "panes": ["default", "full"]
-    },
-    {
       "id": "hp",
       "slot": "body",
       "source": "hook:hp",
+      "optional": true,
       "panes": ["default", "vitals", "full"]
     },
     {
@@ -65,118 +88,276 @@
       "panes": ["default", "vitals", "full"]
     },
     {
+      "id": "supers_infection",
+      "slot": "life",
+      "source": "hook:supers_infection",
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Infection:"]
+    },
+    {
+      "id": "supers_hospital",
+      "slot": "life",
+      "source": "hook:supers_hospital",
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Status: hospitalized"]
+    },
+    {
+      "id": "supers_newbie",
+      "slot": "life",
+      "source": "hook:supers_newbie",
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Status: newbie-protected"]
+    },
+    {
+      "id": "supers_home",
+      "slot": "life",
+      "source": "hook:supers_home",
+      "panes": ["default", "full"],
+      "filter_prefixes": ["  Home:", "  Realm home:"]
+    },
+    {
+      "id": "supers_personality",
+      "slot": "life",
+      "source": "hook:supers_personality",
+      "panes": ["default", "full"],
+      "filter_prefixes": ["  Personality:"]
+    },
+    {
+      "id": "supers_echo",
+      "slot": "life",
+      "source": "hook:supers_echo",
+      "panes": ["default", "full"],
+      "filter_prefixes": ["  Echo:"]
+    },
+    {
+      "id": "supers_needs_urgent",
+      "slot": "life",
+      "source": "hook:supers_needs_urgent",
+      "panes": ["default"],
+      "compact": "only",
+      "filter_prefixes": ["  Needs:"]
+    },
+    {
+      "id": "supers_guise_stain",
+      "slot": "life",
+      "source": "hook:supers_guise_stain",
+      "panes": ["default"],
+      "compact": "only",
+      "filter_prefixes": ["  Guise stained"]
+    },
+    {
       "id": "supers_fuel_tank",
       "slot": "path_resource",
       "source": "hook:supers_fuel_tank",
-      "panes": ["default", "vitals", "full"]
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Blood:", "  Instinct:", "  Grace:", "  Soul:", "  Devotion:", "  Heir Devotion:", "  Passage:", "  Satiation:", "  Essence:", "  Presence:", "  Feral Heat:", "  Visage:", "  Mimic:", "  Venom:", "  Fuel:", "  Power:"]
     },
     {
       "id": "supers_true_form_regen",
       "slot": "path_resource",
       "source": "hook:supers_true_form_regen",
-      "panes": ["full"]
+      "panes": ["full"],
+      "compact": false,
+      "filter_prefixes": ["  True form:"]
     },
     {
       "id": "supers_larder",
       "slot": "path_resource",
       "source": "hook:supers_larder",
-      "panes": ["full"]
+      "panes": ["full"],
+      "compact": false,
+      "filter_prefixes": ["  Larder:"]
     },
     {
       "id": "supers_vessel",
       "slot": "vessel",
       "source": "hook:supers_vessel",
-      "panes": ["full"]
+      "panes": ["full"],
+      "compact": false,
+      "filter_prefixes": ["  Vessel:"]
+    },
+    {
+      "id": "supers_vessel_blend",
+      "slot": "vessel",
+      "source": "hook:supers_vessel_blend",
+      "panes": ["default", "full"],
+      "filter_prefixes": ["  Vessel blend:"]
     },
     {
       "id": "supers_deal_urgent",
       "slot": "deal_urgent",
       "source": "hook:supers_deal_urgent",
-      "panes": ["default", "vitals", "full"]
+      "panes": ["default", "vitals", "full"],
+      "compact": "only",
+      "filter_prefixes": ["  Deal ("]
     },
     {
       "id": "supers_souls_ferried",
       "slot": "lifetime",
       "source": "hook:supers_souls_ferried",
-      "panes": ["full"]
+      "panes": ["full"],
+      "compact": false,
+      "filter_prefixes": ["  Souls ferried:"]
     },
     {
       "id": "supers_souls_taken",
       "slot": "lifetime",
       "source": "hook:supers_souls_taken",
-      "panes": ["full"]
+      "panes": ["full"],
+      "compact": false,
+      "filter_prefixes": ["  Souls taken:"]
     },
     {
       "id": "supers_deal_clock",
       "slot": "lifetime",
       "source": "hook:supers_deal_clock",
-      "panes": ["full"]
+      "panes": ["full"],
+      "compact": false,
+      "filter_prefixes": ["  Deal ("]
     },
     {
       "id": "supers_deal_edge",
       "slot": "lifetime",
       "source": "hook:supers_deal_edge",
-      "panes": ["full"]
+      "panes": ["full"],
+      "compact": false,
+      "filter_prefixes": ["  Deal edge:"]
     },
     {
       "id": "supers_deal_ward",
       "slot": "lifetime",
       "source": "hook:supers_deal_ward",
-      "panes": ["full"]
+      "panes": ["full"],
+      "compact": false,
+      "filter_prefixes": ["  Deal death ward:"]
+    },
+    {
+      "id": "supers_deal_boons",
+      "slot": "lifetime",
+      "source": "hook:supers_deal_boons",
+      "panes": ["full"],
+      "compact": false,
+      "filter_prefixes": ["  Deal gift:"]
     },
     {
       "id": "supers_victims_drained",
       "slot": "lifetime",
       "source": "hook:supers_victims_drained",
-      "panes": ["full"]
+      "panes": ["full"],
+      "compact": false,
+      "filter_prefixes": ["  Victims drained:"]
     },
     {
       "id": "supers_integrity",
       "slot": "origin_meters",
       "source": "hook:supers_integrity",
-      "panes": ["default", "vitals", "full"]
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Integrity:"]
     },
     {
       "id": "supers_favor",
       "slot": "origin_meters",
       "source": "hook:supers_favor",
-      "panes": ["default", "vitals", "full"]
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Favor:"]
     },
     {
-      "id": "supers_solar_charge",
+      "id": "supers_infernal_favor",
       "slot": "origin_meters",
-      "source": "hook:supers_solar_charge",
-      "panes": ["default", "vitals", "full"]
+      "source": "hook:supers_infernal_favor",
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Infernal favor:"]
     },
     {
-      "id": "supers_umbral_charge",
+      "id": "solar_charge",
       "slot": "origin_meters",
-      "source": "hook:supers_umbral_charge",
-      "panes": ["default", "vitals", "full"]
+      "source": "engine:solar_charge",
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Solar charge:"]
+    },
+    {
+      "id": "umbral_charge",
+      "slot": "origin_meters",
+      "source": "engine:umbral_charge",
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Umbral charge:"]
     },
     {
       "id": "supers_mutation",
       "slot": "origin_meters",
       "source": "hook:supers_mutation",
-      "panes": ["default", "vitals", "full"]
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Mutation charges:"]
     },
     {
       "id": "supers_spirit",
       "slot": "origin_meters",
       "source": "hook:supers_spirit",
-      "panes": ["default", "vitals", "full"]
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Qi:"]
     },
     {
       "id": "supers_mana",
       "slot": "origin_meters",
       "source": "hook:supers_mana",
-      "panes": ["default", "vitals", "full"]
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Mana:"]
     },
     {
       "id": "supers_mark_corruption",
       "slot": "origin_meters",
       "source": "hook:supers_mark_corruption",
-      "panes": ["default", "vitals", "full"]
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Mark corruption:", "  Shade echo:"]
+    },
+    {
+      "id": "supers_luck",
+      "slot": "origin_meters",
+      "source": "hook:supers_luck",
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Luck:"]
+    },
+    {
+      "id": "supers_edges",
+      "slot": "standing",
+      "source": "hook:supers_edges",
+      "panes": ["default", "full"],
+      "filter_prefixes": ["  Edges:"]
+    },
+    {
+      "id": "supers_cult_reach",
+      "slot": "standing",
+      "source": "hook:supers_cult_reach",
+      "panes": ["default", "full"],
+      "filter_prefixes": ["  Cult reach:"]
+    },
+    {
+      "id": "supers_god_hunt_intel",
+      "slot": "standing",
+      "source": "hook:supers_god_hunt_intel",
+      "panes": ["default", "full"],
+      "filter_prefixes": ["  Pantheon vein:", "  Patron:", "  Mischief:", "  Cover:"]
+    },
+    {
+      "id": "supers_sitemask",
+      "slot": "standing",
+      "source": "hook:supers_sitemask",
+      "panes": ["default", "full"],
+      "filter_prefixes": ["  Sitemask:"]
+    },
+    {
+      "id": "supers_grand_coven_standing",
+      "slot": "standing",
+      "source": "hook:supers_grand_coven_standing",
+      "panes": ["default", "full"],
+      "filter_prefixes": ["  Coven Standing:"]
+    },
+    {
+      "id": "supers_tutoring",
+      "slot": "standing",
+      "source": "hook:supers_tutoring",
+      "panes": ["default", "full"],
+      "filter_prefixes": ["  Apprentice of:"]
     }
   ],
   "panes": {

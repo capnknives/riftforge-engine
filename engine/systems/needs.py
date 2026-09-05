@@ -76,11 +76,11 @@ def load_meters(character, names, saved, *, precision=3):
         attach_meters(character, names)
         return
     for name in names:
-        setattr(
-            character,
-            name,
-            round(float(saved.get(name, 0.0) or 0.0), precision),
-        )
+        try:
+            raw = float(saved.get(name, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            raw = 0.0
+        setattr(character, name, round(max(0.0, min(1.0, raw)), precision))
 
 
 def clamp_meters(character, names):

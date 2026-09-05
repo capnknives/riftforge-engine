@@ -156,6 +156,10 @@ def ensure_display_defaults(character):
     Migrates the exact old ``[%h/%Hhp]`` default to the colored classic
     template; leaves any custom prompt alone.
     """
+    if character is None:
+        # Copyover / gateway reattach can dispatch look before the body
+        # is rebound (live: AttributeError on command_aliases).
+        return
     if not hasattr(character, "command_aliases") or character.command_aliases is None:
         character.command_aliases = {}
     if not hasattr(character, "prompt_format") or character.prompt_format is None:
@@ -222,6 +226,9 @@ def ensure_display_defaults(character):
     if not hasattr(character, "show_combat_tags"):
         # Default on (a11y). Any player may opt out via config combattags.
         character.show_combat_tags = True
+    if not hasattr(character, "combat_prose"):
+        # Word-only combat overlay (numbers/diag/tags all off).
+        character.combat_prose = False
     if not hasattr(character, "show_combat_hints"):
         # Tutorial nudges on engage/KO/score/connect reads; config combathints off.
         character.show_combat_hints = True
@@ -258,6 +265,29 @@ def ensure_display_defaults(character):
     if not hasattr(character, "traffic_mode") or character.traffic_mode is None:
         # quiet | normal | verbose -- NPC leave/arrive crowd sampling.
         character.traffic_mode = TRAFFIC_NORMAL
+    if not hasattr(character, "angel_radio_mode") or character.angel_radio_mode is None:
+        character.angel_radio_mode = RADIO_MODE_FULL
+
+
+RADIO_MODE_FULL = "full"
+RADIO_MODE_QUIET = "quiet"
+RADIO_MODES = frozenset({RADIO_MODE_FULL, RADIO_MODE_QUIET})
+
+
+def normalize_radio_mode(raw):
+    if raw is None:
+        return None
+    key = str(raw).strip().lower()
+    if key in RADIO_MODES:
+        return key
+    return None
+
+
+def angel_radio_mode(character):
+    ensure_display_defaults(character)
+    return normalize_radio_mode(getattr(character, "angel_radio_mode", None)) or (
+        RADIO_MODE_FULL
+    )
 
 
 def normalize_traffic_mode(raw):
@@ -508,6 +538,25 @@ def format_tell_chat(viewer, *, outgoing, peer_face, message):
     return f'{peer} tells you, "{text}"'
 
 
+def format_ooctell_chat(viewer, *, outgoing, peer_face, message):
+    """Private OOC tell line for one viewer (OOC channel chrome)."""
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    peer = str(peer_face or "?").strip() or "?"
+    if wants_plain_comms(viewer):
+        text = plain_comm_message(text)
+        if not text:
+            return ""
+        label = plain_comm_face(peer)
+        if outgoing:
+            return f"You ooctell {label}. {text}."
+        return f"OOC tell from {label}. {text}."
+    if outgoing:
+        return f'You ooctell {peer}, "{text}"'
+    return f'{peer} ooctells you, "{text}"'
+
+
 def format_custom_chat(viewer, channel_title, prefix, face, message):
     """Staff/custom global channel line for one viewer."""
     text = str(message or "").strip()
@@ -595,6 +644,8 @@ def expand_aliases(character, raw):
     (e.g. ``ns`` -> ``north``).
     Returns the (possibly unchanged) raw line.
     """
+    if character is None:
+        return (raw or "").strip()
     ensure_display_defaults(character)
     raw = (raw or "").strip()
     if not raw:
@@ -664,15 +715,27 @@ def format_exit_abbrevs(character, game=None):
         from engine import hooks
         from engine import vision as vision_mod
         from engine import style as style_mod
+        from engine.systems import vehicles as vehicles_mod
     except Exception:
         return "-"
+    exit_room = vehicles_mod.exit_source_room(game, room)
+    if game is not None:
+        vision = hooks.weather_look_vision(
+            character,
+            exit_room,
+            game,
+            screenreader=bool(getattr(character, "screenreader", False)),
+            after_move=False,
+        )
+        if isinstance(vision, dict) and vision.get("whiteout"):
+            return "-"
     if not vision_mod.can_see_room(character, room):
         return "-"
     pairs = []
-    for direction, dest in (room.exits or {}).items():
+    for direction, dest in (exit_room.exits or {}).items():
         if not hooks.look_exit_visible(dest, game):
             continue
-        if not vision_mod.character_knows_exit(character, room, direction):
+        if not vision_mod.character_knows_exit(character, exit_room, direction):
             continue
         pairs.append((direction, dest.look_title() if hasattr(dest, "look_title") else ""))
     if not pairs:

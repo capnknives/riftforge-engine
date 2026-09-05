@@ -175,17 +175,20 @@ def transfer_sale_payout(
     """Credit ``seller``; optionally debit ``payer`` (vendor buy-back).
 
     When the payer cannot cover the payout, their wallet is zeroed (pawn
-    shops still take the goods). Always credits the seller.
+    shops still take the goods). Returns False when the seller cannot
+    receive cash (full hands, no pocket wallet, no loose bills) -- callers
+    must restore the peeled ware and skip restock.
     """
     price_cents = int(price_cents or 0)
     d, c = economy_mod.cents_to_parts(price_cents)
-    economy_mod.credit_wallet(
+    if not economy_mod.credit_wallet(
         seller,
         d,
         c,
         reason=credit_reason,
         tick=tick,
-    )
+    ):
+        return False
     if payer is not None and payer is not seller:
         if not economy_mod.debit_wallet(
             payer,
@@ -326,11 +329,13 @@ def sell(character, wares, ware_key, price_cents, *, game=None):
 
     inventory.remove(sold_item)
     character.inventory = inventory
-    transfer_sale_payout(
+    if not transfer_sale_payout(
         character,
         payout,
         credit_reason=f"Sell {getattr(sold_item, 'key', 'item')}",
-    )
+    ):
+        character.inventory.append(sold_item)
+        return False, economy_mod.HANDS_FULL_CASH_MSG
 
     restocked = find_ware(wares, getattr(sold_item, "key", ""))
     if restocked is not None:

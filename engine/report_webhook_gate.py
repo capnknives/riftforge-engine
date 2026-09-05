@@ -43,21 +43,22 @@ def reconcile_tickets(game) -> dict[str, list[int]]:
 
     directory = game.report_dir
     open_bugs_before = set(auto_deploy.open_bug_ids(directory))
-    open_sug_before = set(auto_deploy.open_suggestion_ids(directory))
+    open_sug_before = set(auto_deploy.unresolved_suggestion_ids(directory))
     deploy_notify.reconcile_deployed_ticket_heals(game)
     open_bugs_after = set(auto_deploy.open_bug_ids(directory))
-    open_sug_after = set(auto_deploy.open_suggestion_ids(directory))
+    open_sug_after = set(auto_deploy.unresolved_suggestion_ids(directory))
     return {
         "bugs": sorted(open_bugs_before - open_bugs_after),
         "suggestions": sorted(open_sug_before - open_sug_after),
     }
 
 
-def _open_entries(kind, directory, *, report_ids=None):
+def _entries(kind, directory, *, report_ids=None, statuses=None):
+    wanted_status = tuple(statuses) if statuses is not None else ("open",)
     entries = [
         entry
         for entry in reports.recent(kind, None, directory=directory)
-        if entry.get("status", "open") == "open"
+        if (entry.get("status", "open") in wanted_status)
     ]
     if report_ids is not None:
         wanted = set(report_ids)
@@ -81,7 +82,7 @@ def _deployed_open_ids(kind, directory):
     open_ids = set(
         auto_deploy.open_bug_ids(directory)
         if kind == reports.BUG
-        else auto_deploy.open_suggestion_ids(directory)
+        else auto_deploy.unresolved_suggestion_ids(directory)
     )
     if not open_ids:
         return set()
@@ -105,7 +106,7 @@ def plan_bugs(directory, game=None, *, bug_ids=None, reconcile=True):
         reconciled_bugs=list(reconciled.get("bugs") or []),
         reconciled_suggestions=list(reconciled.get("suggestions") or []),
     )
-    for entry in _open_entries(reports.BUG, directory, report_ids=bug_ids):
+    for entry in _entries(reports.BUG, directory, report_ids=bug_ids):
         bid = entry.get("id")
         if bid in watched:
             plan.skipped.append({"id": bid, "reason": SKIP_WATCHED})
@@ -118,7 +119,12 @@ def plan_bugs(directory, game=None, *, bug_ids=None, reconcile=True):
 
 
 def plan_suggestions(directory, game=None, *, suggestion_ids=None, reconcile=True):
-    """Build a webhook plan for open suggestion reports."""
+    """Build a webhook plan for suggestion reports.
+
+    Bulk ``squashsuggest`` (no ids) queues **approved** ideas only.
+    A specific id still matches open or approved so ``sendsuggest`` can
+    pick one from the inbox (and the GM verb auto-approves it first).
+    """
     reconciled = (
         reconcile_tickets(game) if reconcile and game is not None
         else {"bugs": [], "suggestions": []}
@@ -130,8 +136,12 @@ def plan_suggestions(directory, game=None, *, suggestion_ids=None, reconcile=Tru
         reconciled_bugs=list(reconciled.get("bugs") or []),
         reconciled_suggestions=list(reconciled.get("suggestions") or []),
     )
-    for entry in _open_entries(
+    statuses = (
+        ("open", "approved") if suggestion_ids is not None else ("approved",)
+    )
+    for entry in _entries(
         reports.SUGGEST, directory, report_ids=suggestion_ids,
+        statuses=statuses,
     ):
         sid = entry.get("id")
         if sid in watched:

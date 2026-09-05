@@ -498,15 +498,28 @@ class Session:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(
+        task = loop.create_task(
             bridge.notify_bound(
                 sid,
                 bind,
                 ooc_face=ooc_face,
                 head_gm=head_gm,
                 staff_gm=staff_gm,
+                gmcp_supports=dict(getattr(self, "gmcp_supports", None) or {}),
             )
         )
+
+        def _bound_done(done):
+            err = done.exception() if not done.cancelled() else None
+            if err is None:
+                return
+            print(
+                f"[connection] gateway bound notify failed sid={sid} "
+                f"bind={bind!r}: {err!r}",
+                flush=True,
+            )
+
+        task.add_done_callback(_bound_done)
 
     def _kick_gateway_client(self):
         """Ask the gateway to drop the public TCP (quit / intentional close)."""
@@ -575,6 +588,20 @@ class Session:
         tagged copy (engine/snoop.py) -- classic MUD viewpoint mirroring.
         """
         if self.alive:
+            # Live telnet concatenates message + CRLF. None/list/tuple used
+            # to TypeError and kill the play loop (HB-09). Skip None; refuse
+            # non-str without raising. Never str(list) -- that hides
+            # FakeSession / viewport smokes that must assert str.
+            if message is None:
+                print("[session] send skipped None", flush=True)
+                return
+            if not isinstance(message, str):
+                print(
+                    f"[session] send refused non-str "
+                    f"{type(message).__name__}",
+                    flush=True,
+                )
+                return
             # Strip gothic ANSI when the player turned color off. Import
             # locally so connection.py stays light at module load and the
             # style helpers stay the single source of strip_ansi.
@@ -793,14 +820,16 @@ class Session:
                 chargen_char.session = self
                 self.character = chargen_char
                 self._set_creating()
-                self.reset_gmcp()
                 from engine import gmcp
-                from engine import mssp
-                from engine import telnet
-                gmcp.offer_gmcp(self)
-                mssp.offer_mssp(self)
-                telnet.offer_naws(self)
-                telnet.set_client_echo(self, True)
+
+                # This TCP already completed telnet negotiation (WILL MSSP,
+                # DO NAWS, WONT ECHO) once, back at the original connect --
+                # only GMCP needs restoring here since reset_gmcp() wiped it.
+                # Re-sending the other three negotiations on an already-
+                # negotiated socket on every gateway reattach (deploy /
+                # game-only restart) crashed a screenreader TinTin++ client
+                # every single copyover (bug report 1219).
+                gmcp.resume_gmcp_after_gateway_reattach(self)
                 from engine.copyover import MSG_AFTER
                 from engine.account_login import resume_chargen_after_hold
                 self.send(MSG_AFTER)
@@ -848,16 +877,17 @@ class Session:
                 self.character = char
                 # Reattach skips the name prompt -- never on connecting_sessions.
                 self._promote_to_sessions()
-                self.reset_gmcp()
                 from engine import gmcp
-                from engine import mssp
-                from engine import telnet
-                gmcp.offer_gmcp(self)
-                mssp.offer_mssp(self)
-                telnet.offer_naws(self)
-                # Gateway reattach skips password prompts -- restore local
-                # echo in case the client still holds ECHO-off from login.
-                telnet.set_client_echo(self, True)
+
+                # Same reasoning as the chargen branch above: this socket
+                # already negotiated MSSP/NAWS/ECHO once, at original login,
+                # and chargen's own password prompts manage ECHO themselves
+                # (engine.telnet.set_client_echo) whenever they actually run
+                # -- resending WILL/DO/WONT here was pure re-negotiation
+                # noise that crashed a screenreader TinTin++ client every
+                # copyover (bug report 1219). Only GMCP needs a fresh push
+                # (reset_gmcp() wiped it on gateway reconnect).
+                gmcp.resume_gmcp_after_gateway_reattach(self)
                 from engine.copyover import MSG_AFTER
                 from engine import char_identity as identity_mod
                 self.send(MSG_AFTER)
@@ -942,6 +972,11 @@ class Session:
         here -- skipping the name/password prompt above entirely, since a
         copyover already knows who was on this socket before the reload.
         """
+        if self.character is None:
+            # Mid-chargen copyover can reach play() after the draft body
+            # was vaulted -- looking here used to AttributeError and leave
+            # the browser HUD looking frozen while the socket still sent.
+            return
         from engine import telnet
         # Belt-and-suspenders after any password prompt or gateway bounce.
         telnet.set_client_echo(self, True)
@@ -1009,13 +1044,13 @@ class Session:
             entry = [history_line_for_storage(line), None]
             self.history.append(entry)
             # Player pace log: what they typed (already redacted for setpass).
-            _activity_logger_call(self.character, "cmd", entry[0])
+            _activity_logger_call(self.character, "cmd", entry[0], self.game)
             # Classic snoop: GMs watching this character also see what they type.
             from engine import snoop
             snoop.mirror_input(self.character, line)
             try:
                 dispatch(self.character, line, self.game)
-            except Exception:
+            except Exception as exc:
                 # A bug in ONE command shouldn't kill the player's whole session.
                 # We print the error to the server console for debugging and tell
                 # the player something went wrong. During development you might
@@ -1025,7 +1060,12 @@ class Session:
                 import traceback
                 entry[1] = traceback.format_exc()
                 traceback.print_exc()
+                _activity_logger_call(self.character, "error", exc)
                 self.send("Something went wrong with that command.")
+            # GATE / FLAG after dispatch (including failed commands).
+            _activity_logger_call(
+                self.character, "after_cmd", entry[0], self.game,
+            )
             if tracks_last_command(line):
                 self.last_command = line
             # drain() waits if the outgoing buffer is backed up (slow client),
@@ -1347,6 +1387,7 @@ class Session:
         char.session = self
         char.offline_gains_this_stretch = 0
         char.idle_mode = False
+        char.afk_mode = False
         hooks.stamp_input_activity(char, self.game)
         self.character = char
         self._promote_to_sessions()
@@ -1594,6 +1635,16 @@ class Session:
                 "session already detached",
                 flush=True,
             )
+            # Session may still be on the wire (soft logout / quit). Warn
+            # before the socket closes so the player does not assume a flush.
+            try:
+                if self.alive:
+                    self.send(
+                        "Your logout may not have saved. Tell staff if "
+                        "you return and something is missing."
+                    )
+            except Exception:
+                pass
         if keep_connection:
             # Soft logout: clear gateway bind, stay on TCP, re-enter login.
             self._notify_gateway_unbound()

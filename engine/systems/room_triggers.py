@@ -17,13 +17,16 @@ def register_action(effect_type: str, fn) -> None:
     _ACTIONS[effect_type] = fn
 
 
-def load_triggers(directory="supers/content/triggers") -> None:
-    """Load every room.trigger JSON file and index by attach room."""
+def load_triggers(directory=None) -> None:
+    """Load every room.trigger JSON file and index by attach room.
+
+    ``directory`` is required; a bare engine has no default game path.
+    """
     import json
     import os
 
     _TRIGGERS_BY_ROOM.clear()
-    if not os.path.isdir(directory):
+    if not directory or not os.path.isdir(directory):
         return
     for name in sorted(os.listdir(directory)):
         if not name.endswith(".json"):

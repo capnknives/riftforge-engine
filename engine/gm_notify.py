@@ -205,13 +205,28 @@ def paint_wiz_line(message):
     return style.paint("absinthe_green", f"[WIZ] {message}")
 
 
-def wiznet_speaker_label(speaker):
-    """Public staff label for wiznet -- never ``gmspirit:`` / ``husk:`` keys."""
+def wiznet_speaker_label(speaker, game=None):
+    """Public staff label for wiznet -- never ``gmspirit:`` / ``husk:`` keys.
+
+    Uses the same OOC face resolver as ``ooc`` / ``otell`` so ``config oocname
+    account`` (Daniel body, Matt account) reads ``Matt(GM)`` on wiznet, not
+    the mortal character key. Kokid/system strings still fall back to
+    ``_public_label``.
+    """
     from engine.command_support import _is_gm, _public_label
     from engine import hooks
     from world import Character
 
-    who = _public_label(speaker)
+    if game is None:
+        session = getattr(speaker, "session", None)
+        game = getattr(session, "game", None) if session is not None else None
+
+    if isinstance(speaker, Character) and game is not None:
+        from engine import ooc_channel
+
+        who = ooc_channel.speaker_face_for_character(speaker, game)
+    else:
+        who = _public_label(speaker)
     # Mortal-body staff (``gm off``) still read as staff on wiznet.
     if (
         isinstance(speaker, Character)
@@ -229,18 +244,18 @@ def wiznet_speaker_label(speaker):
     return who
 
 
-def format_wiznet_plain(speaker, message):
+def format_wiznet_plain(speaker, message, game=None):
     """Plain ``[WIZ] Name(GM): text`` line for history (no ANSI)."""
-    who = wiznet_speaker_label(speaker)
+    who = wiznet_speaker_label(speaker, game=game)
     text = (message or "").strip()
     if not text:
         return None
     return f"[WIZ] {who}: {text}"
 
 
-def format_wiznet_line(speaker, message):
+def format_wiznet_line(speaker, message, game=None):
     """Build one painted ``[WIZ] Name(GM): text`` line for staff chat."""
-    plain = format_wiznet_plain(speaker, message)
+    plain = format_wiznet_plain(speaker, message, game=game)
     if plain is None:
         return None
     return style.paint_preserving_urls("absinthe_green", plain)
@@ -265,11 +280,11 @@ def wiznet_broadcast(game, speaker, message, *, exclude=None, skip_discord_mirro
     out so in-character bodies never see the channel. In-game lines also
     mirror to Discord #staff unless *skip_discord_mirror* (inbound Discord).
     """
-    plain = format_wiznet_plain(speaker, message)
+    plain = format_wiznet_plain(speaker, message, game=game)
     if plain is None:
         return False
     append_wiznet_history(game, plain)
-    line = format_wiznet_line(speaker, message)
+    line = format_wiznet_line(speaker, message, game=game)
     sent = _deliver_wiznet_line(game, line, exclude=exclude)
     if not skip_discord_mirror:
         _mirror_wiznet_discord(plain)

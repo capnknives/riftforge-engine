@@ -2,11 +2,11 @@
 web_client.py -- static browser play page served on the WebSocket port.
 
 Plain HTTP GET requests on ``RIFTFORGE_WS_PORT`` (default 4080) receive
-``index.html``, ``app.js``, ``style.css``, and ``discord-invite.js``.
-``GET /discord.json`` and ``GET /status.json`` serve gitignored sidecars
-the game writes (login Discord invite; who-count + last player-facing ship).
-WebSocket upgrades on the same port are handled by ``engine.gateway``
-(not this module).
+the allowlisted static files (HTML/JS/CSS, PWA manifest, icons, and the
+service worker). ``GET /discord.json`` and ``GET /status.json`` serve
+gitignored sidecars the game writes (login Discord invite; who-count +
+last player-facing ship). WebSocket upgrades on the same port are handled
+by ``engine.gateway`` (not this module).
 
 Stdlib only. See ``docs/plans/browser_websocket_client.md``.
 """
@@ -28,6 +28,11 @@ _ALLOWED: dict[str, str] = {
     "/app.js": "app.js",
     "/style.css": "style.css",
     "/discord-invite.js": "discord-invite.js",
+    "/manifest.json": "manifest.json",
+    "/service-worker.js": "service-worker.js",
+    "/icon.svg": "icon.svg",
+    "/icon-192.png": "icon-192.png",
+    "/icon-512.png": "icon-512.png",
 }
 
 
@@ -145,4 +150,10 @@ def serve_http(raw: bytes) -> bytes:
         ctype = "text/css; charset=utf-8"
     elif rel.endswith(".html"):
         ctype = "text/html; charset=utf-8"
+    elif rel.endswith(".json"):
+        ctype = "application/json; charset=utf-8"
+    elif rel.endswith(".svg"):
+        ctype = "image/svg+xml"
+    elif rel.endswith(".png"):
+        ctype = "image/png"
     return _http_response(200, "OK", body, content_type=ctype)

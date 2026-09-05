@@ -77,6 +77,8 @@ def payload_from_record(record_payload):
     dumps. Older ``suggestions.log`` rows still get trimmed here even
     if they were filed before the slim snapshot landed.
     """
+    from engine import reports as reports_mod
+
     body = dict(record_payload)
     body["kind"] = "suggest"
     ctx = body.get("context")
@@ -84,6 +86,9 @@ def payload_from_record(record_payload):
         from engine import report_context as report_context_mod
 
         body["context"] = report_context_mod.slim_suggestion_context(ctx)
+    summary = reports_mod.format_messages_for_webhook(body)
+    if summary:
+        body["ticket_comments"] = summary
     return body
 
 

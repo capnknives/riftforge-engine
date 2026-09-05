@@ -197,7 +197,7 @@ def _copyover_settle_seconds():
 
 
 def reload_auto_deploy():
-    """Reload apply_pr_fix + deploy_notify + hooks + changelog stamp + auto_deploy.
+    """Reload apply_pr_fix, notify, ticket map, hooks, changelog, auto_deploy.
 
     The watcher is long-lived (often PID 1). A one-shot ``from engine.auto_deploy
     import try_auto_deploy`` at boot keeps the pre-patch function forever after
@@ -209,15 +209,21 @@ def reload_auto_deploy():
     ``queue_catchup_resolves`` / map heal must match disk), then
     ``engine.changelog_ledger`` (mint any new ``#N``), then
     ``engine.discord_patch_notes`` (posts from the ledger's unposted rows),
-    then ``engine.auto_deploy``. Call on every deploy poll.
+    then ``engine.deploy_pr_ticket_map`` (``lookup(..., commit_sha=)`` must
+    match ``auto_deploy``), then ``engine.auto_deploy``. Call on every
+    deploy poll.
 
     Without reloading ``deploy_notify``, a tip-only ``auto_deploy`` reload
     can call ``queue_deploy(..., bug_ids=...)`` against a stale module and
     error-loop every poll (reset --hard + protect restore → copyover churn).
+    Same for ``deploy_pr_ticket_map``: new auto_deploy passing
+    ``commit_sha=`` against an old ``lookup()`` TypeErrors the whole poll
+    and shipped tickets stay open.
     """
     import engine.auto_deploy as auto_deploy
     import engine.changelog_ledger as changelog_ledger
     import engine.deploy_notify as deploy_notify
+    import engine.deploy_pr_ticket_map as deploy_pr_ticket_map
     import engine.discord_patch_notes as discord_patch_notes
     import engine.hooks as hooks
     import tools.apply_pr_fix as apply_pr_fix
@@ -227,13 +233,17 @@ def reload_auto_deploy():
     importlib.reload(hooks)
     importlib.reload(changelog_ledger)
     importlib.reload(discord_patch_notes)
+    importlib.reload(deploy_pr_ticket_map)
     # Watcher is not the game child — bootstrap never re-registers map
     # heal after this hooks reload. Late-bind so the next reset --hard
     # actually merges content/map_backups into zone/map JSON.
     try:
         hooks.ensure_auto_deploy_map_heal(reload_impl=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(
+            f"[watch] ensure_auto_deploy_map_heal failed: {exc!r}",
+            flush=True,
+        )
     mod = importlib.reload(auto_deploy)
     return mod
 
@@ -673,8 +683,11 @@ def _maybe_auto_revert(*, reason_prefix=""):
                 reason=f"{reason_prefix}revert raised: {exc!r}"[:500],
             )
             crash_recovery.clear_gateway_outage()
-        except Exception:
-            pass
+        except Exception as hold_exc:
+            print(
+                f"[watch] set_revert_hold failed: {hold_exc!r}",
+                flush=True,
+            )
         return False
     if ok:
         print(

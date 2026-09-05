@@ -4,6 +4,11 @@ America atlas JSON stores two glyph-string arrays instead of a
 ``cell_overrides`` blob per land tile. Named mouths (cities, dungeons,
 the bunker) stay in sparse ``cell_overrides`` and win on a per-key merge.
 
+Optional ``highland_rows`` marks mining country with ``H`` (same size as
+terrain_rows). Visual biome stays in terrain_rows -- only ridge cells
+are ``^`` mountains. Both CONUS atlases use this
+(``earth_america.json`` and secret ``earth_frontierland_1861.json``).
+
 y=0 is the first row (south); x=0 is the first character (west). That
 matches grid_x / grid_y on generated Rooms.
 
@@ -27,7 +32,23 @@ AREA_TO_TERRAIN_GLYPH = {
     area: glyph for glyph, area in TERRAIN_GLYPH_TO_AREA.items()
 }
 # Interstate overlay painted on top of topography.
+# Live paint is a single "=" tile. Older maps still store | / \ + from
+# the cardinal-only line-art era -- loaders accept them and normalize
+# the visible glyph to "=" in expand_grid_cell.
 ROAD_GLYPHS = frozenset("=|/\\+")
+# HUD-only void-margin tint on earth_america (cosmetic; area_type stays void).
+WATER_VIEW_GLYPHS = frozenset("~o")
+# HUD-only Canada land on America void margins (cosmetic; area_type void).
+LAND_VIEW_GLYPHS = frozenset(".T^,")
+# Inland river overlay on land (Mississippi, …) — does not change area_type.
+RIVER_GLYPHS = frozenset("~n")
+# Max depth band index on playable water maps (0/1/2).
+DEPTH_BAND_GLYPHS = frozenset("012")
+# Layers that sit ON land instead of replacing the terrain fill.
+ROAD_OVERLAY_LAYERS = frozenset({"highway", "mountain_highway", "trail"})
+# Mining-country mask. Space = not highland. H = Rockies / Sierra /
+# Appalachian belt (peaks AND forested/high-plain fill).
+HIGHLAND_GLYPHS = frozenset("H")
 
 
 def layer_char(rows, x, y):
@@ -91,21 +112,68 @@ def expand_grid_cell(grid, x, y):
     road_ch = layer_char(grid.get("road_rows"), x, y)
     if road_ch and road_ch in ROAD_GLYPHS:
         under = out.get("area_type") or grid.get("area_type")
+        if under and under not in ("highway", "trail", "road"):
+            out["terrain_base"] = under
         if str(grid.get("route_kind") or "").strip().lower() == "trail":
             out["area_type"] = "trail"
-            out["map_glyph"] = road_ch
+            out["map_glyph"] = "-"
             out["map_layer"] = "trail"
             out["title"] = "Wagon trail"
         else:
             out["area_type"] = "highway"
-            out["map_glyph"] = road_ch
+            # One tile -- not directional line-art. Cars step 8-way on this.
+            out["map_glyph"] = "="
             out["map_layer"] = (
                 "mountain_highway" if under == "mountains" else "highway"
             )
             out["title"] = "Highway"
+    highland_ch = layer_char(grid.get("highland_rows"), x, y)
+    if highland_ch and highland_ch in HIGHLAND_GLYPHS:
+        # Mining-country flag only. Do not stamp a hills letter -- fill
+        # already shows as forest T / plains . / desert , like the rest
+        # of the atlas. Peaks stay grey ^.
+        out["highland"] = True
+    # HUD water on America void margin — paint only; sim stays void.
+    view_ch = layer_char(grid.get("water_view_rows"), x, y)
+    sim_area = out.get("area_type") or grid.get("area_type")
+    if (
+        view_ch
+        and view_ch in WATER_VIEW_GLYPHS
+        and str(sim_area or "").strip().lower() == "void"
+    ):
+        out["water_view"] = True
+        out["map_glyph"] = view_ch
+        out["map_layer"] = "water_view"
+    # HUD Canada land on America void — paint only; sim stays void.
+    land_ch = layer_char(grid.get("land_view_rows"), x, y)
+    if (
+        land_ch
+        and land_ch in LAND_VIEW_GLYPHS
+        and str(sim_area or "").strip().lower() == "void"
+        and not out.get("water_view")
+    ):
+        out["land_view"] = True
+        out["map_glyph"] = land_ch
+        out["map_layer"] = "land_view"
+    # Inland river overlay on land — never replaces terrain area_type.
+    # After highland so a Mississippi cell can still set map_layer=river.
+    river_ch = layer_char(grid.get("river_rows"), x, y)
+    if river_ch and river_ch in RIVER_GLYPHS:
+        base = str(out.get("area_type") or "").strip().lower()
+        if base not in ("void", "ocean", "lake", "highway", "trail"):
+            out["map_glyph"] = river_ch
+            out["map_layer"] = "river"
+    depth_ch = layer_char(grid.get("depth_rows"), x, y)
+    if depth_ch and depth_ch in DEPTH_BAND_GLYPHS:
+        out["max_water_band"] = int(depth_ch)
     key = f"{x},{y}"
     override = (grid.get("cell_overrides") or {}).get(key) or {}
     if isinstance(override, dict):
         for field, value in override.items():
             out[field] = value
+    # City letters win. Leftover | / \ + from old JSON collapse to "=".
+    layer = str(out.get("map_layer") or "").strip().lower()
+    glyph = str(out.get("map_glyph") or "")
+    if layer in ("highway", "mountain_highway") and glyph in ROAD_GLYPHS:
+        out["map_glyph"] = "="
     return out

@@ -821,7 +821,7 @@ def _branch_room_entry(kind, room_key, title, living_key, back_dir,
             f"{title}. A small bedroom with a quilted bed. "
             f"{back_dir.capitalize()} returns to the living room."
         )
-        entry["resources"] = ["sleep", "water", "hygiene"]
+        entry["resources"] = ["sleep", "water"]
         entry["resource_capacity"] = {"sleep": 1}
         entry["seed_items"] = [{"item": "worn_bed"}]
     elif kind == "bathroom":
@@ -835,7 +835,7 @@ def _branch_room_entry(kind, room_key, title, living_key, back_dir,
             f"{title}. A galley kitchen with a humming refrigerator. "
             f"{back_dir.capitalize()} returns to the living room."
         )
-        entry["resources"] = ["water", "food", "hygiene"]
+        entry["resources"] = ["water", "food"]
         if include_fridge:
             entry["seed_items"] = [{"item": "refrigerator"}]
     else:  # den
@@ -843,7 +843,7 @@ def _branch_room_entry(kind, room_key, title, living_key, back_dir,
             f"{title}. A second sitting room with a battered TV. "
             f"{back_dir.capitalize()} returns to the living room."
         )
-        entry["resources"] = ["water", "entertainment", "hygiene"]
+        entry["resources"] = ["water", "entertainment"]
         entry["seed_items"] = [{"item": "battered_tv"}]
     return entry
 
@@ -885,7 +885,11 @@ def _porch_and_living_shell(
     if zone:
         porch["zone"] = zone
 
-    living_seeds = [{"item": "battered_tv"}, {"item": "tabletop_radio"}]
+    living_seeds = [
+        {"item": "battered_tv"},
+        {"item": "tabletop_radio"},
+        {"item": "house_landline"},
+    ]
     # Fridge lives in the kitchen when one was rolled; otherwise living.
     if not has_kitchen:
         living_seeds.append({"item": "refrigerator"})
@@ -909,7 +913,7 @@ def _porch_and_living_shell(
         "is_house": True,
         "is_home": True,
         "main_homeroom": living_key,
-        "resources": ["water", "entertainment", "hygiene"],
+        "resources": ["water", "entertainment"],
         "seed_items": living_seeds,
     }
     if zone:
@@ -1086,7 +1090,7 @@ def _build_large_home(street_room, street_name, address, *, rng):
         "is_house": True,
         "is_home": True,
         "main_homeroom": living_key,
-        "resources": ["sleep", "water", "hygiene"],
+        "resources": ["sleep", "water"],
         "resource_capacity": {"sleep": 1},
         "seed_items": [{"item": "worn_bed"}],
     }
@@ -1108,7 +1112,7 @@ def _build_large_home(street_room, street_name, address, *, rng):
         "is_house": True,
         "is_home": True,
         "main_homeroom": living_key,
-        "resources": ["water", "entertainment", "hygiene"],
+        "resources": ["water", "entertainment"],
         "seed_items": [{"item": "battered_tv"}],
     }
     if zone:

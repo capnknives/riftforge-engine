@@ -76,6 +76,10 @@ def default_plan_actor_intents(projection: CadenceActorProjection) -> list:
 
     Priority: decay-only (no verb), sleep/wake, wander. Returns at most one
     CadenceIntent. Must never import supers, touch Character/Room, or call npc_do.
+
+    Blood / hunt / grocery are **not** planned here -- those verbs need
+    live world state. ``should_lod_skip`` keeps SEEK-fuel Vampires and
+    CRITICAL survival on the main-loop ``_act`` path instead.
     """
     if not projection.lod_eligible:
         return []

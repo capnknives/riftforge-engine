@@ -68,6 +68,11 @@ class Account:
         self.features_suggested = 0
         # Peer / staff gifted account points (counts toward account totals).
         self.gifted = 0
+        # Lifetime account points burned at successful character create.
+        # Available leftover = contribution_points - chargen_spent.
+        self.chargen_spent = 0
+        # Short debit/refund history for staff (capped in supers.chargen_spend).
+        self.chargen_spend_log = []
         # Spendable pool for ``giftpoints`` (1 banked per hour active online).
         self.gift_bank = 0
         self.gift_bank_last_accrual_ts = 0.0
@@ -118,6 +123,10 @@ class Account:
             "bugs_squashed": int(self.bugs_squashed or 0),
             "features_suggested": int(self.features_suggested or 0),
             "gifted": int(getattr(self, "gifted", 0) or 0),
+            "chargen_spent": int(getattr(self, "chargen_spent", 0) or 0),
+            "chargen_spend_log": list(
+                getattr(self, "chargen_spend_log", None) or []
+            ),
             "gift_bank": int(getattr(self, "gift_bank", 0) or 0),
             "gift_bank_last_accrual_ts": float(
                 getattr(self, "gift_bank_last_accrual_ts", 0) or 0
@@ -181,17 +190,41 @@ class Account:
             str(spirit).strip() if isinstance(spirit, str) and spirit.strip()
             else None
         )
-        self.bugs_squashed = int(data.get("bugs_squashed", 0) or 0)
-        self.features_suggested = int(data.get("features_suggested", 0) or 0)
-        self.gifted = int(data.get("gifted", 0) or 0)
-        self.gift_bank = int(data.get("gift_bank", 0) or 0)
+        try:
+            self.bugs_squashed = int(data.get("bugs_squashed", 0) or 0)
+        except (TypeError, ValueError):
+            self.bugs_squashed = 0
+        try:
+            self.features_suggested = int(
+                data.get("features_suggested", 0) or 0
+            )
+        except (TypeError, ValueError):
+            self.features_suggested = 0
+        try:
+            self.gifted = int(data.get("gifted", 0) or 0)
+        except (TypeError, ValueError):
+            self.gifted = 0
+        try:
+            self.chargen_spent = max(0, int(data.get("chargen_spent", 0) or 0))
+        except (TypeError, ValueError):
+            self.chargen_spent = 0
+        log = data.get("chargen_spend_log") or []
+        self.chargen_spend_log = list(log) if isinstance(log, list) else []
+        try:
+            self.gift_bank = int(data.get("gift_bank", 0) or 0)
+        except (TypeError, ValueError):
+            self.gift_bank = 0
         try:
             self.gift_bank_last_accrual_ts = float(
                 data.get("gift_bank_last_accrual_ts", 0) or 0
             )
         except (TypeError, ValueError):
             self.gift_bank_last_accrual_ts = 0.0
-        ooc = (data.get("ooc_identity") or OOC_IDENTITY_ACCOUNT).strip().lower()
+        raw_ooc = data.get("ooc_identity")
+        if isinstance(raw_ooc, str) and raw_ooc.strip():
+            ooc = raw_ooc.strip().lower()
+        else:
+            ooc = OOC_IDENTITY_ACCOUNT
         self.ooc_identity = (
             ooc if ooc in OOC_IDENTITY_CHOICES else OOC_IDENTITY_ACCOUNT
         )
@@ -201,9 +234,12 @@ class Account:
         self.playtester = bool(data.get("playtester", False))
         self.mud_basics_seen = bool(data.get("mud_basics_seen", False))
         self.player_helper = bool(data.get("player_helper", False))
-        self.last_seen_changelog_id = int(
-            data.get("last_seen_changelog_id", 0) or 0
-        )
+        try:
+            self.last_seen_changelog_id = int(
+                data.get("last_seen_changelog_id", 0) or 0
+            )
+        except (TypeError, ValueError):
+            self.last_seen_changelog_id = 0
         self.last_seen_changelog_sort_ts = str(
             data.get("last_seen_changelog_sort_ts", "") or ""
         )
@@ -311,6 +347,27 @@ def contribution_points(account):
     return max(0, bugs + ideas + gifted)
 
 
+def available_chargen_points(account):
+    """Earned account points still unspent at character create."""
+    if account is None:
+        return 0
+    try:
+        spent = max(0, int(getattr(account, "chargen_spent", 0) or 0))
+    except (TypeError, ValueError):
+        spent = 0
+    return max(0, contribution_points(account) - spent)
+
+
+def _report_tally_for_character_key(character_key, counts):
+    """Count resolved rows filed under a mortal key or ``gmspirit:<key>``."""
+    key = (character_key or "").strip()
+    if not key:
+        return 0
+    total = int(counts.get(key, 0))
+    total += int(counts.get(f"gmspirit:{key}", 0))
+    return total
+
+
 def refresh_contribution_totals(game, account):
     """Recompute ``bugs_squashed`` / ``features_suggested`` from report logs.
 
@@ -346,8 +403,8 @@ def refresh_contribution_totals(game, account):
             k = (key or "").strip()
             if not k:
                 continue
-            bugs += int(bug_counts.get(k, 0))
-            suggests += int(suggest_counts.get(k, 0))
+            bugs += _report_tally_for_character_key(k, bug_counts)
+            suggests += _report_tally_for_character_key(k, suggest_counts)
         account.bugs_squashed = bugs
         account.features_suggested = suggests
         return (bugs, suggests)
@@ -357,15 +414,29 @@ def refresh_contribution_totals(game, account):
         return (bugs, ideas)
 
 
+def _try_mark_account_dirty(game, account, *, label=None):
+    """Queue an account persist; log when the dirty stamp itself fails."""
+    try:
+        from engine.persistence import mark_account_dirty
+
+        mark_account_dirty(game, account)
+    except Exception as exc:
+        from engine import log_util
+
+        name = getattr(account, "name", account)
+        log_util.ops(
+            "accounts",
+            f"mark_account_dirty failed account={name!r}"
+            + (f" ({label})" if label else ""),
+            exc=exc,
+        )
+
+
 def register_account(game, account):
     """Insert ``account`` into ``game.accounts`` (overwrites same key)."""
     accounts = ensure_accounts_dict(game)
     accounts[account_lookup_key(account.name)] = account
-    try:
-        from engine.persistence import mark_account_dirty
-        mark_account_dirty(game, account)
-    except Exception:
-        pass
+    _try_mark_account_dirty(game, account, label="register")
     return account
 
 
@@ -409,6 +480,65 @@ def verify_account_password(account, password):
     return auth.verify_password(password or "", account.password_hash or "")
 
 
+def verify_character_or_account_password(game, character, password):
+    """True when ``password`` matches the body or linked account hash.
+
+    ``setpass`` accepts either so players who only remember the account
+    login password can still rotate credentials after account-first shipped.
+    """
+    if character is None:
+        return False
+    stored = getattr(character, "password_hash", None) or ""
+    if stored and auth.verify_password(password or "", stored):
+        return True
+    account = account_for_character(game, character)
+    if account is not None:
+        return verify_account_password(account, password)
+    return False
+
+
+def apply_login_password_hash(game, character, password_hash):
+    """Set the body login hash and mirror it on the linked account.
+
+    Account-first login reads ``account.password_hash``; without this mirror
+    ``setpass`` / ``gm setpass`` only changed the body and account login kept
+    the old secret (bug hunt P4-13).
+    """
+    if character is None:
+        return None
+    character.password_hash = password_hash or ""
+    account = account_for_character(game, character)
+    if account is not None:
+        account.password_hash = password_hash or ""
+        _try_mark_account_dirty(game, account, label="password")
+    return account
+
+
+def persist_login_password_change(game, character, *, reason="setpass"):
+    """Checkpoint password hash changes without a full ``game.save()`` snapshot.
+
+    ``apply_login_password_hash`` already marks the linked account dirty.
+    This flushes the account row and the body row only (P11-14).
+    """
+    if character is None or game is None:
+        return False
+    db = getattr(game, "db", None)
+    if db is None:
+        return False
+    from engine.persistence import (
+        flush_accounts_now,
+        flush_character_checkpoint_now,
+        mark_character_dirty,
+    )
+
+    mark_character_dirty(game, character, force=True)
+    account_ok = flush_accounts_now(db, game, reason=f"{reason}:accounts")
+    char_ok = flush_character_checkpoint_now(
+        db, game, character, reason=f"{reason}:character",
+    )
+    return account_ok and char_ok
+
+
 def link_character(game, account, character):
     """Attach ``character`` to ``account`` (both directions).
 
@@ -439,15 +569,11 @@ def link_character(game, account, character):
     if key_low not in existing_low:
         account.character_keys.append(key)
     character.account = account.name
-    try:
-        from engine.persistence import mark_account_dirty
-        mark_account_dirty(game, account)
-        if prev_name:
-            prev = find_account(game, prev_name)
-            if prev is not None and prev is not account:
-                mark_account_dirty(game, prev)
-    except Exception:
-        pass
+    _try_mark_account_dirty(game, account, label="link")
+    if prev_name:
+        prev = find_account(game, prev_name)
+        if prev is not None and prev is not account:
+            _try_mark_account_dirty(game, prev, label="link_prev")
     return None
 
 
@@ -469,11 +595,7 @@ def unlink_character(game, account, character, *, clear_back_pointer=True):
             account_lookup_key(account.name)
         ):
             character.account = ""
-    try:
-        from engine.persistence import mark_account_dirty
-        mark_account_dirty(game, account)
-    except Exception:
-        pass
+    _try_mark_account_dirty(game, account, label="unlink")
 
 
 def account_for_character(game, character):
@@ -483,9 +605,19 @@ def account_for_character(game, character):
     empty but the storage key still sits on an account roster (boot heal /
     wipe recovery), match via ``character_keys`` and repair the pointer
     (bug report 740: promoted staff could not ``gm on`` on a roster body).
+
+    God bilocate twins have no account row -- resolve the owning Mantle so
+    ``config oocname account`` still applies on OOC and global channels
+  while act focus is on the husk (bug report 1149).
     """
     if character is None:
         return None
+    try:
+        from engine import hooks as hooks_mod
+
+        character = hooks_mod.resolve_account_character(character, game)
+    except Exception:
+        pass
     name = (getattr(character, "account", None) or "").strip()
     if name:
         acct = find_account(game, name)
@@ -509,6 +641,35 @@ def account_for_character(game, character):
             character.account = account.name
         return account
     return None
+
+
+def notify_other_account_sessions(game, actor, message):
+    """Ping live sessions on the same account (other roster bodies).
+
+    Used when one alt finishes a long drive so a player on another window
+    knows the trip landed (suggestion report 377).
+    """
+    if game is None or actor is None or not message:
+        return
+    account = account_for_character(game, actor)
+    if account is None:
+        return
+    actor_key = (getattr(actor, "key", None) or "").strip().lower()
+    for session in list(getattr(game, "sessions", None) or []):
+        if session is None or not getattr(session, "alive", True):
+            continue
+        other = getattr(session, "character", None)
+        if other is None:
+            continue
+        other_key = (getattr(other, "key", None) or "").strip().lower()
+        if not other_key or other_key == actor_key:
+            continue
+        if account_for_character(game, other) is not account:
+            continue
+        try:
+            session.send(message)
+        except Exception:
+            continue
 
 
 def account_name_for_character_key(game, speaker_key) -> Optional[str]:
@@ -590,11 +751,7 @@ def ooc_block_account(game, listener_account, target_name):
         return False, f"You already mute {target.display_name or target.name} on OOC channels."
     blocked.append(target.name)
     listener_account.ooc_blocked_accounts = blocked
-    try:
-        from engine.persistence import mark_account_dirty
-        mark_account_dirty(game, listener_account)
-    except Exception:
-        pass
+    _try_mark_account_dirty(game, listener_account, label="ooc_block")
     label = target.display_name or target.name
     return True, (
         f"You will no longer hear {label} on OOC or player public channels. "
@@ -631,11 +788,7 @@ def ooc_unblock_account(game, listener_account, target_name):
         ]
         removed_label = target.display_name or target.name
     listener_account.ooc_blocked_accounts = kept
-    try:
-        from engine.persistence import mark_account_dirty
-        mark_account_dirty(game, listener_account)
-    except Exception:
-        pass
+    _try_mark_account_dirty(game, listener_account, label="ooc_unblock")
     return True, f"You can hear {removed_label} on OOC and player public channels again."
 
 
@@ -684,6 +837,117 @@ def gm_spirit_key_for_account(account):
     return f"gmspirit:{account.name}"
 
 
+def live_gm_spirit_for_account(game, account):
+    """Return the account GM spirit when it still holds a live Session."""
+    if game is None or account is None or not account_is_staff(account):
+        return None
+    spirit_key = gm_spirit_key_for_account(account)
+    if not spirit_key:
+        return None
+    spirit = game.find_character(spirit_key)
+    if spirit is None:
+        return None
+    if getattr(spirit, "session", None) is None:
+        return None
+    return spirit
+
+
+def _is_gm_spirit_character(spirit):
+    """True when *spirit* is a staff GM-form body, not a playable alt.
+
+    Login used to pass the picked character itself into
+    ``login_blocked_by_live_gm_spirit``. A live session on that alt then
+    read as "GM form is already open" (bug report 1063) even for players
+    who are not staff.
+    """
+    if spirit is None:
+        return False
+    if getattr(spirit, "gm_spirit", False) or getattr(
+        spirit, "gm_spirit_permanent", False
+    ):
+        return True
+    key = (getattr(spirit, "key", None) or "").lower()
+    return key.startswith("gmspirit:")
+
+
+def _picked_owns_gm_form(picked, spirit):
+    """True when *picked* is the playable body currently in GM form.
+
+    One account may play several characters in different windows (alpha).
+    The shared ``gmspirit:…`` seat only collides with the body that typed
+    ``gm on`` -- sibling roster picks must log in as themselves.
+    """
+    if picked is None or spirit is None:
+        return False
+    picked_key = getattr(picked, "key", None)
+    body_key = getattr(spirit, "gm_body_key", None)
+    # When the spirit names its Echo body, only that roster pick collides.
+    # Leftover gm_staff_form on a sibling alt must not lock them out.
+    if body_key:
+        return picked_key == body_key
+    return bool(
+        getattr(picked, "gm_staff_form", False)
+        or getattr(picked, "gm_away", False)
+    )
+
+
+def login_blocked_by_live_gm_spirit(game, account, picked, session, spirit):
+    """Refuse login that would kick a still-connected GM spirit Session.
+
+    One staff account shares a single ``gmspirit:…`` seat. Reconnecting as
+    the body that is already in GM form must not silently
+    ``_take_over_session`` while that socket is still alive -- that reads
+    as an unexplained disconnect (bug report 914). Sibling alts on the
+    same account may still log in on other windows (bug report 1063).
+    Zombie sessions from a dropped TCP may still be taken over.
+    """
+    if game is None or account is None or picked is None or session is None:
+        return None
+    if spirit is None or not _is_gm_spirit_character(spirit):
+        return None
+    if not _picked_owns_gm_form(picked, spirit):
+        return None
+    live_sess = getattr(spirit, "session", None)
+    if live_sess is None or live_sess is session:
+        return None
+    if not _peer_session_still_connected(live_sess):
+        return None
+    from engine.command_support import _presence_face
+
+    picked_face = _presence_face(picked) or getattr(picked, "key", "?")
+    body_key = getattr(spirit, "gm_body_key", None)
+    if body_key and getattr(picked, "key", None) == body_key:
+        return (
+            "GM form is already active on another live connection for this "
+            "account. `gm off` or close that client before logging in here."
+        )
+    return (
+        "GM form is already open in another client on this account. "
+        f"`gm off` or close that window before logging in as {picked_face} "
+        "here."
+    )
+
+
+def _peer_session_still_connected(session):
+    """True when a Session still owns an open transport (not a zombie seat)."""
+    if session is None:
+        return False
+    if not getattr(session, "alive", False):
+        return False
+    writer = getattr(session, "writer", None)
+    if writer is None:
+        return False
+    is_closing = getattr(writer, "is_closing", None)
+    if callable(is_closing) and is_closing():
+        return False
+    transport = getattr(writer, "transport", None)
+    if transport is not None:
+        closing = getattr(transport, "is_closing", None)
+        if callable(closing) and closing():
+            return False
+    return True
+
+
 def _vaulted_character_keys_lower(game):
     """Lowercase storage keys in ``character_vault`` (folded offline bodies).
 
@@ -703,7 +967,10 @@ def _vaulted_character_keys_lower(game):
             for row in persistence.vault_list(db)
             if row and (row[0] or "").strip()
         }
-    except Exception:
+    except Exception as exc:
+        from engine import log_util
+
+        log_util.ops("accounts", "vault probe failed", exc=exc)
         return set()
 
 
@@ -998,8 +1265,10 @@ def _account_has_staff_spirit_evidence(game, account):
             row = persistence.vault_get(db, spirit_key)
             if row is not None and (row[3] or "") == "gm-spirit-parked":
                 return True
-        except Exception:
-            pass
+        except Exception as exc:
+            from engine import log_util
+
+            log_util.ops("accounts", "vault probe failed", exc=exc)
     return False
 
 
@@ -1094,11 +1363,7 @@ def heal_empty_account_passwords(game):
                 continue
             account.password_hash = body_hash
             healed += 1
-            try:
-                from engine.persistence import mark_account_dirty
-                mark_account_dirty(game, account)
-            except Exception:
-                pass
+            _try_mark_account_dirty(game, account, label="heal_password")
             print(
                 f"[accounts] boot-heal copied password_hash onto account "
                 f"{account.name!r} from character {key!r}",
@@ -1129,12 +1394,7 @@ def heal_account_created_at_stamps(game):
             continue
         account.created_at = now
         stamped += 1
-        try:
-            from engine.persistence import mark_account_dirty
-
-            mark_account_dirty(game, account)
-        except Exception:
-            pass
+        _try_mark_account_dirty(game, account, label="heal_created_at")
     if stamped:
         print(
             f"[accounts] boot-heal stamped created_at on {stamped} account(s)",
@@ -1190,11 +1450,7 @@ def unregister_account(game, account):
     key = account_lookup_key(account.name)
     if key in accounts and accounts[key] is account:
         del accounts[key]
-        try:
-            from engine.persistence import mark_account_dirty
-            mark_account_dirty(game, account)
-        except Exception:
-            pass
+        _try_mark_account_dirty(game, account, label="unregister")
 
 
 def playable_link_target(game, character):
@@ -1425,11 +1681,7 @@ def assign_character_to_account(game, account, character_name, *, quiet=False):
             "on Assigned Characters."
         )
     account.assigned_characters.append(key)
-    try:
-        from engine.persistence import mark_account_dirty
-        mark_account_dirty(game, account)
-    except Exception:
-        pass
+    _try_mark_account_dirty(game, account, label="assign")
     return (
         True,
         f"Assigned {key} to account '{account.display_name}' for the run. "
@@ -1460,11 +1712,7 @@ def revoke_character_from_account(game, account, character_name):
             f"named '{character_name}'."
         )
     account.assigned_characters = kept
-    try:
-        from engine.persistence import mark_account_dirty
-        mark_account_dirty(game, account)
-    except Exception:
-        pass
+    _try_mark_account_dirty(game, account, label="unassign")
     label = cast.key if cast is not None else character_name
     return (
         True,

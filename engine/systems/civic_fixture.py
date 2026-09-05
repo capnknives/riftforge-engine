@@ -470,7 +470,10 @@ def breach_defender_into_fixture(
     old_room = getattr(character, "location", None)
     if old_room is not None and source_line:
         old_room.broadcast(source_line, exclude=character)
-    character.move_to(hub)
+    from engine.world import safe_place
+
+    if not safe_place(character, hub):
+        return False
     character.zone_entry_hub_key = hub.key
     if landing_line:
         hub.broadcast(landing_line, exclude=character)

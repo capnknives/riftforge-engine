@@ -23,6 +23,10 @@ MAX_ROOMS_PER_MOUTH = 12
 SHORE_GATE_ROOM_COUNT = 6
 MAX_CHANNEL_JOINERS = 3
 MINE_CAPABLE_AREA_TYPES = frozenset({"mountains", "desert", "hills"})
+# Settled / water tiles never host a mouth even if highland_rows marked the cell.
+_NOT_MINE_AREA_TYPES = frozenset({
+    "city", "city_street", "ocean", "lake", "void", "highway", "trail",
+})
 
 # Carve directions inside the graph (down = shaft from surface).
 GRAPH_DIRECTIONS = frozenset({
@@ -39,16 +43,40 @@ DEFAULT_SUPPORT_MIN_DEEP = 2       # steel (depth >= 3)
 
 
 def mouth_key_from_room(room):
-    """Build a mouth key from a wilderness virtual room, or None."""
+    """Build a mouth key from a wilderness cell, or None.
+
+    Live America uses dual-layer ``Wilderness (mx,my)/ux,uy`` rooms after
+    you leave the car. The 1861 Frontierland atlas is walked as authored
+    grid rooms (``Frontierland Overland (x, y)``) -- one mouth per macro
+    cell, anchored at the landmark micro center so the key shape matches
+    Earth v1. Demesnes / Wastes / other grids stay out: only that
+    Frontierland prefix (or map_id) is accepted on the grid path.
+    """
     if room is None:
         return None
-    from engine.systems.overland import parse_wilderness_room_key
+    from engine.map_ui import parse_grid_key
+    from engine.systems.overland import (
+        FRONTIERLAND_MAP_ID,
+        FRONTIERLAND_PREFIX,
+        LANDMARK_MICRO,
+        parse_wilderness_room_key,
+    )
+
     wild = parse_wilderness_room_key(getattr(room, "key", "") or "")
-    if wild is None:
+    if wild is not None:
+        map_id = getattr(room, "map_id", None) or "earth_america"
+        (mx, my), (ux, uy) = wild
+        return format_mouth_key(map_id, mx, my, ux, uy)
+
+    parsed = parse_grid_key(getattr(room, "key", "") or "")
+    if parsed is None:
         return None
-    map_id = getattr(room, "map_id", None) or "earth_america"
-    (mx, my), (ux, uy) = wild
-    return format_mouth_key(map_id, mx, my, ux, uy)
+    prefix, mx, my = parsed
+    map_id = str(getattr(room, "map_id", None) or "").strip()
+    if prefix != FRONTIERLAND_PREFIX and map_id != FRONTIERLAND_MAP_ID:
+        return None
+    ux, uy = LANDMARK_MICRO
+    return format_mouth_key(map_id or FRONTIERLAND_MAP_ID, mx, my, ux, uy)
 
 
 def format_mouth_key(map_id, mx, my, ux, uy):
@@ -72,6 +100,53 @@ def parse_mouth_key(key):
 def is_mine_capable_area(area_type):
     """True when this wilderness macro terrain may host a mine mouth."""
     return str(area_type or "").lower() in MINE_CAPABLE_AREA_TYPES
+
+
+def is_mine_capable_cell(area_type, highland=False):
+    """True when this atlas cell may host a mine mouth (no Room needed)."""
+    area = str(area_type or "").lower()
+    if area in _NOT_MINE_AREA_TYPES:
+        return False
+    if is_mine_capable_area(area):
+        return True
+    return bool(highland)
+
+
+def is_mine_capable_room(room):
+    """True when this room may host a mine mouth.
+
+    Peaks, desert, and (reserved) hills stay mine-capable by area_type.
+    America / 1861 CONUS highland timber / high plains use Room.highland
+    from the atlas mask so mining country is not a grey slab on the map.
+    """
+    if room is None:
+        return False
+    return is_mine_capable_cell(
+        getattr(room, "area_type", None),
+        highland=getattr(room, "highland", False),
+    )
+
+
+# Always-on look sentence for mine-capable wilderness (peaks, desert,
+# highland timber / high plains). Not a random stumble -- players need
+# to see they can still mine down after the atlas stopped painting
+# those belts as solid grey rock.
+MINE_COUNTRY_LOOK_TELL = (
+    "Broken stone shows through the soil -- this is mining country. "
+    "Type mine down to open a shaft."
+)
+
+
+def with_mine_country_tell(text, area_type, highland=False):
+    """Append the mining-country look line when this cell can host a mouth."""
+    body = str(text or "").strip()
+    if not is_mine_capable_cell(area_type, highland):
+        return body
+    if MINE_COUNTRY_LOOK_TELL in body:
+        return body
+    if body:
+        return f"{body} {MINE_COUNTRY_LOOK_TELL}"
+    return MINE_COUNTRY_LOOK_TELL
 
 
 def normalize_loaded(blob):

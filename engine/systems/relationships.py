@@ -13,6 +13,7 @@ from __future__ import annotations
 # Kind ids players may set. Extensible -- keep COMMANDS / help in sync.
 # Favorite auto-pick walks FAVORITE_PRIORITY (greatest first).
 KINDS = (
+    "spouse",
     "lover",
     "sibling",
     "parent",
@@ -30,12 +31,12 @@ KINDS = (
 FAVORITE_PRIORITY = KINDS
 # Hunt / rest / beckon close ties (never Enemy-tier).
 CLOSE_KINDS = frozenset({
-    "lover", "sibling", "parent", "best_friend", "ashkin", "friend",
+    "spouse", "lover", "sibling", "parent", "best_friend", "ashkin", "friend",
 })
 # Mutual ashkin side-by-side soak (incoming damage mult cut).
 ASHKIN_SOAK = 0.05
 # Help category only -- not a settable kind id.
-FAMILY_KINDS = frozenset({"sibling", "parent"})
+FAMILY_KINDS = frozenset({"spouse", "sibling", "parent"})
 # Cadence lethal pursue (rival is competitive only -- not in this set).
 ENEMY_TIER = frozenset({
     "enemy", "oppressor", "nemesis", "mortal_enemy",
@@ -48,6 +49,7 @@ ENEMY_TIER = frozenset({
 _wants_solo_hunt = None
 _is_grumpy_for_partners = None
 _social_lead_follow_grumpy_gate = None
+_reluctant_hangout_follow = None
 
 
 def set_relationship_wants_solo_hunt(fn):
@@ -66,6 +68,16 @@ def set_relationship_social_lead_follow_grumpy_gate(fn):
     """Register fn(follower) -> bool; False blocks a grumpy hangout follow."""
     global _social_lead_follow_grumpy_gate
     _social_lead_follow_grumpy_gate = fn
+
+
+def set_relationship_reluctant_hangout_follow(fn):
+    """Register fn(follower) -> True when Cadence should skip hangout follow.
+
+    SUPERS uses this for grumpy / hermit / loner (critical-social exception).
+    When unset, the old grumpy-only gate still applies.
+    """
+    global _reluctant_hangout_follow
+    _reluctant_hangout_follow = fn
 
 
 def actor_has_purgatory_scar(character) -> bool:
@@ -107,6 +119,11 @@ def normalize_kind(value):
         "love": "lover",
         "loves": "lover",
         "dating": "lover",
+        "spouse": "spouse",
+        "husband": "spouse",
+        "wife": "spouse",
+        "married": "spouse",
+        "partner": "spouse",
         "buddy": "friend",
         "friends": "friend",
         "bestfriend": "best_friend",
@@ -227,6 +244,8 @@ def asymmetry(character, other):
     b = reciprocal_kind(character, other)
     if a is None and b is None:
         return None
+    if a == b == "spouse":
+        return "mutual_spouse"
     if a == b == "lover":
         return "mutual_lover"
     if a == b == "friend":
@@ -332,7 +351,7 @@ def pick_hunt_partner(actor, candidates, *, grumpy=None):
         grumpy = is_grumpy_for_partners(actor)
     ensure_defaults(actor)
     order = (
-        "lover", "sibling", "parent", "best_friend", "ashkin", "friend",
+        "spouse", "lover", "sibling", "parent", "best_friend", "ashkin", "friend",
     )
     for kind in order:
         if kind == "lover" and grumpy:
@@ -355,7 +374,7 @@ def pick_rest_bar_buddy(actor, candidates, *, grumpy=None, game=None):
             if not (grumpy and get_kind(actor, fav) == "lover"):
                 return fav
     order = (
-        "lover", "sibling", "parent", "best_friend", "ashkin", "friend",
+        "spouse", "lover", "sibling", "parent", "best_friend", "ashkin", "friend",
     )
     for kind in order:
         if kind == "lover" and grumpy:
@@ -522,6 +541,10 @@ def social_lead_follow_roles(a, b):
             else:
                 leader, follower = b, a
 
+    if _reluctant_hangout_follow is not None:
+        if _reluctant_hangout_follow(follower):
+            return (None, None)
+        return (leader, follower)
     traits = getattr(follower, "traits", None) or []
     if "grumpy" in traits:
         if _social_lead_follow_grumpy_gate is not None:
