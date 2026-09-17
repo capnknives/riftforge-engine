@@ -55,6 +55,13 @@ DEFAULT_REPO_ENV_KEYS = (
     "RIFTFORGE_SQLITE_WAL_AUTOSAVE_TRUNCATE_MIN_BYTES",
     "RIFTFORGE_AUTO_DEPLOY_COALESCE_S",
     "RIFTFORGE_AUTOSAVE_SKIP_AFTER_DEPLOY_S",
+    # Auto-deploy throwaway Game() wait (seconds). Live boot is 3–5 min;
+    # the old 180s cap abort-held good merges. Default in boot_probe.py
+    # is 600. Also whitelist the on/off so ops can skip without compose.
+    "AUTO_DEPLOY_BOOT_PROBE",
+    "RIFTFORGE_BOOT_PROBE",
+    "RIFTFORGE_BOOT_PROBE_TIMEOUT",
+    "AUTO_DEPLOY_BOOT_PROBE_TIMEOUT",
     "RIFTFORGE_PERSIST_APPLY_COMMIT_BATCH",
     "RIFTFORGE_INTER_TICK_GAP_MS",
     "RIFTFORGE_AUTOSAVE_SLOW_MS",
@@ -70,9 +77,16 @@ DEFAULT_REPO_ENV_KEYS = (
     "RIFTFORGE_PERSIST_FULL_EVERY",
     "RIFTFORGE_PERSIST_DIRTY_CHAR_CAP",
     "RIFTFORGE_PERSIST_DIRTY_ROOM_CAP",
+    "RIFTFORGE_FUEL_TICK_WALL_MS",
+    "RIFTFORGE_HUMANITY_ROSTER_WALL_MS",
+    "ACCORD_DISPATCH_ACTOR_MS_CAP",
     "RIFTFORGE_PERSIST_OFFLINE_DIRTY_SHARDS",
     "RIFTFORGE_CADENCE_PLANNER_THREAD",
     "RIFTFORGE_CADENCE_PLANNER_MAX_ACTORS",
+    # Copyover/boot phase timing (docs/plans -- copyover duration diagnosis).
+    # Whitelisted so ops can flip it on for a live boot-time investigation
+    # via a game-only restart, without a compose recreate (hard rule 19).
+    "RIFTFORGE_BOOT_PROFILE",
     # Discord bridge: refresh webhook/channel map on game-only restart so staff
     # briefs (bug/suggest) and radio mirrors pick up .env edits without a
     # compose recreate (hard rule 19).
@@ -97,4 +111,10 @@ DEFAULT_REPO_ENV_KEYS = (
     "RIFTFORGE_VIEWPORT_BIND",
     "RIFTFORGE_VIEWPORT_ALLOW_NONLOCAL",
     "RIFTFORGE_VIEWPORT_STAFF_ACCOUNT",
+    # gm debuglog channel files (engine/gm_debug_export.py). Issue number +
+    # env on/off reload on game-only restart -- do not compose-recreate.
+    # Token stays the existing RIFTFORGE_DIAG_GITHUB_TOKEN (compose).
+    "RIFTFORGE_GM_DEBUG_CAPTURE",
+    "RIFTFORGE_GM_DEBUG_GITHUB_ISSUE",
+    "RIFTFORGE_GM_DEBUG_LOG_DIR",
 )

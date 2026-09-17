@@ -27,11 +27,26 @@ _map_room_stamper = None
 _blob_to = None
 _blob_from = None
 
+# Lag S2: game-owned megachar shards (life_log / property stash) live in
+# ``character_heavy_blobs``. Engine never imports the game to fill them.
+_heavy_sidecar_collect = None
+_heavy_sidecar_load = None
+_heavy_sidecar_merge = None
+_heavy_sidecar_parse_payload = None
+_heavy_sidecar_property_stash_empty = None
+_mark_property_stash_heavy_dirty = None
+
 # Game-owned Game meta (T3 persistence-api): moral/Tide, Cadence overrides,
 # tuning tables, rumor boards, … — loaded/saved around the engine-generic
 # world snapshot. Default no-op so lean boots keep __init__ defaults.
 _game_meta_loader = None
 _game_meta_saver = None
+
+# Per-character built sites (homestead / demesne / shop / realm / town)
+# flushed on player ``save`` and archived in the checkpoint tank.
+_save_player_built_sites = None
+_collect_player_built_checkpoint = None
+_restore_player_built_sites = None
 
 # Optional post-password new-character flow (appearance, Background, ...).
 _chargen = None
@@ -60,6 +75,28 @@ _park_gm_spirit_on_disconnect = None
 # engine/gmcp.py sends). fn(character) -> dict or None.
 _gmcp_char_vitals = None
 _gmcp_char_status = None
+# Room.Occupants / Zone who[] row policy. fn(obj, viewer) -> str | None.
+_occupant_kind = None
+_occupant_token = None
+# Wave 2 folklore peel: fishing + lockpick kernels.
+_fishing_tables = None
+_fishing_skill = None
+_aboard_water_craft = None
+_lock_dc = None
+_skill_check = None
+# Wave 3 folklore peel: devil's trap stamp + temporary circle query.
+_temporary_devils_trap = None
+_temporary_salt_line = None
+_occult_mark_blocks = None
+# Wave 5c folklore peel: corporeal-prison plane policy hook.
+_is_corporeal_prison_plane = None
+# Wave 4 folklore peel: Cadence seek/wander kernel hooks.
+_cadence_meter_names = None
+_cadence_seek_threshold = None
+_cadence_need_resource = None
+_cadence_room_passable = None
+_cadence_urgent_override = None
+_cadence_plan_override = None
 # Browser atlas right-click verbs. fn(character, map_id, x, y, landmark) ->
 # list of {"label", "command"} using player-facing names only.
 _web_map_cell_verbs = None
@@ -123,9 +160,9 @@ _room_command_hints = None
 # fn(room, character, game) -> list[(direction, dest_label)].
 _room_look_virtual_exits = None
 
-# Soft fear nudge shown to a Vampire after `look` when a Slayer/hunter
-# shares the room. fn(character, room) -> str or None.
-_vampire_fear_message = None
+# Soft fear nudge shown to any monster after `look` when the active Called
+# Slayer shares the room. fn(character, room) -> str or None.
+_monster_sense_message = None
 
 # One-sided relationship "quirk" line shown after looking at/examining a
 # person. fn(viewer, target) -> str or None.
@@ -154,9 +191,18 @@ _identity_verify_hook = None
 _identity_pierce_supernatural = None
 _disguise_pierce_check = None
 _follow_pull_skip = None
+_follow_pull_handled = None
+_follow_pull_homestead_plot = None
+# Homestead interior graph self-heal before ``exits`` / failed compass moves.
+# fn(character, game) -> bool (True when repair rewired exits this call).
+_ensure_homestead_plot_graph_for_actor = None
+_follow_pull_household_pet = None
+_follow_shares_origin = None
+_group_share_travel_spot = None
 _report_context_extra = None
 _room_broadcast_deliver = None
 _room_broadcast_transform = None
+_room_broadcast_after = None
 _perception_character = None
 _preference_character = None
 
@@ -179,6 +225,14 @@ _look_exit_door_closed = None
 
 # Trickster site mask: filter pocket zone_entries per viewer.
 _filter_zone_entries = None
+
+# Look-only zone_entries dedupe (e.g. hide Enter: line when a fixture
+# already advertises the same mouth). Travel keeps full entries.
+_filter_zone_entries_look = None
+
+# Civic curb fixtures: ``enter shop`` / stale alias recovery on commercial
+# streets. fn(character, raw, game) -> bool when the hop was handled.
+_try_civic_fixture_enter = None
 
 # Per-viewer exit hide (shrine fold). fn(viewer, room, direction, dest, game) -> bool.
 _look_exit_hidden_from_viewer = None
@@ -246,6 +300,8 @@ _can_see_hellhound = None
 # fn(viewer, other) -> bool when other is hidden but swinging at viewer.
 _can_target_hidden_attacker = None
 _can_notice_stealth = None
+# Game-side extra presence hide (Signal dwell, …). fn(viewer, other) -> bool.
+_presence_hidden_extra = None
 _extra_affect_rows = None
 # Staff gm-on look pierce for hidden presences (stealth, etc.) -- tagged
 # ``(hidden)`` instead of omitted. fn(viewer, other) -> bool.
@@ -354,6 +410,10 @@ _extra_target_match_needles = None
 # Viewer-relative look/examine body text.
 # fn(viewer, subject) -> str | None.
 _look_body_for = None
+
+# Viewer-relative look at a named extra on a person (look ayla head).
+# fn(viewer, subject, keyword) -> str | None. None = hook unset (lean engine).
+_look_detail_for = None
 
 # Registered combat helper that cannot be targeted (owner's pet/minion).
 # fn(character) -> bool. Default False when no game is installed.
@@ -691,6 +751,29 @@ def should_skip_map_missing_stub_heal(character):
     return bool(_should_skip_map_missing_stub_heal(character))
 
 
+_on_map_missing_stub_healed = None  # fn(character, stub_key) -> None
+
+
+def set_on_map_missing_stub_healed(fn):
+    """Register fn(character, stub_key) -> None, called after a body is
+    relocated off a persistence ``map_missing_stub`` room.
+
+    Lets game-owned per-character stamps that reference the dead stub
+    (e.g. an instanced dungeon run id) get scrubbed and the player told
+    why they moved, instead of a silent generic relocation (bug reports
+    1629/1630). Pass None to restore the default (no-op).
+    """
+    global _on_map_missing_stub_healed
+    _on_map_missing_stub_healed = fn
+
+
+def on_map_missing_stub_healed(character, stub_key):
+    """Notify game-owned code that ``character`` was healed off ``stub_key``."""
+    if _on_map_missing_stub_healed is None:
+        return
+    _on_map_missing_stub_healed(character, stub_key)
+
+
 def set_gateway_resume_hook(fn):
     """Register fn(game) (sync or async) to run once gateway reattach
     finishes welcoming held clients back (engine/gateway_client.py's
@@ -970,6 +1053,81 @@ def blob_codec_registered():
     return _blob_to is not None
 
 
+def set_heavy_sidecar_codec(collect_fn, load_fn, merge_fn):
+    """Register megachar sidecar collect / load / merge (or None to clear).
+
+    collect_fn(game, character, cnum, *, prev_shard_hashes) -> (rows, hashes)
+    load_fn(conn) -> {cnum: {shard: dict}}
+    merge_fn(saved_dict, sidecar_shards) -> dict
+    """
+    global _heavy_sidecar_collect, _heavy_sidecar_load, _heavy_sidecar_merge
+    _heavy_sidecar_collect = collect_fn
+    _heavy_sidecar_load = load_fn
+    _heavy_sidecar_merge = merge_fn
+
+
+def collect_heavy_sidecar_rows(game, character, cnum, *, prev_shard_hashes):
+    """Build ``character_heavy_blobs`` INSERT rows, or empty when unregistered."""
+    if _heavy_sidecar_collect is None:
+        return [], prev_shard_hashes or {}
+    return _heavy_sidecar_collect(
+        game, character, cnum, prev_shard_hashes=prev_shard_hashes,
+    )
+
+
+def load_heavy_sidecars_index(conn):
+    """Boot index of sidecar shards, or ``{}`` when unregistered."""
+    if _heavy_sidecar_load is None:
+        return {}
+    return _heavy_sidecar_load(conn) or {}
+
+
+def merge_saved_with_sidecars(saved, sidecar_shards):
+    """Overlay sidecar shards onto a stats dict (identity when unregistered)."""
+    if _heavy_sidecar_merge is None:
+        return saved
+    return _heavy_sidecar_merge(saved, sidecar_shards)
+
+
+def set_heavy_sidecar_property_stash_helpers(parse_fn=None, empty_fn=None):
+    """Register property-stash shard parse/empty helpers for upsert skip logic."""
+    global _heavy_sidecar_parse_payload, _heavy_sidecar_property_stash_empty
+    _heavy_sidecar_parse_payload = parse_fn
+    _heavy_sidecar_property_stash_empty = empty_fn
+
+
+def parse_heavy_shard_payload(payload):
+    """Parse a sidecar shard payload, or None when unregistered."""
+    if _heavy_sidecar_parse_payload is None:
+        return None
+    return _heavy_sidecar_parse_payload(payload)
+
+
+def property_stash_payload_empty(parsed):
+    """True when a parsed property-stash shard is empty; False when unregistered."""
+    if _heavy_sidecar_property_stash_empty is None:
+        return False
+    return bool(_heavy_sidecar_property_stash_empty(parsed))
+
+
+def set_mark_property_stash_heavy_dirty(fn):
+    """Register fn(game, character, *, allow_empty_write=False) after stash edits."""
+    global _mark_property_stash_heavy_dirty
+    _mark_property_stash_heavy_dirty = fn
+
+
+def mark_property_stash_heavy_dirty(game, character, *, allow_empty_write=False):
+    """Queue property-stash sidecar writes when the game registers a codec."""
+    if _mark_property_stash_heavy_dirty is None:
+        return
+    try:
+        _mark_property_stash_heavy_dirty(
+            game, character, allow_empty_write=allow_empty_write,
+        )
+    except Exception:
+        pass
+
+
 def character_attacher_registered():
     """True when Character composition (stats/Origin/…) will run on init."""
     return _character_attacher is not None
@@ -980,10 +1138,10 @@ def game_meta_codec_registered():
     return _game_meta_saver is not None
 
 
-def character_to_blob(character):
+def character_to_blob(character, **kwargs):
     """Serialize game fields for the characters.stats JSON column."""
     if _blob_to is not None:
-        return _blob_to(character)
+        return _blob_to(character, **kwargs)
     return {}
 
 
@@ -1021,6 +1179,44 @@ def save_game_meta(game, conn):
     """Run the registered meta saver, or no-op if none is set."""
     if _game_meta_saver is not None:
         _game_meta_saver(game, conn)
+
+
+def set_player_built_site_codec(save_fn, collect_fn, restore_fn):
+    """Register per-character built-site save / checkpoint / restore.
+
+    save_fn(game, conn, character) -> list of kind labels
+    collect_fn(game, character) -> dict for the checkpoint tank
+    restore_fn(game, character, payload) -> (ok, kinds)
+
+    Pass None, None, None to clear (lean engine / basegame keep no-ops).
+    """
+    global _save_player_built_sites
+    global _collect_player_built_checkpoint
+    global _restore_player_built_sites
+    _save_player_built_sites = save_fn
+    _collect_player_built_checkpoint = collect_fn
+    _restore_player_built_sites = restore_fn
+
+
+def save_player_built_sites(game, conn, character):
+    """Flush this character's homestead / demesne / shop / realm / town."""
+    if _save_player_built_sites is None:
+        return []
+    return _save_player_built_sites(game, conn, character) or []
+
+
+def collect_player_built_checkpoint(game, character):
+    """JSON snapshot of this character's built sites for the save tank."""
+    if _collect_player_built_checkpoint is None:
+        return {}
+    return _collect_player_built_checkpoint(game, character) or {}
+
+
+def restore_player_built_sites(game, character, payload):
+    """Rematerialize built sites from a checkpoint blob."""
+    if _restore_player_built_sites is None:
+        return True, []
+    return _restore_player_built_sites(game, character, payload)
 
 
 def set_chargen(async_fn):
@@ -1306,6 +1502,346 @@ def gmcp_char_status(character):
     return None
 
 
+def set_occupant_kind(fn):
+    """Register fn(obj, viewer) -> kind str or None for Room.Occupants rows.
+
+    Return a value from engine.gmcp.OCCUPANT_KINDS, or None to let the
+    engine apply its default rules (player / npc / echo / hostile / other).
+    Pass None to clear the hook.
+    """
+    global _occupant_kind
+    _occupant_kind = fn
+
+
+def occupant_kind(obj, viewer):
+    """Game override for one occupant row's ``kind``, or None for default."""
+    if _occupant_kind is not None:
+        try:
+            return _occupant_kind(obj, viewer)
+        except Exception as exc:
+            game = None
+            if viewer is not None:
+                game = getattr(getattr(viewer, "session", None), "game", None)
+            _log_hook_fail(game, "occupant_kind", exc)
+            return None
+    return None
+
+
+def set_occupant_token(fn):
+    """Register fn(obj, viewer) -> token id str or None for Room.Occupants.
+
+    Wave 1 clients only understand ``person``; unknown hook values are
+    coerced to that default in engine.gmcp. Pass None to clear.
+    """
+    global _occupant_token
+    _occupant_token = fn
+
+
+def occupant_token(obj, viewer):
+    """Game override for one occupant row's ``token``, or None for person."""
+    if _occupant_token is not None:
+        try:
+            return _occupant_token(obj, viewer)
+        except Exception as exc:
+            game = None
+            if viewer is not None:
+                game = getattr(getattr(viewer, "session", None), "game", None)
+            _log_hook_fail(game, "occupant_token", exc)
+            return None
+    return None
+
+
+def set_fishing_tables(fn):
+    """Register fn() -> dict of fishing catch tables (JSON shape)."""
+    global _fishing_tables
+    _fishing_tables = fn
+
+
+def fishing_tables():
+    """Catch tables from the game, or empty dict when unset."""
+    if _fishing_tables is not None:
+        try:
+            data = _fishing_tables()
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            game = None
+            _log_hook_fail(game, "fishing_tables", exc)
+            return {}
+    return {}
+
+
+def set_fishing_skill(fn):
+    """Register fn(character) -> float effective fishing skill rank."""
+    global _fishing_skill
+    _fishing_skill = fn
+
+
+def fishing_skill(character):
+    """Effective fishing skill from the game, or 0.0 when unset."""
+    if _fishing_skill is not None:
+        try:
+            return float(_fishing_skill(character))
+        except Exception as exc:
+            game = getattr(getattr(character, "session", None), "game", None)
+            _log_hook_fail(game, "fishing_skill", exc)
+            return 0.0
+    return 0.0
+
+
+def set_cadence_meter_names(fn):
+    """Register fn() -> tuple[str] of lifestyle meter names."""
+    global _cadence_meter_names
+    _cadence_meter_names = fn
+
+
+def cadence_meter_names():
+    """Meter names for Cadence seek scans (default hunger + thirst)."""
+    if _cadence_meter_names is not None:
+        try:
+            names = _cadence_meter_names()
+            if names:
+                return tuple(names)
+        except Exception as exc:
+            _log_hook_fail(None, "cadence_meter_names", exc)
+    from engine.systems.cadence_kernel import METER_NAMES_DEFAULT
+    return METER_NAMES_DEFAULT
+
+
+def set_cadence_seek_threshold(fn):
+    """Register fn(character) -> float seek threshold for one actor."""
+    global _cadence_seek_threshold
+    _cadence_seek_threshold = fn
+
+
+def cadence_seek_threshold(character):
+    """Per-actor seek threshold (default ``needs.SEEK_THRESHOLD``)."""
+    if _cadence_seek_threshold is not None:
+        try:
+            return float(_cadence_seek_threshold(character))
+        except Exception as exc:
+            game = getattr(getattr(character, "session", None), "game", None)
+            _log_hook_fail(game, "cadence_seek_threshold", exc)
+    from engine.systems import needs as needs_engine
+    return needs_engine.SEEK_THRESHOLD
+
+
+def set_cadence_need_resource(fn):
+    """Register fn(need_name) -> resource tag str or None."""
+    global _cadence_need_resource
+    _cadence_need_resource = fn
+
+
+def cadence_need_resource(need):
+    """Resource tag for a need meter (default hunger->food, thirst->water)."""
+    if _cadence_need_resource is not None:
+        try:
+            tag = _cadence_need_resource(need)
+            if tag is not None:
+                return str(tag)
+        except Exception as exc:
+            _log_hook_fail(None, "cadence_need_resource", exc)
+    from engine.systems.cadence_kernel import NEED_RESOURCE_DEFAULT
+    return NEED_RESOURCE_DEFAULT.get(need)
+
+
+def set_cadence_room_passable(fn):
+    """Register fn(character, dest_room, game) -> bool for seek/wander BFS."""
+    global _cadence_room_passable
+    _cadence_room_passable = fn
+
+
+def cadence_room_passable(character, dest_room, game):
+    """True when ``character`` may walk into ``dest_room`` during Cadence BFS."""
+    if _cadence_room_passable is not None:
+        try:
+            return bool(_cadence_room_passable(character, dest_room, game))
+        except Exception as exc:
+            _log_hook_fail(game, "cadence_room_passable", exc)
+            return False
+    origin = getattr(character, "location", None)
+    origin_zone = getattr(origin, "zone", None)
+    dest_zone = getattr(dest_room, "zone", None)
+    if origin_zone is None and dest_zone is None:
+        return True
+    return origin_zone == dest_zone
+
+
+def set_cadence_urgent_override(fn):
+    """Register fn(character) -> need name str or None (soiled clothes, …)."""
+    global _cadence_urgent_override
+    _cadence_urgent_override = fn
+
+
+def cadence_urgent_override(character):
+    """Game override for the urgent need name, or None for meter scan."""
+    if _cadence_urgent_override is not None:
+        try:
+            return _cadence_urgent_override(character)
+        except Exception as exc:
+            game = getattr(getattr(character, "session", None), "game", None)
+            _log_hook_fail(game, "cadence_urgent_override", exc)
+            return None
+    return None
+
+
+def set_cadence_plan_override(fn):
+    """Register fn(character, game) -> plan dict or None before kernel FSM."""
+    global _cadence_plan_override
+    _cadence_plan_override = fn
+
+
+def cadence_plan_override(character, game):
+    """Game-owned plan dict replacing the kernel FSM, or None."""
+    if _cadence_plan_override is not None:
+        try:
+            return _cadence_plan_override(character, game)
+        except Exception as exc:
+            _log_hook_fail(game, "cadence_plan_override", exc)
+            return None
+    return None
+
+
+def set_aboard_water_craft(fn):
+    """Register fn(character) -> bool for offshore boat requirement."""
+    global _aboard_water_craft
+    _aboard_water_craft = fn
+
+
+def aboard_water_craft(character):
+    """True when the character is aboard a water craft (offshore fishing)."""
+    if _aboard_water_craft is not None:
+        try:
+            return bool(_aboard_water_craft(character))
+        except Exception as exc:
+            game = getattr(getattr(character, "session", None), "game", None)
+            _log_hook_fail(game, "aboard_water_craft", exc)
+            return False
+    return False
+
+
+def set_lock_dc(fn):
+    """Register fn(kind) -> float | None override for lock difficulties."""
+    global _lock_dc
+    _lock_dc = fn
+
+
+def lock_dc(kind):
+    """Per-kind DC override from the game, or None for engine defaults."""
+    if _lock_dc is not None:
+        try:
+            return _lock_dc(kind)
+        except Exception as exc:
+            game = None
+            _log_hook_fail(game, "lock_dc", exc)
+            return None
+    return None
+
+
+def set_skill_check(fn):
+    """Register fn(character, skill_id, dc) -> bool for lock bypass rolls."""
+    global _skill_check
+    _skill_check = fn
+
+
+def skill_check(character, skill_id, dc):
+    """Run a registered skill check, or a simple random vs dc fallback."""
+    if _skill_check is not None:
+        try:
+            return bool(_skill_check(character, skill_id, dc))
+        except Exception as exc:
+            game = getattr(getattr(character, "session", None), "game", None)
+            _log_hook_fail(game, "skill_check", exc)
+    import random
+    return random.random() * 100.0 >= float(dc)
+
+
+def set_temporary_devils_trap(fn):
+    """Register fn(room, game_time_ticks) -> bool for live circle overlays.
+
+    SUPERS wires Hellcraft ``room_has_circle``; basegame leaves this unset
+    (always False). Pass None to clear the hook.
+    """
+    global _temporary_devils_trap
+    _temporary_devils_trap = fn
+
+
+def temporary_devils_trap(room, game_time_ticks=0):
+    """True when a hooked temporary devil's trap binds the room."""
+    if _temporary_devils_trap is not None:
+        try:
+            return bool(_temporary_devils_trap(room, game_time_ticks))
+        except Exception as exc:
+            game = None
+            _log_hook_fail(game, "temporary_devils_trap", exc)
+            return False
+    return False
+
+
+def set_temporary_salt_line(fn):
+    """Register fn(room, game_time_ticks) -> bool for live saltline overlays.
+
+    SUPERS may wire Magic Warding rites; basegame leaves this unset. Pass
+    None to clear the hook.
+    """
+    global _temporary_salt_line
+    _temporary_salt_line = fn
+
+
+def temporary_salt_line(room, game_time_ticks=0):
+    """True when a hooked temporary salt line binds the room."""
+    if _temporary_salt_line is not None:
+        try:
+            return bool(_temporary_salt_line(room, game_time_ticks))
+        except Exception as exc:
+            game = None
+            _log_hook_fail(game, "temporary_salt_line", exc)
+            return False
+    return False
+
+
+def set_occult_mark_blocks(fn):
+    """Register fn(character, room) -> str | None for leave-gate refusals.
+
+    Return a player-facing message when occult marks block exit; None when
+    the engine move gate should keep checking other rules. Pass None to clear.
+    """
+    global _occult_mark_blocks
+    _occult_mark_blocks = fn
+
+
+def occult_mark_blocks(character, room):
+    """Game policy for occult mark leave blocks, or None when unset."""
+    if _occult_mark_blocks is not None:
+        try:
+            return _occult_mark_blocks(character, room)
+        except Exception as exc:
+            game = getattr(getattr(character, "session", None), "game", None)
+            _log_hook_fail(game, "occult_mark_blocks", exc)
+            return None
+    return None
+
+
+def set_is_corporeal_prison_plane(fn):
+    """Register fn(plane) -> bool. Pass None to restore default."""
+    global _is_corporeal_prison_plane
+    _is_corporeal_prison_plane = fn
+
+
+def is_corporeal_prison_plane(plane) -> bool:
+    """True when this plane id is the corporeal-prison afterlife.
+
+    Default: str(plane or "").strip().lower() == "purgatory".
+    If a hook is set, call it; on exception _log_hook_fail and use default.
+    """
+    default = str(plane or "").strip().lower() == "purgatory"
+    if _is_corporeal_prison_plane is not None:
+        try:
+            return bool(_is_corporeal_prison_plane(plane))
+        except Exception as exc:
+            _log_hook_fail(None, "is_corporeal_prison_plane", exc)
+    return default
+
+
 def set_web_map_cell_verbs(fn):
     """Register browser atlas right-click verbs, or None to clear."""
     global _web_map_cell_verbs
@@ -1517,6 +2053,47 @@ def resolve_dispatch_actor(character, verb, game, force_actor=None):
     return force_actor if force_actor is not None else character
 
 
+_heal_staff_occupy_session_desync = None
+
+
+def set_heal_staff_occupy_session_desync(fn):
+    """Register fn(character, game) -> corporeal Character for this Session."""
+    global _heal_staff_occupy_session_desync
+    _heal_staff_occupy_session_desync = fn
+
+
+def heal_staff_occupy_session_desync(character, game):
+    """Heal ranked-PC / cast occupy Session drift (bug report 1714)."""
+    if _heal_staff_occupy_session_desync is not None:
+        return _heal_staff_occupy_session_desync(character, game)
+    return character
+
+
+_sleep_dream_awareness = None
+
+
+def set_sleep_dream_awareness(fn):
+    """Register fn(character, game) -> Character|None for sleep-astral hop.
+
+    When a live Session is stuck on a sleeping husk (or a God Mantle
+    whose twin is asleep), hop awareness onto the Threshold dream-self
+    before look / the world-closed gate. Pass None to restore the no-op.
+    """
+    global _sleep_dream_awareness
+    _sleep_dream_awareness = fn
+
+
+def maybe_sleep_dream_awareness(character, game):
+    """Hop a stuck sleeper onto their dream-self, or return None."""
+    if _sleep_dream_awareness is None:
+        return None
+    try:
+        return _sleep_dream_awareness(character, game)
+    except Exception as exc:
+        _log_hook_fail(game, "sleep_dream_awareness", exc)
+        return None
+
+
 def set_pre_command_handler(fn):
     """Register fn(actor, verb, game) -> twin_owner|None before handler."""
     global _pre_command_handler
@@ -1635,16 +2212,16 @@ def room_look_virtual_exits(room, character, game):
         return list(_room_look_virtual_exits(room, character) or [])
 
 
-def set_vampire_fear_message(fn):
+def set_monster_sense_message(fn):
     """Register fn(character, room) -> str or None for the post-look fear nudge."""
-    global _vampire_fear_message
-    _vampire_fear_message = fn
+    global _monster_sense_message
+    _monster_sense_message = fn
 
 
-def vampire_fear_message(character, room):
-    """Return the Vampire-vs-Slayer fear line, or None if no game/none due."""
-    if _vampire_fear_message is not None:
-        return _vampire_fear_message(character, room)
+def monster_sense_message(character, room):
+    """Return the monster-vs-Called Slayer fear line, or None if none due."""
+    if _monster_sense_message is not None:
+        return _monster_sense_message(character, room)
     return None
 
 
@@ -1970,6 +2547,100 @@ def follow_pull_skip(follower, leader, game):
     return False
 
 
+def set_follow_pull_handled(fn):
+    """Register fn(follower, origin, dest, game) -> True if it relocated them.
+
+    Used when a follower is aboard their own ride: park that vehicle at
+    ``dest`` instead of yanking the rider off the saddle with ``_move_one``.
+    """
+    global _follow_pull_handled
+    _follow_pull_handled = fn
+
+
+def follow_pull_handled(follower, origin, dest, game):
+    """True when a game hook already moved this follower to ``dest``."""
+    if _follow_pull_handled is not None:
+        return bool(_follow_pull_handled(follower, origin, dest, game))
+    return False
+
+
+def set_follow_pull_homestead_plot(fn):
+    """Register fn(follower, leader, origin, dest, game) -> bool."""
+    global _follow_pull_homestead_plot
+    _follow_pull_homestead_plot = fn
+
+
+def follow_pull_homestead_plot(follower, leader, origin, dest, game):
+    """True when a homestead pet may pull from another room on the plot."""
+    if _follow_pull_homestead_plot is not None:
+        return bool(_follow_pull_homestead_plot(
+            follower, leader, origin, dest, game,
+        ))
+    return False
+
+
+def set_ensure_homestead_plot_graph_for_actor(fn):
+    """Register fn(character, game) -> bool for homestead exit-graph repair.
+
+    Called from ``exits`` and from ``cmd_move`` when a compass direction has
+    no ``Room.exits`` entry. True means the game rewired at least one exit
+    on this call (caller may retry the move once). Pass None to clear.
+    """
+    global _ensure_homestead_plot_graph_for_actor
+    _ensure_homestead_plot_graph_for_actor = fn
+
+
+def ensure_homestead_plot_graph_for_actor(character, game):
+    """Self-heal a homestead plot graph when the actor stands on one.
+
+    Default False (no game registered, or plot already validated this session).
+    """
+    if _ensure_homestead_plot_graph_for_actor is not None:
+        return bool(_ensure_homestead_plot_graph_for_actor(character, game))
+    return False
+
+
+def set_follow_pull_household_pet(fn):
+    """Register fn(follower, leader, origin, dest, game) -> bool."""
+    global _follow_pull_household_pet
+    _follow_pull_household_pet = fn
+
+
+def follow_pull_household_pet(follower, leader, origin, dest, game):
+    """True when a bonded beast pet was relocated with the owner."""
+    if _follow_pull_household_pet is not None:
+        return bool(_follow_pull_household_pet(
+            follower, leader, origin, dest, game,
+        ))
+    return False
+
+
+def set_follow_shares_origin(fn):
+    """Register fn(follower, origin, game) -> True when they share the curb."""
+    global _follow_shares_origin
+    _follow_shares_origin = fn
+
+
+def follow_shares_origin(follower, origin, game):
+    """True when a boarded follower's ride is still at ``origin``."""
+    if _follow_shares_origin is not None:
+        return bool(_follow_shares_origin(follower, origin, game))
+    return False
+
+
+def set_group_share_travel_spot(fn):
+    """Register fn(a, b, game) -> True when two bodies share a curb or trail cell."""
+    global _group_share_travel_spot
+    _group_share_travel_spot = fn
+
+
+def group_share_travel_spot(a, b, game=None):
+    """True when separate rides still count as the same group location."""
+    if _group_share_travel_spot is not None:
+        return bool(_group_share_travel_spot(a, b, game))
+    return False
+
+
 _follow_survival_peel_message = None
 
 
@@ -2069,6 +2740,26 @@ def room_broadcast_transform(watcher, room, text, game=None):
     return text
 
 
+def set_room_broadcast_after(fn):
+    """Register fn(room, message, game, *, exclude=None) after in-room delivery.
+
+    Lets a game fan room traffic to extra listeners (observation screens)
+    without the engine importing game code. ``message`` is the same payload
+    Room.broadcast received (str or per-watcher callable).
+    """
+    global _room_broadcast_after
+    _room_broadcast_after = fn
+
+
+def room_broadcast_after(room, message, game=None, *, exclude=None):
+    """Optional extra listeners after a room.broadcast in-room loop."""
+    if _room_broadcast_after is not None:
+        try:
+            _room_broadcast_after(room, message, game, exclude=exclude)
+        except Exception as exc:
+            _log_hook_fail(game, "room_broadcast_after", exc)
+
+
 def set_perception_character(fn):
     """Register fn(character, game) -> Character for prompt / located UI.
 
@@ -2154,9 +2845,48 @@ def filter_zone_entries(viewer, room, entries, game):
     if _filter_zone_entries is None:
         return base
     try:
-        return dict(_filter_zone_entries(viewer, room, base, game) or base)
+        filtered = _filter_zone_entries(viewer, room, base, game)
     except TypeError:
-        return dict(_filter_zone_entries(viewer, room, base) or base)
+        filtered = _filter_zone_entries(viewer, room, base)
+    if filtered is None:
+        return base
+    return dict(filtered)
+
+
+def set_filter_zone_entries_look(fn):
+    """Register fn(viewer, room, entries, game) -> look-hint entries dict."""
+    global _filter_zone_entries_look
+    _filter_zone_entries_look = fn
+
+
+def filter_zone_entries_look(viewer, room, entries, game):
+    """Look-hint subset of zone_entries (fixture dedupe; travel unchanged)."""
+    base = dict(entries or {})
+    if _filter_zone_entries_look is None:
+        return base
+    try:
+        filtered = _filter_zone_entries_look(viewer, room, base, game)
+    except TypeError:
+        filtered = _filter_zone_entries_look(viewer, room, base)
+    if filtered is None:
+        return base
+    return dict(filtered)
+
+
+def set_try_civic_fixture_enter(fn):
+    """Register fn(character, raw, game) -> bool (True when enter handled)."""
+    global _try_civic_fixture_enter
+    _try_civic_fixture_enter = fn
+
+
+def try_civic_fixture_enter(character, raw, game):
+    """Best-effort civic fixture enter before zone-not-found refusal."""
+    if _try_civic_fixture_enter is None:
+        return False
+    try:
+        return bool(_try_civic_fixture_enter(character, raw, game))
+    except TypeError:
+        return bool(_try_civic_fixture_enter(character, raw))
 
 
 def set_look_exit_hidden_from_viewer(fn):
@@ -2750,6 +3480,24 @@ def can_notice_stealth(viewer, other, game=None):
     return True
 
 
+def set_presence_hidden_extra(fn):
+    """Register fn(viewer, other) -> bool for extra look/targeting hide."""
+    global _presence_hidden_extra
+    _presence_hidden_extra = fn
+
+
+def presence_hidden_extra(viewer, other) -> bool:
+    """True when a game hook hides ``other`` from ``viewer`` (not stealth)."""
+    if viewer is other or other is None or viewer is None:
+        return False
+    if _presence_hidden_extra is None:
+        return False
+    try:
+        return bool(_presence_hidden_extra(viewer, other))
+    except Exception:
+        return False
+
+
 def set_extra_affect_rows(fn):
     """Register fn(character) -> list[dict] for ``aff`` / ``affects``."""
     global _extra_affect_rows
@@ -2779,8 +3527,8 @@ def can_perceive_trickster_laylow(viewer, other):
     """Can `viewer` see `other` while `other` is laying low (withdrawn)?
 
     Default (no game installed): True -- bare engine has no trickster kit.
-    SUPERS registers ``trickster_laylow.pierce_lay_low`` (staff, research
-    intel, hunter field codex, or a tier-3+ angel's grace-sight).
+    SUPERS registers ``trickster_laylow.pierce_lay_low`` (staff, trickster
+    library research, logged trickster field pages, or tier-3+ grace-sight).
     """
     if viewer is other:
         return True
@@ -2931,6 +3679,14 @@ def after_move_crossing(character, from_room, direction, dest, game):
     """Auto close doors left open for a permitted crossing (SUPERS hook)."""
     if _after_move_crossing is not None:
         _after_move_crossing(character, from_room, direction, dest, game)
+    # Engine-side Cadence ping-pong stamp (NPC / Echo / idlemode only).
+    # Lives here so we have ``from_room`` without extending ``after_move_step``.
+    try:
+        from engine.report_debug import note_cadence_pingpong_on_move
+
+        note_cadence_pingpong_on_move(character, from_room, dest, game)
+    except Exception:
+        pass
 
 
 def set_move_public_name(fn):
@@ -3242,6 +3998,19 @@ def look_body_for(viewer, subject):
     return None
 
 
+def set_look_detail_for(fn):
+    """Register fn(viewer, subject, keyword) -> str|None for look <who> <part>."""
+    global _look_detail_for
+    _look_detail_for = fn
+
+
+def look_detail_for(viewer, subject, keyword):
+    """Named look-target body, or None when the hook is unset."""
+    if _look_detail_for is not None:
+        return _look_detail_for(viewer, subject, keyword)
+    return None
+
+
 def set_encounter_check(fn):
     """Register fn(game, room) for room-entry spawn/aggro rolls (wilderness
     hostiles, procedural dungeons, idle-hostile aggro). Pass None to
@@ -3530,6 +4299,10 @@ _try_directional_open = None
 # True = handled. fn(character, args, game) -> bool
 _try_enter_zone = None
 
+# Floor ``get`` miss: scrape / forage a room prop that is not an Item yet.
+# True = handled (messages already sent). fn(character, args, game) -> bool
+_try_get_unlisted = None
+
 # Boarded vehicle: ``enter`` / ``in`` / ``out`` while in_vehicle is set.
 # fn(character, args, game) -> bool  /  fn(character, game, direction=) -> bool
 _try_vehicle_enter_as_house_in = None
@@ -3579,6 +4352,77 @@ def clear_companion_duty(member, game, *, reason="group_split", silent=False):
     if _clear_companion_duty is None:
         return None
     return _clear_companion_duty(member, game, reason=reason, silent=silent)
+
+
+# --- Spawn / erase / follow hooks (Phase 2 purity) ------------------------
+_spawn_reserved_character_keys_extra = None
+_scrub_player_erase_attachments = None
+_follow_declined_companion_cooldown = None
+
+
+def set_spawn_reserved_character_keys_extra(fn):
+    """Register fn(game) -> iterable of keys reserved for spawn/chargen names.
+
+    Games add immersion cast keys, assigned NPC ids, etc. Pass None to clear.
+    """
+    global _spawn_reserved_character_keys_extra
+    _spawn_reserved_character_keys_extra = fn
+
+
+def iter_spawn_reserved_character_keys_extra(game):
+    """Yield extra reserved keys from the game hook, or nothing when unset."""
+    if _spawn_reserved_character_keys_extra is None:
+        return
+    try:
+        keys = _spawn_reserved_character_keys_extra(game)
+        if keys is None:
+            return
+        for raw in keys:
+            key = (raw or "").strip()
+            if key:
+                yield key
+    except Exception:
+        return
+
+
+def set_scrub_player_erase_attachments(fn):
+    """Register fn(character, game) -> None before erase / orphan purge.
+
+    Games drop hunt jobs, felony rows, and other world attachments. Pass
+    None to clear (engine still zeroes generic crime fields when needed).
+    """
+    global _scrub_player_erase_attachments
+    _scrub_player_erase_attachments = fn
+
+
+def scrub_player_erase_attachments(character, game):
+    """Invoke game scrub hook for deleted/off-roster player bodies."""
+    if _scrub_player_erase_attachments is None:
+        return
+    try:
+        _scrub_player_erase_attachments(character, game)
+    except Exception:
+        pass
+
+
+def set_follow_declined_companion_cooldown(fn):
+    """Register fn(follower, leader, game) -> None after explicit unfollow.
+
+    Games stamp companion beckon-refuse cooldown (SUPERS: companion module).
+    Pass None to clear.
+    """
+    global _follow_declined_companion_cooldown
+    _follow_declined_companion_cooldown = fn
+
+
+def stamp_follow_declined_companion_cooldown(follower, leader, game=None):
+    """Mirror companion cooldown when a player peels off follow."""
+    if _follow_declined_companion_cooldown is None:
+        return
+    try:
+        _follow_declined_companion_cooldown(follower, leader, game)
+    except Exception:
+        pass
 
 
 # --- Player tips hooks ----------------------------------------------------
@@ -3700,6 +4544,23 @@ def try_enter_zone(character, args, game):
     """True when a registered game handler consumed this enter attempt."""
     if _try_enter_zone is not None:
         return bool(_try_enter_zone(character, args, game))
+    return False
+
+
+def set_try_get_unlisted(fn):
+    """Register fn(character, args, game) -> bool for floor get misses.
+
+    True means the game handled ``get`` (e.g. scrape grit from rails).
+    Pass None to clear.
+    """
+    global _try_get_unlisted
+    _try_get_unlisted = fn
+
+
+def try_get_unlisted(character, args, game):
+    """True when a registered game handler consumed this get miss."""
+    if _try_get_unlisted is not None:
+        return bool(_try_get_unlisted(character, args, game))
     return False
 
 
@@ -4145,6 +5006,9 @@ def weather_look_vision(
 # Optional regional-weather game hooks (SUPERS registers; basegame uses defaults).
 _weather_is_elemental_realm = None
 _weather_room_plane = None
+_weather_is_demesne_room = None
+_weather_demesne_region_id = None
+_weather_homestead_macro_xy = None
 _weather_clinic_admit = None
 _weather_radio_bulletin = None
 
@@ -4175,6 +5039,45 @@ def weather_room_plane(room):
     if room is None:
         return None
     return getattr(room, "plane", None) or "earth"
+
+
+def set_weather_is_demesne_room(fn):
+    """Register fn(room) -> bool for god demesne pocket cells."""
+    global _weather_is_demesne_room
+    _weather_is_demesne_room = fn
+
+
+def weather_is_demesne_room(room):
+    """True when the room is a demesne pocket (not CONUS atlas)."""
+    if _weather_is_demesne_room is not None:
+        return bool(_weather_is_demesne_room(room))
+    return False
+
+
+def set_weather_demesne_region_id(fn):
+    """Register fn(room) -> str pocket region id (e.g. demesne:slug) or None."""
+    global _weather_demesne_region_id
+    _weather_demesne_region_id = fn
+
+
+def weather_demesne_region_id(room):
+    """Climate region id for a demesne pocket room, or None when not a demesne."""
+    if _weather_demesne_region_id is not None:
+        return _weather_demesne_region_id(room)
+    return None
+
+
+def set_weather_homestead_macro_xy(fn):
+    """Register fn(room, game, character=None) -> (x, y) | None for plot atlas cells."""
+    global _weather_homestead_macro_xy
+    _weather_homestead_macro_xy = fn
+
+
+def weather_homestead_macro_xy(room, game, character=None):
+    """America macro coords for a homestead plot room, or None when not applicable."""
+    if _weather_homestead_macro_xy is not None:
+        return _weather_homestead_macro_xy(room, game, character)
+    return None
 
 
 def set_weather_clinic_admit(fn):
@@ -4410,6 +5313,7 @@ def clear_overland_coords(character):
 _overland_starter_keys = None
 _overland_room_influenced = None
 _overland_queue_vehicle_macro_move = None
+_overland_vehicle_compass_as_foot = None
 _overland_notify_dungeon_hub = None
 _overland_cadence_travel_toward = None
 _overland_solar_land_all_the_way = None
@@ -4451,6 +5355,23 @@ def overland_queue_vehicle_macro_move(character, direction, game):
         return bool(
             _overland_queue_vehicle_macro_move(character, direction, game),
         )
+    return False
+
+
+def set_overland_vehicle_compass_as_foot(fn):
+    """Register fn(character, game) -> bool.
+
+    True means the game placed the boarded character on the on-foot
+    micro grid, so this compass verb should walk that grid instead of a
+    vehicle macro hop.
+    """
+    global _overland_vehicle_compass_as_foot
+    _overland_vehicle_compass_as_foot = fn
+
+
+def overland_vehicle_compass_as_foot(character, game):
+    if _overland_vehicle_compass_as_foot is not None:
+        return bool(_overland_vehicle_compass_as_foot(character, game))
     return False
 
 
@@ -4577,6 +5498,7 @@ _rset_bool_flags = frozenset()
 _rset_text_fields = frozenset()
 _rset_reference_lines_fn = None
 _rset_list_validator = None
+_rset_item_id_validator = None
 _map_store_apply_entry_fields = None
 _map_store_place_seed_items = None
 _map_store_append_hand_rooms = None
@@ -4783,6 +5705,22 @@ def rset_list_validate(field, tokens):
     """Optional game hook: validate parsed rset list-field tokens."""
     if _rset_list_validator is not None:
         _rset_list_validator(field, tokens)
+
+
+def set_rset_item_id_validator(fn):
+    """Register fn(item_id, *, where) -> None; raise ValueError on bad ids."""
+    global _rset_item_id_validator
+    _rset_item_id_validator = fn
+
+
+def rset_item_id_validate(item_id, *, where=""):
+    """Optional game hook: validate one item catalog id at author time."""
+    if _rset_item_id_validator is not None:
+        _rset_item_id_validator(item_id, where=where)
+        return
+    if _item_catalog_get is not None and not _item_catalog_get(item_id):
+        label = f" ({where})" if where else ""
+        raise ValueError(f"Unknown item id {item_id!r}{label}.")
 
 
 def set_map_store_apply_entry_fields(fn):
@@ -5093,9 +6031,9 @@ def set_blocked_foot_step(fn):
     _blocked_foot_step = fn
 
 
-def blocked_foot_step(game, macro, micro):
+def blocked_foot_step(game, macro, micro, character=None):
     if _blocked_foot_step is not None:
-        return _blocked_foot_step(game, macro, micro)
+        return _blocked_foot_step(game, macro, micro, character)
     return None
 
 
@@ -5184,6 +6122,7 @@ _containers_stacked_carry_lines = None
 _containers_gear_acquire_refusal = None
 _containers_relic_acquire_refusal = None
 _containers_room_is_character_home = None
+_containers_remote_stash_gate = None
 _containers_heal_folded_kit_bags = None
 _containers_consolidate_ammo_stack = None
 _containers_heal_folded_gear_bag_stacks = None
@@ -5353,6 +6292,23 @@ def containers_room_is_character_home(character, room, game):
     return False
 
 
+def set_containers_remote_stash_gate(fn):
+    """Game overlay: named-archangel remote stash / retrieve / outfit."""
+    global _containers_remote_stash_gate
+    _containers_remote_stash_gate = fn
+
+
+def containers_remote_stash_gate(character, action):
+    """Return ``(ok, msg)`` to skip the in-room home gate.
+
+    Default denies. SUPERS registers named-archangel remote retrieve /
+    outfit (Grace) and free remote deposit.
+    """
+    if _containers_remote_stash_gate is not None:
+        return _containers_remote_stash_gate(character, action)
+    return False, "You can only stash things at your claimed home."
+
+
 def set_containers_heal_folded_kit_bags(fn):
     global _containers_heal_folded_kit_bags
     _containers_heal_folded_kit_bags = fn
@@ -5388,6 +6344,31 @@ def containers_heal_folded_gear_bag_stacks(game):
     return 0
 
 
+# Pocket-grid micro room builder (optional; default blank stamp when unset).
+_build_pocket_micro_room = None
+
+
+def set_build_pocket_micro_room(fn):
+    """Register room builder. Pass None to restore default blank stamp."""
+    global _build_pocket_micro_room
+    _build_pocket_micro_room = fn
+
+
+def build_pocket_micro_room(game, pocket, mx, my, ux, uy):
+    """Call the registered builder, or return None for the engine default.
+
+    On exception, log and return None so ``get_or_create_pocket_micro`` falls
+    back to a stamped ``Open ground.`` cell.
+    """
+    if _build_pocket_micro_room is None:
+        return None
+    try:
+        return _build_pocket_micro_room(game, pocket, mx, my, ux, uy)
+    except Exception as exc:
+        _log_hook_fail(game, "build_pocket_micro_room", exc)
+        return None
+
+
 # Demesne micro-room persistence (SUPERS demesne/overland registers these).
 _demesne_resolve_room_key = None
 _demesne_lookup_room_for_persist = None
@@ -5404,6 +6385,26 @@ def set_demesne_resolve_room_key(fn):
 def demesne_resolve_room_key(game, room_key):
     if _demesne_resolve_room_key is not None:
         return _demesne_resolve_room_key(game, room_key)
+    return None
+
+
+_resolve_party_run_saved_room = None
+
+
+def set_resolve_party_run_saved_room(fn):
+    """Register fn(game, room_key, character=None) -> Room | None.
+
+    SUPERS party private dungeons use ephemeral ``partyrun:`` clone keys.
+    Pass None to restore the default (no resolver).
+    """
+    global _resolve_party_run_saved_room
+    _resolve_party_run_saved_room = fn
+
+
+def resolve_party_run_saved_room(game, room_key, character=None):
+    """Rematerialize a private party dungeon room key when registered."""
+    if _resolve_party_run_saved_room is not None:
+        return _resolve_party_run_saved_room(game, room_key, character=character)
     return None
 
 
@@ -5538,6 +6539,34 @@ def content_kind_load_entity(kind_id, entity_id):
             "(game must call set_content_kind_load_entity at boot)"
         )
     return _content_kind_load_entity(kind_id, entity_id)
+
+
+_content_kind_capability = None
+
+
+def set_content_kind_capability(fn):
+    """Register fn(kind_id) -> 'full' | 'create' | 'none'.
+
+    'full'   = save_entity and load_entity both work (new + edit)
+    'create' = save_entity works, load_entity does not (olc new only)
+    'none'   = no persist helper (explain / lint only)
+
+    Games that do not register this default to 'full' for every kind, which
+    preserves the pre-hook behavior (try the save, report the error).
+    """
+    global _content_kind_capability
+    _content_kind_capability = fn
+
+
+def content_kind_capability(kind_id):
+    """Persist capability for one kind ('full' when no game hook)."""
+    if _content_kind_capability is None:
+        return "full"
+    try:
+        return _content_kind_capability(kind_id) or "none"
+    except Exception:
+        # A broken game hook must never break the kind listing.
+        return "full"
 
 
 # Pluggable calendar (Gregorian default; games may swap at boot).

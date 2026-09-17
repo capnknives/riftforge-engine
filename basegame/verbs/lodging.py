@@ -34,7 +34,9 @@ def cmd_rent_bed(character, args, game):
     economy_mod.debit_wallet(
         character, cents=INN_NIGHT_CENTS, reason="Inn rent",
     )
-    character.home_room_key = room.key
+    from engine.room_vnum import internal_room_key
+
+    character.home_room_key = internal_room_key(room) or room.key
     lodging_mod.bump_claimants_index(game)
     lodging_mod.stamp_home_basics(room)
     bed, err = lodging_mod.pick_bed(room, character)

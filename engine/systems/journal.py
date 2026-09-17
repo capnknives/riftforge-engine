@@ -9,8 +9,10 @@ stdlib only. No game imports.
 
 from __future__ import annotations
 
+from engine.systems.player_text import PLAYER_TEXT_WALL_MAX
+
 JOURNAL_CAP = 20
-JOURNAL_TEXT_MAX = 2000
+JOURNAL_TEXT_MAX = PLAYER_TEXT_WALL_MAX
 
 
 def entries(character):

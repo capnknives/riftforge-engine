@@ -13,9 +13,11 @@ stdlib only.
 
 from __future__ import annotations
 
+from engine.systems.player_text import PLAYER_TEXT_WALL_MAX
+
 # Soft cap so one room cannot grow an unbounded scroll.
 NOTICE_CAP = 20
-NOTICE_TEXT_MAX = 400
+NOTICE_TEXT_MAX = PLAYER_TEXT_WALL_MAX
 
 
 def is_noticeboard_room(room):

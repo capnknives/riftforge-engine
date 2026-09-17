@@ -10,14 +10,14 @@ briefs, body parts, content kinds, travel, economy, …). Game-specific lore,
 catalogs, and prose live in a **separate** consumer repo and pin **tagged
 releases** of this package.
 
-**Current release: [`v0.7.0`](https://github.com/capnknives/riftforge-engine/releases/tag/v0.7.0)** — Phase 2 purity restore (engine never imports a game package), journal / rumor / job-catalog kernels, and flavor-neutral news/storm desks. Pin `@v0.7.0` until the next semver tag ships from `main`.
+**Current release: [`v0.8.0`](https://github.com/capnknives/riftforge-engine/releases/tag/v0.8.0)** — Phase 2 purity restore, folklore hunting kernels (fishing, lockpick, occult marks, Cadence seek/wander, grace/vessel, Purgatory policy, pocket-grid), Occupants GMCP. Pin `@v0.8.0`. `basegame/` help still contains some TV proper nouns until the planned folklore catalogs pass.
 
 ## Install
 
 ```bash
 pip install -e .
 # or pin from another project:
-#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.7.0
+#   riftforge @ git+https://github.com/capnknives/riftforge-engine.git@v0.8.0
 ```
 
 Requires **Python 3.11+**.
@@ -66,6 +66,14 @@ python tools/scaffold_game_mode.py --slug mygame --label "My Game"
 ```
 
 See [`docs/GAME_MODE_SCHEMA_CHECKLIST.md`](docs/GAME_MODE_SCHEMA_CHECKLIST.md).
+
+## What's new in v0.8.0
+
+- **Phase 2 purity restore** — remaining live `engine/` lazy game imports are hooks (`accounts` spawn reserved keys / erase scrub, `group` companion cooldown, heavy-sidecar property-stash parse/empty/dirty). Games register them from bootstrap. `rg from supers engine/` is empty.
+- **Folklore kernels** — fishing catch math, lockpick attempts, occult room stamps (`devils_trap`, `salt_line`, `iron_ward`, `holy_water_ward` on `room.engine`), Cadence seek/wander (`cadence_kernel`), grace meter + vessel chassis, Purgatory corporeal-prison plane policy, pocket-grid demesne chassis. Show names stay out of `engine/`.
+- **Room.Occupants + click-to-walk** — GMCP who-is-here tokens and interior-map path walking (layout graph). In-room `local_x`/`local_y` stay parked.
+- **`origin_registry.FOLKLORE_ORIGIN_IDS`** — reserved hunter / vampire / werewolf / ghost / witch / celestial_vessel ids for a later game catalog pass. Alien remains the shipped sideline demo origin.
+- **Known debt** — public `basegame/help_topics.py` still pastes some Winchester / Lebanon / Men of Letters lines. Folklore Mortals & Monsters catalogs are **planned**, not this tag.
 
 ## What's new in v0.7.0
 
@@ -217,7 +225,7 @@ CI runs all three on every push.
 
 ## Building your own game
 
-1. `pip install -e .` (or pin `@v0.7.0`).
+1. `pip install -e .` (or pin `@v0.8.0`).
 2. Read [`docs/ENGINE_CONSUMER.md`](docs/ENGINE_CONSUMER.md) — hooks for chargen, persist, help, `register_all_hooks()`.
 3. Copy `basegame/` or `classic/` as a skeleton, or register your package via `RIFTFORGE_GAME=yourgame`.
 4. Put catalogs in your repo (`content/kinds/`, maps, NPCs); register kind dirs with `set_content_kinds_dirs`. Run `tools/scaffold_game_mode.py` for a fresh tree.

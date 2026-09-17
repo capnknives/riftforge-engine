@@ -104,12 +104,12 @@
     "water_view_rows": {
       "type": "list",
       "required": false,
-      "doc": "HUD-only water paint on America void margins (earth_america). Height strings of width glyphs (y=0 south): ~ ocean-view, o lake-view, space none. Cosmetic minimap tint only — does not change sim area_type when terrain is void and does not create walkable ocean on America. Great Lakes follow shore rings, not a lat/lon rectangle."
+      "doc": "HUD-only water paint on America void margins (earth_america). Height strings of width glyphs (y=0 south): ~ ocean-view, o lake-view, space none. Cosmetic minimap tint only — does not change sim area_type when terrain is void and does not create walkable ocean on America. Great Lakes follow shore rings, not a lat/lon rectangle. A 2-cell Atlantic seaboard rim is paint only (no Atlantic water map; compass hop off that rim is not a Gulf hop)."
     },
     "land_view_rows": {
       "type": "list",
       "required": false,
-      "doc": "HUD-only Canada land paint on America void margins (earth_america). Height strings of width glyphs (y=0 south): T timber, . prairie, space none. Cosmetic only — sim stays void. Sibling earth_canada.json holds real Canada grid coords for a later hop."
+      "doc": "HUD-only Canada land paint on America void margins (earth_america). Height strings of width glyphs (y=0 south): T timber, . prairie, space none. Cosmetic only — sim stays void. Country silhouettes (web, Mudlet, atlas/map big) omit this layer so CONUS stays CONUS; the local minimap still paints it near a northern border. Sibling earth_canada.json holds real Canada grid coords for a later hop."
     },
     "river_rows": {
       "type": "list",

@@ -177,6 +177,16 @@ def schedule_for_deploy(root, from_sha: str | None = None, to_sha: str | None = 
     working unchanged; posting is driven by the ledger's ``posted`` column.
     """
     del from_sha, to_sha  # kept for call-site compatibility; ledger-driven now
+    # pending_player_entries parses every unposted CHANGELOG.d fragment
+    # (~1.5s at today's fragment count) and this runs on the boot /
+    # copyover critical path. With no Discord route configured that scan
+    # could only ever end in "post skipped", so check the route first.
+    if not discord_bridge.can_deliver("patch_notes"):
+        print(
+            "[discord_patch_notes] post skipped (no webhook/channel configured)",
+            flush=True,
+        )
+        return False
     ready = pending_player_entries(root)
     if not ready:
         return False

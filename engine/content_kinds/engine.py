@@ -11,6 +11,7 @@ persistence register through hooks (see docs/plans/two_repo_purity.md).
 from __future__ import annotations
 
 import copy
+import difflib
 import json
 import os
 import re
@@ -126,6 +127,42 @@ def list_kinds(*, include_abstract=False):
             continue
         out.append(kind_id)
     return out
+
+
+def resolve_kind_id(token):
+    """Resolve a typed kind id to a registered profile id.
+
+    Resolution order:
+      1. Exact match on the full kind id.
+      2. Unique leaf suffix when the token has no dot (``god_research_topic``
+         -> ``catalog.god_research_topic``).
+      3. ``difflib`` close matches for a friendly miss hint.
+
+    Never raises on unknown input -- returns ``(None, hints)`` instead.
+    """
+    raw = (token or "").strip()
+    if not raw:
+        return None, []
+
+    profiles = _load_profiles()
+    if raw in profiles:
+        return raw, []
+
+    # Leaf suffix: only when the user did not type a dotted family id.
+    if "." not in raw:
+        suffix_matches = sorted(
+            kind_id for kind_id in profiles
+            if kind_id.split(".")[-1] == raw
+        )
+        if len(suffix_matches) == 1:
+            return suffix_matches[0], []
+        if len(suffix_matches) > 1:
+            return None, suffix_matches
+
+    hints = difflib.get_close_matches(
+        raw, sorted(profiles), n=5, cutoff=0.55,
+    )
+    return None, hints
 
 
 def _merged_fields(kind_id, *, _seen=None):

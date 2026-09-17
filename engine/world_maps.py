@@ -156,6 +156,8 @@ KNOWN_RESOURCE_TAGS = frozenset({
     "bank", "mail", "rumor_board", "noticeboard",
     # Tailor bench for sew / Tailoring (Hattie's Threads, clothing_craft.py).
     "tailor",
+    # Glassworking torch bench (player glass shops; glass_craft.py).
+    "glassbench",
     # Leisure venue flavors (personality prefs; still need entertainment/social
     # on the room for ambient sate). library also marks hunter research dens.
     "bar", "arcade", "theater", "library", "park", "plaza", "nightlife",
@@ -174,7 +176,7 @@ KNOWN_RESOURCE_TAGS = frozenset({
     # Lifestyle professions pillar — fishing site tags (fishing.py FISH_RESOURCES).
     "fish_shore", "fish_pier", "fish_river", "fish_pond", "fish_offshore",
     # Hunting blinds and tagged wilderness hunt cells (hunting.py).
-    "hunt_blind", "hunt_wilds",
+    "hunt_blind", "hunt_wilds", "hunt_abundant",
     # Homestead hearth / trail cooking and occult kitchen benches (cooking.py).
     "hearth", "fireplace", "still", "apothecary",
     # Cellar fermenter and smoke preservation yard builds (brewing / lifestyle_smoke).
@@ -196,6 +198,7 @@ PLANES = frozenset({
     "avalon",
     "coalescence",
     "riftcrash",
+    "bug_war",
     "stellar", "umbral", "empty",
     "earth_frontierland_1861",
 })
@@ -218,6 +221,7 @@ REALM_FOR_PLANE = {
     "avalon": "void",
     "coalescence": "spirit",
     "riftcrash": "pocket",
+    "bug_war": "pocket",
     "earth_frontierland_1861": "prime",
     "stellar": "void",
     "umbral": "void",
@@ -227,15 +231,16 @@ REALM_FOR_PLANE = {
 # Pocket kinds for map JSON pockets[] metadata (authors/tools).
 POCKET_KINDS = frozenset({"settlement", "dungeon", "landmark"})
 def ensure_hand_room_identity(room_data, *, where="map"):
-    """Ensure a hand-authored room dict has a non-empty storage ``key``.
+    """Ensure a hand-authored room dict has a non-empty JSON ``key``.
 
-    Storage key is what character ``room_key`` / dig / goto persist on.
-    Optional ``title`` is player-facing look text and may match the key.
+    After Phase 3 the JSON key is the VNUM. This helper is the last-ditch
+    boot/Studio fallback when both key and VNUM are blank: copy title →
+    key so save does not invent a silent Plaza dump. Dig / populate /
+    Area Studio stamp a VNUM as key instead of relying on this path.
+    Optional ``title`` is the player-facing ROOM NAME.
 
-    If ``key`` is missing or blank but ``title`` is set, copy title → key
-    (builder typed a name and left key empty). If both are empty, raise
-    ``ValueError`` so boot / Studio save fail loud instead of inventing
-    a silent Plaza dump later.
+    If both key and title are empty, raise ``ValueError`` so boot /
+    Studio save fail loud.
 
     Mutates ``room_data`` in place; returns the resolved key string.
     """
@@ -469,6 +474,19 @@ def iter_map_json_paths():
         yield path
 
 
+def _read_map_json(path):
+    """Load one map/zone JSON and apply the in-memory hot-backup overlay.
+
+    Git SoT on disk is unchanged; backup extras (dig / remodel) still reach
+    the live room graph. Overlay helper lives in ``engine.map_heal``.
+    """
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    from engine import map_heal as map_heal_mod
+
+    return map_heal_mod.apply_hot_backup_overlay(path, data)
+
+
 def collect_map_room_keys(exclude_path=None):
     """Room keys from every map/zone JSON except *exclude_path*.
 
@@ -501,8 +519,7 @@ def resolve_map_file(name):
     if os.path.isfile(needle):
         path = os.path.abspath(needle)
         base = os.path.basename(path)
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = _read_map_json(path)
         kind = "zone" if os.path.dirname(path).endswith("zones") else "map"
         return path, base, data, kind
     if not needle.endswith(".json"):
@@ -513,8 +530,7 @@ def resolve_map_file(name):
     needles.add(needle.lower())
     for path in iter_map_json_paths():
         base = os.path.basename(path)
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = _read_map_json(path)
         map_id = _map_id_for(base, data)
         if (
             base.lower() in needles
@@ -574,8 +590,7 @@ def _load_map_files(*, include_deferred=False):
     deferred = {}
     for path in iter_map_json_paths():
         base = os.path.basename(path)
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = _read_map_json(path)
         map_id = _map_id_for(base, data)
         if not _autoload_enabled(data):
             deferred[map_id] = {
@@ -718,6 +733,55 @@ def _stamp_harvest_pools(room, data, *, key):
         setattr(room, field, cleaned)
 
 
+# --- vnum uniqueness index -------------------------------------------------
+# The hand-room vnum guard in _add_room used to scan every room already
+# loaded, which made map load O(rooms x vnum_rooms): 21k rooms / 7.6k vnums
+# cost ~38M getattr calls and dominated cold boot (and every copyover).
+# We keep a {vnum: owner_key} side index instead so the check is O(1).
+#
+# _INDEX is a 3-tuple: (the rooms dict we indexed, how many entries that
+# dict had when we last touched it, the {vnum: key} map). The length is a
+# cheap tripwire: _add_room bumps it as it inserts, so a mismatch means
+# somebody else mutated `rooms` behind our back (runtime `gm maps load`,
+# a zone unload, dig assigning vnums directly) and the index is rebuilt.
+_VNUM_INDEX = None
+
+
+def _vnum_owner_index(rooms):
+    """Return the {vnum: room_key} index for `rooms`, rebuilding if stale.
+
+    `global` lets us reassign the module-level cache from inside the
+    function (without it, Python would treat _VNUM_INDEX as a new local).
+    """
+    global _VNUM_INDEX
+    if _VNUM_INDEX is not None:
+        indexed_rooms, seen_len, index = _VNUM_INDEX
+        # `is` (identity, not ==) so we notice a brand-new rooms dict even
+        # when it happens to hold equal contents.
+        if indexed_rooms is rooms and seen_len == len(rooms):
+            return index
+    index = {}
+    for other_key, other in rooms.items():
+        # getattr(..., None) because not every Room carries a vnum.
+        other_vnum = getattr(other, "vnum", None)
+        if other_vnum:
+            index[other_vnum] = other_key
+    _VNUM_INDEX = (rooms, len(rooms), index)
+    return index
+
+
+def _note_indexed_room(rooms, key, vnum=None):
+    """Keep the index in step with an insert _add_room just made."""
+    global _VNUM_INDEX
+    if _VNUM_INDEX is None or _VNUM_INDEX[0] is not rooms:
+        return
+    _, _, index = _VNUM_INDEX
+    if vnum:
+        index[vnum] = key
+    # len(rooms) already includes the new room, so re-baseline the tripwire.
+    _VNUM_INDEX = (rooms, len(rooms), index)
+
+
 def _add_room(rooms, filename, key, description, gravity=1.0,
               wilderness=None, area_type=None, bestiary_categories=None,
               plane=None, realm=None, map_id=None,
@@ -797,12 +861,16 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
             raise ValueError(
                 f"{filename}: room key {key!r}: {err}"
             ) from err
-        for other in rooms.values():
-            other_v = getattr(other, "vnum", None)
-            if other_v and other_v == normalized:
+        owner_key = _vnum_owner_index(rooms).get(normalized)
+        if owner_key is not None:
+            # Re-read the claimed owner before failing the boot. A stale
+            # index entry (room removed, vnum reassigned elsewhere) must
+            # never be able to crash startup on a duplicate that is gone.
+            owner = rooms.get(owner_key)
+            if owner is not None and getattr(owner, "vnum", None) == normalized:
                 raise ValueError(
                     f"{filename}: room key {key!r} vnum {normalized!r} "
-                    f"already used by {other.key!r}"
+                    f"already used by {owner.key!r}"
                 )
         room.vnum = normalized
     # Phase 3 dual-read: former dig / JSON key before VNUM identity.
@@ -1012,6 +1080,7 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
     from engine import hooks as _hooks
     _hooks.stamp_map_room(room, game_fields or {}, filename=filename)
     rooms[key] = room
+    _note_indexed_room(rooms, key, getattr(room, "vnum", None))
 
 def _resolve_plane_and_realm(filename, data):
     """Validate map-level plane and return (plane, realm).
@@ -1462,12 +1531,39 @@ def _link_room_exits(rooms, filename, room_data):
             )
 
 
+def _link_room_enter_as(rooms, filename, room_data):
+    """Stamp ``Room.zone_entries`` from authored ``enter_as`` aliases.
+
+    Each alias points at this room's ``in`` (or ``enter``) exit dest so
+    ``enter treaty`` matches walking in. Fail loud when ``enter_as`` is
+    set but that dest is missing -- otherwise look hints would lie.
+    """
+    aliases = room_data.get("enter_as") or []
+    if not aliases:
+        return
+    room = rooms[room_data["key"]]
+    dest = room.exits.get("in") or room.exits.get("enter")
+    if dest is None:
+        raise ValueError(
+            f"{filename}: {room_data['key']!r} lists enter_as but has no "
+            f"'in' or 'enter' exit"
+        )
+    entries = dict(getattr(room, "zone_entries", None) or {})
+    for alias in aliases:
+        text = str(alias or "").strip().lower()
+        if not text:
+            continue
+        entries[text] = dest
+    room.zone_entries = entries
+
+
 # Short player-facing enter aliases for look hints (one label per hub).
 # Longer than pathfind's homeward list on purpose -- hotels, highways, etc.
 _LOOK_ENTER_ALIAS_PREF = (
     "city", "gate", "plaza", "town", "heaven", "hell", "nest", "bunker",
     "waystation", "highway", "hotel", "dungeon", "ruins", "pit", "lebanon",
     "welcome", "crossroads", "asylum", "orchard", "ridge", "mafia",
+    "purgatory", "treaty", "separatio",
 )
 
 
@@ -1795,6 +1891,7 @@ def link_map_data(rooms, filename, data):
         _link_grid_portals(rooms, filename, grid)
     for room_data in data.get("rooms", []):
         _link_room_exits(rooms, filename, room_data)
+        _link_room_enter_as(rooms, filename, room_data)
         for item_data in room_data.get("seed_items", []):
             from engine.hooks import make_world_item
             room_key = room_data["key"]
@@ -2045,6 +2142,7 @@ def load_all_maps(*, include_deferred=False):
                 _link_grid_portals(rooms, filename, grid)
             for room_data in data.get("rooms", []):
                 _link_room_exits(rooms, filename, room_data)
+                _link_room_enter_as(rooms, filename, room_data)
                 for item_data in room_data.get("seed_items", []):
                     from engine.hooks import make_world_item
                     room_key = room_data["key"]

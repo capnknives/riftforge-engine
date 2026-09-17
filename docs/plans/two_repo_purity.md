@@ -10,10 +10,11 @@ hook API details grow in [`../ENGINE_CONSUMER.md`](../ENGINE_CONSUMER.md).
 **complete** — Stages **1–10**, A1/A2, Plan B, Stage G, and public tags
 `v0.2.0`–`v0.5.0`. Public
 [`riftforge-engine`](https://github.com/capnknives/riftforge-engine) Latest
-**`v0.7.0`** (2026-09-05, Phase 2 purity restore + journal / rumor / job-catalog
-kernels + flavor-neutral news/storm desks; prior **`v0.6.2`** 2026-08-29
-liquid-flavor kernels; **`v0.6.1`** 2026-08-27 purity restore; **`v0.6.0`**
-2026-08-21); private `capnknives/RiftForge` (SUPERS) pins **`@v0.7.0`**.
+**`v0.8.0`** (folklore kernels + Phase 2 purity restore + Occupants GMCP;
+prior **`v0.7.0`** 2026-09-05 journal / rumor / job-catalog kernels;
+**`v0.6.2`** 2026-08-29 liquid-flavor kernels; **`v0.6.1`** 2026-08-27
+purity restore; **`v0.6.0`** 2026-08-21); private `capnknives/RiftForge`
+(SUPERS) pins **`@v0.8.0`**.
 **Post–`v0.4.0` hygiene track (H1–H10)** **complete** (2026-08-05) —
 execution SoT: [`two_repo_purity_extractions_plan.md`](two_repo_purity_extractions_plan.md);
 closeout inventory: [`two_repo_purity_audit_2026-08-05.md`](two_repo_purity_audit_2026-08-05.md).
@@ -63,18 +64,20 @@ plans.
 
 ## Locked decisions
 
-- **Three layers:** `engine/` (public core) · `basegame/` (public proof
-  consumer of engine APIs) · `supers/` (private production game). Detail:
+- **Four layers:** `engine/` (public core) · `basegame/` (folklore Mortals
+  & Monsters **destination**; today Notbigville proof) · `classic/` (OSR
+  Millbrook demo) · `supers/` (private production game). Detail:
   [`../ENGINE_CONSUMER.md`](../ENGINE_CONSUMER.md).
 - **One game per process:** `game_select.py` + `RIFTFORGE_GAME`
-  (`supers` | `basegame` | `none`) — never import both game packages in one
-  process (hooks would clobber). Live auto-selects SUPERS.
+  (`supers` | `basegame` | `classic` | `none`) — never import both game
+  packages in one process (hooks would clobber). Live auto-selects SUPERS.
 - **Dependency:** SUPERS → Riftforge only. Never `engine` → `supers`
   (lazy imports count as violations). `basegame` → engine only (never
   `supers`).
 - **End state:** Two GitHub remotes — public
   **`capnknives/riftforge-engine`**, private **`capnknives/RiftForge`**
-  (SUPERS; this monorepo). Public tree includes `engine/` + `basegame/`.
+  (SUPERS; this monorepo). Public tree includes `engine/` + `basegame/` +
+  `classic/`.
 - **Wiring:** SUPERS `pyproject.toml` pins Riftforge via **GitHub version
   tags** on `riftforge-engine` (pip). Local hacking: editable path install.
   Live Docker: dual bind-mount while editing; tagged pin for clean ship.
@@ -98,7 +101,7 @@ plans.
 |-------|------|----------------|
 | **0** | Document destination | This file + consumer/upgrade stubs linked from AGENTS/HANDOFF |
 | **1** | Registry hooks | Character/persist/chargen/help registered; no hardwired `attach_supers` / blob import |
-| **2** | Engine purity | ✅ `rg "from supers\|import supers" engine/` empty; `engine_hooks_purity_tests` + `engine-only-smoke` enforced (restored 2026-08-03) |
+| **2** | Engine purity | ✅ Gate is **zero** `from supers` / `import supers` under `engine/` (`engine_hooks_purity_tests`, `tools/engine_smoke.py`, `tools/two_repo_purity_v070_smoke.py`). Regressions are fixed via hooks in `engine/hooks.py` + `supers/bootstrap.py` — do not re-import game packages from engine code. |
 | **2b** | `command_support.py` purity | ✅ shared move/spirit-sight helpers hookified; zero supers imports in `engine/command_support.py` |
 | **3** | Lean world + game bootstrap | ✅ MVP: lean `engine/world.py`/`engine/persistence.py`; dual installable packages declared; game entry alias added |
 | **4** | Engine-only smoke | ✅ Job exists (`tools/engine_smoke.py`). **2026-08-27:** private-repo GitHub workflow `CI` (`.github/workflows/ci.yml`) is **`disabled_manually`**, so `engine-only-smoke` is **not running on GitHub**. Local `engine_smoke.py` + public `riftforge-engine` CI (active) still gate. Re-enable is a billing/maintainer decision. |
@@ -311,7 +314,8 @@ defaults exist today.
 | Layer | Owns |
 |-------|------|
 | **`engine/` / `engine/systems/`** | Primitives + frameworks: meters, coin/vendor APIs, pathfind BFS, battle-brief build/apply, content store, tick registry, **content kind profiles + menu OLC** (`engine/content_kinds/`, `engine/olc.py`), shared spine, generic ambient weather **and** CONUS `regional_weather` / overland / storm chase / globe+aerial (Notbigville / `v0.3.0`), lean Character surface |
-| **`basegame/`** | Proof consumer: adopts engine frameworks; ships minimal verbs/help/maps; no SUPERS lore |
+| **`basegame/`** | Folklore M&M destination (charter); today Notbigville proof + peel verbs. TV-noun catalogs/help scrub is **planned**. |
+| **`classic/`** | OSR Millbrook demo — keep; do not fold into folklore. |
 | **`supers/`** | Catalogs, Origin/Path/Cadence fiction, combat prose/lexicon, daylight + clinic/radio/elemental **hooks** into regional weather, Tier flavor names, fuel economies, town AI; **kind JSON profiles**, domain validators, persist paths, guess heuristics, GM inspect sheets; thin facades for peeled frameworks |
 
 **Confirm before promoting (edge cases):** public remote visibility (new
@@ -324,6 +328,19 @@ crime, alignment/incap kill methods, combat prose/narrate/lexicon, full
 `training.py` Track-B, `daylight`, Origin fuel chassis. CONUS weather /
 storm chase / America overland / globe flight now live under
 `engine/systems/` with supers re-export facades (`v0.3.0`).
+
+**Folklore basegame + 2D client (design lock 2026-09-05 / 2026-09-06):**
+[`folklore_basegame_charter.md`](folklore_basegame_charter.md) redefines
+public `basegame/` as Mortals & Monsters **minus TV copyright**, and
+unparks vessel / grace / Purgatory-as-monster-prison / devil’s traps as
+**engine mechanisms**. Execution SoT:
+[`folklore_2d_mmo_peel.md`](folklore_2d_mmo_peel.md). The 2D MMO is a
+**client on the same room graph** (GMCP + existing browser HUD), not a
+second world model. Named show people and episode plot stay `supers/`.
+Waves 1–6 + Later B click-to-walk shipped 2026-09-06/07. Follow the peel
+file for leftovers (in-room coords, Combat Viz). The “Stay in supers”
+row above still applies to **prose, job-behavior enums, and Winchester
+overlay**. Live stays `RIFTFORGE_GAME=supers`.
 
 ### Content kinds + OLC (locked — Stage 10)
 

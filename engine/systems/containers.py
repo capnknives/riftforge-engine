@@ -178,10 +178,28 @@ def bag_contents(item):
     return item.bag_contents
 
 
+def _item_nostack(item):
+    """True when this row must not share a display/drop stack with copies."""
+    if item is None:
+        return False
+    if getattr(item, "nostack", False):
+        return True
+    catalog_id = getattr(item, "catalog_id", None)
+    if catalog_id:
+        spec = hooks_mod.get_item_spec(str(catalog_id))
+        if isinstance(spec, dict) and (
+            spec.get("nostack") or spec.get("unique")
+        ):
+            return True
+    return False
+
+
 def stack_key(item, viewer):
     """Grouping key for open-inventory cap (matches display stacks)."""
     if item is None:
         return ""
+    if _item_nostack(item):
+        return f"row:{id(item)}"
     catalog_id = getattr(item, "catalog_id", None)
     if catalog_id:
         return f"cat:{str(catalog_id).strip().lower()}"
@@ -570,7 +588,13 @@ def stow_count_in_loot_bag(character, count, *, loot_bag=None, predicate=None):
 
 
 def unstow_from_loot_bag(character, item, *, loot_bag=None):
-    """Move ``item`` from the loot backpack onto open inventory."""
+    """Move ``item`` from the loot backpack onto open inventory.
+
+    Does not dump overflow onto the belt: ``get all from backpack`` must
+    stop at the open-inventory cap instead of stuffing every row into
+    hands (bug report 1280). Items that would only fit back in the bag
+    stay in the bag.
+    """
     if character is None or item is None:
         return False, STOW_NOT_IN_LOOT_BAG
     bag = loot_bag if loot_bag is not None else designated_loot_bag(character)
@@ -579,16 +603,32 @@ def unstow_from_loot_bag(character, item, *, loot_bag=None):
     contents = bag_contents(bag)
     if item not in contents:
         return False, STOW_NOT_IN_LOOT_BAG
-    refusal = open_inventory_refusal(character, item)
-    if refusal:
-        return False, refusal
-    inv = getattr(character, "inventory", None)
-    if inv is None:
-        character.inventory = []
-        inv = character.inventory
+    dest = placement_destination(character, item)
+    if dest is None or dest == "loot":
+        refusal = open_inventory_refusal(character, item)
+        if dest == "loot":
+            return False, OPEN_FULL
+        if refusal:
+            return False, refusal
+        return False, OPEN_FULL
+    open_merge_target = None
+    if _item_stack_merge_eligible(item):
+        open_merge_target = _find_matching_stack_item(
+            _surface_items(character), item, character,
+        )
     contents.remove(item)
-    inv.append(item)
-    return True, f"You pull {item.key} from {bag.key}."
+    tuck = route_acquired_item(character, item)
+    if _item_carried_by_character(character, item):
+        if tuck:
+            return True, tuck
+        return True, f"You pull {item.key} from {bag.key}."
+    # Folded into an existing open stack -- ``item`` is consumed, not carried.
+    if open_merge_target is not None:
+        if tuck:
+            return True, tuck
+        return True, f"You pull {item.key} from {bag.key}."
+    bag_contents(bag).append(item)
+    return False, OPEN_FULL
 
 
 def unstow_all_from_loot_bag(character, *, loot_bag=None):
@@ -606,6 +646,9 @@ def unstow_all_from_loot_bag(character, *, loot_bag=None):
         if ok:
             names.append(piece.key)
     if not names:
+        contents = bag_contents(bag)
+        if contents:
+            return False, OPEN_FULL
         return False, "Your backpack is empty."
     from command_support import format_item_tally
 
@@ -684,6 +727,18 @@ def _item_resting_place(character, item):
     inv = getattr(character, "inventory", None) or []
     if item in inv:
         return "hands"
+    # Handheld bags (satchel in hand, not worn) still hold real rows.
+    for holder in inv:
+        if not is_bag_item(holder):
+            continue
+        if item not in bag_contents(holder):
+            continue
+        if is_gear_bag_item(holder):
+            return "gear"
+        return "loot"
+    equipment = getattr(character, "equipment", None)
+    if isinstance(equipment, dict) and item in equipment.values():
+        return "wielded"
     return None
 
 
@@ -716,6 +771,77 @@ def _ensure_open_inventory_holds(character, item):
         inv.append(item)
 
 
+def is_stackable_reward_box(item):
+    """True for locked sealed strongboxes that may share one inventory row.
+
+    Each unit keeps its own loot table on ``loot_payloads``. Corpses, bags,
+    furniture, and pit mimics never qualify (bug reports 488 / 1058 / 1288).
+    Unlocked lockpicked boxes stay separate so flavor leftovers cannot
+    swallow a live table (bug report 1058).
+    """
+    if item is None:
+        return False
+    if getattr(item, "is_body", False) or getattr(item, "furniture", False):
+        return False
+    if getattr(item, "pit_mimic", False):
+        return False
+    if is_bag_item(item):
+        return False
+    if not getattr(item, "locked", False):
+        return False
+    if getattr(item, "loot", None):
+        return True
+    payloads = getattr(item, "loot_payloads", None)
+    return bool(isinstance(payloads, list) and payloads)
+
+
+def _copy_loot_table(loot):
+    """Shallow-copy one lockbox loot list (dicts stay dicts)."""
+    out = []
+    for entry in loot or []:
+        if isinstance(entry, dict):
+            out.append(dict(entry))
+        else:
+            out.append(entry)
+    return out
+
+
+def _reward_box_payloads(item):
+    """One loot table per stacked strongbox unit."""
+    n = _stack_unit_count(item)
+    payloads = getattr(item, "loot_payloads", None)
+    if isinstance(payloads, list) and payloads:
+        out = [_copy_loot_table(p) for p in payloads]
+        while len(out) < n:
+            out.append(_copy_loot_table(getattr(item, "loot", None)))
+        return out
+    loot = _copy_loot_table(getattr(item, "loot", None))
+    return [list(loot) for _ in range(max(1, n))]
+
+
+def peel_open_reward_box(item):
+    """Pay one stacked strongbox unit. Returns (loot_rows, consumed).
+
+    ``consumed`` True means the Item row should leave its holder (the last
+    unit, or any non-stacked container). Remaining units keep their loot.
+    """
+    if item is None:
+        return [], True
+    count = _stack_unit_count(item)
+    payloads = getattr(item, "loot_payloads", None)
+    stacked = count > 1 or (
+        isinstance(payloads, list) and len(payloads) > 1
+    )
+    if not stacked:
+        return list(getattr(item, "loot", None) or []), True
+    pays = _reward_box_payloads(item)
+    this_loot = _copy_loot_table(pays.pop(0))
+    item.stack_charges = count - 1
+    item.loot_payloads = pays
+    item.loot = _copy_loot_table(pays[0]) if pays else []
+    return this_loot, False
+
+
 def _item_stack_merge_eligible(item):
     """True when duplicate pickups may fold into one open-inventory stack row.
 
@@ -724,10 +850,23 @@ def _item_stack_merge_eligible(item):
     Reward containers with loot tables (locked pit strongboxes, lockpicked
     boxes, corpses) must stay separate rows -- merging folds ``stack_charges``
     onto one Item and discards the merged copy's loot (bug reports 488 / 1058).
+    Sealed locked strongboxes are the exception: they stack and keep each
+    unit's loot on ``loot_payloads`` so a full belt can still pick up another
+    box (bug report 1288). Corpses and pit mimics never fold.
     """
     if item is None:
         return False
-    if getattr(item, "loot", None):
+    if getattr(item, "is_body", False):
+        return False
+    if getattr(item, "pit_mimic", False):
+        return False
+    if getattr(item, "loot", None) or getattr(item, "loot_payloads", None):
+        if not is_stackable_reward_box(item):
+            return False
+    # Unique quest keys (Rowena tower keys, …) must not fold by name.
+    if getattr(item, "nostack", False):
+        return False
+    if getattr(item, "portal_tower_key", False):
         return False
     if item_carry_size(item) != "small":
         return False
@@ -885,6 +1024,25 @@ def pickup_needs_new_open_stack(character, item):
     return not _item_stack_merge_eligible(item)
 
 
+def count_catalog_units(items, catalog_id):
+    """How many units of ``catalog_id`` sit in an item list (stack-aware).
+
+    Merged rows use ``stack_charges`` — count units, not rows. A naive
+    ``len(...)`` on a 100-loaf bread stack would report 1 and a stock
+    quota would never fill.
+    """
+    want = str(catalog_id or "").strip()
+    if not want:
+        return 0
+    total = 0
+    for piece in list(items or []):
+        cid = str(getattr(piece, "catalog_id", None) or "").strip()
+        if cid != want:
+            continue
+        total += _stack_unit_count(piece)
+    return total
+
+
 def _stack_unit_count(item):
     """How many units one Item row represents (``stack_charges`` or 1)."""
     raw = getattr(item, "stack_charges", None)
@@ -910,8 +1068,22 @@ def _stack_unit_count(item):
 
 def _merge_stack_items(target, incoming):
     """Fold ``incoming`` into ``target``; ``incoming`` is discarded after."""
-    total = _stack_unit_count(target) + _stack_unit_count(incoming)
-    target.stack_charges = total
+    t_count = _stack_unit_count(target)
+    i_count = _stack_unit_count(incoming)
+    t_loot = bool(
+        getattr(target, "loot", None) or getattr(target, "loot_payloads", None)
+    )
+    i_loot = bool(
+        getattr(incoming, "loot", None)
+        or getattr(incoming, "loot_payloads", None)
+    )
+    if t_loot or i_loot:
+        merged = _reward_box_payloads(target) + _reward_box_payloads(incoming)
+        target.loot_payloads = merged
+        target.loot = _copy_loot_table(merged[0]) if merged else []
+        if getattr(incoming, "locked", False):
+            target.locked = True
+    target.stack_charges = t_count + i_count
 
 
 def _find_matching_stack_item(items, item, viewer):
@@ -923,27 +1095,38 @@ def _find_matching_stack_item(items, item, viewer):
         # Never fold a row into itself (``give`` pre-appends before merge).
         if piece is item:
             continue
+        # A nostack / unique key row is never a merge target.
+        if not _item_stack_merge_eligible(piece):
+            continue
         if stack_key(piece, viewer) == key:
             return piece
     return None
 
 
 def _remove_carried_item(character, item):
-    """Drop ``item`` from open inventory, a worn bag, or the gear bag list."""
+    """Drop ``item`` from open inventory, bags, gear bag, and wielded slots.
+
+    A piece can sit in inventory *and* a weapon slot after grant_and_equip;
+    peel/destroy must clear every copy or eat leaves a ghost in hand.
+    """
     if character is None or item is None:
         return
     inv = getattr(character, "inventory", None) or []
     if item in inv:
         inv.remove(item)
-        return
     for bag in worn_bags(character):
         contents = bag_contents(bag)
         if item in contents:
             contents.remove(item)
-            return
     gear = hooks_mod.containers_ensure_gear_bag(character)
     if item in gear:
         gear.remove(item)
+    equipment = getattr(character, "equipment", None)
+    if isinstance(equipment, dict):
+        for slot, held in list(equipment.items()):
+            if held is item:
+                equipment.pop(slot, None)
+                setattr(item, "equipped", False)
 
 
 def _plain_carried_item_text(item, attr, fallback):
@@ -1044,8 +1227,18 @@ def peel_one_carried_unit(character, item):
     if count <= 1:
         _remove_carried_item(character, item)
         return item
+    pays = None
+    if getattr(item, "loot", None) or getattr(item, "loot_payloads", None):
+        pays = _reward_box_payloads(item)
     item.stack_charges = count - 1
-    return _spawn_single_stack_unit(item)
+    unit = _spawn_single_stack_unit(item)
+    if pays:
+        unit.loot = _copy_loot_table(pays.pop(0))
+        unit.locked = bool(getattr(item, "locked", False))
+        unit.loot_payloads = None
+        item.loot_payloads = pays
+        item.loot = _copy_loot_table(pays[0]) if pays else []
+    return unit
 
 
 def try_merge_carried_stack(character, item, *, dest=None):
@@ -1181,6 +1374,24 @@ def designated_gear_bag(character):
     return None
 
 
+def designated_profession_bag(character):
+    """Worn profession satchel, or None.
+
+    Game policy (which items count as satchels) lives on the hook
+    ``containers_is_profession_bag_item`` so this engine helper never
+    imports SUPERS. Prefers the hip slot, then any other worn bag slot.
+    """
+    containers = ensure_containers_map(character)
+    hip = containers.get(HIP_SLOT)
+    if hip is not None and hooks_mod.containers_is_profession_bag_item(hip):
+        return hip
+    for slot in CONTAINER_SLOTS:
+        bag = containers.get(slot)
+        if bag is not None and hooks_mod.containers_is_profession_bag_item(bag):
+            return bag
+    return None
+
+
 def worn_bags(character):
     """List of worn bag Items (back, shoulder, then hip)."""
     out = []
@@ -1253,7 +1464,7 @@ def wear_bag(character, bag_item, slot):
         if other is not None and other is not bag_item:
             return False, "You already wear a kit bag -- remove it first."
     if is_satchel:
-        other = satchel_mod.designated_profession_bag(character)
+        other = designated_profession_bag(character)
         if other is not None and other is not bag_item:
             return False, "You already wear a satchel -- remove it first."
     occupied = containers.get(slot)
@@ -1542,13 +1753,31 @@ def heal_all_gear_bag_stack_consolidation(game):
     return total
 
 
+def _stash_location_ok(character, game, *, action="stash"):
+    """True when the actor is at claimed home, or named-archangel remote."""
+    room = getattr(character, "location", None)
+    if hooks_mod.containers_room_is_character_home(character, room, game):
+        return True, ""
+    return hooks_mod.containers_remote_stash_gate(character, action)
+
+
+def _persist_touch_property_stash(character, game=None):
+    """Queue property-stash sidecar writes after a player stash mutation."""
+    game = game or getattr(character, "game", None)
+    if game is None or character is None:
+        return
+    hooks_mod.mark_property_stash_heavy_dirty(
+        game, character, allow_empty_write=True,
+    )
+
+
 def stash_at_home(character, item, game):
     """Move one carried item into ``character.home_stash`` at home."""
     if character is None or item is None:
         return False, "You aren't carrying that."
-    room = getattr(character, "location", None)
-    if not hooks_mod.containers_room_is_character_home(character, room, game):
-        return False, "You can only stash things at your claimed home."
+    ok, msg = _stash_location_ok(character, game, action="stash")
+    if not ok:
+        return False, msg or "You can only stash things at your claimed home."
     refuse = hooks_mod.containers_on_body_carry_refusal(character, item)
     if refuse:
         return False, refuse
@@ -1578,6 +1807,7 @@ def stash_at_home(character, item, game):
         return False, "You aren't carrying that."
     ensure_home_stash(character).append(item)
     consolidate_home_stash_stacks(character)
+    _persist_touch_property_stash(character, game)
     return True, f"You stash {item.key} at home."
 
 
@@ -1585,9 +1815,9 @@ def retrieve_from_stash(character, needle, game):
     """Pull one item from home stash into open inventory (cap-checked)."""
     from command_support import _find_item
 
-    room = getattr(character, "location", None)
-    if not hooks_mod.containers_room_is_character_home(character, room, game):
-        return False, "You can only retrieve stash at your claimed home."
+    ok, msg = _stash_location_ok(character, game, action="retrieve")
+    if not ok:
+        return False, msg or "You can only retrieve stash at your claimed home."
     stash = ensure_home_stash(character)
     item = _find_item(needle, stash)
     if item is None:
@@ -1606,6 +1836,7 @@ def retrieve_from_stash(character, needle, game):
     msg = f"You retrieve {item.key} from your home stash."
     if stow_msg:
         msg = f"{msg} {stow_msg}"
+    _persist_touch_property_stash(character, game)
     return True, msg
 
 
@@ -1728,6 +1959,7 @@ def create_home_box(character, label):
         "contents": [],
     }
     boxes.append(box)
+    _persist_touch_property_stash(character, getattr(character, "game", None))
     return True, f"You set aside a crate and label it {text}.", box
 
 
@@ -1746,6 +1978,7 @@ def relabel_home_box(character, needle, new_label):
         return False, f"You already have a crate labeled {text}."
     old = box_label(box)
     box["label"] = text
+    _persist_touch_property_stash(character, getattr(character, "game", None))
     return True, f"You scratch out {old} and write {text}."
 
 
@@ -1814,9 +2047,9 @@ def stash_in_box(character, item, box, game):
     """Move one carried or loose-stash item into a labeled crate."""
     if character is None or item is None or box is None:
         return False, "You aren't carrying that."
-    room = getattr(character, "location", None)
-    if not hooks_mod.containers_room_is_character_home(character, room, game):
-        return False, "You can only stash things at your claimed home."
+    ok, msg = _stash_location_ok(character, game, action="stash")
+    if not ok:
+        return False, msg or "You can only stash things at your claimed home."
     refuse = hooks_mod.containers_on_body_carry_refusal(character, item)
     if refuse:
         return False, refuse
@@ -1853,6 +2086,7 @@ def stash_in_box(character, item, box, game):
         return False, "You aren't carrying that."
     contents.append(item)
     consolidate_item_list_stacks(contents, character)
+    _persist_touch_property_stash(character, game)
     return True, f"You tuck {item.key} into the {box_label(box)} crate."
 
 
@@ -1860,9 +2094,9 @@ def retrieve_from_box(character, needle, box, game):
     """Pull one item from a labeled crate into open inventory."""
     from command_support import _find_item
 
-    room = getattr(character, "location", None)
-    if not hooks_mod.containers_room_is_character_home(character, room, game):
-        return False, "You can only retrieve stash at your claimed home."
+    ok, msg = _stash_location_ok(character, game, action="retrieve")
+    if not ok:
+        return False, msg or "You can only retrieve stash at your claimed home."
     contents = box_contents(box)
     item = _find_item(needle, contents)
     if item is None:
@@ -1881,6 +2115,7 @@ def retrieve_from_box(character, needle, box, game):
     msg = f"You retrieve {item.key} from the {box_label(box)} crate."
     if stow_msg:
         msg = f"{msg} {stow_msg}"
+    _persist_touch_property_stash(character, game)
     return True, msg
 
 
@@ -1899,9 +2134,9 @@ def box_list_lines(character, box):
 
 def stash_important_at_home(character, game):
     """Send tagged pieces from hands and loot bag into the loose home pile."""
-    room = getattr(character, "location", None)
-    if not hooks_mod.containers_room_is_character_home(character, room, game):
-        return False, "You can only stash things at your claimed home."
+    ok, msg = _stash_location_ok(character, game, action="stash")
+    if not ok:
+        return False, msg or "You can only stash things at your claimed home."
     moved = 0
     skipped = 0
     candidates = []

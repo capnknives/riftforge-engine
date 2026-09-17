@@ -4,7 +4,8 @@
 `riftforge_core_expansion.md` Phases 1-8 **done**; two-repo purity H1-H10
 extraction track (`docs/plans/two_repo_purity_extractions_plan.md`)
 **done**. Public remote **`capnknives/riftforge-engine`**. Current public tag
-**`v0.7.0`** (2026-09-05: Phase 2 purity restore, journal / rumor / job-catalog
+**`v0.8.0`** (folklore kernels + Phase 2 purity restore; Occupants GMCP).
+Prior **`v0.7.0`** (2026-09-05: Phase 2 purity restore, journal / rumor / job-catalog
 kernels, flavor-neutral news/storm desks, chargen-menu sentinel). Prior
 **`v0.6.2`** (2026-08-29: liquid-flavor kernels + kind stamps + party-merge
 companion hook). Prior **`v0.6.1`** (2026-08-27: Phase 2 purity restore PR 3266
@@ -24,8 +25,8 @@ strangler collapse FSM + robbery peel + fixture_id civic mirror.
    `python tools/classic_smoke.py`.
 3. Tag `vX.Y.Z` (semver; breaking hook API = major)::
 
-       git tag -a v0.7.0 -m "riftforge-engine v0.7.0 — purity restore + journal/rumor/job kernels"
-       git push origin v0.7.0
+       git tag -a v0.8.0 -m "riftforge-engine v0.8.0 — folklore kernels + Phase 2 purity"
+       git push origin v0.8.0
 
    Prefer the **latest** tag for new consumers.
    Re-exports via `tools/export_public_engine.py` ignore `__pycache__` /
@@ -54,7 +55,7 @@ strangler collapse FSM + robbery peel + fixture_id civic mirror.
   overflow — do not hand-append in ``format_score``).
 - Optional env: ``RIFTFORGE_DB`` (SQLite path), ``RIFTFORGE_PORT`` (telnet)
 - Optional WebSocket TLS: ``RIFTFORGE_WSS_CERT`` + ``RIFTFORGE_WSS_KEY`` (pair)
-- Monorepo engine version / current public tag: **v0.7.0**. Export via
+- Monorepo engine version / current public tag: **v0.8.0**. Export via
   ``tools/export_public_engine.py``, then tag ``riftforge-engine`` remote.
 - `tools/engine_smoke.py` / `tools/basegame_smoke.py` /
   `tools/classic_smoke.py` pass

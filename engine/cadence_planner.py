@@ -38,6 +38,8 @@ class CadenceActorProjection:
     exits: tuple = ()  # cardinal verb strings, e.g. ("n", "e") — never room objects
     wander_roll: float = 1.0  # 0..1, precomputed on the loop; wander if < wander_chance
     wander_chance: float = 0.06  # matches supers/cadence.py IDLE_WANDER_CHANCE * persona
+    # Main-loop hop/work string (n / enter X / work). Empty = no forced verb.
+    forced_verb: str = ""
 
 
 @dataclass(frozen=True)
@@ -72,10 +74,11 @@ IDLE_WANDER_CHANCE = 0.06  # supers/cadence.py
 
 
 def default_plan_actor_intents(projection: CadenceActorProjection) -> list:
-    """Phase 2 pure lifestyle decisions for unwatched/LOD actors.
+    """Phase 2/3 pure lifestyle decisions for unwatched/LOD actors.
 
-    Priority: decay-only (no verb), sleep/wake, wander. Returns at most one
-    CadenceIntent. Must never import supers, touch Character/Room, or call npc_do.
+    Priority: decay-only, wake, desk-sit / home hop, sleep, wander.
+    Returns at most one CadenceIntent. Must never import supers, touch
+    Character/Room, or call npc_do.
 
     Blood / hunt / grocery are **not** planned here -- those verbs need
     live world state. ``should_lod_skip`` keeps SEEK-fuel Vampires and
@@ -88,20 +91,27 @@ def default_plan_actor_intents(projection: CadenceActorProjection) -> list:
     if flags.get("possessed") or flags.get("riding"):
         return []
 
-    if projection.job_schedule_due:
-        return []
-
     energy = float(projection.needs.get("energy", 0.0) or 0.0)
     tick = projection.projected_tick
     key = projection.actor_key
+    forced = str(getattr(projection, "forced_verb", "") or "").strip()
 
     if projection.asleep:
-        if energy <= WAKE_ENERGY:
+        # On-shift clerks should not sleep through the counter.
+        if projection.job_schedule_due or energy <= WAKE_ENERGY:
             return [CadenceIntent(actor_key=key, verb_line="wake", planned_tick=tick)]
+        return []
+
+    if projection.job_schedule_due:
+        if forced:
+            return [CadenceIntent(actor_key=key, verb_line=forced, planned_tick=tick)]
         return []
 
     if energy >= SEEK_THRESHOLD and projection.can_sleep:
         return [CadenceIntent(actor_key=key, verb_line="sleep", planned_tick=tick)]
+
+    if forced:
+        return [CadenceIntent(actor_key=key, verb_line=forced, planned_tick=tick)]
 
     chance = float(getattr(projection, "wander_chance", None) or IDLE_WANDER_CHANCE)
     if projection.wander_roll < chance and projection.exits:
@@ -198,6 +208,17 @@ class CadencePlannerThread:
                 _ = (time.perf_counter() - t0)  # wall time reserved for profiling
                 self._finish_batch(batch, intents=intents)
             except Exception as exc:
+                try:
+                    from engine import log_util
+
+                    log_util.ops(
+                        "cadence",
+                        "planner thread batch failed "
+                        f"{type(exc).__name__}: {str(exc)[:200]}",
+                        exc=exc,
+                    )
+                except Exception:
+                    pass
                 self._finish_batch(batch, error=exc)
             finally:
                 self._busy.clear()

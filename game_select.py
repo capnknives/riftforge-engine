@@ -142,7 +142,25 @@ def reregister_hooks_after_reload():
     Idempotent.
     """
     reregister_blob_codec()
+    reload_persist_side_modules()
     register_all_hooks()
+
+
+def reload_persist_side_modules():
+    """Reload game persist helpers copyover does not import itself.
+
+    Homestead collect/apply live in ``supers.homestead``. Persistence only
+    calls into them. Copyover reloads ``engine.persistence``; without this
+    the old 7-tuple homestead wipe-rewrite NULLs ``owner_cnum`` after
+    migration 22 added the column.
+    """
+    import importlib
+
+    name = _resolve()
+    if name == "supers":
+        import supers.homestead as hs
+
+        importlib.reload(hs)
 
 
 def restore_hooks_after_copyover_abort():

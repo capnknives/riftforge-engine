@@ -45,6 +45,22 @@ def _umbral_tick(game):
     umbral_mod.tick(game)
 
 
+def _townsfolk_cadence_tick(game):
+    """Run seek/wander kernel for seeded Notbigville townsfolk only."""
+    from engine.char_index import iter_characters
+    from engine.systems import cadence_kernel as cadence_kernel_mod
+
+    keys = getattr(game, "_basegame_townsfolk_keys", None) or ()
+    if not keys:
+        return
+    key_set = set(keys)
+    for character in iter_characters(game):
+        if getattr(character, "key", None) not in key_set:
+            continue
+        plan = cadence_kernel_mod.plan_tick(character, game)
+        cadence_kernel_mod.apply_plan(character, game, plan)
+
+
 def register_default_ticks(game):
     """Wire every basegame tick handler onto `game` (idempotent clear+fill)."""
     clear_ticks(game)
@@ -55,6 +71,7 @@ def register_default_ticks(game):
     register_tick(game, weather_module.tick_all, order=80, name="weather")
     register_tick(game, _rift_gate_tick, order=81, name="rift_gates")
     register_tick(game, _demo_needs_tick, order=82, name="demo_needs")
+    register_tick(game, _townsfolk_cadence_tick, order=84, name="townsfolk_cadence")
     from basegame import spawn_nests as spawn_nests_mod
     register_tick(game, spawn_nests_mod.tick_nests, order=83, name="spawn_nests")
     from engine.systems import room_reset as room_reset_mod

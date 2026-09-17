@@ -484,7 +484,9 @@ def next_hop_toward_destination(start, dest_key, actor=None, game=None,
     """
     if start is None or not dest_key:
         return None
-    if start.key == dest_key:
+    from engine.room_vnum import room_keys_match
+
+    if room_keys_match(game, start.key, dest_key):
         return None
     if is_virtual_room(start):
         return None
@@ -530,7 +532,7 @@ def next_hop_toward_destination(start, dest_key, actor=None, game=None,
     _expand(start, None)
     while queue:
         room, first_hop = queue.popleft()
-        if room.key == dest_key:
+        if room_keys_match(game, room.key, dest_key):
             return first_hop
         expanded += 1
         if max_nodes is not None and expanded > max_nodes:
@@ -720,7 +722,9 @@ def nearest_reachable_toward(start, dest, actor=None, game=None, max_nodes=600):
         return dest, None
 
     rooms = getattr(game, "rooms", None) or {}
-    frontier = rooms.get(best_key)
+    from engine.room_vnum import lookup_room
+
+    frontier = lookup_room(game, best_key)
     if frontier is None:
         return None, None
     return frontier, None
@@ -967,7 +971,9 @@ def walk_to(character, dest_room, game, *, pace="walk", **kwargs):
 def _advance_room_walk(character, game, focus, engaged_check=None):
     """One paced hop for a room-mode walk_focus."""
     dest_key = focus.get("dest_room_key")
-    dest = (getattr(game, "rooms", None) or {}).get(dest_key) if dest_key else None
+    from engine.room_vnum import lookup_room
+
+    dest = lookup_room(game, dest_key) if dest_key else None
     label = focus.get("dest_label") or dest_key or "your destination"
     pace = pace_of_focus(focus)
     if dest is None:

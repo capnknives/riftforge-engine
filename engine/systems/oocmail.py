@@ -6,9 +6,11 @@ plane-gated; tight cap; staff can wipe a character inbox.
 
 from __future__ import annotations
 
+from engine.systems.player_text import PLAYER_TEXT_WALL_MAX
+
 # Small cap -- OOC persistence is a harassment-retention risk.
 OOCMAIL_CAP = 10
-OOCMAIL_TEXT_MAX = 500
+OOCMAIL_TEXT_MAX = PLAYER_TEXT_WALL_MAX
 
 
 def inbox(character):

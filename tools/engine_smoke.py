@@ -182,7 +182,7 @@ def main():
 
     # Hook defaults with no game registered.
     assert hooks.eclipse_ambient_line(_FakeGame()) == ""
-    assert hooks.vampire_fear_message(c, None) is None
+    assert hooks.monster_sense_message(c, None) is None
     assert hooks.look_quirk(c, c) is None
     assert hooks.move_gate_block(c, None, None, _FakeGame()) is None
     assert hooks.make_relic_item("anything") is None
@@ -800,6 +800,19 @@ def main():
     assert callable(alien["on_attach"])
     # Mundane is never registered -- it is the engine default only.
     assert "mundane" not in origin_registry.known_origins()
+    # Folklore M&M ids are reserved for game catalogs, not engine defaults.
+    assert origin_registry.FOLKLORE_ORIGIN_IDS.isdisjoint(
+        origin_registry.known_origins(),
+    )
+    for oid in (
+        "hunter",
+        "vampire",
+        "werewolf",
+        "ghost",
+        "witch",
+        "celestial_vessel",
+    ):
+        assert oid in origin_registry.FOLKLORE_ORIGIN_IDS, oid
 
     umbral_char = Character("UmbralSmoke")
     assert umbral_char.origin == "mundane"
@@ -941,8 +954,41 @@ def main():
     )
     assert disguise_mod.disguise_short_desc(subject)
 
+    _run_folklore_kernel_subtools()
+
     print("engine_smoke_ok")
     return 0
+
+
+def _run_folklore_kernel_subtools():
+    """Folklore peel kernels (stdlib smokes; no supers/)."""
+    import subprocess
+
+    root = _repo_root()
+    scripts = (
+        "tools/fishing_lockpick_kernel_smoke.py",
+        "tools/occult_marks_kernel_smoke.py",
+        "tools/cadence_kernel_smoke.py",
+        "tools/grace_vessel_smoke.py",
+        "tools/purgatory_policy_smoke.py",
+        "tools/pocket_grid_smoke.py",
+    )
+    py = sys.executable
+    for rel in scripts:
+        path = os.path.join(root, rel)
+        if not os.path.isfile(path):
+            raise AssertionError(f"missing folklore smoke: {rel}")
+        proc = subprocess.run(
+            [py, path],
+            cwd=root,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise AssertionError(
+                f"{rel} failed (exit {proc.returncode}):\n"
+                f"{proc.stdout}\n{proc.stderr}",
+            )
 
 
 if __name__ == "__main__":

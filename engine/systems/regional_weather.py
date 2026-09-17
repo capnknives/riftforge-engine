@@ -238,6 +238,9 @@ def get_pack():
 
 def region_display_name(region_id):
     """Player/GM facing region label."""
+    rid = str(region_id or "")
+    if rid.startswith("demesne:") or rid.startswith("Demesne:"):
+        return "Demesne pocket"
     pack = get_pack()
     entry = (pack.get("regions") or {}).get(region_id) or {}
     return entry.get("display_name") or _REGION_LABELS.get(
@@ -287,6 +290,26 @@ def _days_in_month(month, year=2024):
 
 def _macro_xy_for_room(room, game, character=None):
     """Best-effort America macro (x, y) for a room / optional actor."""
+    from engine import hooks as hooks_mod
+
+    # Demesne micro cells carry macro/micro coords for pocket grids, not
+    # CONUS atlas cells. Leftover Earth ``macro_pos`` while standing in a
+    # demesne must not pin Lebanon weather (bug report 1631).
+    if room is not None and hooks_mod.weather_is_demesne_room(room):
+        return (None, None)
+    loc = getattr(character, "location", None) if character is not None else None
+    if loc is not None and hooks_mod.weather_is_demesne_room(loc):
+        return (None, None)
+
+    # Homestead interiors lack climate_region; stale macro_pos must not
+    # pin Lebanon / Great Plains (bug reports 1669 / 1670).
+    hs_macro = hooks_mod.weather_homestead_macro_xy(room, game, character)
+    if hs_macro is not None:
+        try:
+            return (int(hs_macro[0]), int(hs_macro[1]))
+        except (TypeError, ValueError, IndexError):
+            pass
+
     if character is not None and game is not None:
         try:
             from engine.systems import overland as overland_mod
@@ -427,7 +450,19 @@ def _nearest_land_region(game, mx, my, pack, overrides):
 
 def resolve_region(room, game, character=None):
     """Resolve climate region id for a room / actor location."""
+    from engine import hooks as hooks_mod
+
     pack = get_pack()
+    effective_room = room
+    if effective_room is None and character is not None:
+        effective_room = getattr(character, "location", None)
+    pocket_rid = (
+        hooks_mod.weather_demesne_region_id(effective_room)
+        if effective_room is not None
+        else None
+    )
+    if pocket_rid:
+        return str(pocket_rid)
     # 1. Explicit room / zone override.
     if room is not None:
         rid = getattr(room, "climate_region", None)
@@ -451,6 +486,8 @@ def resolve_region(room, game, character=None):
                 return "great_plains"
 
     mx, my = _macro_xy_for_room(room, game, character)
+    if mx is None or my is None:
+        return FALLBACK_REGION
     overrides = _override_map(pack)
     # 2–3. Atlas override at cell (hubs / explicit paint).
     if (mx, my) in overrides:
@@ -753,6 +790,28 @@ def weather_for_room(room, game, character=None):
     """Regional weather for a specific room (preferred player path)."""
     rid = resolve_region(room, game, character)
     return snapshot(game, room=room, region_id=rid, character=character)
+
+
+def seasonal_forced_condition(condition, season):
+    """Map a requested weather pin to the seasonally honest condition.
+
+    God storm rain in winter should fall as snow; a summer snow pin melts
+    to rain. Other pairs pass through so callers can extend the table
+    without a second codepath. Staff ``gm weather`` still pins literally
+    via ``force_condition`` -- this helper is for Acts that mean
+    "weather of this kind," not a named crystal.
+    """
+    cond = str(condition or "").strip().lower()
+    sea = str(season or "").strip().lower()
+    if not cond:
+        return cond
+    # Winter rain is snow. Spring/autumn keep rain unless we add more pairs.
+    if sea == "winter" and cond == "rain":
+        return "snow"
+    # Summer cannot honestly hold a snow pin -- it thaws to rain.
+    if sea == "summer" and cond == "snow":
+        return "rain"
+    return cond
 
 
 def force_condition(
@@ -1379,6 +1438,10 @@ def _region_has_active_tornado(game, region_id):
 def _nearby_tornado(game, room, character=None, *, radius=1):
     """Closest active tornado within Chebyshev radius of actor/room, or None."""
     mx, my = _macro_xy_for_room(room, game, character)
+    # Demesne / off-atlas rooms return (None, None) so they are not on
+    # the America funnel grid -- never subtract None (look crash).
+    if mx is None or my is None:
+        return None
     best = None
     best_d = None
     for t in list_tornadoes(game):

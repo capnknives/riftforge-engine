@@ -92,6 +92,11 @@ HOLD_MUSIC_LINES = (
     b"\r\n*** [WAIT] The world stitches itself whole again behind the "
     b"Veil -- please stand by. ***\r\n",
 )
+# How long a ``planned_restart`` CTRL keeps suppressing outage noise while the
+# game is *still connected*. The game announces the copyover, finishes its save,
+# then exits — several seconds on live. Long enough to cover that window, short
+# enough that a cancelled copyover does not mask the next real crash.
+PLANNED_RESTART_ARM_SECONDS = 120.0
 # Broadcast when the gateway process itself must exit (clients drop).
 CLIENT_DISCONNECT_WARNING = (
     "*** [ALERT] The binding Veil tears free -- your thread will unravel "
@@ -200,7 +205,7 @@ class ClientSlot:
         self.name: Optional[str] = None  # set when game reports bound
         self.ooc_face: Optional[str] = None  # account or character label for OOC
         self.head_gm: bool = False  # head GM may queue restart from gateway
-        self.staff_gm: bool = False  # staff may use wiznet while game is down
+        self.staff_gm: bool = False  # staff may use wiznet / gm while game is down
         # Real public-socket peer (not the IPC loopback). Forwarded on
         # open / welcome so the game Session can ban + head-GM-notify.
         self.peer: Optional[str] = peer
@@ -227,6 +232,17 @@ def _note_client_gmcp_supports(slot: ClientSlot, package: str, payload) -> None:
     if package == "Core.Supports.Remove":
         for name in gmcp_mod._parse_supports_list(payload):
             slot.gmcp_supports.pop(name, None)
+
+
+def _slot_outage_staff(slot: ClientSlot) -> bool:
+    """True when this held client may use staff stitch (wiznet / gm recover).
+
+    ``staff_gm`` is the usual bind stamp. Head-GM occupy of immersion cast
+    (Gabriel, Ash) used to bind ``head_gm`` True and ``staff_gm`` False
+    because ``_is_staff_gm`` skips catalog bodies -- still treat ``head_gm``
+    as staff so copyover ``gm`` is not "You aren't a GM."
+    """
+    return bool(getattr(slot, "staff_gm", False) or getattr(slot, "head_gm", False))
 
 
 class Gateway:
@@ -259,8 +275,16 @@ class Gateway:
         # One Discord down/up pair per outage that lasts past Discord grace.
         self._wknz_outage_announced = False
         # Set by game CTRL ``planned_restart`` (SIGUSR1 / copyover exit) so
-        # intentional game-only reloads never hit WKNZ as a "crash".
+        # intentional game-only reloads never hit WKNZ as a "crash" and never
+        # drip [WAIT] hold music on top of the Veil countdown arc.
         self._suppress_discord_outage = False
+        # Monotonic time the ``planned_restart`` CTRL arrived while the game
+        # was *still connected*. The game announces the copyover several
+        # seconds before its IPC socket actually closes, so the flag above has
+        # to survive that window (see ``_hold_music_loop``). Bounded by
+        # PLANNED_RESTART_ARM_SECONDS so a *cancelled* copyover cannot leave
+        # a real later crash looking planned.
+        self._planned_restart_armed_at: Optional[float] = None
         # Gateway stitch mirrors for global channels (plain text, no color).
         # Authoritative rings live on the game — see engine/channel_history.py.
         from engine import channel_history
@@ -268,9 +292,11 @@ class Gateway:
         self._stitch_histories: dict[str, deque[str]] = {}
         for spec in channel_history.gateway_stitch_channels():
             self._stitch_histories[spec.name] = deque(maxlen=spec.ring_max)
-        # Ring lengths when game IPC first dropped — limits copyover import to
-        # lines appended while stitch mode was active (not the whole mirror).
-        self._stitch_ipc_down_lens: Optional[dict[str, int]] = None
+        # Frozen gateway mirror at copyover start + lines appended while IPC
+        # is down. Deque rotation made len(buf) watermarks drop copyover OOC
+        # (bug 1473) — suffix lists survive a full ring.
+        self._stitch_outage_frozen: Optional[dict[str, list[str]]] = None
+        self._stitch_outage_suffix: Optional[dict[str, list[str]]] = None
         # Last time any game→client DATA frame was forwarded (stitch detect).
         self._last_game_data_at = time.monotonic()
         # Game sets via CTRL boot_warming during deferred copyover boot --
@@ -437,26 +463,70 @@ class Gateway:
             )
 
     def _snapshot_stitch_ipc_down_lens(self) -> None:
-        """Record stitch ring lengths at copyover start (once per outage).
+        """Freeze stitch rings at copyover start (once per outage).
 
-        ``chat_history`` import uses this watermark so only lines appended
-        while game IPC is down merge back — not the whole gateway mirror
-        (bug 1036). Planned reloads must stamp here on ``planned_restart``;
-        if the new game IPC connects before the old socket's finally runs,
-        waiting for IPC disconnect would leave the watermark unset and bare
-        wiznet/ooc replay resurrected ancient lines (bug 1088).
+        ``chat_history`` merge unions the game snapshot, this frozen pre-outage
+        mirror, and ``_stitch_outage_suffix`` lines — never ``buf[len:]`` after
+        a rotating deque drops the watermark (bug 1473). Planned reloads stamp
+        on ``planned_restart`` so a fast IPC swap still bounds import (bug 1088).
         """
-        if self._stitch_ipc_down_lens is not None:
+        if self._stitch_outage_suffix is not None:
             return
-        self._stitch_ipc_down_lens = {
-            name: len(buf)
-            for name, buf in self._stitch_histories.items()
-            if buf is not None
-        }
+        frozen: dict[str, list[str]] = {}
+        suffix: dict[str, list[str]] = {}
+        for name, buf in self._stitch_histories.items():
+            if buf is None:
+                continue
+            frozen[name] = [
+                line.strip()
+                for line in list(buf)
+                if isinstance(line, str) and line.strip()
+            ]
+            suffix[name] = []
+        self._stitch_outage_frozen = frozen
+        self._stitch_outage_suffix = suffix
+
+    def _append_outage_suffix(self, channel: str, line: str) -> None:
+        """Track one plain line spoken while game IPC is down."""
+        suffix_map = self._stitch_outage_suffix
+        if not isinstance(suffix_map, dict):
+            return
+        text = (line or "").strip()
+        if not text:
+            return
+        bucket = suffix_map.setdefault(channel, [])
+        if text not in bucket:
+            bucket.append(text)
+
+    def _planned_restart_announce_window(self) -> bool:
+        """True while a ``planned_restart`` CTRL is waiting for the IPC drop.
+
+        The game announces the copyover, saves, then exits — the socket is
+        still attached for those seconds. Suppression must survive that window
+        or hold music starts the moment the drop finally lands.
+
+        A copyover that *cancels* after announcing (2026-09-12 live: a failed
+        pre-copyover save) never produces the drop, so the window is age-bound
+        by ``PLANNED_RESTART_ARM_SECONDS``; after that the next genuine crash
+        is reported normally.
+        """
+        armed_at = self._planned_restart_armed_at
+        if armed_at is None:
+            return False
+        return (time.monotonic() - armed_at) < PLANNED_RESTART_ARM_SECONDS
+
+    def _clear_planned_restart_suppress(self) -> None:
+        """Drop planned-restart suppression (outage really is over)."""
+        self._suppress_discord_outage = False
+        self._planned_restart_armed_at = None
 
     def _mark_game_ipc_down(self, *, planned_restart: bool = False) -> None:
         """Start tracking downtime when IPC drops."""
         first_mark = self._hold_down_since_wall is None
+        if first_mark:
+            # The announce→exit window is over; suppression now rides the
+            # outage itself rather than the age bound.
+            self._planned_restart_armed_at = None
         if self._hold_down_since is None:
             self._hold_down_since = time.monotonic()
         if self._hold_down_since_wall is None:
@@ -513,7 +583,11 @@ class Gateway:
                 game_up = self._game_writer is not None
                 if game_up:
                     self._discord_outage_up()
-                    self._suppress_discord_outage = False
+                    if (
+                        self._hold_down_since is not None
+                        or not self._planned_restart_announce_window()
+                    ):
+                        self._clear_planned_restart_suppress()
                     self._clear_game_ipc_down()
                     continue
                 self._mark_game_ipc_down(
@@ -531,8 +605,21 @@ class Gateway:
             has_clients = any(c.alive for c in self.clients.values())
             if game_up:
                 # Game back -- Discord "we're back" if we announced down.
+                #
+                # Do NOT clear planned-restart suppression just because the
+                # game is still attached. The copyover CTRL lands seconds
+                # before the socket closes, and this loop runs every 0.5s --
+                # clearing here wiped the flag before the drop, so a planned
+                # reload dripped [WAIT] hold music for its whole respawn
+                # (2026-09-12 live). Suppression is dropped only once it is no
+                # longer armed: either the outage completed, or the announce
+                # aged out because the copyover was cancelled.
                 self._discord_outage_up()
-                self._suppress_discord_outage = False
+                if (
+                    self._hold_down_since is not None
+                    or not self._planned_restart_announce_window()
+                ):
+                    self._clear_planned_restart_suppress()
                 self._clear_game_ipc_down()
                 continue
             self._mark_game_ipc_down(
@@ -683,12 +770,12 @@ class Gateway:
             return face
         return f"{face}(GM)"
 
-    def _stitch_copyover_start(self, channel_name: str) -> int:
-        """Index in a stitch ring where copyover-only lines begin (0 if unknown)."""
-        down_lens = self._stitch_ipc_down_lens
-        if not isinstance(down_lens, dict):
-            return 0
-        return max(0, int(down_lens.get(channel_name, 0)))
+    def _stitch_outage_extra(self, channel_name: str) -> list[str]:
+        """Plain lines appended on the gateway while game IPC is down."""
+        suffix_map = self._stitch_outage_suffix
+        if not isinstance(suffix_map, dict):
+            return []
+        return list(suffix_map.get(channel_name) or [])
 
     def _stitch_import_delta(self, snapshot: dict[str, list]) -> dict[str, list[str]]:
         """Lines appended during copyover that the game snapshot does not have."""
@@ -702,8 +789,7 @@ class Gateway:
                 if isinstance(line, str) and line.strip()
             }
             extra: list[str] = []
-            start = self._stitch_copyover_start(name)
-            for line in list(buf)[start:]:
+            for line in self._stitch_outage_extra(name):
                 text = line.strip() if isinstance(line, str) else ""
                 if text and text not in known:
                     extra.append(text)
@@ -712,27 +798,39 @@ class Gateway:
         return out
 
     def _merge_chat_history(self, snapshot: dict[str, list]) -> None:
-        """Rebuild gateway stitch buffers from game snapshot + copyover suffix."""
+        """Rebuild gateway stitch buffers from snapshot + frozen pre + suffix."""
+        from engine import channel_history
+
+        frozen_map = self._stitch_outage_frozen or {}
         for name, lines in (snapshot or {}).items():
             buf = self._stitch_histories.get(name)
             if buf is None:
                 continue
-            known = {
+            spec = channel_history.get_channel(name)
+            ring_max = max(
+                1,
+                int(getattr(spec, "ring_max", 20) or 20),
+            )
+            snapshot_lines = [
                 line.strip()
                 for line in (lines or [])
                 if isinstance(line, str) and line.strip()
-            }
-            start = self._stitch_copyover_start(name)
-            extra: list[str] = []
-            for line in list(buf)[start:]:
-                text = line.strip() if isinstance(line, str) else ""
-                if text and text not in known:
-                    extra.append(text)
+            ]
+            frozen_lines = list(frozen_map.get(name) or [])
+            suffix_lines = self._stitch_outage_extra(name)
+            merged: list[str] = []
+            seen: set[str] = set()
+            for source in (snapshot_lines, frozen_lines, suffix_lines):
+                for line in source:
+                    text = (line or "").strip()
+                    if not text or text in seen:
+                        continue
+                    merged.append(text)
+                    seen.add(text)
+            if len(merged) > ring_max:
+                merged = merged[-ring_max:]
             buf.clear()
-            for line in lines or []:
-                if isinstance(line, str) and line.strip():
-                    buf.append(line.strip())
-            for line in extra:
+            for line in merged:
                 buf.append(line)
 
     def _merge_chat_history_payload(self, payload: dict) -> None:
@@ -758,6 +856,7 @@ class Gateway:
         buf = self._stitch_histories.get(channel)
         if buf is not None:
             buf.append(text)
+        self._append_outage_suffix(channel, text)
 
     def _channel_message_text(self, text: str, verb: str) -> Optional[str]:
         """Return speak body, or ``None`` when *text* is the bare verb."""
@@ -792,13 +891,14 @@ class Gateway:
         """Broadcast one wiznet line from the gateway while stitch mode is on."""
         plain = f"[WIZ] {self._slot_wiznet_face(slot)}: {message}"
         self._append_gateway_chat_line("wiznet", plain)
+        await self._maybe_forward_stitch_transcript("wiznet", plain)
         for sid, peer in list(self.clients.items()):
-            if not peer.staff_gm:
+            if not _slot_outage_staff(peer):
                 continue
             await self._send_plain(sid, plain)
             await self._send_plain(sid, "")
         await self._relay_stitch_comm_gmcp(
-            "wiznet", plain, slot_ok=lambda peer: peer.staff_gm,
+            "wiznet", plain, slot_ok=_slot_outage_staff,
         )
 
     async def _relay_gateway_ooc(self, slot: ClientSlot, message: str) -> None:
@@ -809,11 +909,32 @@ class Gateway:
         await self._broadcast_plain(plain)
         await self._broadcast_plain("")
         await self._relay_stitch_comm_gmcp("ooc", plain)
+        await self._maybe_forward_stitch_transcript("ooc", plain)
         try:
             bridge = self._discord_bridge()
             bridge.schedule_ooc(plain)
         except Exception as exc:
             print(f"[gateway] ooc discord mirror skipped: {exc!r}", flush=True)
+
+    async def _maybe_forward_stitch_transcript(
+        self, channel: str, plain: str,
+    ) -> None:
+        """Push one stitch relay line to the game for ooc.log while IPC is up."""
+        text = (plain or "").strip()
+        if not text:
+            return
+        async with self._game_lock:
+            if self._game_writer is None:
+                return
+        await self.send_to_game(
+            encode_ctrl(
+                {
+                    "op": "chat_transcript",
+                    "channel": channel,
+                    "line": text,
+                }
+            )
+        )
 
     async def _relay_gateway_channel(
         self, slot: ClientSlot, channel_name: str, message: str,
@@ -848,7 +969,7 @@ class Gateway:
         if aud in ("", channels.AUDIENCE_ALL):
             return True
         if aud in (channels.AUDIENCE_STAFF, channels.AUDIENCE_GM):
-            return bool(slot.staff_gm)
+            return _slot_outage_staff(slot)
         return True
 
     async def _try_gateway_stitch_channel(
@@ -879,7 +1000,7 @@ class Gateway:
         if spec is None:
             return False
         aud = (getattr(spec, "audience", "") or "").lower()
-        if aud in ("staff", "gm") and not slot.staff_gm:
+        if aud in ("staff", "gm") and not _slot_outage_staff(slot):
             await self._send_plain(slot.session_id, "You aren't a GM.")
             return True
         body = self._channel_message_text(text, spec.verb)
@@ -906,19 +1027,23 @@ class Gateway:
         from engine import gateway_outage_cmds as outage_cmds
 
         if lower in ("help outage", "help gm recover", "help recover"):
-            if not slot.staff_gm:
+            if not _slot_outage_staff(slot):
                 await self._send_plain(slot.session_id, "You aren't a GM.")
                 return True
             await self._send_plain(slot.session_id, outage_cmds.outage_help_text())
             return True
         if lower in ("gm outage", "gm"):
-            if not slot.staff_gm:
+            if _slot_outage_staff(slot):
+                await self._send_plain(slot.session_id, outage_cmds.outage_cheat_sheet())
+                return True
+            # Occupy GMs with a stale staff_gm stamp used to see
+            # "You aren't a GM." during copyover. While IPC is down, wait
+            # like any other verb; do not lie about rank.
+            if self._game_writer is not None:
                 await self._send_plain(slot.session_id, "You aren't a GM.")
                 return True
-            await self._send_plain(slot.session_id, outage_cmds.outage_cheat_sheet())
-            return True
         if lower in ("gm recover status", "recover status"):
-            if not slot.staff_gm:
+            if not _slot_outage_staff(slot):
                 await self._send_plain(slot.session_id, "You aren't a GM.")
                 return True
             await self._send_plain(
@@ -1075,7 +1200,7 @@ class Gateway:
                 "*** [WAIT] OOC, wiznet, gm outage, and gm recover status work "
                 "while the game restarts; other commands need the rewrite to "
                 "finish. ***"
-                if slot.staff_gm
+                if _slot_outage_staff(slot)
                 else "*** [WAIT] OOC works while the game restarts; other "
                 "commands need the rewrite to finish. ***"
             )
@@ -1317,8 +1442,9 @@ class Gateway:
             self._hold_next_at = None
             self._note_game_data()
             self._discord_outage_up()
-            # Clear planned-restart suppress whether or not Discord fired.
-            self._suppress_discord_outage = False
+            # A *new* game connected, so the planned outage really is over --
+            # clear suppression whether or not Discord fired.
+            self._clear_planned_restart_suppress()
             # Stamp disk markers immediately so the watcher does not
             # desync-kill a freshly connected game before hold_music runs.
             self._clear_game_ipc_down()
@@ -1387,10 +1513,14 @@ class Gateway:
                         if sid:
                             await self._drop_client(sid, notify_game=False)
                     elif op == "planned_restart":
-                        # SIGUSR1 / auto-deploy game-only reload -- Veil
-                        # hold music still runs for clients, but WKNZ must
-                        # not treat this as a crash/uncrash pair.
+                        # SIGUSR1 / auto-deploy game-only reload -- the Veil
+                        # countdown arc already told players what is happening,
+                        # so neither [WAIT] hold music nor a WKNZ crash/uncrash
+                        # pair should fire for this outage. The CTRL arrives
+                        # before the socket closes; arm a timestamp so the
+                        # hold loop does not wipe the flag in that window.
                         self._suppress_discord_outage = True
+                        self._planned_restart_armed_at = time.monotonic()
                         # Stamp stitch watermarks now — the new game IPC can
                         # connect before this writer's finally runs (bug 1088).
                         self._snapshot_stitch_ipc_down_lens()
@@ -1446,8 +1576,12 @@ class Gateway:
                                     }
                                 )
                             )
-                        # Consumed — next outage gets a fresh watermark.
-                        self._stitch_ipc_down_lens = None
+                        # Consumed — next outage gets a fresh freeze/suffix pair.
+                        self._stitch_outage_frozen = None
+                        self._stitch_outage_suffix = None
+                        await self.send_to_game(
+                            encode_ctrl({"op": "chat_history_ack"})
+                        )
                     elif op == "chat_append":
                         self._append_gateway_chat_line(
                             str((payload or {}).get("channel") or ""),

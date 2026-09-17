@@ -280,12 +280,31 @@ def contribute_detail_footer(ctx):
     )
 
 
+def _grace(ctx):
+    """Grace tank line for folklore celestial demo characters."""
+    target = ctx.target
+    grace_val = getattr(target, "grace", None)
+    if grace_val is None:
+        return None
+    from engine.systems import grace as grace_mod
+
+    cur = float(grace_val)
+    cap = float(grace_mod.GRACE_MAX)
+    return f"  Grace: {cur:.0f}/{cap:.0f}"
+
+
 def register_score_sheet_hooks():
     """Wire basegame Path + HP + injuries/needs/combat into the engine sheet."""
     hooks.register_sheet_field("header", _header)
     hooks.register_sheet_field("primaries_row1", _primaries_row1)
     hooks.register_sheet_field("primaries_row2", _primaries_row2)
     hooks.register_sheet_field("hp", _hp)
+    hooks.register_sheet_field(
+        "grace",
+        _grace,
+        slot="resources",
+        panes=_PANES_VITALS,
+    )
     hooks.register_sheet_contributor("basegame", contribute_basegame, priority=50)
     hooks.register_sheet_contributor("path_blurb", contribute_path_blurb, priority=45)
     hooks.register_sheet_contributor("injuries", contribute_injuries, priority=70)

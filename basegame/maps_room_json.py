@@ -80,3 +80,7 @@ def stamp_basegame_map_room(room, data, *, filename=None):
                 f"{where}room {room.key!r}: reset_item_specs must be a list"
             )
         room.reset_item_specs = [dict(entry) for entry in reset_specs]
+
+    devils_trap = data.get("devils_trap")
+    if devils_trap is not None:
+        room.devils_trap = bool(devils_trap)

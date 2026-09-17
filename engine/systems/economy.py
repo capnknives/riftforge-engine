@@ -126,8 +126,12 @@ def is_cash_loot_type(reward_type):
 
 
 def apply_cash_reward(character, amount, *, reason="Cash reward", tick=None):
-    """Credit wallet cash from a loot amount (int, float, or money dict)."""
-    credit_wallet(
+    """Credit wallet cash from a loot amount (int, float, or money dict).
+
+    Returns the ``credit_wallet`` result (False when hands are full and
+    there is no pocket wallet / existing loose-bill stack to land on).
+    """
+    return credit_wallet(
         character,
         cents=money_to_cents(amount),
         reason=reason,
@@ -422,6 +426,15 @@ def carry_cash_total_cents(character):
     if pocket is not None:
         from engine.systems import wallet_container as wallet_mod
         total += wallet_mod.wallet_total_cents(pocket)
+    else:
+        # Possess spill can leave cash on an unworn wallet in inventory.
+        try:
+            from engine.systems import wallet_container as wallet_mod
+        except ImportError:
+            wallet_mod = None
+        if wallet_mod is not None:
+            for piece in wallet_mod._inventory_wallets(character):
+                total += wallet_mod.wallet_total_cents(piece)
     return total
 
 

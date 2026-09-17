@@ -95,6 +95,13 @@
       "filter_prefixes": ["  Infection:"]
     },
     {
+      "id": "supers_eve_alpha",
+      "slot": "life",
+      "source": "hook:supers_eve_alpha",
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Alpha:"]
+    },
+    {
       "id": "supers_hospital",
       "slot": "life",
       "source": "hook:supers_hospital",
@@ -297,6 +304,13 @@
       "filter_prefixes": ["  Qi:"]
     },
     {
+      "id": "supers_solomon_charge",
+      "slot": "origin_meters",
+      "source": "hook:supers_solomon_charge",
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Solomon charge:"]
+    },
+    {
       "id": "supers_mana",
       "slot": "origin_meters",
       "source": "hook:supers_mana",
@@ -316,6 +330,20 @@
       "source": "hook:supers_luck",
       "panes": ["default", "vitals", "full"],
       "filter_prefixes": ["  Luck:"]
+    },
+    {
+      "id": "supers_breakthrough",
+      "slot": "origin_meters",
+      "source": "hook:supers_breakthrough",
+      "panes": ["default", "vitals", "full"],
+      "filter_prefixes": ["  Breakthrough:"]
+    },
+    {
+      "id": "supers_path_primary",
+      "slot": "attributes_extras",
+      "source": "hook:supers_path_primary",
+      "panes": ["default", "combat", "full"],
+      "filter_prefixes": ["  Hunter edge:", "  Occultist edge:", "  Slayer edge:", "  Men of Letters edge:", "  Alchemist edge:"]
     },
     {
       "id": "supers_edges",

@@ -29,3 +29,5 @@ def seed_content(game):
 
     from basegame import personas as personas_mod
     personas_mod.ensure_demo_npc(game)
+    from basegame import cadence_town as cadence_town_mod
+    cadence_town_mod.ensure_townsfolk(game)

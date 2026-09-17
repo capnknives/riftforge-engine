@@ -155,15 +155,23 @@ def resolve_live_map(name):
 
 
 def write_backup(name, *, root=None):
-    """Replace the backup slot with the current live map/zone JSON.
+    """Replace the backup slot with the live merged map/zone JSON.
+
+    Snapshots Git SoT plus the in-memory hot-backup overlay so staff
+    ``gm maps backup`` does not clobber protected extras with a thin
+    Git file after boot stopped rewriting zones on disk.
 
     Returns a short GM-facing status string.
     """
-    path, filename, map_id, kind, _data = resolve_live_map(name)
+    from engine.content_store import save_json
+    from engine import map_heal as map_heal_mod
+
+    path, filename, map_id, kind, data = resolve_live_map(name)
     _ensure_backup_dir(root)
     dest = backup_path_for(map_id, root=root)
+    doc = map_heal_mod.healed_live_doc(path) or data
     try:
-        shutil.copy2(path, dest)
+        save_json(dest, doc)
     except OSError as exc:
         raise MapBackupError(f"backup write failed: {exc}") from exc
     size = os.path.getsize(dest)
@@ -228,6 +236,10 @@ def restore_backup(name, game=None, *, root=None):
         shutil.copy2(src, path)
     except OSError as exc:
         raise MapBackupError(f"restore write failed: {exc}") from exc
+    # Staff restore rewrote Git SoT -- drop the stale overlay so the next
+    # load sees the restored bytes, not a cached pre-restore merge.
+    from engine import map_heal as map_heal_mod
+    map_heal_mod.forget_live_overlay(path)
 
     reload_note = ""
     if game is not None:

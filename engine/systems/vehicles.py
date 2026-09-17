@@ -20,9 +20,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
+import time
+import zlib
 
 from engine import hooks as hooks_mod
-from engine.content_store import save_json
 from engine.world import Room
 
 # Live park spots -- next to riftforge.db / bug_reports.log (not in git).
@@ -309,9 +311,6 @@ def canonical_park_key(game, key):
         return key
     from engine.room_vnum import lookup_room, internal_room_key
     room = lookup_room(game, key)
-    if room is None:
-        rooms = getattr(game, "rooms", None) or {}
-        room = rooms.get(key)
     if room is not None:
         return internal_room_key(room) or getattr(room, "key", key)
     return key
@@ -368,12 +367,93 @@ def load_parking_state(game):
     return out
 
 
-def tick_scrub_invalid_vehicle_parks(game):
+def _scrub_invalid_vehicle_park_one(game, veh):
+    """Rehome one nested/invalid park when ``parked_room`` is set."""
+    if not isinstance(veh, dict):
+        return
+    park_key = veh.get("parked_room")
+    interior_key = veh.get("interior_key")
+    if not park_key:
+        return
+    from engine.room_vnum import lookup_room
+
+    park_room = lookup_room(game, park_key)
+    if park_room is None:
+        park_room = lookup_room(
+            game, canonical_park_key(game, park_key),
+        )
+    nested = bool(
+        (interior_key and park_key == interior_key)
+        or (
+            isinstance(park_key, str)
+            and park_key.startswith("Inside ")
+        )
+    )
+    if not nested and park_room is not None:
+        nested = is_vehicle_interior_room(park_room, game)
+    if not nested and park_room is not None:
+        if not room_is_valid_park_spot(park_room, game):
+            owner = None
+            owner_key = (veh.get("owner_key") or "").strip()
+            if owner_key:
+                find = getattr(game, "find_character", None)
+                if callable(find):
+                    owner = find(owner_key)
+            if hooks_mod.vehicle_park_scrub_exempt(
+                game, veh, park_room, owner,
+            ):
+                return
+            nested = True
+    if not nested:
+        return
+    owner = None
+    owner_key = (veh.get("owner_key") or "").strip()
+    if owner_key:
+        find = getattr(game, "find_character", None)
+        if callable(find):
+            owner = find(owner_key)
+    if park_room is None:
+        park_room = lookup_room(game, park_key)
+    rehome = hooks_mod.vehicle_invalid_park_rehome(
+        game, veh, park_room, owner,
+    )
+    if rehome and rehome != park_key:
+        rehome_room = lookup_room(game, rehome)
+        if rehome_room is not None:
+            veh["parked_room"] = rehome
+            veh["macro_pos"] = None
+            veh["micro_pos"] = None
+            return
+    dest = nearest_driveable_park_key(
+        game, park_room or lookup_room(game, park_key), character=owner,
+    )
+    if not dest:
+        dest = safe_park_room_key(
+            game,
+            owner,
+            avoid_keys={interior_key} if interior_key else None,
+        )
+    if dest and dest != park_key:
+        veh["parked_room"] = dest
+        veh["macro_pos"] = None
+        veh["micro_pos"] = None
+        return
+    dest = safe_park_room_key(
+        game,
+        avoid_keys={interior_key} if interior_key else None,
+    )
+    if dest and dest != park_key:
+        veh["parked_room"] = dest
+        veh["macro_pos"] = None
+        veh["micro_pos"] = None
+
+
+def tick_scrub_invalid_vehicle_parks(game, *, max_ms=40.0):
     """Skippable heartbeat: rehome nested/invalid parks off the drive path.
 
-    ``save_parking_state`` used to walk every vehicle through ``lookup_room``
-    (linear scan of ``game.rooms`` on a miss) on every street hop. Azure
-    billed that to Cadence nest-helper ``north`` as ``dir_veh`` ~4s.
+    Round-robins ``game.vehicles`` with a wall budget so ~15k rows are not
+    ``lookup_room``-scanned in one beat (lag S4). ``save_parking_state`` no
+    longer walks the full lot on every street hop either (S2 dirty ids).
     """
     if game is None or not getattr(game, "vehicles", None):
         return
@@ -381,163 +461,406 @@ def tick_scrub_invalid_vehicle_parks(game):
         return
     game._parking_save_scrubbing = True
     try:
-        rooms = getattr(game, "rooms", None) or {}
-        # Snapshot -- rehoming a nested park below can call back into
-        # kit/park helpers that touch ``game.vehicles`` mid-scrub.
-        for veh in list(game.vehicles.values()):
-            if not isinstance(veh, dict):
-                continue
-            park_key = veh.get("parked_room")
-            interior_key = veh.get("interior_key")
-            if not park_key:
-                continue
-            from engine.room_vnum import lookup_room
-
-            park_room = rooms.get(park_key)
-            if park_room is None:
-                park_room = lookup_room(game, park_key)
-            if park_room is None:
-                park_room = lookup_room(
-                    game, canonical_park_key(game, park_key),
-                )
-            nested = bool(
-                (interior_key and park_key == interior_key)
-                or (
-                    isinstance(park_key, str)
-                    and park_key.startswith("Inside ")
-                )
-            )
-            if not nested and park_room is not None:
-                nested = is_vehicle_interior_room(park_room, game)
-            if not nested and park_room is not None:
-                if not room_is_valid_park_spot(park_room, game):
-                    owner = None
-                    owner_key = (veh.get("owner_key") or "").strip()
-                    if owner_key:
-                        find = getattr(game, "find_character", None)
-                        if callable(find):
-                            owner = find(owner_key)
-                    if hooks_mod.vehicle_park_scrub_exempt(
-                        game, veh, park_room, owner,
-                    ):
-                        continue
-                    nested = True
-            if not nested:
-                continue
-            owner = None
-            owner_key = (veh.get("owner_key") or "").strip()
-            if owner_key:
-                find = getattr(game, "find_character", None)
-                if callable(find):
-                    owner = find(owner_key)
-            if park_room is None:
-                park_room = rooms.get(park_key)
-            if park_room is None:
-                park_room = lookup_room(game, park_key)
-            rehome = hooks_mod.vehicle_invalid_park_rehome(
-                game, veh, park_room, owner,
-            )
-            if rehome and rehome != park_key:
-                rehome_room = lookup_room(game, rehome) or rooms.get(rehome)
-                if rehome_room is not None:
-                    veh["parked_room"] = rehome
-                    veh["macro_pos"] = None
-                    veh["micro_pos"] = None
-                    continue
-            dest = nearest_driveable_park_key(
-                game, park_room or rooms.get(park_key), character=owner,
-            )
-            if not dest:
-                dest = safe_park_room_key(
-                    game,
-                    owner,
-                    avoid_keys={interior_key} if interior_key else None,
-                )
-            if dest and dest != park_key:
-                veh["parked_room"] = dest
-                veh["macro_pos"] = None
-                veh["micro_pos"] = None
-                continue
-            dest = safe_park_room_key(
-                game,
-                avoid_keys={interior_key} if interior_key else None,
-            )
-            if dest and dest != park_key:
-                veh["parked_room"] = dest
-                veh["macro_pos"] = None
-                veh["micro_pos"] = None
+        vehicles = game.vehicles
+        keys = sorted(vehicles.keys())
+        n = len(keys)
+        if n == 0:
+            return
+        t0 = time.perf_counter()
+        start = int(getattr(game, "_vehicle_park_scrub_rr", 0) or 0) % n
+        scanned = 0
+        while scanned < n and (time.perf_counter() - t0) * 1000.0 < max_ms:
+            vid = keys[(start + scanned) % n]
+            veh = vehicles.get(vid)
+            _scrub_invalid_vehicle_park_one(game, veh)
+            scanned += 1
+        game._vehicle_park_scrub_rr = (start + scanned) % n
+        game._vehicle_park_scrub_last_n = scanned
     finally:
         game._parking_save_scrubbing = False
 
 
-def save_parking_state(game):
+def mark_parking_dirty(game, vehicle_id=None):
+    """Defer ``save_parking_state`` until tick flush or a force=True save.
+
+    America macro cruises used to call ``save_parking_state`` on every tile,
+    reloading and pretty-printing the whole parking file each time (bug report
+    195). Scenic steps only mutate in-memory coords; one flush per heartbeat
+    is enough.
+
+    Pass ``vehicle_id`` when only one roster row moved (street hop, leave,
+    drive_step). Lag S2 incremental flush merges just those ids instead of
+    walking all ~15k vehicles through ``_build_parking_payload``.
+    """
+    game._parking_dirty = True
+    if vehicle_id is None:
+        game._parking_dirty_all = True
+        return
+    vid = str(vehicle_id).strip()
+    if not vid:
+        game._parking_dirty_all = True
+        return
+    dirty = getattr(game, "_parking_dirty_vehicle_ids", None)
+    if dirty is None:
+        dirty = set()
+        game._parking_dirty_vehicle_ids = dirty
+    dirty.add(vid)
+
+
+def touch_parking_after_vehicle_mutation(game, vehicle_id):
+    """Command-path parking: queue one vehicle for incremental flush.
+
+    Do not call ``save_parking_state(force=True)`` on every hop -- that still
+    serializes the whole roster when it writes. Tick flush (or an explicit
+    ``force=True`` GM/copyover save) persists to disk.
+    """
+    mark_parking_dirty(game, vehicle_id)
+
+
+def _parking_payload_fingerprint(payload):
+    """Stable hash so unchanged roster skips a disk rewrite on flush."""
+    raw = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return zlib.adler32(raw.encode("utf-8")) & 0xFFFFFFFF
+
+
+def _write_parking_json(path, payload, text=None):
+    """Atomic compact JSON for ``vehicle_parking.json`` only (not catalogs).
+
+    Authored catalogs stay ``content_store.save_json`` indent=4; this live
+    file is rewritten every cruise flush and benefits from smaller I/O.
+
+    ``text`` is the already-serialized body from ``save_parking_state`` so
+    we do not dump the 16k-vehicle roster twice. Returns False on a
+    locked replace instead of ``time.sleep`` on the asyncio loop (P24-14);
+    the caller leaves the dirty flag set and retries next heartbeat.
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".parking_", suffix=".tmp", dir=directory,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            if text is None:
+                json.dump(
+                    payload,
+                    handle,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+                handle.write("\n")
+            else:
+                handle.write(text)
+                if not text.endswith("\n"):
+                    handle.write("\n")
+        try:
+            os.replace(tmp_path, path)
+        except PermissionError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return False
+        return True
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _parking_entry_fingerprint(entry):
+    """Hash one vehicle's parking JSON slice (incremental skip without full roster)."""
+    if not entry:
+        return 0
+    raw = json.dumps(
+        entry,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return zlib.adler32(raw.encode("utf-8")) & 0xFFFFFFFF
+
+
+def _merge_vehicle_parking_entry(game, payload, vid, veh):
+    """Patch one vehicle id into the parking dict (O(1) per dirty hop)."""
+    if not isinstance(veh, dict):
+        payload.pop(vid, None)
+        return
+    entry = {}
+    room_key = veh.get("parked_room")
+    interior_key = veh.get("interior_key")
+    if (
+        isinstance(room_key, str)
+        and room_key
+        and room_key != interior_key
+        and not room_key.startswith("Inside ")
+    ):
+        rooms = getattr(game, "rooms", None) or {}
+        park = rooms.get(room_key) if hasattr(rooms, "get") else None
+        if park is not None:
+            from engine.room_vnum import internal_room_key
+
+            room_key = internal_room_key(park) or getattr(
+                park, "key", room_key,
+            )
+        entry["parked_room"] = room_key
+    macro = veh.get("macro_pos")
+    if isinstance(macro, (list, tuple)) and len(macro) == 2:
+        entry["macro"] = [int(macro[0]), int(macro[1])]
+    micro = veh.get("micro_pos")
+    if micro is None and "macro" in entry:
+        entry["micro"] = None
+    elif isinstance(micro, (list, tuple)) and len(micro) == 2:
+        entry["micro"] = [int(micro[0]), int(micro[1])]
+    extra = hooks_mod.vehicle_extra_persist_fields(veh)
+    if extra:
+        entry["extra"] = extra
+    if entry:
+        payload[vid] = entry
+    elif vid in payload:
+        del payload[vid]
+
+
+def _build_parking_payload(game, prior, *, vehicle_ids=None):
+    """Merge live ``game.vehicles`` into the on-disk parking dict.
+
+    When ``vehicle_ids`` is set, only those roster rows are read from
+    ``game.vehicles`` (lag S2). ``vehicle_ids=None`` walks the full roster
+    (copyover / first persist / ``force=True``).
+    """
+    payload = dict(prior)
+    if vehicle_ids is None:
+        before_n = len(game.vehicles)
+        veh_items = list(game.vehicles.items())
+        after_n = len(game.vehicles)
+        if after_n != before_n:
+            from engine.log_util import ops_once_per_tick
+
+            ops_once_per_tick(
+                game,
+                "vehicles-roster-mut",
+                "vehicles",
+                f"roster mutated during park write before={before_n} after={after_n}",
+            )
+        for vid, veh in veh_items:
+            _merge_vehicle_parking_entry(game, payload, vid, veh)
+        return payload
+    for vid in vehicle_ids:
+        veh = (getattr(game, "vehicles", None) or {}).get(vid)
+        if veh is None:
+            payload.pop(vid, None)
+            continue
+        _merge_vehicle_parking_entry(game, payload, vid, veh)
+    return payload
+
+
+def _parking_incremental_merge_changed(game, prior, payload, dirty_ids):
+    """True when at least one dirty vehicle's parking slice changed."""
+    fps = getattr(game, "_parking_entry_fingerprints", None) or {}
+    for vid in dirty_ids:
+        old_fp = fps.get(vid)
+        new_entry = payload.get(vid)
+        prior_entry = prior.get(vid) if isinstance(prior, dict) else None
+        if prior_entry != new_entry and old_fp is None:
+            # Cold cache -- compare to prior snapshot we merged from.
+            if prior_entry == new_entry:
+                continue
+            return True
+        new_fp = _parking_entry_fingerprint(new_entry if new_entry else None)
+        if old_fp != new_fp:
+            return True
+        if prior_entry != new_entry:
+            return True
+    return False
+
+
+def _refresh_parking_entry_fingerprints(game, payload):
+    """Rebuild per-vehicle fingerprints after a successful disk write."""
+    fps = {}
+    for vid, entry in (payload or {}).items():
+        fps[vid] = _parking_entry_fingerprint(entry)
+    game._parking_entry_fingerprints = fps
+
+
+def _stamp_parking_lag(game, *, write_ms, n_vehicles, n_bytes, skipped):
+    game._lag_parking_write_ms = round(float(write_ms), 2)
+    game._lag_parking_vehicles = int(n_vehicles)
+    game._lag_parking_bytes = int(n_bytes)
+    game._lag_parking_skipped = 1 if skipped else 0
+
+
+def save_parking_state(game, *, force=True):
     """Atomically write every vehicle's park room and/or overland coords.
 
     Invalid-park scrub lives on ``tick_scrub_invalid_vehicle_parks`` so a
     Cadence street hop does not walk the whole room table.
+
+    ``force=False`` (tick flush): write only when ``mark_parking_dirty`` ran
+    since the last successful save, merging only dirty vehicle ids when
+    possible (lag S2). ``force=True`` (default): copyover / GM / first catalog
+    persist still rebuilds the full roster. Unchanged payload fingerprints
+    skip the disk write unless ``force=True``.
     """
     if not getattr(game, "vehicles", None):
         return
-    path = parking_path(game)
-    try:
-        prior = load_parking_state(game)
-    except Exception as exc:
-        from engine import log_util
+    if not force and not getattr(game, "_parking_dirty", False):
+        return
+    dirty_all = bool(getattr(game, "_parking_dirty_all", False))
+    dirty_ids = set(getattr(game, "_parking_dirty_vehicle_ids", None) or ())
+    prior = getattr(game, "_parking_payload_cache", None)
+    if prior is None or force or not isinstance(prior, dict):
+        path = parking_path(game)
+        try:
+            prior = load_parking_state(game)
+        except Exception as exc:
+            from engine import log_util
 
-        log_util.ops(
-            "vehicles",
-            "persist prior snapshot failed -- aborting park write "
-            "(will not wipe extra fields)",
-            exc=exc,
+            log_util.ops(
+                "vehicles",
+                "persist prior snapshot failed -- aborting park write "
+                "(will not wipe extra fields)",
+                exc=exc,
+            )
+            return
+        if not isinstance(prior, dict):
+            prior = {}
+    incremental_ids = None
+    if not force and not dirty_all and dirty_ids:
+        incremental_ids = dirty_ids
+    if force or dirty_all or incremental_ids is None:
+        payload = _build_parking_payload(game, prior, vehicle_ids=None)
+        n_merged = len(getattr(game, "vehicles", None) or {})
+    else:
+        payload = _build_parking_payload(
+            game, prior, vehicle_ids=incremental_ids,
+        )
+        n_merged = len(incremental_ids)
+    game._lag_parking_merge_count = int(n_merged)
+    body = None
+    if not force:
+        if incremental_ids is not None:
+            if not _parking_incremental_merge_changed(
+                game, prior, payload, incremental_ids,
+            ):
+                game._parking_dirty = False
+                game._parking_dirty_all = False
+                game._parking_dirty_vehicle_ids = set()
+                game._parking_payload_cache = payload
+                _stamp_parking_lag(
+                    game,
+                    write_ms=0.0,
+                    n_vehicles=len(payload),
+                    n_bytes=0,
+                    skipped=True,
+                )
+                return
+        else:
+            body = json.dumps(
+                payload,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            fp = zlib.adler32(body.encode("utf-8")) & 0xFFFFFFFF
+            last_fp = getattr(game, "_parking_last_write_fingerprint", None)
+            if last_fp is not None and fp == last_fp:
+                game._parking_dirty = False
+                game._parking_dirty_all = False
+                game._parking_dirty_vehicle_ids = set()
+                game._parking_payload_cache = payload
+                _stamp_parking_lag(
+                    game, write_ms=0.0, n_vehicles=len(payload), n_bytes=0, skipped=True,
+                )
+                return
+    if body is None:
+        body = json.dumps(
+            payload,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+    raw = body.encode("utf-8")
+    path = parking_path(game)
+    t0 = time.perf_counter()
+    wrote = _write_parking_json(path, payload, text=body)
+    write_ms = (time.perf_counter() - t0) * 1000.0
+    if not wrote:
+        # Windows file lock -- stay dirty and try the next heartbeat
+        # instead of sleeping the game loop.
+        _stamp_parking_lag(
+            game,
+            write_ms=write_ms,
+            n_vehicles=len(payload),
+            n_bytes=len(raw),
+            skipped=True,
         )
         return
-    if not isinstance(prior, dict):
-        prior = {}
-    payload = dict(prior)
-    # Snapshot before iterating -- a hook callback (trunk extra fields,
-    # park-scrub exemptions) or a kit ensure still in flight elsewhere in
-    # the same tick can add/remove a vehicle id while this walks the
-    # roster, which raises "dictionary changed size during iteration" on
-    # the live ``game.vehicles`` dict (bug report -- makecar crash).
-    before_n = len(game.vehicles)
-    veh_items = list(game.vehicles.items())
-    after_n = len(game.vehicles)
-    if after_n != before_n:
-        from engine.log_util import ops_once_per_tick
+    n_bytes = len(raw)
+    game._parking_last_write_fingerprint = zlib.adler32(raw) & 0xFFFFFFFF
+    game._parking_payload_cache = payload
+    if incremental_ids is not None:
+        fps = getattr(game, "_parking_entry_fingerprints", None) or {}
+        for vid in incremental_ids:
+            fps[vid] = _parking_entry_fingerprint(payload.get(vid))
+        game._parking_entry_fingerprints = fps
+    else:
+        _refresh_parking_entry_fingerprints(game, payload)
+    game._parking_dirty = False
+    game._parking_dirty_all = False
+    game._parking_dirty_vehicle_ids = set()
+    _stamp_parking_lag(
+        game,
+        write_ms=write_ms,
+        n_vehicles=len(payload),
+        n_bytes=n_bytes,
+        skipped=False,
+    )
+    if write_ms >= 50.0:
+        from engine import lag_watch
 
-        ops_once_per_tick(
+        lag_watch.note_parking_write(
             game,
-            "vehicles-roster-mut",
-            "vehicles",
-            f"roster mutated during park write before={before_n} after={after_n}",
+            write_ms=write_ms,
+            n_vehicles=len(payload),
+            n_bytes=n_bytes,
         )
-    for vid, veh in veh_items:
-        entry = {}
-        room_key = veh.get("parked_room")
-        interior_key = veh.get("interior_key")
-        if (
-            isinstance(room_key, str)
-            and room_key
-            and room_key != interior_key
-            and not room_key.startswith("Inside ")
-        ):
-            entry["parked_room"] = room_key
-        macro = veh.get("macro_pos")
-        if isinstance(macro, (list, tuple)) and len(macro) == 2:
-            entry["macro"] = [int(macro[0]), int(macro[1])]
-        micro = veh.get("micro_pos")
-        if micro is None and "macro" in entry:
-            entry["micro"] = None
-        elif isinstance(micro, (list, tuple)) and len(micro) == 2:
-            entry["micro"] = [int(micro[0]), int(micro[1])]
-        extra = hooks_mod.vehicle_extra_persist_fields(veh)
-        if extra:
-            entry["extra"] = extra
-        if entry:
-            payload[vid] = entry
-        elif vid in payload:
-            del payload[vid]
-    save_json(path, payload)
+
+
+def _catalog_interior_title(spec):
+    """Player-facing cabin name -- never the interior_description first sentence.
+
+    Catalog Impala cabins used to stamp the sensory blurb as ROOM NAME
+    (bug report 1277). Prefer the authored interior_key (Inside the Impala).
+    """
+    if not isinstance(spec, dict):
+        return "Inside a vehicle"
+    key = (spec.get("interior_key") or "").strip()
+    if key:
+        return key
+    model = (spec.get("key") or "vehicle").strip() or "vehicle"
+    return f"Inside {model}"
+
+
+def _apply_interior_title(interior, spec):
+    """Stamp or heal a catalog cabin title when it is missing or a blurb."""
+    if interior is None:
+        return
+    want = _catalog_interior_title(spec)
+    cur = (getattr(interior, "title", None) or "").strip()
+    desc = (spec.get("interior_description") or "").strip()
+    first = desc.split(".")[0].strip() if desc else ""
+    if (
+        not cur
+        or cur == first
+        or cur == getattr(interior, "key", None)
+        or (first and len(first) >= 24 and cur.startswith(first[:24]))
+    ):
+        interior.title = want
+    interior.is_vehicle_interior = True
 
 
 def ensure_vehicle_defaults(character):
@@ -573,7 +896,10 @@ def ensure_game_vehicles(game, *, pre_character_load=False):
         if str(vid).startswith("_"):
             continue
         interior_key = spec["interior_key"]
-        if interior_key not in rooms:
+        from engine.room_vnum import lookup_room
+
+        interior = lookup_room(game, interior_key)
+        if interior is None:
             interior = Room(
                 interior_key,
                 spec.get(
@@ -586,44 +912,48 @@ def ensure_game_vehicles(game, *, pre_character_load=False):
             interior.outdoor = False
             interior.area_type = "city"
             interior.is_vehicle_interior = True
+            _apply_interior_title(interior, spec)
             rooms[interior_key] = interior
-        else:
-            interior = rooms[interior_key]
-            if getattr(interior, "map_missing_stub", False):
-                occupants = list(interior.characters())
-                fresh = Room(
-                    interior_key,
-                    spec.get(
-                        "interior_description",
-                        "The inside of a vehicle. Type 'leave' to climb out.",
-                    ),
-                )
-                fresh.zone = None
-                fresh.wilderness = False
-                fresh.outdoor = False
-                fresh.area_type = "city"
-                fresh.is_vehicle_interior = True
-                rooms[interior_key] = fresh
-                from engine.world import safe_place
+        elif getattr(interior, "map_missing_stub", False):
+            occupants = list(interior.characters())
+            fresh = Room(
+                interior_key,
+                spec.get(
+                    "interior_description",
+                    "The inside of a vehicle. Type 'leave' to climb out.",
+                ),
+            )
+            fresh.zone = None
+            fresh.wilderness = False
+            fresh.outdoor = False
+            fresh.area_type = "city"
+            fresh.is_vehicle_interior = True
+            _apply_interior_title(fresh, spec)
+            rooms[interior_key] = fresh
+            from engine.world import safe_place
 
-                for who in occupants:
-                    safe_place(who, fresh)
-                interior = fresh
-                print(
-                    f"[vehicles] replaced map_missing_stub cabin "
-                    f"{interior_key!r}",
-                    flush=True,
-                )
+            for who in occupants:
+                safe_place(who, fresh)
+            interior = fresh
+            print(
+                f"[vehicles] replaced map_missing_stub cabin "
+                f"{interior_key!r}",
+                flush=True,
+            )
+        else:
+            _apply_interior_title(interior, spec)
         parked_key = spec["parked_room"]
         saved = saved_parks.get(vid) or {}
         if saved.get("parked_room"):
-            saved_room = rooms.get(saved["parked_room"])
-            if saved_room is None:
-                from engine.room_vnum import lookup_room
+            from engine.room_vnum import lookup_room, internal_room_key
 
-                saved_room = lookup_room(game, saved["parked_room"])
+            saved_room = lookup_room(game, saved["parked_room"])
             if saved_room is not None:
-                parked_key = saved["parked_room"]
+                from engine.room_vnum import internal_room_key
+
+                parked_key = internal_room_key(saved_room) or getattr(
+                    saved_room, "key", saved["parked_room"],
+                )
         elif "macro" in saved:
             # Open-road cruise: parking JSON has atlas coords, no curb.
             parked_key = None
@@ -680,7 +1010,7 @@ def _stamp_catalog_vehicle_interior_vnums(game):
 
     rooms = getattr(game, "rooms", None) or {}
     taken = room_vnum_mod.collect_taken_vnums(rooms.values())
-    for veh in (getattr(game, "vehicles", None) or {}).values():
+    for veh in list((getattr(game, "vehicles", None) or {}).values()):
         if not isinstance(veh, dict):
             continue
         for slot in ("interior",):
@@ -702,22 +1032,67 @@ def _stamp_catalog_vehicle_interior_vnums(game):
                 rooms.pop(vnum, None)
 
 
+def _room_looks_like_vehicle_cabin(room):
+    """True when the room itself is stamped or titled as a cabin.
+
+    Does **not** walk ``game.vehicles``. Copyover used to call
+    ``vehicle_for_interior_room`` for every Echo on a plaza, which is
+    O(characters x vehicles) and stretched the Veil into minutes.
+    """
+    if room is None:
+        return False
+    if getattr(room, "is_vehicle_interior", False):
+        return True
+    key = getattr(room, "key", None) or ""
+    return isinstance(key, str) and key.startswith("Inside ")
+
+
+def _vehicle_interior_index(game):
+    """O(1) cabin lookup: interior object id plus interior/cockpit/cargo keys.
+
+    Rebuilt when the live vehicle count changes (owned kits stamp in during
+    ``load_world``). A linear scan per Echo was the copyover hog.
+    """
+    vehicles = getattr(game, "vehicles", None) or {}
+    # Snapshot: owned-kit stamps and the 1329 mid-scan smoke mutate this
+    # dict while a lookup is in flight (same reason the old loop used list()).
+    snapshot = list(vehicles.values())
+    n = len(vehicles)
+    cached = getattr(game, "_vehicle_interior_index", None)
+    if isinstance(cached, tuple) and len(cached) == 2 and cached[0] == n:
+        return cached[1]
+    idx = {}
+    for veh in snapshot:
+        if not isinstance(veh, dict):
+            continue
+        interior = veh.get("interior")
+        if interior is not None:
+            idx[id(interior)] = veh
+            ik = getattr(interior, "key", None)
+            if ik:
+                idx[("key", ik)] = veh
+        for kname in ("interior_key", "cockpit_key", "cargo_key"):
+            k = veh.get(kname)
+            if k:
+                idx[("key", k)] = veh
+    game._vehicle_interior_index = (n, idx)
+    return idx
+
+
 def vehicle_for_interior_room(game, room):
     """Return the live vehicle whose interior is ``room``, or None."""
     if room is None or game is None:
         return None
     ensure_game_vehicles(game)
+    idx = _vehicle_interior_index(game)
+    found = idx.get(id(room))
+    if found is not None:
+        return found
     room_key = getattr(room, "key", None)
-    for veh in (getattr(game, "vehicles", None) or {}).values():
-        interior = veh.get("interior")
-        if interior is room:
-            return veh
-        if room_key and veh.get("interior_key") == room_key:
-            return veh
-        if room_key and veh.get("cockpit_key") == room_key:
-            return veh
-        if room_key and veh.get("cargo_key") == room_key:
-            return veh
+    if room_key:
+        found = idx.get(("key", room_key))
+        if found is not None:
+            return found
     return None
 
 
@@ -725,10 +1100,7 @@ def is_vehicle_interior_room(room, game=None):
     """True when ``room`` is (or looks like) a vehicle cabin."""
     if room is None:
         return False
-    if getattr(room, "is_vehicle_interior", False):
-        return True
-    key = getattr(room, "key", None) or ""
-    if isinstance(key, str) and key.startswith("Inside "):
+    if _room_looks_like_vehicle_cabin(room):
         return True
     if game is not None and vehicle_for_interior_room(game, room) is not None:
         return True
@@ -770,7 +1142,7 @@ def vehicle_host_room(game, interior_room):
     for candidate in (canon, park_key):
         if not candidate:
             continue
-        host = lookup_room(game, candidate) or rooms.get(candidate)
+        host = lookup_room(game, candidate)
         if host is not None and not is_vehicle_interior_room(host, game):
             return host
     return None
@@ -875,32 +1247,30 @@ def nearest_driveable_park_key(game, room, *, character=None):
         else:
             indoor_berth.append(key)
     if outdoor:
-        return outdoor[0]
+        return canonical_park_key(game, outdoor[0]) or outdoor[0]
     if indoor_berth:
-        return indoor_berth[0]
+        return canonical_park_key(game, indoor_berth[0]) or indoor_berth[0]
     zone = getattr(room, "zone", None)
     if zone:
         for key, cand in _rooms_items_snapshot(rooms):
             if getattr(cand, "zone", None) != zone:
                 continue
             if room_is_valid_park_spot(cand, game, character=character):
-                return key
+                return canonical_park_key(game, key) or key
     return None
 
 
 def safe_park_room_key(game, character=None, *, preferred=None, avoid_keys=None):
     """Pick a real curb key -- never a vehicle cabin or blocked room."""
+    from engine.room_vnum import lookup_room
+
     rooms = getattr(game, "rooms", None) or {}
     avoid = set(avoid_keys or ())
 
     def _ok(key):
         if not key or key in avoid:
             return False
-        room = rooms.get(key)
-        if room is None:
-            from engine.room_vnum import lookup_room
-
-            room = lookup_room(game, key)
+        room = lookup_room(game, key)
         if room is None:
             return False
         canon = getattr(room, "key", None)
@@ -946,9 +1316,10 @@ def safe_park_room_key(game, character=None, *, preferred=None, avoid_keys=None)
         if key in avoid:
             continue
         if room_is_valid_park_spot(room, game, character=character):
+            canon = canonical_park_key(game, key) or key
             if game is not None:
-                game._vehicle_park_fallback_key = key
-            return key
+                game._vehicle_park_fallback_key = canon
+            return canon
     return None
 
 
@@ -991,8 +1362,7 @@ def _park_room_overland_gate_macro(game, park_key):
         _room_zone_exit_macro,
     )
 
-    rooms = getattr(game, "rooms", None) or {}
-    park = lookup_room(game, park_key) or rooms.get(park_key)
+    park = lookup_room(game, park_key)
     if park is None:
         return None
     macro = _room_zone_exit_macro(park)
@@ -1005,9 +1375,35 @@ def _vehicle_parked_in_virtual_room(game, veh, room):
     """True when ``veh`` is parked on the dual-layer cell for ``room``."""
     from engine.systems import overland as overland_mod
 
+    park_key = veh.get("parked_room")
+    interior_key = veh.get("interior_key")
+    if park_key and interior_key and park_key == interior_key:
+        return False
+    room_key = getattr(room, "key", None) or ""
+    # Homestead yard cruise stores the virtual cell on parked_room and
+    # clears macro/micro so compass stays a driveway hop, not atlas cruise
+    # (bug report 1613). Match the cell key before coord stamps.
+    if park_key and room_key:
+        if str(park_key) == str(room_key):
+            return True
+        canon = canonical_park_key(game, park_key)
+        if canon and str(canon) == str(room_key):
+            return True
+        parked = overland_mod.resolve_virtual_overland_room_key(game, park_key)
+        if parked is room:
+            return True
     room_macro = getattr(room, "overland_macro", None)
     room_micro = getattr(room, "overland_micro", None)
     if room_macro is None or room_micro is None:
+        return False
+    # Earth and 1861 share Wilderness titles. A Camaro at today's
+    # homestead mouth must not also sit on the sealed-age twin
+    # (bug report 1449). Unstamped kits default to Prime Earth.
+    room_plane = str(
+        overland_mod._overland_plane_for_room(room) or "earth",
+    ).strip().lower() or "earth"
+    veh_plane = str(veh.get("overland_plane") or "earth").strip().lower() or "earth"
+    if veh_plane != room_plane:
         return False
     macro = overland_mod._parse_pos_pair(veh.get("macro_pos"))
     micro = overland_mod._parse_pos_pair(veh.get("micro_pos"))
@@ -1017,10 +1413,6 @@ def _vehicle_parked_in_virtual_room(game, veh, room):
         # Open-road stamp without micro: visible anywhere on the atlas tile
         # (legacy saves and leave before micro was stamped -- bug report 1134).
         return True
-    park_key = veh.get("parked_room")
-    interior_key = veh.get("interior_key")
-    if park_key and interior_key and park_key == interior_key:
-        return False
     if park_key:
         mouth_macro = _park_room_overland_gate_macro(game, park_key)
         if (
@@ -1044,7 +1436,7 @@ def _vehicle_parked_in_room(game, veh, room):
         return False
     canon = canonical_park_key(game, park_key)
     from engine.room_vnum import lookup_room
-    park = lookup_room(game, canon) or game.rooms.get(canon) or game.rooms.get(park_key)
+    park = lookup_room(game, canon) or lookup_room(game, park_key)
     if park is None:
         return False
     interior = veh.get("interior")
@@ -1137,7 +1529,7 @@ def parked_vehicles_in(game, room):
     if room is None:
         return []
     return [
-        v for v in game.vehicles.values()
+        v for v in list(game.vehicles.values())
         if _vehicle_parked_in_room(game, v, room)
     ]
 
@@ -1219,12 +1611,9 @@ def eject_motorcycle_from_cabin(character, game, veh):
     park_key = veh.get("parked_room")
     if not park_key:
         return False
-    rooms = getattr(game, "rooms", None) or {}
-    park = rooms.get(park_key)
-    if park is None:
-        from engine.room_vnum import lookup_room
+    from engine.room_vnum import lookup_room
 
-        park = lookup_room(game, park_key)
+    park = lookup_room(game, park_key)
     if park is None or getattr(character, "location", None) is park:
         return False
     character.move_to(park)
@@ -1233,6 +1622,35 @@ def eject_motorcycle_from_cabin(character, game, veh):
         character.vehicle_role = None
         if veh.get("driver") is character:
             veh["driver"] = None
+    return True
+
+
+def reseat_aboard_from_map_missing_stub(character, game):
+    """Move a boarded body onto the live cabin instead of ``home_room_key``.
+
+    ``heal_map_missing_stub_occupants`` runs right after owned-kit cabins
+    are stamped; this belt catches ordering gaps (copyover cleared
+    ``game.vehicles[vid]`` so the new-entry aboard reclaim had to run).
+    Motorcycles stay curb/highway -- never stuff riders into storage cabins.
+    """
+    if character is None or game is None:
+        return False
+    vid = getattr(character, "in_vehicle", None)
+    # Passengers share the kit id without owning it -- still reseat them.
+    if not vid:
+        return False
+    loc = getattr(character, "location", None)
+    if loc is None or not getattr(loc, "map_missing_stub", False):
+        return False
+    veh = vehicle_by_id(game, vid)
+    if veh is None:
+        return False
+    if vehicle_is_motorcycle(veh):
+        return False
+    interior = veh.get("interior")
+    if interior is None or loc is interior:
+        return False
+    character.move_to(interior)
     return True
 
 
@@ -1324,6 +1742,12 @@ def heal_character_vehicle_board_state(character, game):
     ensure_game_vehicles(game)
     ensure_vehicle_defaults(character)
     room = getattr(character, "location", None)
+    vid = getattr(character, "in_vehicle", None)
+    # Town NPCs / plaza Echoes are the copyover bulk. Skip the cabin
+    # relink unless they look boarded or already sit in a cabin.
+    if not vid and not _room_looks_like_vehicle_cabin(room):
+        if vehicle_for_interior_room(game, room) is None:
+            return False
     # Owned stale cabins before generic interior lookup so a replaced VNUM
     # does not relink to another parked ride in game.vehicles (677).
     veh_here = _resolve_stale_owned_interior(character, game, room)
@@ -1387,11 +1811,9 @@ def heal_character_vehicle_board_state(character, game):
         interior = veh.get("interior")
         if room is interior:
             park_key = veh.get("parked_room")
-            park = (
-                (getattr(game, "rooms", None) or {}).get(park_key)
-                if park_key
-                else None
-            )
+            from engine.room_vnum import lookup_room
+
+            park = lookup_room(game, park_key) if park_key else None
             if park is not None:
                 character.move_to(park)
                 return True
@@ -1416,6 +1838,8 @@ def heal_character_vehicle_board_state(character, game):
             return False
     interior = veh.get("interior")
     if room is not interior:
+        if getattr(room, "map_missing_stub", False):
+            return False
         room_key = getattr(room, "key", None)
         interior_key = veh.get("interior_key")
         if (
@@ -1525,8 +1949,6 @@ def restore_logout_vehicle_anchor(character, game):
     from engine import room_vnum as room_vnum_mod
 
     dest = room_vnum_mod.lookup_room(game, logout_room_key)
-    if dest is None:
-        dest = (getattr(game, "rooms", None) or {}).get(logout_room_key)
     if dest is not None and not is_vehicle_interior_room(dest, game):
         character.move_to(dest)
         _clear_stamp()
@@ -1579,12 +2001,14 @@ def vehicle_occupants(game, veh):
     out = []
     seen = set()
     rooms = []
-    interior = veh.get("interior") or game.rooms.get(veh.get("interior_key"))
+    from engine.room_vnum import lookup_room
+
+    interior = veh.get("interior") or lookup_room(game, veh.get("interior_key"))
     if interior is not None:
         rooms.append(interior)
     if veh.get("is_charter"):
-        cockpit = veh.get("cockpit") or game.rooms.get(veh.get("cockpit_key"))
-        cargo = veh.get("cargo") or game.rooms.get(veh.get("cargo_key"))
+        cockpit = veh.get("cockpit") or lookup_room(game, veh.get("cockpit_key"))
+        cargo = veh.get("cargo") or lookup_room(game, veh.get("cargo_key"))
         if cockpit is not None:
             rooms.append(cockpit)
         if cargo is not None:
@@ -1644,7 +2068,9 @@ def board_followers(driver, veh, game):
     park = None
     park_key = veh.get("parked_room") if isinstance(veh, dict) else None
     if park_key and game is not None:
-        park = (getattr(game, "rooms", None) or {}).get(park_key)
+        from engine.room_vnum import lookup_room
+
+        park = lookup_room(game, park_key)
     if park is None:
         park = driver.location
     elif getattr(driver, "in_vehicle", None) == veh.get("id"):
@@ -1746,6 +2172,16 @@ def try_leave_vehicle(character, game, *, pull_followers=True):
     cannot soft-lock when the body is still in a cabin but ``in_vehicle``
     was cleared (bug reports 675 / 677).
     """
+    loc = getattr(character, "location", None)
+    if loc is not None and (
+        getattr(loc, "bugworld_pocket", False)
+        or getattr(loc, "gabriel_pocket_instance_id", None)
+    ):
+        character.in_vehicle = None
+        if hasattr(character, "vehicle_role"):
+            character.vehicle_role = None
+        _send(character, "There is no hatch out of this scene.")
+        return True
     ensure_game_vehicles(game)
     ensure_vehicle_defaults(character)
     if not getattr(character, "in_vehicle", None):
@@ -1771,6 +2207,13 @@ def leave_vehicle(character, game, *, pull_followers=True):
     vid = getattr(character, "in_vehicle", None)
     if not vid:
         return False
+    loc = getattr(character, "location", None)
+    if loc is not None and (
+        getattr(loc, "bugworld_pocket", False)
+        or getattr(loc, "gabriel_pocket_instance_id", None)
+    ):
+        _send(character, "There is no hatch out of this scene.")
+        return False
     veh = vehicle_by_id(game, vid)
     if veh is None:
         character.in_vehicle = None
@@ -1789,7 +2232,9 @@ def leave_vehicle(character, game, *, pull_followers=True):
             character, game, veh, pull_followers=pull_followers,
         )
     park_key = veh.get("parked_room")
-    park = game.rooms.get(park_key) if park_key else None
+    from engine.room_vnum import lookup_room
+
+    park = lookup_room(game, park_key) if park_key else None
     interior = veh.get("interior")
     if (
         park is None
@@ -1832,16 +2277,22 @@ def leave_vehicle(character, game, *, pull_followers=True):
                 veh["micro_pos"] = (
                     tuple(road_micro) if road_micro is not None else None
                 )
+                here = character.location
+                if here is not None and overland_mod.is_real_overland_room(here):
+                    veh["overland_plane"] = overland_mod._overland_plane_for_room(
+                        here,
+                    ) or "earth"
+                else:
+                    veh["overland_plane"] = "earth"
                 if veh.get("driver") is character:
                     veh["driver"] = None
-                here = character.location
                 if here is not None:
                     here.broadcast(
                         f"{face} climbs out of the {veh['key']}.",
                         exclude=character,
                     )
                 _send(character, f"You leave the {veh['key']}.")
-                save_parking_state(game)
+                touch_parking_after_vehicle_mutation(game, vid)
                 if pull_followers and role == "driver":
                     for follower in list(
                         getattr(character, "followers", None) or []
@@ -1860,7 +2311,7 @@ def leave_vehicle(character, game, *, pull_followers=True):
             veh["parked_room"] = fallback
             veh["macro_pos"] = None
             veh["micro_pos"] = None
-            save_parking_state(game)
+            touch_parking_after_vehicle_mutation(game, vid)
             park = game.rooms[fallback]
         else:
             _send(
@@ -1883,7 +2334,7 @@ def leave_vehicle(character, game, *, pull_followers=True):
         veh["driver"] = None
     park.broadcast(f"{face} climbs out of the {veh['key']}.", exclude=character)
     _send(character, f"You leave the {veh['key']}.")
-    save_parking_state(game)
+    touch_parking_after_vehicle_mutation(game, vid)
     if pull_followers and role == "driver":
         for follower in list(getattr(character, "followers", None) or []):
             if getattr(follower, "in_vehicle", None) == vid:
@@ -1907,8 +2358,9 @@ def drive_step(character, vehicle, direction, game) -> bool:
     park_key = vehicle.get("parked_room")
     if not park_key:
         return False
-    rooms = getattr(game, "rooms", None) or {}
-    park = rooms.get(park_key)
+    from engine.room_vnum import lookup_room, internal_room_key
+
+    park = lookup_room(game, park_key)
     if park is None:
         return False
     direction = (direction or "").strip().lower()
@@ -1918,16 +2370,16 @@ def drive_step(character, vehicle, direction, game) -> bool:
     dest_key = exits.get(direction)
     if not dest_key:
         return False
-    dest = rooms.get(dest_key) if isinstance(dest_key, str) else dest_key
+    dest = dest_key if not isinstance(dest_key, str) else lookup_room(game, dest_key)
     if dest is None:
         return False
     if not room_is_valid_park_spot(dest, game, character=character):
         return False
-    new_key = getattr(dest, "key", dest_key)
+    new_key = internal_room_key(dest) or getattr(dest, "key", dest_key)
     vehicle["parked_room"] = new_key
     vehicle["macro_pos"] = None
     vehicle["micro_pos"] = None
-    save_parking_state(game)
+    touch_parking_after_vehicle_mutation(game, vehicle.get("id"))
     label = direction
     for who in vehicle_occupants(game, vehicle):
         _send(who, f"The {vehicle.get('key', 'vehicle')} rolls {label}.")
@@ -1980,6 +2432,11 @@ def _apply_scenic_macro_step(game, veh, nx, ny):
     veh["macro_pos"] = (nx, ny)
     veh["micro_pos"] = None
     veh["parked_room"] = None
+    loc = getattr(driver, "location", None) if driver is not None else None
+    if loc is not None and overland_mod.is_real_overland_room(loc):
+        veh["overland_plane"] = overland_mod._overland_plane_for_room(loc) or "earth"
+    else:
+        veh["overland_plane"] = "earth"
     for who in vehicle_occupants(game, veh):
         overland_mod.ensure_overland_defaults(who)
         who.macro_pos = (nx, ny)
@@ -2020,8 +2477,11 @@ def tick_drives(game, *, finish_drive_fn=None):
     games pass their arrival prose handler (SUPERS ``_finish_drive``).
     """
     if not any_active_vehicle_drives(game):
+        # Player/command steps may have marked dirty with no cruise left.
+        save_parking_state(game, force=False)
         return
     if not getattr(game, "_vehicles_ready", False):
+        save_parking_state(game, force=False)
         return
     now = game.game_time_ticks
     # Snapshot -- ``finish_drive_fn`` arrival prose (road encounters,
@@ -2094,6 +2554,8 @@ def tick_drives(game, *, finish_drive_fn=None):
             veh["scenic_path"] = None
             if finish_drive_fn is not None:
                 finish_drive_fn(game, veh)
+    # One compact parking flush per heartbeat -- not once per macro tile.
+    save_parking_state(game, force=False)
 
 
 # ``config vehicles compact on`` summarizes ordinary look when more than

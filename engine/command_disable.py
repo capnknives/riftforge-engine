@@ -1,7 +1,9 @@
 """Runtime staff toggles to disable player verbs (``gm disable <verb>``).
 
 Disabled verbs are stored on ``game.disabled_verbs`` (in-memory for this
-process). Copyover keeps the set; a full restart clears it.
+process). Copyover keeps the set; a full restart clears it -- except
+``dothepit``, which ``supers.purgatory_dungeon.autopilot_flag`` reloads
+from a gitignored sidecar so staff on/off survives game-child restart.
 """
 
 

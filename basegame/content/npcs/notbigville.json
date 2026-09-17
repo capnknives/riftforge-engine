@@ -1,0 +1,20 @@
+{
+  "npcs": [
+    {
+      "key": "Ellis Quinn",
+      "given_name": "Ellis",
+      "surname": "Quinn",
+      "description": "Keeps the general-store counter wiped down.",
+      "home_room": "NB00004",
+      "zone": "notbigville"
+    },
+    {
+      "key": "June Hale",
+      "given_name": "June",
+      "surname": "Hale",
+      "description": "Wipes glasses at the prairie saloon.",
+      "home_room": "NB00011",
+      "zone": "notbigville"
+    }
+  ]
+}

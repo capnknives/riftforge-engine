@@ -19,9 +19,10 @@ _AUTHOR_NUDGE_VERB_RE = re.compile(r"\b(bug|suggest)\b", re.IGNORECASE)
 def speaker_face_for_character(character, game, viewer=None):
     """OOC label: account display name when pref says account, else character.
 
-    God bilocate twins borrow the owning Mantle's account + OOC pref (bug
-    report 1149) so channel traffic does not leak the husk's character face
-    while act focus is on the twin body.
+    God bilocate twins and sleep dream-selves borrow the Earth owner's
+    account + OOC pref (bug reports 1149, 1643) so channel traffic does
+    not leak the Threshold copy's character face while the Session rides
+    the dream-self.
 
     OOC always shows account or character legal name — never viewer-relative
     short-desc / hood / unintroduced appearance (bug #253).
@@ -36,6 +37,16 @@ def speaker_face_for_character(character, game, viewer=None):
     Staff in ``gm on`` always reads as ``Accountname(GM)`` only — never the
     storage key, Echo body login name, or a redundant ``(Account)`` seeaccounts
     suffix (``CapnKnives(GM)(CapnKnives)``).
+
+    Immersion catalog cast (Chuck, Dean, …) always OOC as the character
+    legal name — never the owning staff account from ``config oocname
+    account``, including ``gm force <cast> ooc`` and Author nudges.
+    Staff ``gm on`` spirit form still reads ``Accountname(GM)`` via
+    ``_staff_form_label`` above; a cast body only gets ``(GM)`` when that
+    body itself is in staff form (gmspirit / gm_mode), not from occupy
+    eyes/powers alone.
+
+    Player roster alts (non-immersion) still honor ``config oocname``.
     """
     try:
         from engine import hooks as hooks_mod
@@ -52,15 +63,19 @@ def speaker_face_for_character(character, game, viewer=None):
             return f"{_presence_face(character)}(GM)"
     except Exception:
         pass
+    if getattr(character, "immersion", False):
+        from command_support import _maybe_append_account_tag, _presence_face
+
+        face = _presence_face(character)
+        if viewer is not None:
+            face = _maybe_append_account_tag(face, character, viewer)
+        return face
     try:
         from engine import accounts as accounts_mod
 
-        account = accounts_mod.account_for_character(game, character)
-        if (
-            account is not None
-            and account.ooc_identity == accounts_mod.OOC_IDENTITY_ACCOUNT
-        ):
-            return account.display_name or account.name
+        occupy_face = accounts_mod.ooc_account_label(game, character)
+        if occupy_face:
+            return occupy_face
     except Exception:
         pass
     from command_support import _maybe_append_account_tag, _presence_face
@@ -279,13 +294,13 @@ def broadcast_ooc_from_face(
     except Exception:
         pass
     delivered = False
-    from engine.accounts import find_account, ooc_is_blocked, account_for_character
+    from engine.accounts import find_account, ooc_is_blocked, account_for_session_character
     for session in list(getattr(game, "sessions", None) or []):
         other = getattr(session, "character", None)
         if other is None:
             continue
         if respect_mutes:
-            listener = account_for_character(game, other)
+            listener = account_for_session_character(game, other)
             if listener is not None:
                 discord_acct = find_account(game, face)
                 if (
@@ -371,13 +386,21 @@ def session_is_head_gm(session, game) -> bool:
 
 
 def session_is_staff_gm(session, game) -> bool:
-    """True when this session's character is online staff (not immersion cast)."""
-    from command_support import _is_staff_gm
+    """True when this session may use staff stitch (wiznet / gm) while IPC is down.
+
+    Gateway ``bound`` metadata uses this. Do **not** call ``_is_staff_gm``
+    here -- that filter skips immersion catalog bodies so who / city-threat
+    stay IC. Occupying Gabriel / Ash still has GM verbs (``_is_gm`` via
+    staff_account / staff_occupy_account / playcast). Using the who-strip
+    filter stamped ``staff_gm`` False and copyover ``gm`` replied
+    "You aren't a GM."
+    """
+    from command_support import _is_gm
 
     character = getattr(session, "character", None)
     if character is None:
         return False
-    return _is_staff_gm(character)
+    return _is_gm(character)
 
 
 def export_plain_history(game) -> list[str]:

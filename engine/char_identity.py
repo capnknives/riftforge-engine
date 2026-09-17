@@ -1,19 +1,27 @@
 """
 char_identity.py -- Given name, surname, CNUM, and ordinal targeting.
 
-Player identity is ``given_name`` + ``surname`` (storage ``Character.key``
-stays a unique immutable PK). CNUM is staff-only. Ordinal query peel
-(``2.carl``, ``other carl``, ``second carl``) lives here so room and
-world resolvers share one parser.
+Player identity is ``given_name`` + ``surname``. Storage ``Character.key``
+is still the SQLite ``characters.name`` PRIMARY KEY (Phase B dual-write:
+UNIQUE ``cnum`` column, name stays the PK). CNUM is staff-only. Ordinal
+query peel (``2.carl``, ``other carl``, ``second carl``) lives here so
+room and world resolvers share one parser.
 
 Engine-pure: no ``supers`` imports.
 """
 
 from __future__ import annotations
 
+import json
 import re
 
-from engine.char_cnum import allocate_cnum, collect_taken_cnums
+from engine.char_cnum import (
+    allocate_cnum,
+    collect_taken_cnums,
+    next_cnum,
+    parse_cnum,
+    validate_cnum,
+)
 
 # Same bounds as login first names (engine/connection.py).
 SURNAME_MIN = 2
@@ -205,6 +213,23 @@ def public_name_order(char) -> str:
     return PUBLIC_NAME_ORDER_GIVEN_FIRST
 
 
+def surname_is_targetable(char) -> bool:
+    """True when given+surname may be a find / look / kit needle.
+
+    Hidden surnames and ``public_mononym`` faces (Daniel the god, Ash)
+    stay on file for staff inspect but must not collect as
+    ``Daniel Miller``. That fuzzy needle is what let a parlor djinn
+    kit overwrite the god.
+    """
+    if char is None:
+        return False
+    if not character_surname(char):
+        return False
+    if bool(getattr(char, "public_mononym", False)):
+        return False
+    return bool(getattr(char, "surname_visible", True))
+
+
 def legal_public_name(char, *, force_surname=False) -> str:
     """Given + optional surname for who / greet when no assumed face.
 
@@ -394,6 +419,39 @@ def reporter_display_name(game, reporter_key) -> str:
             pass
     return humanize_storage_key(raw)
 
+# Articles / glue in a setshort face -- never look-at-the / look-a.
+_SHORT_DESC_SKIP = frozenset({
+    "a", "an", "the", "of", "and", "or", "in", "on", "at", "to", "for",
+    "with", "from",
+})
+
+
+def _short_desc_match_needles(char) -> list[str]:
+    """Words from ``short_desc_override`` (setshort / hunt faces).
+
+    Room listing shows this string to strangers. ``look`` / ``attack``
+    must accept the same words -- ``look sunburn`` and ``look man`` for
+    ``a sunburned man`` -- not only the storage key. Staff pierce still
+    displays the legal name; the override still has to target.
+    """
+    raw = getattr(char, "short_desc_override", None)
+    if not raw:
+        return []
+    face = " ".join(str(raw).split()).strip().lower()
+    if not face:
+        return []
+    out = [face]
+    for part in face.replace("-", " ").split():
+        clean = part.strip(".,;:'\"()[]").strip()
+        if len(clean) < 3:
+            continue
+        if clean in _SHORT_DESC_SKIP:
+            continue
+        if clean not in out:
+            out.append(clean)
+    return out
+
+
 def identity_match_needles(char) -> list[str]:
     """Lowercase strings that should match this character in targeting."""
     needles = []
@@ -412,7 +470,7 @@ def identity_match_needles(char) -> list[str]:
     if given and given not in needles:
         needles.append(given)
     sur = character_surname(char).lower()
-    if given and sur:
+    if given and sur and surname_is_targetable(char):
         full = f"{given} {sur}"
         if full not in needles:
             needles.append(full)
@@ -431,6 +489,19 @@ def identity_match_needles(char) -> list[str]:
         face_l = str(face).strip().lower()
         if face_l and face_l not in needles:
             needles.append(face_l)
+    for extra in _short_desc_match_needles(char):
+        if extra not in needles:
+            needles.append(extra)
+    # Possessive keys (gabriel's appaloosa) -- also match without the mark
+    # so shell-quote peeling and typed "gabriels appaloosa" still hit.
+    folded = []
+    for label in needles:
+        stripped = (
+            label.replace("'", "").replace("\u2019", "").replace("\u2018", "")
+        )
+        if stripped and stripped not in needles and stripped not in folded:
+            folded.append(stripped)
+    needles.extend(folded)
     return needles
 
 
@@ -477,10 +548,31 @@ def pick_ordinal(matches, ordinal):
     return matches[idx]
 
 
+def is_account_linked_body(char) -> bool:
+    """True when this body belongs to a login account.
+
+    This is the kit / persist lock. Do **not** use ``is_npc`` here -- a
+    heal that flips ``is_npc`` on a player must not make the body look
+    like spawn fodder (CNUM ``DN00001`` / Daniel was kitted as a parlor
+    djinn that way). Spirits, husks, and guests still fail this check.
+    """
+    if char is None:
+        return False
+    key_low = (getattr(char, "key", None) or "").lower()
+    if key_low.startswith("gmspirit:") or key_low.startswith("husk:"):
+        return False
+    if getattr(char, "is_guest", False) or getattr(char, "transient_soul", False):
+        return False
+    return bool((getattr(char, "account", None) or "").strip())
+
+
 def is_login_player_body(char) -> bool:
     """True for corporeal player / Echo bodies that can own a login slot.
 
     Skips NPCs, vessel husks, and ephemeral ``husk:`` / ``gmspirit:`` keys.
+
+    After an ``is_npc`` flip this returns False -- use
+    ``is_account_linked_body`` for kit/restamp/persist guards.
     """
     if char is None:
         return False
@@ -492,6 +584,304 @@ def is_login_player_body(char) -> bool:
     if key.startswith("husk:") or key.startswith("gmspirit:"):
         return False
     return True
+
+
+def stats_blob_is_login_pfile(stats) -> bool:
+    """True when a persisted stats blob is a passworded / account PC.
+
+    CNUM clash heals keep this body and remint the NPC occupant. Empty
+    ``account`` still counts when a password hash is present (Andy /
+    AD00002 vs the town NPC that reused the tag).
+    """
+    if not isinstance(stats, dict):
+        return False
+    if (stats.get("account") or "").strip():
+        return True
+    if stats.get("is_npc") is True:
+        return False
+    pw = (stats.get("password_hash") or stats.get("password") or "").strip()
+    return bool(pw)
+
+
+def is_passworded_roster_body(char) -> bool:
+    """True for a login PC even when the account field is still empty.
+
+    ``is_account_linked_body`` misses passworded hunters whose blob never
+    got ``account`` stamped. Clash heals must still prefer them over NPCs.
+    """
+    if is_account_linked_body(char):
+        return True
+    if char is None:
+        return False
+    key_low = (getattr(char, "key", None) or "").lower()
+    if key_low.startswith("gmspirit:") or key_low.startswith("husk:"):
+        return False
+    if getattr(char, "is_guest", False) or getattr(char, "transient_soul", False):
+        return False
+    if getattr(char, "is_npc", False):
+        return False
+    return bool((getattr(char, "password_hash", None) or "").strip())
+
+
+def rewrite_stats_blob_cnum(blob, new_cnum):
+    """Return a stats JSON string with ``cnum`` set to ``new_cnum``."""
+    data = {}
+    if isinstance(blob, str) and blob.strip():
+        try:
+            parsed = json.loads(blob)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = {}
+        if isinstance(parsed, dict):
+            data = parsed
+    elif isinstance(blob, dict):
+        data = dict(blob)
+    data["cnum"] = new_cnum
+    return json.dumps(data)
+
+
+def remint_cnum_clash_for_restore(
+    conn,
+    *,
+    keep_name,
+    keep_cnum,
+    keep_stats=None,
+    game=None,
+):
+    """Free ``keep_cnum`` for a restore/persist write. Remint the loser.
+
+    Passworded / account PCs keep the archived tag; NPCs move to the next
+    free number under the same prefix. Two live PCs on one tag: the
+    restoree takes the next free number so we never steal another player's
+    CNUM. Returns ``(cnum_for_keep_name, notes)``.
+    """
+    notes = []
+    name = (keep_name or "").strip()
+    if not name:
+        return None, notes
+    wanted = None
+    if isinstance(keep_cnum, str) and keep_cnum.strip():
+        try:
+            wanted = validate_cnum(keep_cnum)
+        except ValueError:
+            wanted = None
+    if wanted is None:
+        return None, notes
+    keep_is_pc = stats_blob_is_login_pfile(keep_stats)
+
+    occupant = None
+    if conn is not None:
+        occupant = conn.execute(
+            "SELECT name, stats FROM characters "
+            "WHERE cnum = ? AND name != ? COLLATE NOCASE",
+            (wanted, name),
+        ).fetchone()
+    ram_occupant = None
+    if game is not None:
+        ram_occupant = find_character_by_cnum(game, wanted)
+        if ram_occupant is not None:
+            ram_key = (getattr(ram_occupant, "key", None) or "").strip()
+            if ram_key.lower() == name.lower():
+                ram_occupant = None
+
+    if occupant is None and ram_occupant is None:
+        return wanted, notes
+
+    occ_name = occupant[0] if occupant else (getattr(ram_occupant, "key", None) or "")
+    occ_blob = occupant[1] if occupant else None
+    occ_stats = {}
+    if isinstance(occ_blob, str) and occ_blob.strip():
+        try:
+            parsed = json.loads(occ_blob)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = {}
+        if isinstance(parsed, dict):
+            occ_stats = parsed
+    elif ram_occupant is not None:
+        occ_stats = {
+            "account": getattr(ram_occupant, "account", None),
+            "password_hash": getattr(ram_occupant, "password_hash", None),
+            "is_npc": getattr(ram_occupant, "is_npc", False),
+        }
+    occ_is_pc = stats_blob_is_login_pfile(occ_stats) or is_passworded_roster_body(
+        ram_occupant
+    )
+
+    remint_keep = False
+    if keep_is_pc and not occ_is_pc:
+        remint_keep = False
+    elif occ_is_pc and not keep_is_pc:
+        remint_keep = True
+    elif keep_is_pc and occ_is_pc:
+        remint_keep = True
+    else:
+        remint_keep = False
+
+    parsed = parse_cnum(wanted)
+    prefix = parsed[0] if parsed else "XX"
+    taken = set()
+    if conn is not None:
+        for row in conn.execute(
+            "SELECT cnum FROM characters "
+            "WHERE cnum IS NOT NULL AND cnum != ''"
+        ):
+            raw = row[0]
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    taken.add(validate_cnum(raw))
+                except ValueError:
+                    continue
+    if game is not None:
+        taken.update(collect_taken_cnums(getattr(game, "characters", None)))
+    taken.add(wanted)
+
+    if remint_keep:
+        new = next_cnum(prefix, taken)
+        notes.append(f"restoree {name} {wanted} -> {new} (live PC holds tag)")
+        print(
+            f"[cnum] restore remint {name} {wanted} -> {new} "
+            f"(occupant {occ_name} is a login pfile)",
+            flush=True,
+        )
+        return new, notes
+
+    new = next_cnum(prefix, taken)
+    notes.append(f"occupant {occ_name} {wanted} -> {new}")
+    print(
+        f"[cnum] remint occupant {occ_name} {wanted} -> {new} "
+        f"so {name} can keep the tag",
+        flush=True,
+    )
+    if conn is not None and occ_name:
+        new_blob = rewrite_stats_blob_cnum(occ_blob or "{}", new)
+        conn.execute(
+            "UPDATE characters SET cnum = ?, stats = ? "
+            "WHERE name = ? COLLATE NOCASE",
+            (new, new_blob, occ_name),
+        )
+        _retarget_cnum_sidecars(conn, wanted, new, occ_name)
+    if ram_occupant is not None:
+        ram_occupant.cnum = new
+        if game is not None:
+            try:
+                from engine.persistence import mark_character_dirty
+
+                mark_character_dirty(game, ram_occupant, force=True)
+            except Exception:
+                pass
+    return wanted, notes
+
+
+def _retarget_cnum_sidecars(conn, old_cnum, new_cnum, owner_name):
+    """Move item / homestead / heavy-blob CNUM pointers with a remint."""
+    if conn is None or not old_cnum or not new_cnum:
+        return
+    item_cols = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
+    if "holder_cnum" in item_cols:
+        conn.execute(
+            "UPDATE items SET holder_cnum = ? "
+            "WHERE holder_cnum = ? AND holder_key = ? COLLATE NOCASE",
+            (new_cnum, old_cnum, owner_name),
+        )
+    tables = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    if "character_heavy_blobs" in tables:
+        conn.execute(
+            "UPDATE character_heavy_blobs SET cnum = ? WHERE cnum = ?",
+            (new_cnum, old_cnum),
+        )
+    if "homestead_plots" in tables:
+        plot_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(homestead_plots)")
+        }
+        if "owner_cnum" in plot_cols:
+            conn.execute(
+                "UPDATE homestead_plots SET owner_cnum = ? WHERE owner_cnum = ?",
+                (new_cnum, old_cnum),
+            )
+
+
+def find_character_exact_key(game, key):
+    """Exact ``Character.key`` match (case-insensitive). No substring / CNUM.
+
+    Kit and roster lookups must use this (or ``find_kit_body``) -- never
+    ``Game.find_character``, which is a player-facing fuzzy resolver.
+    """
+    needle = (key or "").strip().lower()
+    if not needle or game is None:
+        return None
+    from engine.char_index import iter_characters
+
+    for obj in iter_characters(game):
+        if (getattr(obj, "key", None) or "").lower() == needle:
+            return obj
+    return None
+
+
+def find_character_by_cnum(game, cnum):
+    """Exact CNUM match. CNUM is the character identity tag, not a name."""
+    from engine.char_cnum import validate_cnum
+    from engine.char_index import iter_characters
+
+    if game is None:
+        return None
+    try:
+        want = validate_cnum(cnum)
+    except ValueError:
+        return None
+    for obj in iter_characters(game):
+        raw = getattr(obj, "cnum", None)
+        if not raw:
+            continue
+        try:
+            if validate_cnum(raw) == want:
+                return obj
+        except ValueError:
+            continue
+    return None
+
+
+def persist_cnum_text(obj):
+    """Validated CNUM string for dual-write columns, or None."""
+    raw = getattr(obj, "cnum", None)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return validate_cnum(raw)
+    except ValueError:
+        return None
+
+
+def resolve_held_character(game, *, holder_cnum=None, holder_key=None):
+    """Inventory/gear persist lookup: CNUM first, then exact storage key.
+
+    Never ``Game.find_character`` -- that is the fuzzy player resolver
+    that kitted Daniel the god as a parlor djinn.
+    """
+    if holder_cnum:
+        found = find_character_by_cnum(game, holder_cnum)
+        if found is not None:
+            return found
+    if holder_key:
+        return find_character_exact_key(game, holder_key)
+    return None
+
+
+def find_kit_body(game, key):
+    """Exact storage key for NPC/mentor/roster kits.
+
+    Returns None when missing **or** when that key is an account-linked
+    login body. Callers must spawn under a new key rather than restamp
+    a player.
+    """
+    obj = find_character_exact_key(game, key)
+    if obj is None:
+        return None
+    if is_account_linked_body(obj):
+        return None
+    return obj
 
 
 def find_players_by_given_name(game, given_name: str) -> list:
@@ -705,7 +1095,6 @@ def stamp_new_identity(char, game, given_name: str, surname: str) -> None:
     existing = getattr(char, "cnum", None)
     if existing:
         try:
-            from engine.char_cnum import validate_cnum
             taken.add(validate_cnum(existing))
         except ValueError:
             pass
@@ -865,12 +1254,106 @@ def ensure_character_identity(char, game=None) -> bool:
     return changed
 
 
+def _cnum_collision_winner(chars):
+    """Keep the login PC when two roster rows share a CNUM.
+
+    Account-linked bodies win first. Passworded hunters with an empty
+    ``account`` field still beat NPCs (Andy / AD00002). Ties break on
+    storage key so the choice is stable across boots.
+    """
+    linked = [c for c in chars if is_account_linked_body(c)]
+    if linked:
+        pool = linked
+    else:
+        passworded = [c for c in chars if is_passworded_roster_body(c)]
+        pool = passworded if passworded else list(chars)
+    return sorted(
+        pool,
+        key=lambda c: (getattr(c, "key", None) or "").lower(),
+    )[0]
+
+
+def heal_unique_character_cnums(game) -> dict:
+    """Make every roster CNUM valid and unique. Collisions keep the prefix.
+
+    Account-linked bodies keep the colliding tag; the other body gets the
+    next free number under that prefix (DN00001 vs DN00002). Invalid tags
+    (legacy blob junk) are treated as missing.
+
+    Idempotent. Returns ``stamped`` / ``reallocated`` / ``changed`` (the
+    Character objects whose ``cnum`` moved) so persist can dirty them.
+    """
+    stats = {"stamped": 0, "reallocated": 0, "changed": []}
+    if game is None:
+        return stats
+    roster = list(getattr(game, "characters", None) or [])
+    groups = {}
+    prefer_prefix = {}
+    for char in roster:
+        raw = getattr(char, "cnum", None)
+        parsed = None
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = validate_cnum(raw)
+            except ValueError:
+                parsed = None
+        if parsed is None:
+            if raw not in (None, ""):
+                char.cnum = None
+            continue
+        if parsed != str(raw).strip().upper():
+            char.cnum = parsed
+            stats["changed"].append(char)
+        groups.setdefault(parsed, []).append(char)
+
+    taken = set()
+    for cnum, chars in groups.items():
+        if len(chars) == 1:
+            taken.add(cnum)
+            continue
+        winner = _cnum_collision_winner(chars)
+        parsed = parse_cnum(cnum)
+        prefix = parsed[0] if parsed else None
+        taken.add(cnum)
+        for char in chars:
+            if char is winner:
+                char.cnum = cnum
+                continue
+            char.cnum = None
+            if prefix:
+                prefer_prefix[id(char)] = prefix
+            stats["changed"].append(char)
+
+    for char in roster:
+        raw = getattr(char, "cnum", None)
+        parsed = None
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = validate_cnum(raw)
+            except ValueError:
+                parsed = None
+        if parsed:
+            continue
+        prefix = prefer_prefix.get(id(char))
+        if prefix:
+            new = next_cnum(prefix, taken)
+            stats["reallocated"] += 1
+        else:
+            new = allocate_cnum(character_given_name(char), taken=taken)
+            stats["stamped"] += 1
+        char.cnum = new
+        taken.add(new)
+        if char not in stats["changed"]:
+            stats["changed"].append(char)
+    return stats
+
+
 def heal_all_character_identities(game) -> dict:
-    """Boot heal: ensure every roster body has given/surname/CNUM.
+    """Boot heal: ensure every roster body has given/surname/unique CNUM.
 
     Idempotent. Returns a small stats dict for smoke / logs.
     """
-    stats = {"healed": 0, "cnums_stamped": 0}
+    stats = {"healed": 0, "cnums_stamped": 0, "cnums_reallocated": 0}
     if game is None:
         return stats
     roster = list(getattr(game, "characters", None) or [])
@@ -878,16 +1361,11 @@ def heal_all_character_identities(game) -> dict:
     for char in roster:
         if ensure_character_identity(char, game=None):
             stats["healed"] += 1
-    # Pass 2: allocate missing CNUMs against the full taken set.
-    taken = collect_taken_cnums(roster)
-    for char in roster:
-        cnum = getattr(char, "cnum", None)
-        if isinstance(cnum, str) and cnum.strip():
-            continue
-        char.cnum = allocate_cnum(character_given_name(char), taken=taken)
-        taken.add(char.cnum)
-        stats["cnums_stamped"] += 1
-        stats["healed"] += 1
+    # Pass 2: unique CNUMs (missing, invalid, collisions).
+    unique = heal_unique_character_cnums(game)
+    stats["cnums_stamped"] = unique.get("stamped", 0)
+    stats["cnums_reallocated"] = unique.get("reallocated", 0)
+    stats["healed"] += unique.get("stamped", 0) + unique.get("reallocated", 0)
     return stats
 
 

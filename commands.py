@@ -110,7 +110,7 @@ IDLE_SPECTATOR = frozenset({
     "regimen",
     # OOC / account (outbound tell/ooc stay spectator; inbound already works)
     "ooc", "tell", "whisper", "reply", "r",
-    "rpseek", "rpwhere",
+    "rpseek", "rpwhere", "turns",
     "bug", "suggest", "setpass", "quit",
     # Relationship / mission list panes (write shortcuts like friend wake)
     "relate", "relationship",
@@ -358,6 +358,14 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
         asleep_blocks_world,
         send_if_online,
     )
+    from engine.session_attach import heal_character_session
+
+    play_session = getattr(character, "session", None)
+    if play_session is None:
+        play_session = heal_character_session(character, game)
+    aware = hooks.maybe_sleep_dream_awareness(character, game)
+    if aware is not None:
+        character = aware
     _asleep_ok = verb in ASLEEP_SPECTATOR
     if not _asleep_ok and verb == "cast":
         # Bare ``cast`` has no rite token -- let cmd_cast print usage instead
@@ -385,7 +393,7 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
     _FROZEN_ALLOWED = frozenset({
         "help", "commands", "more", "stop", "quit", "logout", "bug", "suggest",
         "score", "sc", "ooc", "replay",
-        "rpseek", "rpwhere",
+        "rpseek", "rpwhere", "turns",
         "tell", "whisper", "reply", "r",
     })
     if getattr(character, "frozen", False) and verb not in _FROZEN_ALLOWED:
@@ -401,7 +409,7 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
         send_if_online(
             character,
             "You're frozen by staff. You can still use help, bug, "
-            "suggest, quit, ooc, replay, rpseek, rpwhere, and tell.",
+            "suggest, quit, ooc, replay, rpseek, rpwhere, turns, and tell.",
         )
         return
 
@@ -415,7 +423,8 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
 
     # GM mute: block global / room speech channels only (not movement).
     _MUTED_VERBS = frozenset({
-        "say", "'", "emote", "em", "smote", "tell", "whisper", "reply", "r", "ooc",
+        "say", "'", "emote", "em", "smote", "tell", "whisper", "reply", "r",
+        "ooc", "shout", "questions", "question", "ham", "page", "pose",
     })
     if getattr(character, "muted", False) and verb in _MUTED_VERBS:
         from engine.report_context import note_verb_gate
@@ -425,18 +434,19 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
             "You're muted by staff -- you can't use that channel.",
         )
         return
-    try:
-        from supers import archangel_powers as arch_powers_mod
-        if arch_powers_mod.is_biokinesis_muted(character, game) and verb in _MUTED_VERBS:
-            from engine.report_context import note_verb_gate
-            note_verb_gate(character, verb, "dispatch:biokinesis_muted")
-            send_if_online(
-                character,
-                "Your voice is gone -- you can't use that channel. [MUTED]",
-            )
-            return
-    except ImportError:
-        pass
+    if game_select.game_name() == "supers":
+        try:
+            from supers import archangel_powers as arch_powers_mod
+            if arch_powers_mod.is_biokinesis_muted(character, game) and verb in _MUTED_VERBS:
+                from engine.report_context import note_verb_gate
+                note_verb_gate(character, verb, "dispatch:biokinesis_muted")
+                send_if_online(
+                    character,
+                    "Your voice is gone -- you can't use that channel. [MUTED]",
+                )
+                return
+        except ImportError:
+            pass
 
     # Manual cardinals / aggression cancel a paced walk (say/emote keep it).
     # ``walk`` itself manages focus inside cmd_walk. SUPERS registers the
@@ -470,7 +480,7 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
         character, "asleep", False
     ):
         _REST_KEEP = frozenset({
-            "rest", "wake", "look", "l", "help", "commands", "score", "sc",
+            "rest", "wake", "stand", "look", "l", "help", "commands", "score", "sc",
             "inventory", "inv", "i", "who", "time", "home",
         })
         if (
@@ -643,7 +653,13 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
             character.session.send(f"Unknown command: '{verb}'. Try 'help'.")
 
     # D65: reprint custom prompt after every command (empty template = skip).
-    display_prefs.send_prompt(character, game)
+    from engine import hooks
+
+    prompt_body = character
+    if play_session is not None:
+        prompt_body = getattr(play_session, "character", None) or character
+    prompt_body = hooks.heal_staff_occupy_session_desync(prompt_body, game)
+    display_prefs.send_prompt(prompt_body, game)
 
     # EXTENSION POINT: next up is 'get <item> from <body>' -- the same _find_item
     # helper, but searching a container's contents. That's the plumbing the

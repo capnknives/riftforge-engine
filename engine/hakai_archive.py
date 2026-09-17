@@ -23,6 +23,18 @@ from engine.world_backup import backups_root
 ARCHIVE_VERSION = 1
 ARCHIVE_SUBDIR = "hakai-archive"
 DEFAULT_RETENTION = 5
+# Newest N pre-deploy + newest N nightly DBs the restore path will open.
+# Live 2026-09-11: 24 x 330MB backups, opened per character, crossed the
+# 300s crash window. Cap independently of disk retention so deploy
+# frequency cannot grow boot time again.
+DEFAULT_BACKUP_SCAN_KEEP = 5
+
+# Per-boot memo: backup DBs are 330MB each. Opening them once per
+# character (414 x 24 ~= 10k times) is what hung copyover. Reset via
+# reset_scan_caches() between smokes.
+_sqlite_open_count = 0
+_BACKUP_INDEX = None  # (fingerprint, {name_lower: [(when, db_path, label, row)]})
+_HAKAI_INDEX = None  # (fingerprint, {name_lower: [summary dicts]})
 
 
 def _repo_root():
@@ -46,6 +58,40 @@ def archive_root(root=None):
 
 def character_archive_dir(character_name, *, root=None):
     return os.path.join(archive_root(root), _dir_name(character_name))
+
+
+def sqlite_open_count():
+    """How many read-only backup DB connections this process has opened."""
+    return int(_sqlite_open_count)
+
+
+def reset_scan_caches():
+    """Drop per-boot backup / hakai indexes (smokes + after a new snapshot).
+
+    The 2026-09-11 outage was O(characters x backup_DBs) SQLite opens.
+    These caches exist so a second restore in the same boot is free.
+    """
+    global _BACKUP_INDEX, _HAKAI_INDEX, _sqlite_open_count
+    _BACKUP_INDEX = None
+    _HAKAI_INDEX = None
+    _sqlite_open_count = 0
+    try:
+        from engine.player_save_backup import reset_checkpoint_scan_caches
+
+        reset_checkpoint_scan_caches()
+    except Exception:
+        pass
+
+
+def backup_scan_keep():
+    """Newest backup snapshots the restore path will consider (default 5)."""
+    raw = (os.environ.get("RIFTFORGE_PFILE_BACKUP_SCAN_KEEP") or "").strip()
+    if not raw:
+        return DEFAULT_BACKUP_SCAN_KEEP
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return DEFAULT_BACKUP_SCAN_KEEP
 
 
 def _utc_now():
@@ -143,6 +189,9 @@ def archive_hakai_snapshot(game, character, *, root=None):
         return None, f"write failed: {exc!r}"
 
     _prune_old_archives(char_dir, DEFAULT_RETENTION)
+    # New JSON would otherwise hide behind the per-boot hakai index.
+    global _HAKAI_INDEX
+    _HAKAI_INDEX = None
     rel = os.path.relpath(path, root).replace("\\", "/")
     print(f"[hakai_archive] saved {name!r} -> {rel}", flush=True)
     return path, rel
@@ -160,30 +209,95 @@ def _load_payload_file(path):
     return payload
 
 
+def _listing_fingerprint(path):
+    """Cheap cache key: child names + mtime + size (no file reads)."""
+    if not path or not os.path.isdir(path):
+        return (path or "", ())
+    rows = []
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return (path, ())
+    for name in names:
+        child = os.path.join(path, name)
+        try:
+            st = os.stat(child)
+        except OSError:
+            continue
+        rows.append((name, int(st.st_mtime), int(st.st_size)))
+    rows.sort()
+    return (path, tuple(rows))
+
+
+def _hakai_index(root=None):
+    """Per-boot map of storage-key -> hakai JSON paths (no json.load).
+
+    ``list_hakai_archives`` used to ``os.listdir`` + ``json.load`` every
+    archive for every character. 414 bodies x a handful of files was
+    thousands of extra reads on top of the backup-DB storm.
+    """
+    global _HAKAI_INDEX
+    root = root or _repo_root()
+    base = archive_root(root)
+    fp = _listing_fingerprint(base)
+    cached = _HAKAI_INDEX
+    if cached is not None and cached[0] == fp:
+        return cached[1]
+    by_name = {}
+    if os.path.isdir(base):
+        try:
+            folders = os.listdir(base)
+        except OSError:
+            folders = []
+        for folder in folders:
+            char_dir = os.path.join(base, folder)
+            if not os.path.isdir(char_dir):
+                continue
+            name = decode_archive_dir_name(folder).strip().lower()
+            if not name:
+                continue
+            entries = []
+            try:
+                files = os.listdir(char_dir)
+            except OSError:
+                files = []
+            for filename in files:
+                if not filename.endswith(".json"):
+                    continue
+                path = os.path.join(char_dir, filename)
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    mtime = 0.0
+                entries.append(
+                    {
+                        "path": path,
+                        "file": filename,
+                        # Real ISO time is on the payload; mtime is enough
+                        # to order until the caller loads the winner.
+                        "time": time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime),
+                        ),
+                        "room_key": "",
+                        "source": "hakai-archive",
+                        "_mtime": mtime,
+                    }
+                )
+            entries.sort(key=lambda row: row.get("_mtime") or 0, reverse=True)
+            by_name[name] = entries
+    _HAKAI_INDEX = (fp, by_name)
+    return by_name
+
+
 def list_hakai_archives(character_name, *, root=None):
     """Newest-first archive metadata for one storage key."""
-    char_dir = character_archive_dir(character_name, root=root)
-    if not os.path.isdir(char_dir):
+    name = (character_name or "").strip().lower()
+    if not name:
         return []
-    entries = []
-    for filename in os.listdir(char_dir):
-        if not filename.endswith(".json"):
-            continue
-        path = os.path.join(char_dir, filename)
-        if not os.path.isfile(path):
-            continue
-        payload = _load_payload_file(path) or {}
-        entries.append(
-            {
-                "path": path,
-                "file": filename,
-                "time": payload.get("time") or "?",
-                "room_key": payload.get("room_key") or "",
-                "source": "hakai-archive",
-            }
-        )
-    entries.sort(key=lambda row: os.path.getmtime(row["path"]), reverse=True)
-    return entries
+    entries = _hakai_index(root).get(name) or []
+    return [dict(row) for row in entries]
 
 
 def _predeploy_stamp_iso(folder_name):
@@ -210,20 +324,37 @@ def _nightly_stamp_iso(folder_name):
 
 def _open_sqlite_ro(path):
     """Read-only SQLite connection (never the live writer)."""
+    global _sqlite_open_count
+    _sqlite_open_count += 1
     uri = os.path.abspath(path).replace("\\", "/")
     return sqlite3.connect(f"file:{uri}?mode=ro", uri=True)
 
 
+def _select_row_exact_then_nocase(con, sql_exact, sql_nocase, name):
+    """Exact lookup first so a BINARY index can be used; NOCASE only on miss.
+
+    ``COLLATE NOCASE`` on ``items.holder_key`` made ``idx_items_holder_key``
+    unusable (EXPLAIN QUERY PLAN: ``SCAN items``) — a 52k-row table scan
+    per candidate on live. Character keys are already canonical; the
+    fallback is only for odd mixed-case leftovers.
+    """
+    row = con.execute(sql_exact, (name,)).fetchone()
+    if row is not None:
+        return row
+    return con.execute(sql_nocase, (name,)).fetchone()
+
+
 def _character_row_in_db(db_path, name):
     """Return ``(name, description, room_key, stats)`` or None."""
+    exact = (
+        "SELECT name, description, room_key, stats "
+        "FROM characters WHERE name = ?"
+    )
+    nocase = exact + " COLLATE NOCASE"
     try:
         con = _open_sqlite_ro(db_path)
         try:
-            row = con.execute(
-                "SELECT name, description, room_key, stats "
-                "FROM characters WHERE name = ? COLLATE NOCASE",
-                (name,),
-            ).fetchone()
+            row = _select_row_exact_then_nocase(con, exact, nocase, name)
         finally:
             con.close()
     except sqlite3.Error:
@@ -233,22 +364,54 @@ def _character_row_in_db(db_path, name):
     return row
 
 
+def _item_select_sql(con, *, nocase=False):
+    """SELECT held inventory/gear rows; exact ``holder_key`` uses the index."""
+    cols = {row[1] for row in con.execute("PRAGMA table_info(items)")}
+    collate = " COLLATE NOCASE" if nocase else ""
+    if "holder_cnum" in cols:
+        return (
+            "SELECT key, description, holder_type, holder_key, "
+            "container, holder_cnum FROM items "
+            f"WHERE holder_key = ?{collate} "
+            "AND holder_type IN ('character', 'gear')"
+        )
+    return (
+        "SELECT key, description, holder_type, holder_key, "
+        "container FROM items "
+        f"WHERE holder_key = ?{collate} "
+        "AND holder_type IN ('character', 'gear')"
+    )
+
+
 def _item_rows_in_db(db_path, name):
     """Held inventory/gear rows for ``name`` from a backup DB."""
     try:
         con = _open_sqlite_ro(db_path)
         try:
-            rows = con.execute(
-                "SELECT key, description, holder_type, holder_key, container "
-                "FROM items WHERE holder_key = ? COLLATE NOCASE "
-                "AND holder_type IN ('character', 'gear')",
-                (name,),
-            ).fetchall()
+            sql_exact = _item_select_sql(con, nocase=False)
+            rows = con.execute(sql_exact, (name,)).fetchall()
+            if not rows:
+                sql_nocase = _item_select_sql(con, nocase=True)
+                rows = con.execute(sql_nocase, (name,)).fetchall()
         finally:
             con.close()
     except sqlite3.Error:
         return []
     return list(rows or [])
+
+
+def explain_item_holder_lookup(db_path, name, *, nocase=False):
+    """EXPLAIN QUERY PLAN text for the hot items lookup (smoke / ops)."""
+    try:
+        con = _open_sqlite_ro(db_path)
+        try:
+            sql = _item_select_sql(con, nocase=bool(nocase))
+            plan = con.execute("EXPLAIN QUERY PLAN " + sql, (name,)).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        return f"error: {exc!r}"
+    return " | ".join(str(row) for row in plan)
 
 
 def _payload_from_db_rows(char_row, item_rows, *, when, source):
@@ -262,15 +425,13 @@ def _payload_from_db_rows(char_row, item_rows, *, when, source):
     return payload
 
 
-def iter_backup_db_hits(character_name, *, root=None):
-    """Newest-first backup DBs that still contain ``character_name``.
-
-    Yields ``(iso_time, db_path, label)``. Does not load items until
-    the caller picks a winner.
-    """
+def _backup_db_listing(root, *, unlimited=False):
+    """Newest-first ``(when, db_path, label)`` for pre-deploy + nightly DBs."""
     backups = backups_root(root or _repo_root())
     if not os.path.isdir(backups):
-        return
+        return []
+    cap = None if unlimited else backup_scan_keep()
+    found = []
 
     pre = os.path.join(backups, "pre-deploy")
     if os.path.isdir(pre):
@@ -279,15 +440,14 @@ def iter_backup_db_hits(character_name, *, root=None):
             if os.path.isdir(os.path.join(pre, name))
         ]
         folders.sort(reverse=True)
+        if cap is not None:
+            folders = folders[:cap]
         for folder in folders:
             db_path = os.path.join(pre, folder, "riftforge.db")
             if not os.path.isfile(db_path):
                 continue
-            row = _character_row_in_db(db_path, character_name)
-            if row is None:
-                continue
             when = _predeploy_stamp_iso(folder) or _utc_now()
-            yield when, db_path, f"pre-deploy/{folder}", row
+            found.append((when, db_path, f"pre-deploy/{folder}"))
 
     nights = []
     try:
@@ -302,13 +462,73 @@ def iter_backup_db_hits(character_name, *, root=None):
             continue
         nights.append(name)
     nights.sort(reverse=True)
+    if cap is not None:
+        nights = nights[:cap]
     for folder in nights:
         db_path = os.path.join(backups, folder, "riftforge.db")
-        row = _character_row_in_db(db_path, character_name)
-        if row is None:
-            continue
         when = _nightly_stamp_iso(folder)
-        yield when, db_path, f"nightly/{folder}", row
+        found.append((when, db_path, f"nightly/{folder}"))
+    return found
+
+
+def _backup_listing_fingerprint(root, *, unlimited=False):
+    rows = []
+    for when, db_path, label in _backup_db_listing(root, unlimited=unlimited):
+        try:
+            st = os.stat(db_path)
+            rows.append((label, int(st.st_mtime), int(st.st_size)))
+        except OSError:
+            rows.append((label, 0, 0))
+    return (os.path.abspath(root or _repo_root()), unlimited, tuple(rows))
+
+
+def _backup_roster_index(root=None, *, unlimited=False):
+    """Open each capped backup DB once; map name -> character rows.
+
+    Live 2026-09-11 opened every backup once per character (and again in
+    the duplicate boot sweep). One pass per DB collecting the 414-row
+    ``characters`` table is enough for the whole roster.
+    """
+    global _BACKUP_INDEX
+    root = root or _repo_root()
+    fp = _backup_listing_fingerprint(root, unlimited=unlimited)
+    cached = _BACKUP_INDEX
+    if cached is not None and cached[0] == fp:
+        return cached[1]
+    by_name = {}
+    for when, db_path, label in _backup_db_listing(root, unlimited=unlimited):
+        try:
+            con = _open_sqlite_ro(db_path)
+            try:
+                rows = con.execute(
+                    "SELECT name, description, room_key, stats FROM characters"
+                ).fetchall()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+        for row in rows or ():
+            name = (row[0] or "").strip().lower()
+            if not name:
+                continue
+            by_name.setdefault(name, []).append((when, db_path, label, row))
+    _BACKUP_INDEX = (fp, by_name)
+    return by_name
+
+
+def iter_backup_db_hits(character_name, *, root=None, unlimited=False):
+    """Newest-first backup DBs that still contain ``character_name``.
+
+    Yields ``(iso_time, db_path, label, char_row)``. Does not load items
+    until the caller picks a winner. Consults the per-boot roster index
+    so each backup DB is opened once per boot, not once per character.
+    """
+    name = (character_name or "").strip().lower()
+    if not name:
+        return
+    index = _backup_roster_index(root, unlimited=unlimited)
+    for when, db_path, label, row in index.get(name) or ():
+        yield when, db_path, label, row
 
 
 def _payload_from_checkpoint_file(path, source):
@@ -366,7 +586,9 @@ def resolve_unhakai_payload(character_name, *, root=None, pick=None):
             )
         )
 
-    for when, db_path, label, char_row in iter_backup_db_hits(name, root=root):
+    for when, db_path, label, char_row in iter_backup_db_hits(
+        name, root=root, unlimited=True,
+    ):
         candidates.append(
             (
                 _parse_iso(when),
@@ -384,6 +606,17 @@ def resolve_unhakai_payload(character_name, *, root=None, pick=None):
         )
 
     candidates.sort(key=lambda row: row[0] or "", reverse=True)
+    # Prefer a world-backup row over a stale player checkpoint from the
+    # same second (bug report 1437 -- August ``save`` copies must not beat
+    # a September pre-deploy DB that still has the body).
+    if len(candidates) > 1:
+        best_when = candidates[0][0] or ""
+        same = [row for row in candidates if (row[0] or "") == best_when]
+        backup = [row for row in same if row[1] == "backup-db"]
+        if backup:
+            candidates = backup + [
+                row for row in candidates if row not in backup
+            ]
     when, kind, path, label, char_row = candidates[0]
     if kind == "checkpoint":
         payload = _payload_from_checkpoint_file(path, "player-checkpoint")
@@ -470,6 +703,36 @@ def recreate_character_from_payload(game, payload):
     if not ok:
         return None, msg
     return char, "ok"
+
+
+def perform_unhakai(game, name):
+    """Restore a missing body from hakai archive, checkpoint, or backup DB.
+
+    Returns ``(character, source_label, error)``. On success *error* is
+    None. Shared by ``gm unhakai`` and the Discord staff-ops inbox so a
+    wiped login PC can be brought back without a second ``Game()`` on
+    the live SQLite file (bug report 1437).
+    """
+    want = (name or "").strip()
+    if not want:
+        return None, None, "Unhakai whom? Usage: gm unhakai <name>"
+    existing = live_body_by_storage_key(game, want)
+    if existing is not None:
+        key = getattr(existing, "key", None) or want
+        return None, None, (
+            f"{key} is already in the world. "
+            f"Unhakai only brings back a wiped body. "
+            f"To roll an Echo back to a save tank, type "
+            f"gm restore checkpoint {key}."
+        )
+    root = getattr(game, "report_dir", None)
+    payload, label = resolve_unhakai_payload(want, root=root)
+    if payload is None:
+        return None, None, label
+    restored, msg = recreate_character_from_payload(game, payload)
+    if restored is None:
+        return None, label, f"Unhakai failed: {msg}"
+    return restored, label, None
 
 
 def decode_archive_dir_name(folder):

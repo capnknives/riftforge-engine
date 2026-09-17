@@ -19,6 +19,7 @@ from engine.content_kinds.engine import (
     lint_kind,
     list_kinds,
     normalize_kind,
+    resolve_kind_id,
     validate_kind,
     _clear_profiles_for_tests,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "lint_kind",
     "list_kinds",
     "normalize_kind",
+    "resolve_kind_id",
     "validate_kind",
     "_clear_profiles_for_tests",
     "AuditSection",

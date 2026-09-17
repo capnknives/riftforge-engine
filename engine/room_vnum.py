@@ -5,9 +5,10 @@ Hand-authored rooms (map/zone ``rooms[]``) get a stable human id like
 ``CA00001`` (first + last A–Z of the display name, both uppercase, plus a
 zero-padded sequence under that prefix). New missing VNUMs use
 :func:`scramble_vnum` (hash-seeded neighborhood band) instead of always
-``00001``; :func:`next_vnum` remains the lowest-free fallback. Storage
-keys stay unchanged; GMCP ``Room.Info.num`` uses :func:`pack_vnum` so
-Mudlet stock mappers get an integer.
+``00001``; :func:`next_vnum` remains the lowest-free fallback. After
+Phase 3 the JSON ``key`` / ``game.rooms`` identity **is** that VNUM;
+leftover dig names live on ``legacy_key``. GMCP ``Room.Info.num`` uses
+:func:`pack_vnum` so Mudlet stock mappers get an integer.
 
 Grid / wilderness cells never receive a vnum (``grid_prefix`` set).
 Engine-pure: no ``supers`` imports.
@@ -404,11 +405,109 @@ def stamp_hand_room(
             if dr is room and dk != vnum:
                 rooms.pop(dk, None)
         rooms[vnum] = room
-        if isinstance(aliases, dict):
-            for alias in (leg, old_key):
-                if alias and str(alias).strip() and alias != vnum:
-                    aliases[str(alias).strip()] = vnum
+        for alias in (leg, old_key):
+            note_room_alias(game, alias, vnum)
     return vnum
+
+
+def stamp_json_room_identity(entry, *, taken):
+    """Make a rooms[] dict's JSON key the VNUM.
+
+    Allocates a missing VNUM (or reallocates a colliding stamped one).
+    Leftover leftover-name keys move to ``legacy_key``. ROOM NAME stays
+    on ``title``. Mutates ``entry`` and ``taken``. Returns the VNUM
+    string, or empty when the entry has no key/title to derive from.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    leftover = str(entry.get("key") or "").strip()
+    title = str(entry.get("title") or "").strip()
+    if not leftover and not title:
+        return ""
+
+    raw = entry.get("vnum")
+    vnum = None
+    if raw is not None and str(raw).strip():
+        try:
+            vnum = validate_vnum(raw)
+        except ValueError:
+            vnum = None
+        else:
+            # Keep a room's own VNUM even when ``taken`` already lists it
+            # (Studio re-apply). Reallocate when another room owns it.
+            own = leftover == vnum
+            if vnum in taken and not own:
+                vnum = None
+    if vnum is None:
+        vnum = allocate_vnum_for_name(
+            leftover or title,
+            title or None,
+            taken=taken,
+        )
+    entry["vnum"] = vnum
+    taken.add(vnum)
+
+    if leftover and leftover != vnum:
+        if not str(entry.get("legacy_key") or "").strip():
+            entry["legacy_key"] = leftover
+        if not title:
+            face = bare_key_name(leftover)
+            if face:
+                entry["title"] = face
+        entry["key"] = vnum
+    elif not leftover:
+        entry["key"] = vnum
+    return vnum
+
+
+def rekey_json_room_batch(entries, *, taken, extra_exits=None):
+    """Stamp VNUM identity on a rooms[] batch and remap leftover tokens.
+
+    Exit targets, ``main_homeroom``, and optional ``extra_exits`` leftover
+    names become VNUMs. ``extra_exits`` is mutated in place. Returns the
+    leftover→VNUM alias map (also includes each VNUM→itself).
+    """
+    aliases = {}
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        leftover = str(entry.get("key") or "").strip()
+        vnum = stamp_json_room_identity(entry, taken=taken)
+        if not vnum:
+            continue
+        if leftover:
+            aliases[leftover] = vnum
+        aliases[vnum] = vnum
+        leg = str(entry.get("legacy_key") or "").strip()
+        if leg:
+            aliases[leg] = vnum
+
+    def remap(token):
+        mapped, _changed = _remap_identity_token(token, aliases)
+        return mapped
+
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        exits = entry.get("exits")
+        if isinstance(exits, dict):
+            for direction, dest in list(exits.items()):
+                exits[direction] = remap(dest)
+        if "main_homeroom" in entry:
+            entry["main_homeroom"] = remap(entry.get("main_homeroom"))
+    if extra_exits is not None:
+        remapped = {}
+        for from_key, exits in list(extra_exits.items()):
+            new_from = remap(from_key)
+            new_exits = {
+                direction: remap(dest)
+                for direction, dest in (exits or {}).items()
+            }
+            bucket = remapped.setdefault(new_from, {})
+            bucket.update(new_exits)
+        extra_exits.clear()
+        extra_exits.update(remapped)
+    return aliases
 
 
 def _remap_identity_token(text, aliases):
@@ -424,10 +523,496 @@ def _remap_identity_token(text, aliases):
     return text, False
 
 
+# ---------------------------------------------------------------------------
+# Room ownership identity (engine-pure; no supers imports)
+# ---------------------------------------------------------------------------
+
+# Attrs mirroring persisted ``*_rooms`` SQL tables (``engine.persistence``).
+_ROOM_OWNER_ID_ATTRS = (
+    ("homestead_plot_id", "homestead_plot"),
+    ("personal_realm_id", "personal_realm"),
+    ("player_shop_id", "player_shop"),
+    ("demesne_id", "demesne"),
+    ("township_id", "township"),
+    ("dream_pocket_id", "dream_pocket"),
+    ("realm_town_id", "realm_town"),
+    ("homestead_owner", "homestead_owner"),
+    ("djinn_instance_id", "djinn_instance"),
+    ("dungeon_party_run_id", "dungeon_party"),
+    ("gabriel_pocket_instance_id", "gabriel_pocket"),
+    ("mine_room_id", "mine_room"),
+    ("rowena_portal_run_id", "rowena_portal"),
+)
+
+# Runtime instance / claim markers — not in every SQL table but block title fold.
+_ROOM_INSTANCE_BOOL_ATTRS = (
+    "is_vehicle_interior",
+    "virtual_mine",
+    "dungeon_instance",
+    "is_hotel_room",
+    "is_prison_cell",
+    "purgatory_pit",
+)
+
+# Shared title among multiple owners — alias guard treats as poison-prone.
+_AMBIGUOUS_TITLE_OWNER = ("ambiguous_title", "*")
+
+
+def _nonempty_owner_id(value):
+    """Normalize owner/id stamps: ``None`` / ``""`` / ``0`` are unset."""
+    if value is None or value is False:
+        return None
+    text = str(value).strip()
+    if not text or text == "0":
+        return None
+    return text
+
+
+def _room_attr_owner_token(room):
+    """Owner token from room attrs only (no ``game`` side indexes)."""
+    if room is None:
+        return None
+    for attr, kind in _ROOM_OWNER_ID_ATTRS:
+        ident = _nonempty_owner_id(getattr(room, attr, None))
+        if ident:
+            return (kind, ident)
+    for attr in _ROOM_INSTANCE_BOOL_ATTRS:
+        if getattr(room, attr, False):
+            marker = getattr(room, "key", None) or attr
+            return (attr, str(marker))
+    # ``lodging.claim_house`` stamps is_house/is_home without homestead_plot_id.
+    if getattr(room, "is_home", False) and (
+        getattr(room, "is_house", False) or getattr(room, "private_home", False)
+    ):
+        owner = _nonempty_owner_id(getattr(room, "homestead_owner", None))
+        if owner:
+            return ("homestead_owner", owner)
+        ident = internal_room_key(room) or getattr(room, "key", "") or "claimed_home"
+        return ("claimed_home", ident)
+    return None
+
+
+def _index_game_owner_keys(index, game):
+    """Fill ``index["key"]`` from plot/shop/town side dicts on ``game``."""
+    if game is None:
+        return
+
+    def _stamp(key, tok):
+        text = str(key or "").strip()
+        if text:
+            index["key"][text] = tok
+
+    for plot in (getattr(game, "homestead_plots", None) or {}).values():
+        if not isinstance(plot, dict):
+            continue
+        pid = _nonempty_owner_id(plot.get("plot_id"))
+        if not pid:
+            continue
+        tok = ("homestead_plot", pid)
+        for field in ("hub_room_key", "cell_room_key"):
+            _stamp(plot.get(field), tok)
+        meta = plot.get("meta")
+        if isinstance(meta, dict):
+            for field in ("yard_shop_room_key", "garage_pad_room_key"):
+                _stamp(meta.get(field), tok)
+
+    for shop in (getattr(game, "player_shops", None) or {}).values():
+        if not isinstance(shop, dict):
+            continue
+        sid = _nonempty_owner_id(shop.get("shop_id"))
+        if not sid:
+            continue
+        tok = ("player_shop", sid)
+        for field in ("host_room_key", "hub_room_key"):
+            _stamp(shop.get(field), tok)
+
+    for town in (getattr(game, "townships", None) or {}).values():
+        if not isinstance(town, dict):
+            continue
+        tid = _nonempty_owner_id(town.get("town_id"))
+        if not tid:
+            continue
+        tok = ("township", tid)
+        for field in ("hub_room_key", "mouth_room_key"):
+            _stamp(town.get(field), tok)
+
+    for realm in (getattr(game, "personal_realms", None) or {}).values():
+        if not isinstance(realm, dict):
+            continue
+        rid = _nonempty_owner_id(realm.get("realm_id"))
+        if not rid:
+            continue
+        tok = ("personal_realm", rid)
+        _stamp(realm.get("hub_room_key"), tok)
+
+    for pocket in (getattr(game, "dream_pockets", None) or {}).values():
+        if not isinstance(pocket, dict):
+            continue
+        pid = _nonempty_owner_id(pocket.get("pocket_id"))
+        if not pid:
+            continue
+        tok = ("dream_pocket", pid)
+        for field in ("hub_room_key", "anchor_room_key"):
+            _stamp(pocket.get(field), tok)
+
+    for demesne in (getattr(game, "demesnes", None) or {}).values():
+        if not isinstance(demesne, dict):
+            continue
+        did = _nonempty_owner_id(demesne.get("demesne_id"))
+        if not did:
+            continue
+        tok = ("demesne", did)
+        for field in ("hub_room_key", "host_hub_key"):
+            _stamp(demesne.get(field), tok)
+
+
+def _build_room_owner_index(game):
+    """Cache maps for key/legacy/title → owner token (per boot heal pass).
+
+    Keyed on rooms/plots identity *and* length plus a generation counter,
+    because ``id(game.rooms)`` stays the same while stamp inserts a hall
+    (shared-title fail-open) and because ``load_homesteads`` stamps
+    ``homestead_plot_id`` onto rooms that already sit in the dict.
+    """
+    if game is None:
+        return {"key": {}, "legacy": {}, "title_owners": {}}
+    stamp = _owner_index_stamp(game)
+    cached = getattr(game, "_room_owner_index_cache", None)
+    if isinstance(cached, dict) and cached.get("_stamp") == stamp:
+        return cached
+    index = {"key": {}, "legacy": {}, "title_owners": {}, "_stamp": stamp}
+    rooms = getattr(game, "rooms", None) or {}
+    for room in list((rooms or {}).values()):
+        _index_room_owner_token(index, room)
+    _index_game_owner_keys(index, game)
+    game._room_owner_index_cache = index
+    return index
+
+
+def _index_room_owner_token(index, room):
+    """Fold one room's owner token into ``index`` (no-op when unowned).
+
+    Split out of :func:`_build_room_owner_index` so a bulk insert can add
+    rooms one at a time (:class:`RoomAliasBatch`) and get byte-identical
+    maps to a full rebuild.
+    """
+    if room is None:
+        return
+    tok = _room_attr_owner_token(room)
+    if tok is None:
+        return
+    for candidate in (
+        getattr(room, "key", None),
+        internal_room_key(room),
+        getattr(room, "vnum", None),
+    ):
+        text = str(candidate or "").strip()
+        if text:
+            index["key"][text] = tok
+    leg = str(getattr(room, "legacy_key", None) or "").strip()
+    if leg:
+        index["legacy"][leg] = tok
+    title = (room_name(room) or "").strip().lower()
+    if title:
+        index["title_owners"].setdefault(title, set()).add(tok)
+
+
+def _owner_index_stamp(game):
+    """Identity of the live rooms/plots maps plus an explicit generation."""
+    rooms = getattr(game, "rooms", None)
+    plots = getattr(game, "homestead_plots", None)
+    return (
+        getattr(game, "_room_owner_index_gen", 0),
+        id(rooms),
+        len(rooms) if isinstance(rooms, dict) else 0,
+        id(plots),
+        len(plots) if isinstance(plots, dict) else 0,
+    )
+
+
+def invalidate_room_owner_index(game):
+    """Drop the owner-index cache after plot_id stamps or alias purges."""
+    if game is None:
+        return
+    game._room_owner_index_gen = getattr(game, "_room_owner_index_gen", 0) + 1
+    game._room_owner_index_cache = None
+
+
+def room_owner_identity_token(room, game=None, *, index=None):
+    """Return ``(kind, id)`` when ``room`` belongs to an owned pocket."""
+    if room is None:
+        return None
+    tok = _room_attr_owner_token(room)
+    if tok is not None:
+        return tok
+    if game is None:
+        return None
+    if index is None:
+        index = _build_room_owner_index(game)
+    ident = internal_room_key(room) or getattr(room, "key", "") or ""
+    return index["key"].get(ident)
+
+
+def room_has_owner_identity(room, game=None) -> bool:
+    """True when ``room`` is owner-scoped (attrs or ``game`` side indexes)."""
+    return room_owner_identity_token(room, game) is not None
+
+
+def hand_room_title_fold_eligible(game, room) -> bool:
+    """True only for positively unowned map-loaded hand rooms.
+
+    Conservative default: if we cannot prove the room is generic world
+    content, title-collapse must not touch it.
+    """
+    if room is None or not is_hand_room(room):
+        return False
+    if room_owner_identity_token(room, game) is not None:
+        return False
+    if game is not None:
+        index = _build_room_owner_index(game)
+        ident = internal_room_key(room) or getattr(room, "key", "") or ""
+        if ident and index["key"].get(ident):
+            return False
+        leg = str(getattr(room, "legacy_key", None) or "").strip()
+        if leg and index["legacy"].get(leg):
+            return False
+    return True
+
+
+def build_room_direct_index(game):
+    """Pre-build ``key`` / ``legacy_key`` → Room for leftover resolution.
+
+    Replaces :func:`_resolve_room_direct`'s fallback ``rooms.values()`` scan
+    with a dict hit. First writer wins so a duplicate key/legacy resolves to
+    the same room the scan returned (dict iteration is insertion order).
+
+    Deliberately **not** cached on ``game``: a stale key→Room map would hand
+    a boot heal a room that has since been deleted or rekeyed. Build it for
+    one pass, then drop it.
+    """
+    direct = {}
+    rooms = getattr(game, "rooms", None) if game is not None else None
+    if not isinstance(rooms, dict):
+        return direct
+    for room in rooms.values():
+        _index_room_direct(direct, room)
+    return direct
+
+
+def _index_room_direct(direct, room):
+    """Fold one room's key / legacy_key into a ``build_room_direct_index`` map."""
+    if room is None:
+        return
+    key = str(getattr(room, "key", "") or "").strip()
+    if key:
+        direct.setdefault(key, room)
+    leg = str(getattr(room, "legacy_key", None) or "").strip()
+    if leg:
+        direct.setdefault(leg, room)
+
+
+def _resolve_room_direct(game, token, *, direct=None):
+    """Resolve a token to a Room without following ``room_aliases``.
+
+    ``direct`` is an optional pre-built map from
+    :func:`build_room_direct_index`; when given it replaces the fallback
+    ``rooms.values()`` scan with a dict hit.
+    """
+    if game is None or not token:
+        return None
+    text = str(token).strip()
+    if not text:
+        return None
+    rooms = getattr(game, "rooms", None)
+    if not isinstance(rooms, dict):
+        return None
+    hit = rooms.get(text)
+    if hit is not None:
+        return hit
+    parsed = parse_vnum(text)
+    if parsed is not None:
+        vnum = format_vnum(*parsed)
+        hit = rooms.get(vnum)
+        if hit is not None:
+            return hit
+    if direct is not None:
+        return direct.get(text)
+    for room in list((rooms or {}).values()):
+        if room is None:
+            continue
+        if str(getattr(room, "key", "") or "").strip() == text:
+            return room
+        leg = str(getattr(room, "legacy_key", None) or "").strip()
+        if leg == text:
+            return room
+    return None
+
+
+def _owner_for_leftover_token(game, token, *, index=None, direct=None):
+    """Owner token for a leftover name — never follows alias under test."""
+    if game is None or not token:
+        return None
+    text = str(token).strip()
+    if not text:
+        return None
+    if index is None:
+        index = _build_room_owner_index(game)
+    if text in index["key"]:
+        return index["key"][text]
+    if text in index["legacy"]:
+        return index["legacy"][text]
+    room = _resolve_room_direct(game, text, direct=direct)
+    if room is not None:
+        tok = room_owner_identity_token(room, game, index=index)
+        if tok is not None:
+            return tok
+    title_key = text.lower()
+    owners = index["title_owners"].get(title_key)
+    if owners:
+        if len(owners) > 1:
+            return _AMBIGUOUS_TITLE_OWNER
+        return next(iter(owners))
+    return None
+
+
+def _owners_conflict(src_owner, tgt_owner) -> bool:
+    """True when a remap/alias would cross an ownership boundary.
+
+    Unowned→unowned (both ``None``) is the title-fold path and is allowed.
+    Owned leftover onto an unowned VNUM (Town Park, etc.) is not — that
+    is how a poisoned dual-read rewrote ``home_room_key`` off the plot.
+    """
+    if src_owner == _AMBIGUOUS_TITLE_OWNER:
+        return True
+    if src_owner is None and tgt_owner is None:
+        return False
+    if src_owner is None or tgt_owner is None:
+        return True
+    return src_owner != tgt_owner
+
+
+def room_has_stamped_vnum(room) -> bool:
+    """True when ``room`` already carries its own VNUM identity."""
+    if room is None:
+        return False
+    key = getattr(room, "key", None) or ""
+    if parse_vnum(key) is not None:
+        return True
+    raw = getattr(room, "vnum", None)
+    if raw is None or not str(raw).strip():
+        return False
+    try:
+        validate_vnum(raw)
+        return True
+    except ValueError:
+        return False
+
+
+def _ownership_boundary_blocks_merge(left, right, *, label: str, log=True, game=None):
+    """Refuse graph merges / content moves across different owner pockets."""
+    left_tok = room_owner_identity_token(left, game)
+    right_tok = room_owner_identity_token(right, game)
+    if left_tok is None and right_tok is None:
+        return False
+    if left_tok == right_tok:
+        return False
+    if log:
+        left_label = getattr(left, "key", None) or "?"
+        right_label = getattr(right, "key", None) or "?"
+        print(
+            f"[boot heal] REFUSE {label}: ownership boundary "
+            f"{left_label!r} ({left_tok}) vs {right_label!r} ({right_tok})",
+            flush=True,
+        )
+    return True
+
+
+def _alias_crosses_owner_boundary(game, leftover, vnum, *,
+                                  index=None, direct=None) -> bool:
+    """True when ``leftover`` → ``vnum`` would poison dual-read.
+
+    ``index`` / ``direct`` let a bulk caller (:class:`RoomAliasBatch`) supply
+    maps it maintains itself instead of paying a rebuild and a room scan.
+    """
+    if game is None:
+        return False
+    if index is None:
+        index = _build_room_owner_index(game)
+    src_owner = _owner_for_leftover_token(
+        game, leftover, index=index, direct=direct,
+    )
+    tgt_room = _resolve_room_direct(game, vnum, direct=direct)
+    if tgt_room is None:
+        return False
+    tgt_owner = room_owner_identity_token(tgt_room, game, index=index)
+    if not _owners_conflict(src_owner, tgt_owner):
+        return False
+    print(
+        f"[boot heal] REFUSE room alias: {leftover!r} -> {vnum!r} "
+        f"(source owner {src_owner!r}, target owner {tgt_owner!r})",
+        flush=True,
+    )
+    return True
+
+
+def _self_loop_heal_skips_room(room) -> bool:
+    """Rooms whose self-loops must survive engine heal.
+
+    Homestead plots: ``supers.homestead.repair_homestead_plot_graph`` rewires
+    looping east from reverse evidence (bug reports 1523 / 1525).
+
+    Demesne micro cells: placeholder self-loops are intentional —
+    ``try_demesne_move`` depends on them.
+
+    Shop / township / dream / realm / street-home rooms have no sibling
+    repair — engine heal must still drop accidental self-loops there.
+    """
+    if _nonempty_owner_id(getattr(room, "homestead_plot_id", None)):
+        return True
+    if _nonempty_owner_id(getattr(room, "demesne_id", None)):
+        return True
+    return False
+
+
+def _remap_identity_token_guarded(game, text, aliases, *, expect_owner=None):
+    """Like :func:`_remap_identity_token` but refuse cross-owner alias hops."""
+    new, ch = _remap_identity_token(text, aliases)
+    if not ch or game is None:
+        return new, ch
+    target = lookup_room(game, new)
+    if target is None:
+        return new, ch
+    index = _build_room_owner_index(game)
+    src_owner = _owner_for_leftover_token(game, text, index=index)
+    tgt_owner = room_owner_identity_token(target, game, index=index)
+    if _owners_conflict(src_owner, tgt_owner):
+        print(
+            f"[boot heal] REFUSE string-ref remap {text!r} -> {new!r}: "
+            f"source owner {src_owner!r} vs target owner {tgt_owner!r}"
+            + (
+                f" (expected {expect_owner!r})"
+                if expect_owner is not None
+                else ""
+            ),
+            flush=True,
+        )
+        return text, False
+    if expect_owner is not None and tgt_owner is not None and tgt_owner != expect_owner:
+        print(
+            f"[boot heal] REFUSE string-ref remap {text!r} -> {new!r}: "
+            f"expected owner {expect_owner}, target has {tgt_owner}",
+            flush=True,
+        )
+        return text, False
+    return new, ch
+
+
 def heal_hand_room_string_refs(game) -> int:
     """Remap ``main_homeroom`` / homestead plot keys via ``room_aliases``.
 
-    Idempotent. Returns how many fields were rewritten.
+    Idempotent. Returns how many fields were rewritten. Skips remaps that
+    would follow a poisoned alias across an ownership boundary (a prior bad
+    title-fold could map one plot's dig key at another player's VNUM).
     """
     if game is None:
         return 0
@@ -439,7 +1024,10 @@ def heal_hand_room_string_refs(game) -> int:
         if room is None:
             continue
         raw = getattr(room, "main_homeroom", None)
-        new, ch = _remap_identity_token(raw, aliases)
+        expect = room_owner_identity_token(room, game)
+        new, ch = _remap_identity_token_guarded(
+            game, raw, aliases, expect_owner=expect,
+        )
         if ch:
             room.main_homeroom = new
             changed += 1
@@ -447,8 +1035,12 @@ def heal_hand_room_string_refs(game) -> int:
     for plot in plots.values():
         if not isinstance(plot, dict):
             continue
+        plot_id = str(plot.get("plot_id") or "").strip()
+        expect = ("homestead_plot", plot_id) if plot_id else None
         for field in ("hub_room_key", "cell_room_key"):
-            new, ch = _remap_identity_token(plot.get(field), aliases)
+            new, ch = _remap_identity_token_guarded(
+                game, plot.get(field), aliases, expect_owner=expect,
+            )
             if ch:
                 plot[field] = new
                 changed += 1
@@ -456,7 +1048,9 @@ def heal_hand_room_string_refs(game) -> int:
         if not isinstance(meta, dict):
             continue
         for field in ("yard_shop_room_key", "garage_pad_room_key"):
-            new, ch = _remap_identity_token(meta.get(field), aliases)
+            new, ch = _remap_identity_token_guarded(
+                game, meta.get(field), aliases, expect_owner=expect,
+            )
             if ch:
                 meta[field] = new
                 changed += 1
@@ -539,7 +1133,7 @@ def staff_room_label(room) -> str:
 
     Players must never see this form -- use :func:`room_name` for ordinary
     look. Dig tools that still need the graph id use
-    :func:`internal_room_key` (compat until Phase 3).
+    :func:`internal_room_key` (VNUM for stamped hand rooms).
     """
     name = room_name(room) or (getattr(room, "key", "") if room else "")
     if room is None:
@@ -626,10 +1220,7 @@ def describe_room_key(game, key, *, staff: bool = False, fallback="somewhere"):
     text = str(key or "").strip()
     if not text:
         return fallback
-    rooms = getattr(game, "rooms", None) if game is not None else None
-    room = None
-    if isinstance(rooms, dict):
-        room = rooms.get(text)
+    room = lookup_room(game, text)
     if room is not None:
         label = describe_room(room, staff=staff)
         if label and label != "?":
@@ -855,6 +1446,13 @@ def _rewrite_hand_room_refs_in_doc(data, old_key, new_key):
     for pocket in data.get("pockets") or []:
         if pocket.get("hub_room") == old_key:
             pocket["hub_room"] = new_key
+        if pocket.get("entry_room") == old_key:
+            pocket["entry_room"] = new_key
+    if data.get("runtime_hub") == old_key:
+        data["runtime_hub"] = new_key
+    for field in ("entry_room", "start_room", "hub_room"):
+        if data.get(field) == old_key:
+            data[field] = new_key
     grid = data.get("grid")
     if isinstance(grid, dict):
         for portal in grid.get("portals") or []:
@@ -946,10 +1544,215 @@ def normalize_hand_room_identities_in_map_docs(map_files) -> list[str]:
     return logs
 
 
-def lookup_room(game, key):
-    """Find a Room by VNUM identity key or legacy storage key.
+def _aliases_table(game):
+    """Return ``game.room_aliases``, creating the dict when missing."""
+    aliases = getattr(game, "room_aliases", None)
+    if aliases is None:
+        game.room_aliases = {}
+        aliases = game.room_aliases
+    return aliases if isinstance(aliases, dict) else {}
 
-    Prefers ``game.rooms`` (Phase 3 identity), then ``game.room_aliases``.
+
+def _ensure_alias_fold(game):
+    """Live leftover→VNUM fold. Rebuilds only when the alias table is replaced.
+
+    Do **not** key this on ``_static_room_graph_gen``. Stamp/insert bumps that
+    gen on every authored room; rebuilding the fold each time is O(aliases)
+    per insert (boot quadratic). :func:`note_room_alias` updates the live
+    map in O(1).
+    """
+    aliases = getattr(game, "room_aliases", None) or {}
+    if not isinstance(aliases, dict):
+        return {}
+    fold = getattr(game, "_room_alias_fold", None)
+    bound = getattr(game, "_room_alias_fold_id", None)
+    if not isinstance(fold, dict) or bound != id(aliases):
+        fold = {str(aka).lower(): vnum for aka, vnum in aliases.items()}
+        game._room_alias_fold = fold
+        game._room_alias_fold_id = id(aliases)
+    return fold
+
+
+def _alias_would_poison_owner_boundary(game, leftover, vnum, *,
+                                       index=None, direct=None) -> bool:
+    """True when recording ``leftover`` → ``vnum`` crosses owner pockets."""
+    return _alias_crosses_owner_boundary(
+        game, leftover, vnum, index=index, direct=direct,
+    )
+
+
+def find_poisoned_room_aliases(game) -> list[dict]:
+    """Return poisoned alias rows with owner detail (does not mutate).
+
+    Resolves the leftover **without** following the alias under test so
+    legacy-name / shared-title poison is visible even when ``lookup_room``
+    would already return the wrong room.
+    """
+    if game is None:
+        return []
+    aliases = getattr(game, "room_aliases", None) or {}
+    if not isinstance(aliases, dict):
+        return []
+    index = _build_room_owner_index(game)
+    # One leftover→Room map for the whole table: the per-alias fallback is a
+    # full rooms scan, which made this heal O(aliases × rooms).
+    direct = build_room_direct_index(game)
+    poisoned: list[dict] = []
+    for leftover, vnum in aliases.items():
+        if not leftover or not vnum or leftover == vnum:
+            continue
+        src_owner = _owner_for_leftover_token(
+            game, leftover, index=index, direct=direct,
+        )
+        tgt_room = _resolve_room_direct(game, vnum, direct=direct)
+        if tgt_room is None:
+            continue
+        tgt_owner = room_owner_identity_token(tgt_room, game, index=index)
+        if not _owners_conflict(src_owner, tgt_owner):
+            continue
+        poisoned.append(
+            {
+                "leftover": str(leftover),
+                "target_vnum": str(vnum),
+                "source_owner": src_owner,
+                "target_owner": tgt_owner,
+            }
+        )
+    return poisoned
+
+
+def drop_poisoned_room_aliases(game) -> list[dict]:
+    """Remove cross-owner alias rows; return the rows dropped.
+
+    Always rebuilds the owner index first so a load that just stamped
+    ``homestead_plot_id`` onto existing rooms is visible.
+    """
+    invalidate_room_owner_index(game)
+    rows = find_poisoned_room_aliases(game)
+    for row in rows:
+        drop_room_alias(game, row["leftover"])
+    return rows
+
+
+class RoomAliasBatch:
+    """Incremental owner/direct indexes for a bulk room insert.
+
+    ``note_room_alias`` runs an ownership-poison guard, and on a miss that
+    guard costs two full passes over ``game.rooms``: a rebuild of the owner
+    index (its cache key includes ``len(game.rooms)``, so a *growing* dict
+    never hits) plus the fallback room scan in ``_resolve_room_direct``.
+    Calling it once per room while filling ``game.rooms`` is therefore
+    O(N²) -- on live (~19k rooms) that was ~190s of the ~280s boot, and
+    every auto-deploy boot probe paid it a second time.
+
+    This keeps both maps and folds each room in as it is inserted, so the
+    guard still sees **exactly** the rooms present at that moment. The
+    decisions are unchanged; only the cost is. Batching them to decide
+    against the *finished* room set would be cheaper still, but it is not
+    the same answer -- shared-title rooms flip to ambiguous once their twin
+    lands -- so this keeps insert-time semantics.
+
+    Scoped to one bulk insert and then dropped; nothing is cached on
+    ``game``, so there is no stale-index window.
+    """
+
+    def __init__(self, game):
+        """Snapshot the pre-existing rooms, then fold new ones in."""
+        self.game = game
+        # Deep-enough copy: folding must not mutate the cache other callers
+        # hold. title_owners values are sets, so copy those too.
+        base = _build_room_owner_index(game)
+        self.index = {
+            "key": dict(base.get("key") or {}),
+            "legacy": dict(base.get("legacy") or {}),
+            "title_owners": {
+                title: set(toks)
+                for title, toks in (base.get("title_owners") or {}).items()
+            },
+            "_stamp": None,
+        }
+        self.direct = build_room_direct_index(game)
+        # A full rebuild applies the plot/shop/township side keys *after*
+        # every room, so those win on a key collision. Replay them onto any
+        # room key we fold in later to keep that precedence.
+        side = {"key": {}, "legacy": {}, "title_owners": {}}
+        _index_game_owner_keys(side, game)
+        self._side_keys = side["key"]
+        self.index["key"].update(self._side_keys)
+
+    def add_room(self, room):
+        """Fold a just-inserted room into both maps."""
+        _index_room_owner_token(self.index, room)
+        _index_room_direct(self.direct, room)
+        if not self._side_keys:
+            return
+        for candidate in (
+            getattr(room, "key", None),
+            internal_room_key(room),
+            getattr(room, "vnum", None),
+        ):
+            text = str(candidate or "").strip()
+            if text and text in self._side_keys:
+                self.index["key"][text] = self._side_keys[text]
+
+    def note(self, leftover, vnum):
+        """Record one alias using the maintained maps (no rebuild, no scan)."""
+        note_room_alias(
+            self.game, leftover, vnum, index=self.index, direct=self.direct,
+        )
+
+
+def note_room_alias(game, leftover, vnum, *, index=None, direct=None):
+    """Record leftover dig name → VNUM for O(1) dual-read (tick-safe).
+
+    Call sites that still write ``room_aliases[name] = vnum`` by hand
+    keep exact ``rooms.get`` working; this helper also keeps the
+    case-folded index in step so Cadence homeward hops stay O(1).
+
+    Refuses aliases that would map one owner's room key at another
+    owner's VNUM (title-fold poisoning).
+    """
+    if game is None:
+        return
+    text = str(leftover or "").strip()
+    ident = str(vnum or "").strip()
+    if not text or not ident or text == ident:
+        return
+    if _alias_would_poison_owner_boundary(
+        game, text, ident, index=index, direct=direct,
+    ):
+        return
+    aliases = _aliases_table(game)
+    aliases[text] = ident
+    fold = _ensure_alias_fold(game)
+    fold[text.lower()] = ident
+
+
+def drop_room_alias(game, leftover):
+    """Drop a leftover name from the alias table and fold (room delete)."""
+    if game is None or not leftover:
+        return
+    text = str(leftover).strip()
+    if not text:
+        return
+    aliases = getattr(game, "room_aliases", None)
+    if isinstance(aliases, dict):
+        aliases.pop(text, None)
+    fold = getattr(game, "_room_alias_fold", None)
+    if isinstance(fold, dict):
+        fold.pop(text.lower(), None)
+
+
+def lookup_room(game, key):
+    """Find a Room by VNUM identity key or leftover storage key.
+
+    O(1): ``game.rooms`` (RoomMap resolves leftover names, VNUM case-fold,
+    and the live alias fold), then the leftover ``room_aliases`` table for
+    plain-dict stubs. Does **not** walk ``rooms.values()`` -- that miss
+    scan nested inside Cadence homeward BFS after Phase 3 wired every hop
+    through this helper. Staff ``goto`` still uses :func:`resolve_room`
+    for ROOM NAME scans. Call sites keep using this helper / ``room_keys_match``
+    -- do not revert them to raw ``==`` on dig names.
     """
     if game is None or not key:
         return None
@@ -957,31 +1760,72 @@ def lookup_room(game, key):
     if not text:
         return None
     rooms = getattr(game, "rooms", None)
-    if isinstance(rooms, dict):
-        hit = rooms.get(text)
-        if hit is not None:
-            return hit
+    if not isinstance(rooms, dict):
+        return None
+    hit = rooms.get(text)
+    if hit is not None:
+        return hit
+    # Production Game uses RoomMap -- get() already resolved leftover
+    # names, VNUM case-fold, and the fold. Plain-dict smoke stubs need
+    # the same steps without walking rooms.values().
     aliases = getattr(game, "room_aliases", None) or {}
-    mapped = aliases.get(text)
-    if mapped and isinstance(rooms, dict):
-        hit = rooms.get(mapped)
-        if hit is not None:
-            return hit
-    # Case-insensitive alias / key scan (legacy tips).
-    lowered = text.lower()
-    for aka, vnum in aliases.items():
-        if str(aka).lower() == lowered and isinstance(rooms, dict):
+    if isinstance(aliases, dict):
+        mapped = aliases.get(text)
+        if mapped:
+            hit = rooms.get(mapped)
+            if hit is not None:
+                return hit
+    parsed = parse_vnum(text)
+    if parsed is not None:
+        vnum = format_vnum(*parsed)
+        if vnum != text:
             hit = rooms.get(vnum)
             if hit is not None:
                 return hit
-    if isinstance(rooms, dict):
-        for room in rooms.values():
-            if (getattr(room, "key", "") or "").lower() == lowered:
-                return room
-            leg = getattr(room, "legacy_key", None)
-            if leg and str(leg).lower() == lowered:
-                return room
+    mapped = _ensure_alias_fold(game).get(text.lower())
+    if mapped:
+        hit = rooms.get(mapped)
+        if hit is not None:
+            return hit
     return None
+
+
+def canonical_persisted_room_key(game, token) -> str:
+    """VNUM identity for a stored room token, else the original string.
+
+    Phase 3 dual-write: boot heal and persist blobs should store the live
+    ``internal_room_key`` (VNUM for stamped hand rooms) so the next load
+    does not depend on leftover dig names. Unresolvable tokens stay as-is
+    (grid cells, missing maps, ephemeral pockets).
+
+    Refuses to hop across an ownership boundary — a poisoned alias must
+    not rewrite ``home_room_key`` / ``main_homeroom`` onto another
+    player's VNUM on save (bug reports 1531–1533).
+    """
+    text = str(token or "").strip()
+    if not text:
+        return token if token is None else text
+    index = _build_room_owner_index(game) if game is not None else None
+    src_owner = (
+        _owner_for_leftover_token(game, text, index=index)
+        if game is not None
+        else None
+    )
+    room = lookup_room(game, text)
+    if room is None:
+        return text
+    ident = internal_room_key(room) or (getattr(room, "key", "") or "")
+    if not ident or ident == text:
+        return text
+    tgt_owner = room_owner_identity_token(room, game, index=index)
+    if _owners_conflict(src_owner, tgt_owner):
+        print(
+            f"[boot heal] REFUSE persist canonicalize {text!r} -> {ident!r}: "
+            f"source owner {src_owner!r} vs target owner {tgt_owner!r}",
+            flush=True,
+        )
+        return text
+    return ident
 
 
 def room_keys_match(game, left, right) -> bool:
@@ -990,6 +1834,9 @@ def room_keys_match(game, left, right) -> bool:
     After Phase-3 VNUM rekey, ``room.key`` is ``BS00002`` while authored
     quests/tutorials still name ``Bunker Library Stacks`` (``legacy_key`` /
     ``room_aliases``). Compare identity, not raw strings.
+
+    Pathfind ``is_goal`` calls this once per BFS node. Both sides must
+    stay O(1) -- a miss must not scan the atlas.
     """
     if left is None or right is None:
         return False
@@ -1002,12 +1849,17 @@ def room_keys_match(game, left, right) -> bool:
     if game is None:
         return False
     left_room = lookup_room(game, left_s)
+    if left_room is None:
+        return False
+    # Same object via leftover_key / VNUM without a second dict probe when
+    # the caller already passed this room's identity or leftover name.
+    if right_s == (getattr(left_room, "key", "") or ""):
+        return True
+    leg = getattr(left_room, "legacy_key", None)
+    if leg and str(leg).strip() == right_s:
+        return True
     right_room = lookup_room(game, right_s)
-    return (
-        left_room is not None
-        and right_room is not None
-        and left_room is right_room
-    )
+    return right_room is not None and left_room is right_room
 
 
 def _hand_room_canonical_score(room) -> int:
@@ -1055,6 +1907,12 @@ def heal_duplicate_hand_room_titles(game) -> dict:
     Live map-backup merge can leave both ``The Waystation`` (legacy dig key)
     and ``TN00001`` (VNUM identity) with the same ROOM NAME. Staff ``goto``
     then lists two matches -- one with VNUM chrome, one without.
+
+    **Opt-in for unowned map rooms only.** Owned pockets (homestead plots,
+    demesnes, shops, townships, realms, dream pockets, street-home owners)
+    legitimately reuse template ROOM NAMEs -- never merge them. Two stamped
+    VNUM identities are always distinct rooms. Contents never move across an
+    ownership boundary; the whole fold is skipped when that would happen.
     """
     stats = {"removed": 0, "moved": 0, "rewired_exits": 0}
     if game is None:
@@ -1067,8 +1925,8 @@ def heal_duplicate_hand_room_titles(game) -> dict:
     for room in rooms.values():
         if room is None or not is_hand_room(room):
             continue
-        # Never collapse parallel God demesne instances (pit uses purgatory_pit).
-        if getattr(room, "demesne_id", None):
+        # Conservative: only positively unowned map hand rooms may fold.
+        if not hand_room_title_fold_eligible(game, room):
             continue
         name = (room_name(room) or "").strip().lower()
         if not name:
@@ -1088,15 +1946,36 @@ def heal_duplicate_hand_room_titles(game) -> dict:
         canonical, best = scored[0]
         if best <= 0:
             continue
+        if not room_has_stamped_vnum(canonical):
+            # Canonical must be the VNUM hub we fold into.
+            continue
         canon_key = internal_room_key(canonical)
         if not canon_key:
             continue
         for stale, score in scored[1:]:
             if stale is canonical:
                 continue
+            # Two stamped VNUM identities are different rooms even when the
+            # ROOM NAME matches. Only fold leftover dig-key shells into the
+            # VNUM hub (The Waystation → TN00001).
+            if room_has_stamped_vnum(stale):
+                continue
+            if not hand_room_title_fold_eligible(game, stale):
+                continue
+            if _ownership_boundary_blocks_merge(
+                canonical, stale, label="hand-room title fold", game=game,
+            ):
+                continue
             for obj in list(getattr(stale, "contents", ()) or ()):
                 if hasattr(obj, "move_to"):
                     obj.move_to(canonical)
+                    stats["moved"] += 1
+            from engine.char_index import iter_characters
+            from engine.world import safe_place
+
+            for occupant in list(iter_characters(game)):
+                if getattr(occupant, "location", None) is stale:
+                    safe_place(occupant, canonical)
                     stats["moved"] += 1
             _rewire_room_graph_pointers(game, stale, canonical, stats)
             stale_key = getattr(stale, "key", None)
@@ -1104,16 +1983,43 @@ def heal_duplicate_hand_room_titles(game) -> dict:
                 if dr is stale:
                     rooms.pop(dk, None)
             if stale_key:
-                aliases[stale_key] = canon_key
+                note_room_alias(game, stale_key, canon_key)
             leg = getattr(stale, "legacy_key", None)
             if leg:
-                aliases[str(leg)] = canon_key
+                note_room_alias(game, leg, canon_key)
             title = room_name(stale)
             if title:
-                aliases[title] = canon_key
+                note_room_alias(game, title, canon_key)
             stats["removed"] += 1
 
     return stats
+
+
+def heal_hand_room_self_loop_exits(game) -> int:
+    """Drop compass / in / out exits that point at the room itself.
+
+    Overland virtual cells use placeholder self-loops on purpose -- skip
+    those. Homestead and demesne self-loops are also skipped — see
+    :func:`_self_loop_heal_skips_room`.
+    """
+    if game is None:
+        return 0
+    fixed = 0
+    for room in list((getattr(game, "rooms", None) or {}).values()):
+        if room is None or not is_hand_room(room):
+            continue
+        if _self_loop_heal_skips_room(room):
+            continue
+        if getattr(room, "virtual_overland", False):
+            continue
+        exits = getattr(room, "exits", None)
+        if not isinstance(exits, dict):
+            continue
+        for direction, dest in list(exits.items()):
+            if dest is room:
+                exits.pop(direction, None)
+                fixed += 1
+    return fixed
 
 
 def hub_room(game, name, vnum=None):
@@ -1134,11 +2040,19 @@ def hub_room(game, name, vnum=None):
             hit = rooms.get(vnum)
             if hit is not None:
                 return hit
+    # Persist dual-read first (leftover dig names still find the room).
+    # Staff-facing resolve_room no longer accepts leftover names.
     if name:
+        hit = lookup_room(game, name)
+        if hit is not None:
+            return hit
         room, _ = resolve_room(game, name)
         if room is not None:
             return room
     if vnum:
+        hit = lookup_room(game, vnum)
+        if hit is not None:
+            return hit
         room, _ = resolve_room(game, vnum)
         return room
     return None
@@ -1180,7 +2094,7 @@ def heal_hand_room_title_aliases(game) -> int:
         if not name or title_counts.get(name.lower(), 0) != 1:
             continue
         if aliases.get(name) != vnum:
-            aliases[name] = vnum
+            note_room_alias(game, name, vnum)
             added += 1
     return added
 
@@ -1233,6 +2147,9 @@ def boot_duplicate_hand_room_titles(game, *, exclude_vehicles=True):
             continue
         if exclude_vehicles and name.lower().startswith("inside "):
             continue
+        # Owned / instance rooms legitimately share template ROOM NAMEs.
+        if not hand_room_title_fold_eligible(game, room):
+            continue
         by_name.setdefault(name.lower(), []).append(room)
     hits = [
         (rooms[0].look_title() if hasattr(rooms[0], "look_title") else name, len(rooms))
@@ -1251,34 +2168,52 @@ def heal_character_room_keys(game) -> dict:
     stats = {"room_key": 0, "home": 0, "workplace": 0, "other": 0}
     if game is None:
         return stats
-    aliases = getattr(game, "room_aliases", None) or {}
-    if not aliases:
-        return stats
 
     def _remap(value):
         if not value:
             return value, False
         text = str(value).strip()
-        if text in aliases:
-            return aliases[text], True
-        # Already a VNUM identity key.
-        if isinstance(getattr(game, "rooms", None), dict) and text in game.rooms:
-            return text, False
-        return text, False
+        new = canonical_persisted_room_key(game, text)
+        return new, new != text
 
     blob_fields = (
         ("home_room_key", "home"),
         ("workplace_room_key", "workplace"),
+        ("last_sleep_room_key", "other"),
+        ("logout_room_key", "other"),
+        ("zone_entry_hub_key", "other"),
         ("haunt_room_key", "other"),
         ("chapel_room_key", "other"),
         ("exile_room_key", "other"),
         ("body_room_key", "other"),
         ("gm_spirit_room_key", "other"),
-        ("orbit_return_room", "other"),
-        ("stellar_flight_return_room", "other"),
-        ("vault_return_room", "other"),
+        ("ashen_origin_room_key", "other"),
+        ("gordon_heat_room_key", "other"),
+        ("chargen_start_room_key", "other"),
+        ("trickster_decoy_room_key", "other"),
+        ("site_threshold_room_key", "other"),
+        ("worksite_hq_room_key", "other"),
+        ("cultivator_rival_last_room_key", "other"),
+        ("riftcrash_anchor_room_key", "other"),
+        ("mission_portal_key", "other"),
+        ("limbo_arrival_origin_key", "other"),
+        ("cultivator_cave_heaven_key", "other"),
+        ("djinn_real_room_key", "other"),
+        ("pet_home_room_key", "other"),
+        ("commute_ready_key", "other"),
+        ("prison_cell_key", "other"),
+        ("site_mask_hub_key", "other"),
+        ("fae_banish_return_key", "other"),
+        ("dream_return_key", "other"),
+        ("arachne_nest_home_key", "other"),
+        ("last_earth_loc", "other"),
+        ("cultivator_veil_death_key", "other"),
+        ("worksite_hq_highway_key", "other"),
+        ("worksite_hq_office_key", "other"),
     )
-    for char in list(getattr(game, "characters", None) or []):
+    from engine.char_index import iter_characters
+
+    for char in list(iter_characters(game)):
         loc = getattr(char, "location", None)
         if loc is not None:
             # Location already a Room object -- ensure key is identity.
@@ -1303,6 +2238,19 @@ def heal_character_room_keys(game) -> dict:
             if changed_p:
                 char.protected_rooms = rebuilt
                 stats["other"] += 1
+        brief = getattr(char, "mission_brief", None)
+        if isinstance(brief, dict) and brief:
+            for field in (
+                "portal_room",
+                "home_room_key",
+                "scene_room_key",
+                "nest_room_key",
+            ):
+                raw = brief.get(field)
+                new, changed = _remap(raw)
+                if changed:
+                    brief[field] = new
+                    stats["other"] += 1
         # known_exits dict keys
         known = getattr(char, "known_exits", None)
         if isinstance(known, dict) and known:
@@ -1315,6 +2263,67 @@ def heal_character_room_keys(game) -> dict:
             if changed_k:
                 char.known_exits = rebuilt
                 stats["other"] += 1
+        visited = getattr(char, "visited_room_keys", None)
+        if isinstance(visited, list) and visited:
+            rebuilt_v = []
+            changed_v = False
+            for item in visited:
+                new, ch = _remap(item)
+                rebuilt_v.append(new)
+                changed_v = changed_v or ch
+            if changed_v:
+                char.visited_room_keys = rebuilt_v
+                stats["other"] += 1
+        shrines = getattr(char, "player_shrine_room_keys", None)
+        if isinstance(shrines, list) and shrines:
+            rebuilt_s = []
+            changed_s = False
+            for item in shrines:
+                new, ch = _remap(item)
+                rebuilt_s.append(new)
+                changed_s = changed_s or ch
+            if changed_s:
+                char.player_shrine_room_keys = rebuilt_s
+                stats["other"] += 1
+        plots = getattr(char, "farm_plots", None)
+        if isinstance(plots, dict) and plots:
+            rebuilt_p = {}
+            changed_f = False
+            for key, plot in plots.items():
+                row = dict(plot) if isinstance(plot, dict) else plot
+                if isinstance(row, dict) and row.get("room_key"):
+                    new_rk, ch = _remap(row.get("room_key"))
+                    if ch:
+                        row["room_key"] = new_rk
+                        changed_f = True
+                text = str(key or "")
+                room_part, sep, slot = text.partition("#")
+                if sep:
+                    new_room, ch = _remap(room_part)
+                    new_key = f"{new_room}#{slot}"
+                    changed_f = changed_f or ch
+                else:
+                    new_key, ch = _remap(text)
+                    changed_f = changed_f or ch
+                rebuilt_p[new_key] = row
+            if changed_f:
+                char.farm_plots = rebuilt_p
+                stats["other"] += 1
+        assign = getattr(char, "dungeon_assignment", None)
+        if isinstance(assign, dict) and assign:
+            for field in ("return_room", "portal_room", "portal_entry_key"):
+                raw = assign.get(field)
+                new, changed = _remap(raw)
+                if changed:
+                    assign[field] = new
+                    stats["other"] += 1
+        wild = getattr(char, "wilderness_dungeon_run", None)
+        if isinstance(wild, dict) and wild:
+            raw = wild.get("origin_room_key")
+            new, changed = _remap(raw)
+            if changed:
+                wild["origin_room_key"] = new
+                stats["other"] += 1
     return stats
 
 
@@ -1322,30 +2331,24 @@ def heal_persisted_room_key_blobs(game) -> dict:
     """Boot heal: remap legacy room keys on game-level SQLite blobs.
 
     Extends :func:`heal_character_room_keys` to ``gather_nodes``,
-    ``player_shops``, and ``townships`` tables that store ``room_key``
-    strings outside Character fields.
+    ``player_shops``, ``townships``, and ``rumor_boards`` tables that store
+    ``room_key`` strings outside Character fields.
     """
     stats = {
         "gather_nodes": 0,
         "player_shops": 0,
         "townships": 0,
+        "rumor_boards": 0,
     }
     if game is None:
-        return stats
-    aliases = getattr(game, "room_aliases", None) or {}
-    if not aliases:
         return stats
 
     def _remap(value):
         if not value:
             return value, False
         text = str(value).strip()
-        if text in aliases:
-            return aliases[text], True
-        rooms = getattr(game, "rooms", None) or {}
-        if text in rooms:
-            return text, False
-        return text, False
+        new = canonical_persisted_room_key(game, text)
+        return new, new != text
 
     store = getattr(game, "gather_nodes", None)
     if isinstance(store, dict) and store:
@@ -1396,6 +2399,17 @@ def heal_persisted_room_key_blobs(game) -> dict:
                 if ch:
                     town[field] = new
                     stats["townships"] += 1
+    boards = getattr(game, "rumor_boards", None)
+    if isinstance(boards, dict) and boards:
+        rebuilt_b = {}
+        changed_r = False
+        for room_key, posts in boards.items():
+            new_key, ch = _remap(room_key)
+            rebuilt_b[new_key] = posts
+            changed_r = changed_r or ch
+        if changed_r:
+            game.rumor_boards = rebuilt_b
+            stats["rumor_boards"] = len(rebuilt_b)
     return stats
 
 
@@ -1413,8 +2427,15 @@ def find_room_by_vnum(game, vnum_text):
     try:
         want = validate_vnum(raw)
     except ValueError:
-        want = raw.upper()
+        # Leftover dig names are not VNUMs. ``RoomMap.get`` would still
+        # alias them -- that is persist dual-read, not staff addressing.
+        return None
     rooms = getattr(game, "rooms", None) or {}
+    # Identity keys *are* VNUMs. Use dict.get so RoomMap leftover aliases
+    # cannot satisfy a staff VNUM lookup.
+    hit = dict.get(rooms, want) if isinstance(rooms, dict) else None
+    if hit is not None:
+        return hit
     for room in rooms.values():
         got = getattr(room, "vnum", None)
         if not got:
@@ -1433,9 +2454,9 @@ def room_matches_needle(room, needle, *, match_key=False) -> bool:
 
     Staff ``where`` / partial ``goto`` share this matcher. Underscores
     and hyphens in the query fold to spaces so ``fort_laramie`` hits
-    Fort Laramie. Optional ``match_key`` keeps silent legacy dig-key
-    substring matching for ``where`` discovery until Phase 3 teardown
-    (never teach dig keys).
+    Fort Laramie. Staff addressing is ROOM NAME and VNUM only;
+    ``match_key`` stays off on those verbs. Persist dual-read still
+    uses :func:`lookup_room` / ``legacy_key`` (never teach leftover names).
     """
     if room is None or not needle:
         return False
@@ -1511,8 +2532,8 @@ def iter_rooms_matching(game, needle, *, match_key=False, plane=None):
     return hits
 
 
-def resolve_room(game, query, *, allow_internal_key=True, plane=None):
-    """Resolve a staff/query string to a Room (Phase 1–2 identity bridge).
+def resolve_room(game, query, *, allow_internal_key=False, plane=None):
+    """Resolve a staff/query string to a Room (VNUM / ROOM NAME).
 
     Order:
       1. Exact VNUM (``CA00001``).
@@ -1521,8 +2542,9 @@ def resolve_room(game, query, *, allow_internal_key=True, plane=None):
          is also a substring of another ROOM NAME is still ambiguous
          (``Laramie Approach`` vs ``Fort Laramie Approach``).
       3. Unique partial ROOM NAME / VNUM substring (case-insensitive).
-      4. Exact internal key (``room.key``) -- silent compat until Phase 3;
-         disable with ``allow_internal_key=False`` to rehearse the cutover.
+      4. Exact leftover dig name / ``legacy_key`` -- **off** for staff
+         (default ``allow_internal_key=False``). Persist and Cadence
+         pass ``True`` so old saved homes still resolve.
 
     Optional ``plane`` scopes every step (staff ``goto 1861 laramie``).
 
@@ -1543,7 +2565,15 @@ def resolve_room(game, query, *, allow_internal_key=True, plane=None):
         return by_vnum, "vnum"
     rooms = getattr(game, "rooms", None) or {}
     lowered = text.lower()
-    folded_query = fold_room_needle(text)
+    # A well-formed bare VNUM that find_room_by_vnum just missed cannot be a
+    # ROOM NAME -- player-facing names never contain a raw code (hard rule 7).
+    # Without this, every lookup of a vnum in an unloaded/deferred zone paid
+    # two full world scans (exact title, then partial) to find nothing: 26
+    # such calls cost ~3s of boot. Steps 2-3 are skipped; the internal-key
+    # step below still runs, so a room whose key / legacy_key / alias is
+    # literally that code resolves exactly as before.
+    query_is_bare_vnum = label_is_bare_vnum(text)
+    folded_query = "" if query_is_bare_vnum else fold_room_needle(text)
     name_hits = []
     if folded_query:
         for room in iter_scope_rooms(game, plane=plane):
@@ -1566,13 +2596,14 @@ def resolve_room(game, query, *, allow_internal_key=True, plane=None):
         # coincidental internal-key match and silently pick the wrong room.
         return None, "ambiguous_name"
     # Unique partial ROOM NAME / VNUM substring (goto Town Park, etc.).
-    partial_hits = iter_rooms_matching(
-        game, text, match_key=False, plane=plane,
-    )
-    if len(partial_hits) == 1:
-        return partial_hits[0], "partial_name"
-    if len(partial_hits) > 1:
-        return None, "ambiguous_name"
+    if not query_is_bare_vnum:
+        partial_hits = iter_rooms_matching(
+            game, text, match_key=False, plane=plane,
+        )
+        if len(partial_hits) == 1:
+            return partial_hits[0], "partial_name"
+        if len(partial_hits) > 1:
+            return None, "ambiguous_name"
     if allow_internal_key:
         # Direct dict hit (qualified keys, legacy dig targets, RoomMap aliases).
         hit = rooms.get(text)
@@ -1621,12 +2652,12 @@ def _ambiguous_name_tip(game, query, *, plane=None) -> str:
     )
 
 
-def resolve_room_or_error(game, query, *, allow_internal_key=True, plane=None):
+def resolve_room_or_error(game, query, *, allow_internal_key=False, plane=None):
     """Resolve for staff verbs -- returns ``(room, None)`` or ``(None, err)``.
 
     Staff addressing is **ROOM NAME** and **VNUM** (partial name OK when
-    unique). Internal key remains silent compat when
-    ``allow_internal_key`` is True. Prefer this over bare
+    unique). Leftover dig names are not a staff address; persist dual-read
+    stays on :func:`lookup_room`. Prefer this over bare
     :func:`resolve_room` when the caller sends a tip to a GM.
     Optional ``plane`` scopes the search like :func:`resolve_room`.
     """

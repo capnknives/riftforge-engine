@@ -5,7 +5,7 @@ Four layers in this monorepo (and after the public/private remote split):
 | Layer | Path | Role |
 |-------|------|------|
 | **Engine** | `engine/` | Public Riftforge — generic MUD core. Zero game imports. |
-| **Basegame** | `basegame/` | Shipped **proof consumer** — Notbigville demos every new engine API without SUPERS lore. Ships with public `riftforge-engine`. |
+| **Basegame** | `basegame/` | **Destination:** folklore Mortals & Monsters (charter: `plans/folklore_basegame_charter.md`). **Today:** Notbigville + peel verbs prove engine APIs; TV-noun catalogs/help scrub is **planned**, not shipped. Ships with public `riftforge-engine`. |
 | **Classic** | `classic/` | Second public **OSR demo** — Millbrook village + wilds; schema-first catalogs; `RIFTFORGE_GAME=classic`. |
 | **SUPERS** | `supers/` | Private production game — Origins, Cadence, catalogs, live play. Pins the engine via GitHub tags. |
 
@@ -56,6 +56,7 @@ Call these **before** constructing `Character`s or loading a save:
 | Party-merge auto-accept | `set_can_auto_companion(fn)` | `True` (lean auto-accept) | `supers.companion.can_auto_companion` |
 | Eclipse ambient line | `set_eclipse_ambient_line(fn)` | `""` | `supers.balance.eclipse_ambient_line` |
 | Room look extras | `set_room_look_extras(fn)` | `[]` | `supers.bootstrap._room_look_extras` (planar, haunt, vehicles, boards, …) |
+| Room broadcast extra listeners | `set_room_broadcast_after(fn)` | no-op | `supers.accord_observation.room_broadcast_after` (Elysian gallery `[SCREEN]` feed) |
 | Room command hints | `set_room_command_hints(fn)` | `[]` | `supers.command_hints.commands_here_lines` (`commands here`) |
 | Vampire fear message | `set_vampire_fear_message(fn)` | `None` | `supers.slayer.fear_message_for_vampire` |
 | Look/examine quirk | `set_look_quirk(fn)` | `None` | `supers.relationships.maybe_look_quirk` |
@@ -161,8 +162,11 @@ must refresh modules in this order:
 1. ``importlib.reload(engine.hooks)`` — persistence imports hook callables at
    module top; reloading persistence first raises ``ImportError`` on any newly
    added hook name (bug report 387).
-2. ``importlib.reload(engine.persistence)``
-3. ``game_select.reregister_blob_codec()`` (or ``hooks.reload_blob_codec()``)
+2. ``importlib.reload(engine.char_identity)`` — persistence save-path imports
+   (``is_account_linked_body``) bind to the in-memory identity module; skip
+   this and copyover aborts after the Veil announce (live 2026-09-10).
+3. ``importlib.reload(engine.persistence)``
+4. ``game_select.reregister_blob_codec()`` (or ``hooks.reload_blob_codec()``)
    — ``reload(hooks)`` clears bootstrap callbacks; re-register before
    ``game.save(copyover=True)``.
 
@@ -178,6 +182,23 @@ them once the SUPERS flavor was stripped out. `engine/verbs/basic.py` keeps
 lean stubs under the same verb names for a bare engine install; SUPERS'
 richer versions win at the `{**ENGINE_COMMANDS, **SUPERS_COMMANDS}` merge in
 `commands.py`. See `docs/plans/two_repo_purity.md`'s "Phase 2 notes".
+
+## GMCP / DTO with kernels
+
+New engine state that a client might show (meters, room occupancy, activity)
+ships a **GMCP field in the same PR** as the kernel. Telnet prose stays on
+`Session.send` (str-only); graphics must not scrape it. Stock Mudlet
+`Room.Info` required keys stay unchanged.
+
+| Package | Role | Status |
+|---------|------|--------|
+| `Room.Info` | Mapper name / exits / desc | Shipped — do not add `who` here |
+| `Room.Occupants` | Who is in this room (`who[]`) | Shipped (PR 3980) — [`plans/folklore_2d_mmo_peel.md`](plans/folklore_2d_mmo_peel.md) |
+| `RiftForge.Zone` | Interior streets; additive `who` | Shipped rooms + occupants |
+| `Char.Vitals` | HP / game meters via `set_gmcp_char_vitals` | Shipped hook |
+
+Live stays `RIFTFORGE_GAME=supers`. Occupancy is additive; clients that
+never list `Room.Occupants` ignore it.
 
 ## Help files (engine vs game)
 
@@ -398,7 +419,10 @@ table above is unchanged.
 | **Instance rooms** | `engine/systems/instance_rooms.py` | Shipped |
 | **Studio bridge** | `engine/studio_bridge.py` | Shipped |
 | **Content kinds** | `engine/content_kinds/` + `set_content_kinds_dirs` hooks | Shipped (Phase 2) |
-| **Cadence** | — | **Deferred** — no generic kernel to peel (Phase 4 finding) |
+| **Cadence seek/wander** | `engine/systems/cadence_kernel.py` | Shipped (folklore Wave 4) — full `supers/cadence.py` driver stays private |
+| **Folklore occult marks** | `engine/systems/occult_marks.py` | Shipped — `devils_trap`, `salt_line`, `iron_ward`, `holy_water_ward` on `room.engine`; game hooks for temporary circles/saltlines |
+| **Fishing / lockpick** | `engine/systems/fishing.py`, `locks.py` | Shipped (folklore Wave 2) |
+| **Vessel / grace chassis** | `engine/systems/vessel.py`, grace via `needs.py` | Shipped (folklore Wave 5) |
 | **SUPERS narrative combat** | `supers/combat.py` → `supers/combat_prose.py` | Stays in SUPERS (not swing/active backends) |
 | **Civic shops** | `engine/systems/civic_shop.py` (ware shell) | Shell shipped; deep `player_shops` → `civic_shop` wiring **deferred** (Phase 6b / H-track) |
 | **Lifestyle / civic kernels** | `skill_ranks`, `gather_nodes`, `vendor_stock`, `claim_board`, `wage_curve` | Shipped **v0.6.2** — games keep catalogs and job titles |
@@ -418,9 +442,9 @@ Phases **H1–H7** landed on `feature/purity-h-track-remaining` (see
 `engine/map_ui.py`, `engine/systems/{vehicles,lodging,paced_travel,phone,appearance,persona_registry,relationships}`,
 `engine/map_store.py`, plus **H4** wiring (`hospital`→`clinic`, `crime`→`justice`).
 **Deep `player_shops` → `civic_shop`** remains DEFERRED. **H8** (kind
-grandparents) and **H9** (`v0.5.0` tag) **landed**; SUPERS pin is **`@v0.7.0`**
-(2026-09-05; purity restore + journal/rumor/job kernels. Prior **`v0.6.2`**
-2026-08-29; **`v0.6.1`** 2026-08-27; **`v0.6.0`** 2026-08-21).
+grandparents) and **H9** (`v0.5.0` tag) **landed**; SUPERS pin is **`@v0.8.0`**
+(folklore kernels + Phase 2 purity restore. Prior **`v0.7.0`** 2026-09-05;
+**`v0.6.2`** 2026-08-29; **`v0.6.1`** 2026-08-27; **`v0.6.0`** 2026-08-21).
 
 
 ## Hook bundles (engine mudlib unification)
@@ -439,6 +463,26 @@ and [`plans/supers_engine_overlap_audit.md`](plans/supers_engine_overlap_audit.m
 
 Quest flags remain unimplemented. See
 [`plans/python_mud_engine_features_plan.md`](plans/python_mud_engine_features_plan.md).
+
+## Folklore-ready engine contract (basegame planned)
+
+Charter: [`plans/folklore_basegame_charter.md`](plans/folklore_basegame_charter.md).
+Execution waves 0–6 + click-to-walk: [`plans/folklore_2d_mmo_peel.md`](plans/folklore_2d_mmo_peel.md).
+
+| Topic | Engine owns | Games own |
+|-------|-------------|-----------|
+| **Cadence** | `cadence_kernel.plan_tick` / `apply_plan` + needs meters + `npc_do` observable verbs | Job title enums, Winchester pursuit, full `cadence.py` lifestyle driver |
+| **Hunter on the road** | `overland`, `paced_travel`, `needs`, `job_catalog` lookup | Hunt boards, show mission types, prose |
+| **Origins** | `origin_registry.register_origin` (mechanism only) | Folklore origin modules under `basegame/` when unparked — ids such as `hunter`, `vampire`, `werewolf`, `ghost`, `witch`, `celestial_vessel` are reserved for basegame catalogs, not engine defaults |
+| **Occult** | `occult_marks` stamps + `set_temporary_devils_trap` / `set_temporary_salt_line` / `set_occult_mark_blocks` | Demon/salt policy, reagent items, player verbs |
+| **Export / tag** | Public `riftforge-engine` **`v0.8.0`** — folklore kernels + Phase 2 purity. `basegame/` TV-noun help scrub still planned. | SUPERS pin `@v0.8.0` in `supers/pyproject.toml` |
+
+Default CI folklore coverage: `tools/engine_smoke.py` runs
+`fishing_lockpick_kernel_smoke.py`, `occult_marks_kernel_smoke.py`,
+`cadence_kernel_smoke.py`, `grace_vessel_smoke.py`,
+`purgatory_policy_smoke.py`, and `pocket_grid_smoke.py` with `supers/`
+absent. `origin_registry.FOLKLORE_ORIGIN_IDS` reserves hunter / vampire /
+werewolf / ghost / witch / celestial_vessel for later game registration.
 
 ## See also
 

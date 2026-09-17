@@ -50,6 +50,7 @@ def outage_help_text() -> str:
         "Copyover, auto-deploy, or a crash can leave the game child down.",
         "The gateway keeps your telnet socket and handles a small command set.",
         "Players get OOC only; staff also get wiznet and the recover verbs below.",
+        "Occupying a cast (Gabriel, Ash, playcast) still counts as staff here.",
         "",
         "Read-only:",
         "  gm recover status     revert holds, stable SHA, recent exits, deploy",

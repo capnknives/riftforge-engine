@@ -190,7 +190,13 @@ def tick_fail_log_seconds():
 
 
 def _tick_fail_ops_enabled():
+    """Tagged ``[tick_registry]`` line on handler failure (default on).
+
+    Set ``RIFTFORGE_TICK_FAIL_OPS=0`` to keep only the 60s traceback.
+    """
     raw = (os.environ.get("RIFTFORGE_TICK_FAIL_OPS") or "").strip().lower()
+    if not raw:
+        return True
     return raw in ("1", "true", "yes", "on")
 
 
@@ -296,16 +302,19 @@ def _note_tick_handler_failure(game, name, exc):
         "message": msg[:120],
         "at_mono": time.monotonic(),
     }
-    if _tick_fail_log_due(name):
-        traceback.print_exc()
-        if _tick_fail_ops_enabled():
-            from engine import log_util
+    due = _tick_fail_log_due(name)
+    if _tick_fail_ops_enabled():
+        from engine import log_util
 
-            log_util.ops(
-                "tick_registry",
-                f"handler={name} {type(exc).__name__}: {msg[:200]}",
-                exc=exc,
-            )
+        log_util.ops_once_per_tick(
+            game,
+            f"tick_fail:{name}",
+            "tick_registry",
+            f"handler={name} {type(exc).__name__}: {msg[:200]}",
+            exc=exc if due else None,
+        )
+    elif due:
+        traceback.print_exc()
     _maybe_disable_tick_handler(game, name)
 
 
@@ -367,14 +376,26 @@ def register_tick(
     game._tick_handlers.sort(key=lambda t: (t[0], t[1]))
 
 
-def _handler_due(name, every_n, game_time_ticks):
-    """True when this every_n handler should run on this game tick."""
+def _next_tick_heartbeat_n(game):
+    """Bump once per ``run_ticks`` / ``run_ticks_async`` (not calendar ticks).
+
+    Stock 1:1 calendar pace advances ``game_time_ticks`` only about once per
+    three heartbeats, so gating ``every_n`` on that field made handlers
+    triple-fire when the calendar finally stepped.
+    """
+    n = int(getattr(game, "_tick_heartbeat_n", 0) or 0) + 1
+    game._tick_heartbeat_n = n
+    return n
+
+
+def _handler_due(name, every_n, heartbeat_n):
+    """True when this every_n handler should run on this heartbeat."""
     if every_n <= 1:
         return True
-    ticks = int(game_time_ticks or 0)
+    hb = int(heartbeat_n or 0)
     # Stable stagger: different ambient names land on different residues.
     offset = sum(ord(ch) for ch in (name or "")) % every_n
-    return (ticks % every_n) == offset
+    return (hb % every_n) == offset
 
 
 def _cadence_pressure_skip_ambient(game, name, h_ms, spent, budget):
@@ -531,6 +552,7 @@ def _finalize_tick_run(
                 payload["cadence_top_phases"] = [
                     {"name": key, "ms": val} for key, val in top[:6]
                 ]
+        payload.update(diag_export.tick_hitch_payload(game))
         if diag_export.append_auto_capture_event(
             game, payload, reason=auto_reason,
         ):
@@ -572,13 +594,13 @@ def run_ticks(game):
     skipped = []
     budget = _effective_tick_soft_budget(game)
     save_busy = _persist_save_busy(game)
-    ticks = getattr(game, "game_time_ticks", 0)
+    heartbeat_n = _next_tick_heartbeat_n(game)
     spent = 0.0
     _begin_tick_character_snapshot(game)
     try:
         _run_ticks_sync_body(
             game, handlers, slow_handlers, all_handlers, skipped,
-            budget, save_busy, ticks, spent,
+            budget, save_busy, heartbeat_n, spent,
         )
     finally:
         _end_tick_character_snapshot(game)
@@ -589,12 +611,12 @@ def run_ticks(game):
 
 def _run_ticks_sync_body(
     game, handlers, slow_handlers, all_handlers, skipped,
-    budget, save_busy, ticks, spent,
+    budget, save_busy, heartbeat_n, spent,
 ):
     """Handler loop for sync ``run_ticks`` (roster snapshot already set)."""
     for entry in handlers:
         _order, name, fn, _async_fn, every_n, skippable = _unpack_handler(entry)
-        if not _handler_due(name, every_n, ticks):
+        if not _handler_due(name, every_n, heartbeat_n):
             continue
         if is_tick_handler_disabled(game, name):
             skipped.append(f"{name}:disabled")
@@ -645,6 +667,7 @@ def _begin_tick_character_snapshot(game):
     """One roster tuple for every ``iter_characters`` call this heartbeat."""
     from engine.char_index import capture_character_snapshot
 
+    game._lag_hitch_subphases = {}
     game._tick_character_snapshot = capture_character_snapshot(game)
 
 
@@ -668,13 +691,13 @@ async def run_ticks_async(game):
     skipped = []
     budget = _effective_tick_soft_budget(game)
     save_busy = _persist_save_busy(game)
-    ticks = getattr(game, "game_time_ticks", 0)
+    heartbeat_n = _next_tick_heartbeat_n(game)
     spent = 0.0
     _begin_tick_character_snapshot(game)
     try:
         await _run_ticks_async_body(
             game, handlers, slow_handlers, all_handlers, skipped,
-            budget, save_busy, ticks, spent,
+            budget, save_busy, heartbeat_n, spent,
         )
     finally:
         _end_tick_character_snapshot(game)
@@ -685,12 +708,12 @@ async def run_ticks_async(game):
 
 async def _run_ticks_async_body(
     game, handlers, slow_handlers, all_handlers, skipped,
-    budget, save_busy, ticks, spent,
+    budget, save_busy, heartbeat_n, spent,
 ):
     """Handler loop for async ``run_ticks_async`` (roster snapshot already set)."""
     for entry in handlers:
         _order, name, fn, async_fn, every_n, skippable = _unpack_handler(entry)
-        if not _handler_due(name, every_n, ticks):
+        if not _handler_due(name, every_n, heartbeat_n):
             continue
         if is_tick_handler_disabled(game, name):
             skipped.append(f"{name}:disabled")

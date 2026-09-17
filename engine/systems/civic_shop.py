@@ -138,7 +138,7 @@ def transfer_purchase_payment(
     """Debit ``buyer``; optionally credit ``payee`` (shopkeeper).
 
     Returns ``(ok, error_code)`` where ``error_code`` is ``cant_afford``,
-    ``payment_failed``, or ``None`` on success.
+    ``payment_failed``, ``credit_failed``, or ``None`` on success.
     """
     price_cents = int(price_cents or 0)
     if not economy_mod.can_afford(buyer, 0, cents=price_cents):
@@ -153,13 +153,23 @@ def transfer_purchase_payment(
         return False, "payment_failed"
     if payee is not None and payee is not buyer:
         d, c = economy_mod.cents_to_parts(price_cents)
-        economy_mod.credit_wallet(
+        if not economy_mod.credit_wallet(
             payee,
             d,
             c,
             reason=credit_reason or debit_reason,
             tick=tick,
-        )
+        ):
+            # Buyer already paid — put the cash back so it is not destroyed
+            # when the payee's hands are full (no pocket wallet).
+            economy_mod.credit_wallet(
+                buyer,
+                d,
+                c,
+                reason=f"{debit_reason or 'pay'}_refund",
+                tick=tick,
+            )
+            return False, "credit_failed"
     return True, None
 
 
@@ -287,6 +297,8 @@ def buy(character, wares, ware, *, game=None):
                 f"You cannot afford {normalized[WARE_KEY]} "
                 f"({economy_mod.format_money(d, c)})."
             )
+        if err == "credit_failed":
+            return False, "The clerk cannot take the cash — their hands are full."
         return False, "Payment failed."
 
     del item  # spawned and appended inside purchase_at_stock

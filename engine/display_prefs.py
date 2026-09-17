@@ -8,16 +8,13 @@ no game rules. See docs/plans/mud_formatting_preferences.md.
 
 import re
 
-# Paragraph spacing for *asynchronous* arrivals -- a room event (say,
-# emote, another player's action) or an incoming tell that lands on your
-# screen between your own commands. Airy adds one blank line after each
-# such event so a busy room does not read as a wall of text; packed keeps
-# the old tight layout. This never touches your own command's reply text
-# (see cmd_get's "You pick up X." + "You tuck it into your bag." staying
-# glued together) or anything that already manages its own spacing
-# (combat, pager pages, list/table dumps that loop session.send for one
-# logical block) -- see engine.world.Room.broadcast and cmd_tell for the
-# only two call sites that apply it.
+# Paragraph spacing -- airy (default) vs packed. Two call sites besides
+# combat: Room.broadcast (other people's say/emote/actions) and incoming
+# tell. Combat beats honor the same pref inside engine.output_packet
+# (blank line between staged events, still one send). This never splits
+# your own command's reply text (cmd_get's "You pick up X." + "You tuck
+# it into your bag." stay glued) or pager / list dumps that loop
+# session.send for one logical block. Screenreader always packed.
 OUTPUT_SPACING_AIRY = "airy"
 OUTPUT_SPACING_PACKED = "packed"
 
@@ -75,6 +72,7 @@ TRAFFIC_MODES = frozenset({
 _SEGMENT_TOKENS = frozenset({
     "Hp", "En", "St", "Mn", "Fu", "Mo", "Tg", "Ex", "Gr", "Nd",
     "Fm", "Vs", "Af", "In", "Fv", "Hs",
+    "Cc", "Ch", "Rm", "Mu", "Qi",
 })
 
 # Templates treated as "still on factory default" for Origin migration.
@@ -99,7 +97,7 @@ def normalize_output_spacing(value):
 
 
 def wants_airy_spacing(character):
-    """True when the player wants a blank line after async room/tell events."""
+    """True when the player wants paragraph gaps (room, tell, and combat)."""
     ensure_display_defaults(character)
     if getattr(character, "screenreader", False):
         return False
@@ -176,6 +174,10 @@ def ensure_display_defaults(character):
         character.display_width = WIDTH_DEFAULT
     if not hasattr(character, "screenreader"):
         character.screenreader = False
+    if not hasattr(character, "pref_manual") or character.pref_manual is None:
+        character.pref_manual = []
+    if not hasattr(character, "sr_bundle_snapshot") or character.sr_bundle_snapshot is None:
+        character.sr_bundle_snapshot = {}
     if not hasattr(character, "output_spacing"):
         character.output_spacing = OUTPUT_SPACING_AIRY
     else:
@@ -194,6 +196,14 @@ def ensure_display_defaults(character):
         # Pref: skip room prose on auto-look after a move (default off).
         # Explicit ``look`` still shows the full description.
         character.brief = False
+    if not hasattr(character, "emote_third"):
+        # Pref: actor sees their own name on emote/smote (default on).
+        character.emote_third = True
+    # One-time migrate: suggestion 446 / emote-third-default ship -- flip
+    # legacy saves that still had You-self-view unless they opted in later.
+    if int(getattr(character, "emote_third_rev", 0) or 0) < 1:
+        character.emote_third = True
+        character.emote_third_rev = 1
     if not hasattr(character, "drive_map_full"):
         # Vehicle / overland cruise redraw: full atlas (default) vs local
         # minimap. Screenreader always gets text bearings instead of ASCII.
@@ -244,6 +254,9 @@ def ensure_display_defaults(character):
     if not hasattr(character, "autokill"):
         # Dungeon fodder only -- pit / portal / stronghold trash (help autokill).
         character.autokill = False
+    if not hasattr(character, "wimpy_percent"):
+        # Auto-flee at this lifeforce percent (1-99); 0 = off (help wimpy).
+        character.wimpy_percent = 0
     if not hasattr(character, "show_tips"):
         character.show_tips = True
     if not hasattr(character, "next_tip_tick"):
@@ -519,8 +532,12 @@ def format_say_chat(
     return f'{face} {they_verb}, "{text}"'
 
 
-def format_tell_chat(viewer, *, outgoing, peer_face, message):
-    """Private tell line for one viewer."""
+def format_ic_whisper_chat(viewer, *, outgoing, peer_face, message):
+    """In-character private whisper (same room or same group).
+
+    Distinct from OOC ``tell`` / remote ``whisper`` chrome. Bystanders
+    in the room get a no-text line from ``cmd_whisper`` (bug report 1301).
+    """
     text = str(message or "").strip()
     if not text:
         return ""
@@ -531,10 +548,42 @@ def format_tell_chat(viewer, *, outgoing, peer_face, message):
             return ""
         label = plain_comm_face(peer)
         if outgoing:
+            return f"You whisper to {label}. {text}."
+        return f"{label} whispers. {text}."
+    if outgoing:
+        return f'You whisper to {peer}, "{text}"'
+    return f'{peer} whispers, "{text}"'
+
+
+def format_tell_chat(viewer, *, outgoing, peer_face, message, voice="tell"):
+    """Private tell/whisper line for one viewer.
+
+    ``voice`` is ``tell`` or ``whisper``. Same private OOC channel; the
+    printed verb follows what the sender typed (bug report 1296).
+    """
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    peer = str(peer_face or "?").strip() or "?"
+    whisper = str(voice or "tell").strip().lower() == "whisper"
+    if wants_plain_comms(viewer):
+        text = plain_comm_message(text)
+        if not text:
+            return ""
+        label = plain_comm_face(peer)
+        if outgoing:
+            if whisper:
+                return f"You whisper {label}. {text}."
             return f"You tell {label}. {text}."
+        if whisper:
+            return f"Whisper from {label}. {text}."
         return f"Tell from {label}. {text}."
     if outgoing:
+        if whisper:
+            return f'You whisper {peer}, "{text}"'
         return f'You tell {peer}, "{text}"'
+    if whisper:
+        return f'{peer} whispers you, "{text}"'
     return f'{peer} tells you, "{text}"'
 
 
@@ -576,38 +625,125 @@ def format_custom_chat(viewer, channel_title, prefix, face, message):
     return f"[{label}]: {text}"
 
 
+# Prefs screenreader mode auto-flips so ASCII chrome gets out of the way.
+# Keys a player sets by hand (config map, config traffic, fightlog on, …)
+# stay in ``pref_manual`` and are not restored when screenreader turns off.
+_SR_BUNDLE_ATTRS = (
+    "show_minimap",
+    "map_on_move",
+    "map_on_look",
+    "traffic_mode",
+    "fightlog_enabled",
+)
+_SR_ON_VALUES = {
+    "show_minimap": False,
+    "map_on_move": False,
+    "map_on_look": False,
+    "traffic_mode": TRAFFIC_QUIET,
+    "fightlog_enabled": True,
+}
+_SR_OFF_VALUES = {
+    "show_minimap": True,
+    "map_on_move": False,
+    "map_on_look": False,
+    "traffic_mode": TRAFFIC_NORMAL,
+    "fightlog_enabled": False,
+}
+
+
+def _pref_manual_set(character):
+    """Return the set of pref attr names the player set themselves."""
+    raw = getattr(character, "pref_manual", None) or []
+    if isinstance(raw, str):
+        raw = [raw]
+    return {str(name).strip() for name in raw if str(name).strip()}
+
+
+def mark_pref_manual(character, attr):
+    """Stamp *attr* as a player-chosen pref (survives screenreader off).
+
+    Call this from config / fightlog setters when the player types the
+    toggle themselves -- not from apply_screenreader_mode.
+    """
+    if character is None or not attr:
+        return
+    names = _pref_manual_set(character)
+    names.add(str(attr).strip())
+    character.pref_manual = sorted(names)
+    snap = dict(getattr(character, "sr_bundle_snapshot", None) or {})
+    snap.pop(str(attr).strip(), None)
+    character.sr_bundle_snapshot = snap
+
+
+def _read_bundle_value(character, attr):
+    """Current value of one screenreader-bundle pref."""
+    if attr == "traffic_mode":
+        return traffic_mode(character)
+    return getattr(character, attr, _SR_OFF_VALUES.get(attr))
+
+
+def _write_bundle_value(character, attr, value):
+    """Set one screenreader-bundle pref."""
+    if attr == "traffic_mode":
+        character.traffic_mode = value
+        return
+    setattr(character, attr, value)
+
+
 def apply_screenreader_mode(character, enabled):
     """Turn screenreader mode on or off and sync related display prefs.
 
     When enabling: flatten ASCII UI, turn the ASCII minimap off (directional
-    ``map`` text is used instead), and default fightlog on. When disabling:
-    only clear the screenreader flag -- leave map / tags / color alone so a
-    later ``config screenreader off`` does not surprise someone who had
-    customized those separately.
+    ``map`` text is used instead), quiet NPC traffic, and default fightlog
+    on -- unless the player already set that pref by hand.
+
+    When disabling: restore the bundle prefs screenreader had flipped,
+    unless the player set them manually while it was on. Old saves with
+    no snapshot fall back to sighted defaults for those keys.
 
     Returns a short confirmation string for the caller to send.
     """
     ensure_display_defaults(character)
+    if not hasattr(character, "pref_manual") or character.pref_manual is None:
+        character.pref_manual = []
+    if not hasattr(character, "sr_bundle_snapshot"):
+        character.sr_bundle_snapshot = {}
+    manual = _pref_manual_set(character)
     if enabled:
+        snap = dict(getattr(character, "sr_bundle_snapshot", None) or {})
+        for attr, sr_val in _SR_ON_VALUES.items():
+            if attr in manual:
+                continue
+            snap[attr] = _read_bundle_value(character, attr)
+            _write_bundle_value(character, attr, sr_val)
+        character.sr_bundle_snapshot = snap
         character.screenreader = True
-        character.show_minimap = False
-        character.map_on_move = False
-        character.map_on_look = False
-        if traffic_mode(character) == TRAFFIC_NORMAL:
-            character.traffic_mode = TRAFFIC_QUIET
-        # Default fightlog on for screenreader (cinematic replay after fights).
-        character.fightlog_enabled = True
         _push_screenreader_status(character)
         return (
             "Screenreader mode on -- ASCII frames and minimaps "
-            "flatten to lists; combat stays tagged and brief. "
+            "flatten to lists; combat lines stay brief. "
             "NPC foot traffic is quiet (config traffic normal to restore). "
             "Fightlog on -- cinematic lines buffer for 'fightlog read' "
-            "after a fight (config fightlog off to stop)."
+            "after a fight (config fightlog off to stop). "
+            "Prefs you set yourself stay put. "
+            "config combattags off hides [HIT]/[DMG] prefixes; "
+            "hit and miss still read in plain words."
         )
+    snap = dict(getattr(character, "sr_bundle_snapshot", None) or {})
+    for attr in _SR_BUNDLE_ATTRS:
+        if attr in manual:
+            continue
+        if attr in snap:
+            _write_bundle_value(character, attr, snap[attr])
+        else:
+            _write_bundle_value(character, attr, _SR_OFF_VALUES[attr])
+    character.sr_bundle_snapshot = {}
     character.screenreader = False
     _push_screenreader_status(character)
-    return "Screenreader mode off."
+    return (
+        "Screenreader mode off -- maps, traffic, and fightlog that "
+        "screenreader had flipped are back, except prefs you set yourself."
+    )
 
 
 def _push_screenreader_status(character):
@@ -841,6 +977,35 @@ def _prompt_momentum_value(character, vitals):
         return 0
 
 
+def _prompt_meter_pair(vitals, *, raw_key, raw_max_key, stamp_key, show_raw):
+    """Map GMCP vitals to prompt ``cur/max`` ints (percent or raw pool).
+
+    When ``show_raw`` (``config combatnumbers on``) and the builder
+    stamped ``*_raw`` keys, use the comic-scale pool so the combat-round
+    prompt matches ``hp`` / score -- not a 0--100 percent bar that can
+    read like ``1/100hp`` after a heavy swing (bug reports 1312 / 1313).
+    """
+    cur = 100
+    cap = 100
+    if not vitals:
+        return cur, cap
+    raw_cur = vitals.get(raw_key, vitals.get(stamp_key))
+    raw_cap = vitals.get(raw_max_key, vitals.get(stamp_key))
+    try:
+        cur_f = float(raw_cur)
+        cap_f = float(raw_cap) if raw_cap not in (None, "", "0") else 0.0
+    except (TypeError, ValueError):
+        return cur, cap
+    if cap_f <= 0:
+        return cur, cap
+    if show_raw and raw_key in vitals:
+        return max(0, int(round(cur_f))), max(1, int(round(cap_f)))
+    if cap_f == 100.0 and raw_key not in vitals:
+        return max(0, min(100, int(round(cur_f)))), 100
+    pct = max(0, min(100, int(round(100.0 * cur_f / cap_f))))
+    return pct, 100
+
+
 def _prompt_vitals(character, game=None):
     """Gather meter values for prompt expansion (engine-safe via hooks).
 
@@ -852,6 +1017,7 @@ def _prompt_vitals(character, game=None):
         character = hooks.perception_character(character, game)
     except Exception:
         pass
+    show_raw = bool(getattr(character, "combat_numbers", False))
     hp = 100
     max_hp = 100
     energy = getattr(character, "energy", 0)
@@ -864,26 +1030,34 @@ def _prompt_vitals(character, game=None):
     max_mana_str = ""
     has_fuel = False
     has_mana = False
+    has_cosmic_charge = False
+    cosmic_charge_str = ""
+    cosmic_charge_label = "cosmic"
+    has_construct_charge = False
+    construct_charge_str = ""
+    construct_charge_label = "charge"
+    has_remembrance = False
+    remembrance_str = ""
+    remembrance_label = "remembrance"
+    has_mutation = False
+    mutation_str = ""
+    mutation_label = "mut"
+    has_spirit = False
+    spirit_str = ""
+    spirit_label = "spirit"
     try:
         from engine import hooks
         vitals = hooks.gmcp_char_vitals(character) or {}
     except Exception:
         vitals = {}
     if vitals:
-        raw_hp = vitals.get("hp_raw", vitals.get("hp"))
-        raw_max = vitals.get("maxhp_raw", vitals.get("maxhp"))
-        try:
-            cur = float(raw_hp)
-            cap = float(raw_max) if raw_max not in (None, "", "0") else 0.0
-            if cap > 0:
-                if cap == 100.0 and "hp_raw" not in vitals:
-                    hp = max(0, min(100, int(round(cur))))
-                    max_hp = 100
-                else:
-                    hp = max(0, min(100, int(round(100.0 * cur / cap))))
-                    max_hp = 100
-        except (TypeError, ValueError):
-            pass
+        hp, max_hp = _prompt_meter_pair(
+            vitals,
+            raw_key="hp_raw",
+            raw_max_key="maxhp_raw",
+            stamp_key="hp",
+            show_raw=show_raw,
+        )
         if "energy" in vitals:
             energy = vitals["energy"]
         if "energymax" in vitals:
@@ -891,20 +1065,13 @@ def _prompt_vitals(character, game=None):
         elif "energy_raw" in vitals:
             # Percent mode without energymax still has raw ceiling in payload.
             energy_max = ""
-        raw_stam = vitals.get("stamina_raw", vitals.get("stamina"))
-        raw_stam_max = vitals.get("maxstamina_raw", vitals.get("maxstamina"))
-        try:
-            cur = float(raw_stam)
-            cap = float(raw_stam_max) if raw_stam_max not in (None, "", "0") else 0.0
-            if cap > 0:
-                if cap == 100.0 and "stamina_raw" not in vitals:
-                    stamina = max(0, min(100, int(round(cur))))
-                    max_stamina = 100
-                else:
-                    stamina = max(0, min(100, int(round(100.0 * cur / cap))))
-                    max_stamina = 100
-        except (TypeError, ValueError):
-            pass
+        stamina, max_stamina = _prompt_meter_pair(
+            vitals,
+            raw_key="stamina_raw",
+            raw_max_key="maxstamina_raw",
+            stamp_key="stamina",
+            show_raw=show_raw,
+        )
         if "fuel" in vitals:
             has_fuel = True
             fuel_str = str(vitals["fuel"])
@@ -915,6 +1082,51 @@ def _prompt_vitals(character, game=None):
             has_mana = True
             mana_str = str(vitals["mana"])
             max_mana_str = str(vitals.get("maxmana", ""))
+        if "cosmic_charge" in vitals:
+            has_cosmic_charge = True
+            cosmic_charge_str = str(vitals["cosmic_charge"])
+            cosmic_charge_label = (
+                str(vitals.get("cosmic_charge_label") or "cosmic")
+                .strip()
+                .lower()
+                or "cosmic"
+            )
+        if "construct_charge" in vitals:
+            has_construct_charge = True
+            construct_charge_str = str(vitals["construct_charge"])
+            construct_charge_label = (
+                str(vitals.get("construct_charge_label") or "charge")
+                .strip()
+                .lower()
+                or "charge"
+            )
+        if "remembrance" in vitals:
+            has_remembrance = True
+            remembrance_str = str(vitals["remembrance"])
+            remembrance_label = (
+                str(vitals.get("remembrance_label") or "remembrance")
+                .strip()
+                .lower()
+                or "remembrance"
+            )
+        if "mutation_charges" in vitals:
+            has_mutation = True
+            mutation_str = str(vitals["mutation_charges"])
+            mutation_label = (
+                str(vitals.get("mutation_label") or "mut")
+                .strip()
+                .lower()
+                or "mut"
+            )
+        if "spirit" in vitals:
+            has_spirit = True
+            spirit_str = str(vitals["spirit"])
+            spirit_label = (
+                str(vitals.get("spirit_label") or "spirit")
+                .strip()
+                .lower()
+                or "spirit"
+            )
     room = getattr(character, "location", None)
     room_key = room.key if room is not None else "-"
     try:
@@ -951,6 +1163,21 @@ def _prompt_vitals(character, game=None):
         "has_mana": has_mana,
         "mana": mana_str,
         "max_mana": max_mana_str,
+        "has_cosmic_charge": has_cosmic_charge,
+        "cosmic_charge": cosmic_charge_str,
+        "cosmic_charge_label": cosmic_charge_label,
+        "has_construct_charge": has_construct_charge,
+        "construct_charge": construct_charge_str,
+        "construct_charge_label": construct_charge_label,
+        "has_remembrance": has_remembrance,
+        "remembrance": remembrance_str,
+        "remembrance_label": remembrance_label,
+        "has_mutation": has_mutation,
+        "mutation_charges": mutation_str,
+        "mutation_label": mutation_label,
+        "has_spirit": has_spirit,
+        "spirit": spirit_str,
+        "spirit_label": spirit_label,
         # Fight Momentum (-100..100). Prefer Char.Vitals when SUPERS stamped
         # it (keeps prompt + GMCP in lockstep); else Character.momentum.
         "momentum": _prompt_momentum_value(character, vitals),
@@ -1057,6 +1284,46 @@ def _expand_segment(code, v):
         if not band:
             return ""
         return _seg("<dark_grey> ", f"<dark_red>[{band}]")
+    if code == "Cc":
+        if not v.get("has_cosmic_charge"):
+            return ""
+        noun = v.get("cosmic_charge_label") or "cosmic"
+        return _seg(
+            "<dark_grey> ",
+            f"<pale_blue>[{v['cosmic_charge']}{noun}]",
+        )
+    if code == "Ch":
+        if not v.get("has_construct_charge"):
+            return ""
+        noun = v.get("construct_charge_label") or "charge"
+        return _seg(
+            "<dark_grey> ",
+            f"<silver>[{v['construct_charge']}{noun}]",
+        )
+    if code == "Rm":
+        if not v.get("has_remembrance"):
+            return ""
+        noun = v.get("remembrance_label") or "remembrance"
+        return _seg(
+            "<dark_grey> ",
+            f"<white>[{v['remembrance']}{noun}]",
+        )
+    if code == "Mu":
+        if not v.get("has_mutation"):
+            return ""
+        noun = v.get("mutation_label") or "mut"
+        return _seg(
+            "<dark_grey> ",
+            f"<gold>[{v['mutation_charges']}{noun}]",
+        )
+    if code == "Qi":
+        if not v.get("has_spirit"):
+            return ""
+        noun = v.get("spirit_label") or "spirit"
+        return _seg(
+            "<dark_grey> ",
+            f"<gold>[{v['spirit']}{noun}]",
+        )
     return ""
 
 
@@ -1079,9 +1346,9 @@ def format_prompt(character, game=None):
     Optional *segment* tokens (two letters) -- each is a full colored
     ``[field]`` that **omits itself** when the resource does not apply::
 
-      %Hp  [72/100hp]
+      %Hp  [72/100hp]   (raw cur/max with combatnumbers, same as hp/score)
       %En  [100/100en]   (Focus pool at Tier; raw ceiling with combatnumbers)
-      %St  [72/100st]
+      %St  [72/100st]   (raw cur/max with combatnumbers)
       %Mn  [88/100mn]   (mages only; percent of pool by default)
       %Fu  [80blood]   (fuel Origins only; Path noun)
       %Mo  [66mo]      (fight Momentum; omits at 0)
@@ -1091,8 +1358,13 @@ def format_prompt(character, game=None):
       %Vs  [strained]  vessel strain (Mantle embodied; omits when settled)
       %Af  [winded]    first active combat condition (omits when clean)
       %In  [damaged]   Constructed Integrity state (omits when stable)
-      %Fv  [waning]    Cosmic Favor state (omits when attuned)
-      %Hs  [clinic]     hospitalized at Town Clinic (omits when ambulatory)
+      %Fv  [waning]       Cosmic Favor state (omits when attuned)
+      %Cc  [80cosmic]     Cosmic Charge (Cosmic Origins only)
+      %Ch  [80charge]     Constructed Charge (omits when not Constructed)
+      %Rm  [70remembrance] Ghost Remembrance (Path Ghost only)
+      %Mu  [12mut]        Mutant mutation charges (omits when not Mutant)
+      %Qi  [80spirit]     Human Spirit / Qi / Xian Qi (omits when not Human)
+      %Hs  [clinic]        hospitalized at Town Clinic (omits when ambulatory)
       %Ex  [n,e,s,w]
       %Gr  [Sam, Dean] (colocated groupmates only; omits when solo/apart)
 
@@ -1381,7 +1653,11 @@ def send_tagged(character, text, *, body_role="prose"):
     session = getattr(character, "session", None)
     if session is None or not text:
         return False
-    session.send(format_tagged_text(character, text, body_role=body_role))
+    from engine import output_packet as output_packet_mod
+    output_packet_mod.tell(
+        character,
+        format_tagged_text(character, text, body_role=body_role),
+    )
     return True
 
 

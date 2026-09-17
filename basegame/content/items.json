@@ -1,0 +1,109 @@
+{
+  "fish_perch": {
+    "key": "a fresh perch",
+    "description": "A small lake perch, still flopping.",
+    "fish_catch": true,
+    "weight": 0.4,
+    "aliases": ["perch", "fresh perch"]
+  },
+  "fish_bluegill": {
+    "key": "a fresh bluegill",
+    "description": "A palm-sized bluegill.",
+    "fish_catch": true,
+    "weight": 0.4,
+    "aliases": ["bluegill"]
+  },
+  "fish_catfish": {
+    "key": "a fresh catfish",
+    "description": "A whiskered catfish.",
+    "fish_catch": true,
+    "weight": 0.5,
+    "aliases": ["catfish"]
+  },
+  "fish_trout": {
+    "key": "a fresh trout",
+    "description": "A speckled river trout.",
+    "fish_catch": true,
+    "weight": 0.5,
+    "aliases": ["trout"]
+  },
+  "fish_bass": {
+    "key": "a largemouth bass",
+    "description": "A solid bass.",
+    "fish_catch": true,
+    "weight": 0.7,
+    "aliases": ["bass", "largemouth bass"]
+  },
+  "fishing_tin_can": {
+    "key": "a dented tin can",
+    "description": "Someone's litter. Worthless.",
+    "weight": 0.2,
+    "aliases": ["tin can", "dented tin can"]
+  },
+  "fishing_old_boot": {
+    "key": "a waterlogged old boot",
+    "description": "A sodden boot. Thanks, lake.",
+    "weight": 0.5,
+    "aliases": ["old boot", "waterlogged boot"]
+  },
+  "fishing_tangled_line": {
+    "key": "a tangled fishing line",
+    "description": "Snarled monofilament.",
+    "weight": 0.05
+  },
+  "fishing_rusty_hook": {
+    "key": "a rusty hook",
+    "description": "A bent, rusted hook.",
+    "weight": 0.05
+  },
+  "fishing_worms": {
+    "key": "a tin of worms",
+    "description": "Grocery nightcrawlers. Fish worms at a lake, river, pier, or pond.",
+    "aliases": ["worms", "worm", "nightcrawlers", "tin of worms"],
+    "shop_price": 6
+  },
+  "fishing_fly": {
+    "key": "a tied fishing fly",
+    "description": "A handmade fly. Fish fly at water.",
+    "aliases": ["fly", "flies", "lure"]
+  },
+  "ritual_chalk": {
+    "key": "ritual chalk",
+    "description": "A stub of pale chalk for drawing devil's traps on the floor.",
+    "aliases": [
+      "chalk",
+      "ritual chalk"
+    ],
+    "stow": "gear",
+    "fence": "salvage",
+    "locked": false,
+    "furniture": false,
+    "provides_light": false,
+    "shop_tags": [
+      "magi_reagent"
+    ],
+    "shop_amenities": [
+      "pawn"
+    ],
+    "shop_price": 8
+  },
+  "devils_trap_paint": {
+    "key": "a can of devil's trap paint",
+    "description": "Fluorescent spray paint -- lays a permanent devil's trap when you traps paint.",
+    "aliases": [
+      "devil trap paint",
+      "devils trap paint",
+      "trap paint"
+    ],
+    "stow": "gear",
+    "fence": "salvage",
+    "locked": false,
+    "furniture": false,
+    "provides_light": false,
+    "shop_amenities": [
+      "hardware",
+      "pawn"
+    ],
+    "shop_price": 18
+  }
+}

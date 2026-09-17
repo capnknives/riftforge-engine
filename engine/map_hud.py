@@ -18,6 +18,7 @@ _MAP_TITLES = {
     "earth_america": "America",
     "earth_gulf": "Gulf",
     "earth_great_lakes": "Great Lakes",
+    "earth_frontierland_1861": "Frontierland",
 }
 
 # SGR 16-color codes used by ATLAS_BG / ATLAS_TOPO_FG / ATLAS_LAYER_FG
@@ -68,8 +69,17 @@ def _sgr_hex(code) -> str:
 
 
 def _cell_style(area_type, map_glyph, map_layer, *, glyph_set="atlas",
-                terrain_base=None):
-    """Return (glyph, fg_hex, bg_hex) for one atlas cell."""
+                terrain_base=None, hide_hud_land=True):
+    """Return (glyph, fg_hex, bg_hex) for one atlas cell.
+
+    Country grids hide HUD Canada land (``land_view``) so CONUS stays
+    CONUS. Pass ``hide_hud_land=False`` only for a local closer window.
+    """
+    if hide_hud_land and str(map_layer or "").strip().lower() == "land_view":
+        area_type = "void"
+        map_glyph = " "
+        map_layer = None
+        terrain_base = None
     area = area_type or "plains"
     glyph = None
     if map_glyph:
@@ -172,7 +182,13 @@ def build_map_payload(character, game, *, include_grid=True):
     lives on ``RiftForge.Map.Atlas`` (compact rows). This payload is
     you-are-here plus landmarks.
     """
-    atlas = getattr(game, "overland_atlas", None) if game is not None else None
+    atlas = None
+    if game is not None:
+        from engine.systems import overland as overland_mod
+
+        atlas = overland_mod.atlas_for_character(character, game)
+        if atlas is None:
+            atlas = getattr(game, "overland_atlas", None)
     if atlas is None:
         return None
     width = int(getattr(atlas, "width", 0) or 0)

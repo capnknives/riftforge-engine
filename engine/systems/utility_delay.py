@@ -21,10 +21,14 @@ DEFAULT_DELAY_TICKS = {
     "herbalism_pick": 12,
     "workshop_craft": 20,
     "tailor_sew": 18,
+    "glass_blow": 18,
     "cook": 15,
     "diner_ticket": 12,
+    "bar_ticket": 12,
+    "tattoo_ticket": 12,
     "library_research": 15,
     "hack_records": 20,
+    "hack_wipe": 20,
     "language_learn": 20,
     "storm_research": 30,
     # P1 — investigation / subterfuge / medic / mechanic
@@ -38,6 +42,8 @@ DEFAULT_DELAY_TICKS = {
     "aid_stood": 10,
     "hide": 8,
     "sneak": 8,
+    "sneak_step": 20,
+    "sneak_witness": 30,
     "stealth": 8,
     "mechanic_mend": 20,
     "mechanic_roadside": 25,
@@ -74,10 +80,14 @@ VERB_LABELS = {
     "herbalism_pick": "picking herbs",
     "workshop_craft": "bench craft",
     "tailor_sew": "tailor bench",
+    "glass_blow": "glass bench",
     "cook": "cooking",
     "diner_ticket": "diner tickets",
+    "bar_ticket": "bar tickets",
+    "tattoo_ticket": "tattoo tickets",
     "library_research": "library research",
     "hack_records": "hacking records",
+    "hack_wipe": "wiping records",
     "language_learn": "language study",
     "storm_research": "storm desk research",
     "investigate": "investigation",
@@ -88,6 +98,8 @@ VERB_LABELS = {
     "aid_stood": "another field revive",
     "hide": "hiding",
     "sneak": "sneaking",
+    "sneak_step": "sneak practice here",
+    "sneak_witness": "sneak practice on that witness",
     "stealth": "stealth",
     "mechanic_mend": "gear repair",
     "mechanic_roadside": "roadside repair",
@@ -185,6 +197,21 @@ def stamp(character, game, verb_key, *, extra_ticks=0):
     return character.utility_verb_delays[verb_key]
 
 
+def clear_ability_cooldowns(character):
+    """Clear craft/utility gates plus God forge and war reuse clocks.
+
+    Staff ``restore`` and ``gm set <name> cooldown 0`` call this so a
+    world heal does not leave relicforge / craft still ticking for hours
+    (suggestion report 489).
+    """
+    if character is None:
+        return
+    clear(character)
+    for name in list(vars(character).keys()):
+        if name.startswith("god_forge_cd_") or name.startswith("god_war_cd_"):
+            setattr(character, name, 0)
+
+
 def clear(character, verb_key=None):
     """Clear one gate or the whole map (tests / GM heal)."""
     ensure_defaults(character)
@@ -192,6 +219,9 @@ def clear(character, verb_key=None):
         character.utility_verb_delays = {}
         return
     character.utility_verb_delays.pop(verb_key, None)
+
+
+_PLAYER_WALL_ETA_KEYS = frozenset({"tattoo_ticket", "bar_ticket", "diner_ticket"})
 
 
 def refusal_message(verb_key, ticks_left, *, screenreader=False, game=None):
@@ -203,7 +233,10 @@ def refusal_message(verb_key, ticks_left, *, screenreader=False, game=None):
     if ticks_left <= 0:
         return f"You need a moment before {label} again."
     from engine import game_clock_tuning as clock_mod
-    eta = clock_mod.format_tick_cooldown_eta(ticks_left, game)
+    if base in _PLAYER_WALL_ETA_KEYS:
+        eta = clock_mod.format_player_cooldown_remaining(ticks_left, game)
+    else:
+        eta = clock_mod.format_tick_cooldown_eta(ticks_left, game)
     return f"You need a moment before {label} again ({eta})."
 
 

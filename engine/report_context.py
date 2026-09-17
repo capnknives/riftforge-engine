@@ -68,10 +68,16 @@ def note_report_output(session, message):
 
     Skips blank coalesced lines. Truncates long help/look dumps so a
     report stays readable. Safe to call from FakeSession.send in smokes.
+    ANSI escapes are stripped so triage logs stay plain-text readable.
     """
     if session is None:
         return
-    text = str(message or "").strip()
+    try:
+        from engine.style import strip_ansi
+
+        text = strip_ansi(str(message or "")).strip()
+    except Exception:
+        text = str(message or "").strip()
     if not text:
         return
     if len(text) > _OUTPUT_LINE_MAX:
@@ -139,23 +145,54 @@ def _presence_mode(character):
     return "live"
 
 
-def _deploy_sha(report_dir):
-    """Best-effort live deploy SHA from auto_deploy state beside the DB."""
+def _auto_deploy_state(report_dir):
+    """Parsed ``.auto_deploy_state.json`` beside the DB, or ``{}``."""
     if not report_dir:
-        return None
+        return {}
     path = os.path.join(report_dir, ".auto_deploy_state.json")
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    last = data.get("last_deploy")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _sha_or_none(value):
+    """Strip a git SHA string, or None when empty."""
+    return _safe_str(value, "") or None
+
+
+def _same_sha(left, right):
+    """True when both look like the same commit (ignore case / whitespace)."""
+    if not left or not right:
+        return False
+    return str(left).strip().lower() == str(right).strip().lower()
+
+
+def _deploy_sha(report_dir):
+    """Last Fix/Ship overlay SHA (``last_deploy``). Not the tracked tip.
+
+    Feature merges advance ``origin_main`` without rewriting this field --
+    see ``_tracked_tip_sha``.
+    """
+    last = _auto_deploy_state(report_dir).get("last_deploy")
     if not isinstance(last, dict):
         return None
-    sha = last.get("sha")
-    return _safe_str(sha, "") or None
+    return _sha_or_none(last.get("sha"))
+
+
+def _tracked_tip_sha(report_dir):
+    """SHA auto-deploy last recorded as origin/main (silent advances included).
+
+    ``last_deploy`` is only the last Fix overlay. Comparing HEAD to that
+    false-positives ``overlay_dirty`` after every later feature merge.
+    Fall back to last_deploy when origin_main is missing (old state files).
+    """
+    tip = _sha_or_none(_auto_deploy_state(report_dir).get("origin_main"))
+    if tip:
+        return tip
+    return _deploy_sha(report_dir)
 
 
 def _head_sha_cheap(report_dir):
@@ -275,21 +312,36 @@ def _tick_health_snapshot(game):
 def _runtime_snapshot(game, report_dir):
     """Always-on copyover / overlay honesty for every full bug report.
 
-    ``deploy_sha`` alone is one SHA. The last two days of tickets were
-    "overlay landed, process still old" -- this block names that split.
+    ``overlay_dirty`` means git HEAD is behind the tracked tip
+    (``origin_main`` in auto-deploy state). That is "overlay landed,
+    process still old" -- not "the last Fix SHA is older than HEAD,"
+    which is normal after silent feature merges.
     """
     out = {}
     deploy = _deploy_sha(report_dir)
     if deploy:
         out["deploy_sha"] = deploy
+    tip = _tracked_tip_sha(report_dir)
+    if tip:
+        out["origin_main_sha"] = tip
     head = _head_sha_cheap(report_dir)
     if head:
         out["head_sha"] = head
-    if deploy and head and deploy != head:
+    # Process still old: checkout is not at the tracked origin/main tip.
+    if head and tip and not _same_sha(head, tip):
         out["overlay_dirty"] = True
+    from engine.report_debug import (
+        copyover_abort_is_fresh,
+        last_copyover_ok_snap,
+    )
+
     abort = _copyover_abort_snap()
-    if abort:
+    # Stale abort stamps (days old) polluted every report -- gate on age.
+    if abort and copyover_abort_is_fresh(abort):
         out["last_copyover_abort"] = abort
+    ok_snap = last_copyover_ok_snap(report_dir)
+    if ok_snap:
+        out["last_copyover_ok"] = ok_snap
     try:
         from engine import copyover as copyover_mod
 
@@ -352,11 +404,17 @@ def _group_snapshot(character, context_errors=None):
     except Exception as exc:
         _note_context_error(context_errors, "group_import", exc)
         return {}
+    from engine.report_debug import last_group_event_snap
+
+    last_event = last_group_event_snap(character)
     if not group_mod.in_group(character):
-        return {"in_group": False}
+        out = {"in_group": False}
+        if last_event:
+            out["last_event"] = last_event
+        return out
     members = group_mod.group_members(character)
     leader = group_mod.resolve_leader(character)
-    return {
+    out = {
         "in_group": True,
         "leader": _safe_str(getattr(leader, "key", None)),
         "member_count": len(members),
@@ -365,6 +423,9 @@ def _group_snapshot(character, context_errors=None):
             for m in members[:_MAX_OCCUPANTS]
         ],
     }
+    if last_event:
+        out["last_event"] = last_event
+    return out
 
 
 def _is_minimal_kind(kind):
@@ -639,6 +700,21 @@ def build(character, game, *, history=None, description=None, kind=None):
         last_look_title = getattr(sess, "_last_look_room_title", None)
         if last_look_title:
             ctx["session"]["last_look_room_title"] = str(last_look_title)[:120]
+        if getattr(sess, "playcast_gm_tools", False):
+            ctx["session"]["playcast_gm_tools"] = True
+        staff_acct = getattr(sess, "staff_account", None)
+        if staff_acct:
+            ctx["session"]["staff_account"] = str(staff_acct)
+        occupy_acct = getattr(character, "staff_occupy_account", None)
+        if occupy_acct:
+            ctx["session"]["staff_occupy_account"] = str(occupy_acct)
+        try:
+            from engine.command_support import _is_gm
+
+            if _is_gm(character):
+                ctx["session"]["effective_gm"] = True
+        except Exception:
+            pass
 
     pos = {}
     macro = getattr(character, "macro_pos", None)
@@ -691,4 +767,17 @@ def build(character, game, *, history=None, description=None, kind=None):
             context_errors.append("gameplay: non-dict extra from hook")
     if context_errors:
         ctx["context_errors"] = context_errors
+
+    from engine.report_debug import last_signature_snap, last_vehicle_snap
+
+    sess = getattr(character, "session", None)
+    sig = last_signature_snap(sess)
+    veh = last_vehicle_snap(character)
+    if sig or veh:
+        gameplay = ctx.setdefault("gameplay", {})
+        if sig:
+            gameplay["last_signature"] = sig
+        if veh:
+            gameplay["last_vehicle"] = veh
+
     return ctx

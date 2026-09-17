@@ -31,12 +31,31 @@ TERRAIN_GLYPH_TO_AREA = {
 AREA_TO_TERRAIN_GLYPH = {
     area: glyph for glyph, area in TERRAIN_GLYPH_TO_AREA.items()
 }
+# Tiny alphabet for the full-country GMCP / web / Mudlet silhouette.
+# HUD Canada land is forced to space in country_atlas_glyph -- not here.
+COUNTRY_ATLAS_AREA_GLYPH = {
+    "ocean": "~",
+    "lake": "o",
+    "plains": ".",
+    "forest": "T",
+    "mountains": "^",
+    "hills": "n",
+    "desert": ",",
+    "swamp": ",",
+    "wetland": "'",
+    "city": "*",
+    "highway": "=",
+    "mountain_highway": "=",
+    "trail": "-",
+    "road": "=",
+    "void": " ",
+}
 # Interstate overlay painted on top of topography.
 # Live paint is a single "=" tile. Older maps still store | / \ + from
 # the cardinal-only line-art era -- loaders accept them and normalize
 # the visible glyph to "=" in expand_grid_cell.
 ROAD_GLYPHS = frozenset("=|/\\+")
-# HUD-only void-margin tint on earth_america (cosmetic; area_type stays void).
+# HUD-only void-margin tint on CONUS atlases (cosmetic; area_type stays void).
 WATER_VIEW_GLYPHS = frozenset("~o")
 # HUD-only Canada land on America void margins (cosmetic; area_type void).
 LAND_VIEW_GLYPHS = frozenset(".T^,")
@@ -177,3 +196,43 @@ def expand_grid_cell(grid, x, y):
     if layer in ("highway", "mountain_highway") and glyph in ROAD_GLYPHS:
         out["map_glyph"] = "="
     return out
+
+
+def is_hud_foreign_land(cell_or_room):
+    """True for HUD-only Canada land paint on America (or 1861) void.
+
+    Those cells stay in the JSON and on the local minimap so a closer
+    window can show across a northern border. Country silhouettes
+    (web HUD, Mudlet Atlas packet, in-game ``atlas`` / ``map big``)
+    omit them so the lower forty-eight stays familiar. Real
+    ``earth_canada`` terrain is ordinary land, not this flag -- you
+    see that atlas when you are actually on that map.
+    """
+    if cell_or_room is None:
+        return False
+    if isinstance(cell_or_room, dict):
+        if cell_or_room.get("land_view"):
+            return True
+        layer = str(cell_or_room.get("map_layer") or "").strip().lower()
+        return layer == "land_view"
+    if getattr(cell_or_room, "land_view", False):
+        return True
+    layer = str(getattr(cell_or_room, "map_layer", "") or "").strip().lower()
+    return layer == "land_view"
+
+
+def country_atlas_glyph(cell):
+    """One glyph for the full-country silhouette (web / Mudlet / GMCP).
+
+    HUD Canada land paints as off-map space. Authored city letters,
+    highways, and HUD water (Gulf, lakes, ocean) still show. Local
+    minimaps use the raw ``map_glyph`` instead of this helper.
+    """
+    cell = cell or {}
+    if is_hud_foreign_land(cell):
+        return " "
+    authored = str(cell.get("map_glyph") or "").strip()
+    if authored:
+        return authored[0]
+    area = str(cell.get("area_type") or "").strip().lower()
+    return COUNTRY_ATLAS_AREA_GLYPH.get(area, ".")

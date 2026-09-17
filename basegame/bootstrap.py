@@ -268,6 +268,67 @@ def register_all_hooks():
     from basegame import personas as personas_mod
     personas_mod.register_persona_hooks()
     _register_phone_hooks()
+    _register_fishing_lock_hooks()
+    _register_grace_vessel_hooks()
+    hooks.set_cadence_meter_names(lambda: ("hunger", "thirst"))
+
+
+def _register_grace_vessel_hooks():
+    """Wave 5a/5b folklore peel: GMCP vitals grace + vessel occupant token."""
+    from basegame import stats as stats_module
+    from engine.systems import grace as grace_mod
+    from engine.systems import vessel as vessel_mod
+
+    def _build_char_vitals(character):
+        """Char.Vitals for basegame: HP plus optional demo grace gauge."""
+        max_hp = stats_module.max_hp(character)
+        hp = float(getattr(character, "hp", max_hp) or 0)
+        pct = 0
+        if max_hp > 0:
+            pct = int(round(100.0 * hp / max_hp))
+        payload = {
+            "hp": str(pct),
+            "maxhp": "100",
+            "hp_raw": str(int(hp)),
+            "maxhp_raw": str(int(max_hp)),
+        }
+        grace_val = getattr(character, "grace", None)
+        if grace_val is not None:
+            payload["grace"] = str(int(round(float(grace_val))))
+            payload["maxgrace"] = str(int(grace_mod.GRACE_MAX))
+        payload["string"] = f"H:{payload['hp']}/{payload['maxhp']}"
+        if "grace" in payload:
+            payload["string"] += f" G:{payload['grace']}/{payload['maxgrace']}"
+        return payload
+
+    def _occupant_token(obj, viewer):
+        del viewer
+        if vessel_mod.is_riding(obj) or vessel_mod.is_possessed_host(obj):
+            return "vessel"
+        return None
+
+    hooks.set_gmcp_char_vitals(_build_char_vitals)
+    hooks.set_occupant_token(_occupant_token)
+
+
+def _register_fishing_lock_hooks():
+    """Wave 2 folklore peel: engine fishing tables + item catalog for basegame."""
+    import json
+
+    from basegame import items as items_mod
+
+    hooks.set_item_catalog_get(items_mod.get)
+    hooks.set_make_world_item(items_mod.make_world_item)
+
+    tables_path = os.path.join(_CONTENT_DIR, "fishing_tables.json")
+
+    def _fishing_tables():
+        with open(tables_path, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    hooks.set_fishing_tables(_fishing_tables)
+    hooks.set_temporary_devils_trap(None)
+    hooks.set_occult_mark_blocks(None)
 
 
 def _register_appearance_hooks():

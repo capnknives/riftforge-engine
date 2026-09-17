@@ -30,7 +30,11 @@ from engine.hooks import (
     can_perceive_reaper,
     can_see_spirit,
     encounter_check,
+    follow_pull_handled,
+    follow_pull_homestead_plot,
+    follow_pull_household_pet,
     follow_pull_skip,
+    follow_shares_origin,
     follow_survival_peel_message,
     in_veil,
     move_gate_block,
@@ -68,6 +72,40 @@ def peel_shell_arg(text):
     return first, rest
 
 
+def unwrap_name_quotes(text):
+    """Strip one matching ``'…'`` / ``"…"`` wrapper from a name token."""
+    raw = (text or "").strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+        return raw[1:-1].strip()
+    return raw
+
+
+def split_gm_name_and_rest(game, args):
+    """Split ``<name> <command>`` for gm force (quoted or two-word keys).
+
+    ``gm force Officer Bates look`` used to take name ``Officer`` and
+    command ``Bates look``. Prefer a quoted first token, then the longest
+    prefix that ``resolve_gm_target_character`` actually finds, leaving at
+    least one command token.
+    """
+    text = (args or "").strip()
+    if not text:
+        return "", ""
+    if text[:1] in ("'", '"'):
+        name, rest = peel_shell_arg(text)
+        return unwrap_name_quotes(name), rest
+    tokens = text.split()
+    if len(tokens) < 2:
+        return "", ""
+    # Longest resolvable name prefix, then first token as fallback.
+    for i in range(len(tokens) - 1, 0, -1):
+        name = " ".join(tokens[:i])
+        rest = " ".join(tokens[i:])
+        if resolve_gm_target_character(game, name) is not None:
+            return name, rest
+    return tokens[0], " ".join(tokens[1:])
+
+
 def collapse_shell_args(text):
     """Turn args into one lookup string; unwrap quotes, keep inner spaces."""
     tokens = split_shell_args(text)
@@ -91,8 +129,18 @@ def asleep_blocks_world(character):
     Full-moon sleep-hunt is the Cadence exception: offline Echoes / NPCs
     with ``sleep_hunting`` may still move and hunt via ``npc_do`` (SilentSession).
     Live players must type ``wake`` first.
+
+    Sleep-dream awareness is the other exception: the dream-self (or an
+    in-place lucid sleeper already on the Dream plane) can look / speak /
+    walk. The frozen Earth husk stays closed.
     """
     if not getattr(character, "asleep", False):
+        return False
+    if getattr(character, "is_sleep_dream_clone", False):
+        return False
+    if getattr(character, "sleep_dream_tour", False) and not getattr(
+        character, "sleep_dream_clone_key", None,
+    ):
         return False
     if getattr(character, "sleep_hunting", False):
         from engine.npc_act import is_live_session
@@ -234,7 +282,47 @@ def staff_perfect_vision(character):
     if getattr(character, "gm_spirit_permanent", False):
         return True
     key_low = (getattr(character, "key", None) or "").lower()
-    return key_low.startswith("gmspirit:")
+    if key_low.startswith("gmspirit:"):
+        return True
+    # Staff riding visible immersion cast (playcast / assigned login).
+    session = getattr(character, "session", None)
+    if session is None:
+        return False
+    if bool(getattr(session, "playcast_gm_tools", False)):
+        return bool(getattr(session, "gm_eyes_staff_view", False))
+    if getattr(character, "immersion", False) and getattr(
+        session, "staff_account", None,
+    ):
+        return bool(getattr(session, "gm_eyes_staff_view", False))
+    return False
+
+
+def in_active_gm_form(character):
+    """True while this character is actually piloting GM form right now.
+
+    Mirrors ``in_gm_mode`` in ``supers/verbs/gm/presence.py`` without
+    importing SUPERS from engine layers (two-repo purity). Unlike
+    ``_is_gm`` (account-is-staff, ever), this reflects the live GM
+    on/off toggle -- a staff account playing an immersion cast body
+    with GM powers off returns False here (bug report 1574: ``follow``
+    was routing a staff-off cast body into the GM-only diagnostic tail
+    because it checked ``_is_gm`` instead of this).
+    """
+    if character is None:
+        return False
+    if bool(getattr(character, "gm_mode", False)):
+        return True
+    if getattr(character, "session", None) is None:
+        return False
+    if not getattr(character, "gm_spirit", False):
+        return False
+    key_low = (getattr(character, "key", None) or "").lower()
+    if key_low.startswith("gmspirit:") or bool(
+        getattr(character, "gm_spirit_permanent", False)
+    ):
+        character.gm_mode = True
+        return True
+    return False
 
 
 def _can_see_hellhound(viewer, hound):
@@ -310,11 +398,15 @@ def _is_presence_hidden(viewer, other):
         from engine import hooks
         if not hooks.can_notice_stealth(viewer, other):
             return True
+    # Game extras (Signal dwell in hardware, …) -- not mundane stealth.
+    from engine import hooks as _hooks_presence
+    if _hooks_presence.presence_hidden_extra(viewer, other):
+        return True
     # Trickster withdraw -- real Loki (etc.) folds into the shrine while an
     # archangel wears their face; casual onlookers should not see two of
     # them standing in the same room (bug report 632 / docs/LORE.md
     # "Gabriel/Loki bargain"). Staff, research intel, hunter field codex,
-    # and tier-3+ angel grace-sight still pierce it (pierce_lay_low).
+    # and tier-3+ angel grace-sight still pierce it (trickster research).
     if getattr(other, "trickster_laying_low", False):
         from engine import hooks
         if not hooks.can_perceive_trickster_laylow(viewer, other):
@@ -430,6 +522,7 @@ def strip_ephemeral_storage_prefix(name):
             low.startswith("gmspirit:")
             or low.startswith("husk:")
             or low.startswith("twin:")
+            or low.startswith("dreamself:")
         ):
             text = text.split(":", 1)[1].strip()
             if not text:
@@ -438,6 +531,9 @@ def strip_ephemeral_storage_prefix(name):
         if low.startswith("gym_dummy:"):
             # Room suffix is an internal VNUM -- never expose it.
             return "a training dummy"
+        if low.startswith("cultivator_rival:"):
+            # Bonded rival storage keys are never player-facing names.
+            return "a rival"
         return text
 
 
@@ -672,6 +768,13 @@ def floor_item_look_lines(items, character=None):
     for group in groups.values():
         sample = group[0]
         name = _display_name(sample)
+        count = len(group)
+        # Staff look: singles show short desc[INUM] (same gate as room VNUMs).
+        # Stacks stay the player plural -- use ``where item all`` for copies.
+        if count == 1 and staff_room_vnums_in_look(character):
+            from engine.item_inum import staff_item_label
+
+            name = staff_item_label(sample)
         # Wayfinding signs: faint muted paint for sighted; plain + [SIGN]
         # meaning for everyone (never color alone).
         cat = getattr(sample, "catalog_id", None) or ""
@@ -686,7 +789,6 @@ def floor_item_look_lines(items, character=None):
                 name = style_mod.paint_for(character, "muted", name)
             if "[SIGN]" not in name.upper() and "sign" not in name.lower():
                 name = f"[SIGN] {name}"
-        count = len(group)
         if count == 1:
             line = name
         else:
@@ -799,6 +901,35 @@ def _display_name(obj, viewer=None):
     return name
 
 
+def staff_room_vnums_in_look(viewer):
+    """True when ``look`` room titles append staff VNUM chrome."""
+    if viewer is None:
+        return False
+    if getattr(viewer, "gm_mode", False):
+        return True
+    session = getattr(viewer, "session", None)
+    if session is None:
+        return False
+    return bool(getattr(session, "gm_eyes_staff_view", False))
+
+
+def _staff_viewer_uses_gm_who(viewer):
+    """True when *viewer* should get staff who / seeaccounts, not player who.
+
+    Invis GM spirit, or staff riding immersion cast with gm eyes on.
+    Engine cannot import SUPERS ``staff_sees_as_gm``; Session flags
+    carry the same occupy stamp.
+    """
+    if viewer is None:
+        return False
+    if getattr(viewer, "gm_mode", False) or getattr(viewer, "gm_spirit", False):
+        return True
+    session = getattr(viewer, "session", None)
+    if session is None:
+        return False
+    return bool(getattr(session, "gm_eyes_staff_view", False))
+
+
 def _maybe_append_account_tag(name, subject, viewer):
     """Append ``(AccountName)`` when the viewer is staff with the pref on.
 
@@ -807,9 +938,7 @@ def _maybe_append_account_tag(name, subject, viewer):
     Staff already in GM form read as ``Accountname(GM)`` -- never append
     a second ``(Accountname)`` (``CapnKnives(GM)(CapnKnives)`` is noise).
     """
-    if not getattr(viewer, "gm_mode", False) and not getattr(
-        viewer, "gm_spirit", False
-    ):
+    if not _staff_viewer_uses_gm_who(viewer):
         return name
     # Face is already the account + (GM); tagging again is redundant.
     if _staff_form_label(subject):
@@ -941,6 +1070,13 @@ def _display_name_base(obj, viewer=None):
         return f"{_presence_face(obj)} (criminal)"
     if isinstance(obj, Character):
         return _presence_face(obj)
+    from engine.world import Item
+    if isinstance(obj, Item):
+        from engine.systems.civic_fixture import is_fixture_item
+        if is_fixture_item(obj):
+            display = (getattr(obj, "display_name", None) or "").strip()
+            if display:
+                return display
     return obj.key
 
 
@@ -1040,7 +1176,6 @@ def _move_one(character, direction, dest, game, auto_look=True):
     if train_msg and character.session:
         character.session.send(train_msg)
     character.move_to(dest)
-    after_move_crossing(character, room, direction, dest, game)
     from engine.systems import combat_pursuit as combat_pursuit_mod
     combat_pursuit_mod.notify_character_relocated(
         character, room, dest, game,
@@ -1051,8 +1186,14 @@ def _move_one(character, direction, dest, game, auto_look=True):
     t_after = _time.perf_counter()
     after_arrive(character, dest, game, was_working)
     lag_watch.stamp_move_phase(game, "after_arrive", t_after)
-    # Opt-in combat-pit pose feed (direction known here; after_arrive does not).
-    after_move_step(character, direction, dest, game)
+    # Occupancy GMCP is additive HUD. Never let a DTO fault skip arrive
+    # broadcast, auto-look, or follower pull (body already in dest).
+    try:
+        from engine import gmcp as gmcp_mod
+        gmcp_mod.push_occupants_for_room(room)
+        gmcp_mod.push_occupants_for_room(dest)
+    except Exception as exc:
+        print(f"[move] occupants gmcp skipped: {exc!r}", flush=True)
     # A body heaved onto your shoulder (cmd_heave) travels with you, exactly
     # like the gravedigger NPC carrying a corpse to the plot -- after_arrive
     # above already moved it through cadence.move_body so any spirit's
@@ -1077,6 +1218,13 @@ def _move_one(character, direction, dest, game, auto_look=True):
                 predicate=_hears_move,
             )
     lag_watch.stamp_move_phase(game, "broadcast", t_arrive)
+    # Auto-close (and re-lock) after arrive so destination watchers see
+    # open → walk in → close, not close before the threshold line (bug 1749).
+    after_move_crossing(character, room, direction, dest, game)
+    # Opt-in combat-pit pose feed + hygiene exposure + stealth stamps run
+    # after leave/arrive broadcasts so state-swap room tells (naked, filthy,
+    # …) never precede the walk-in line (bug report 1372).
+    after_move_step(character, direction, dest, game)
     # Local import: cmd_look now lives in engine.verbs.basic, a different
     # package from this shared-helper module -- lazy avoids a module-level
     # cross-package import, same reasoning as every other import here.
@@ -1143,14 +1291,23 @@ def start_following(follower, leader):
         leader.followers = [follower]
     elif follower not in followers:
         followers.append(follower)
+    leader_key = getattr(leader, "key", None)
+    if leader_key:
+        follower.following_leader_key = str(leader_key).strip()
+    from engine import group as group_mod
+
+    group_mod.clear_follow_declined_for(follower, leader)
     return True
 
 
-def stop_following(follower, silent=False):
+def stop_following(follower, silent=False, *, declined=False, game=None):
     """Clear `follower`'s follow bond. Safe with no Session (Cadence / Echo).
 
     When `silent` is False and the follower has a live Session, send the
     usual "you stop following" line (player unfollow / bare follow).
+
+    ``declined=True`` stamps ``follow_declined_leader_key`` so Cadence pack /
+    companion glue does not immediately re-bond (bug report 1574).
     """
     if follower is None:
         return
@@ -1163,10 +1320,15 @@ def stop_following(follower, silent=False):
     if follower in followers:
         followers.remove(follower)
     follower.following = None
+    follower.following_leader_key = None
     # Opaque SUPERS beckon-companion marker (supers/companion.py) -- clear
     # when the follow bond drops so duty does not outlive the trail.
     if getattr(follower, "companion_leader_key", None) is not None:
         follower.companion_leader_key = None
+    if declined and target is not None:
+        from engine import group as group_mod
+
+        group_mod.record_follow_declined(follower, target, game=game)
     if not silent and getattr(follower, "session", None) is not None:
         follower.session.send(f"You stop following {target.key}.")
 
@@ -1213,27 +1375,43 @@ def stop_staff_tail(tailer, silent=False):
         tailer.session.send(f"You stop tailing {label}.")
 
 
-def _pull_staff_tailers(leader, origin, direction, game):
+def _pull_staff_tailers(leader, origin, direction, game, dest=None):
     """Move staff GMs tailing `leader` with the same step (no group/pack)."""
+    if dest is None and origin is not None and direction:
+        dest = origin.exits.get(direction)
     for tailer in list(getattr(leader, "staff_tailers", None) or []):
         if getattr(tailer, "staff_tailing", None) is not leader:
             continue
         if tailer.location is not origin or getattr(tailer, "spirit", False):
             continue
-        dest = origin.exits.get(direction)
-        if dest is not None and move_gate_block(tailer, origin, dest, game):
+        if dest is None:
+            continue
+        if move_gate_block(tailer, origin, dest, game):
             if tailer.session is not None:
                 tailer.session.send(
                     "[Staff] Tail stopped -- that exit is blocked for you."
                 )
             stop_staff_tail(tailer, silent=True)
             continue
-        _move_one(tailer, direction, dest, game)
+        _move_one(tailer, direction or "in", dest, game)
 
 
 def _pull_followers(leader, origin, direction, game):
+    """Move everyone trailing `leader` the same compass exit."""
+    dest = None
+    if origin is not None and direction:
+        dest = origin.exits.get(direction)
+    _pull_followers_to(leader, origin, dest, game, direction=direction)
+
+
+def _pull_followers_to(leader, origin, dest, game, *, direction="in"):
     """Move everyone trailing `leader` (and, transitively, everyone trailing
-    THEM) the same direction leader just went -- suggestions.log #44.
+    THEM) to *dest* -- suggestions.log 44 plus zone enter/exit.
+
+    Compass ``cmd_move`` looks dest up from ``origin.exits``. ``enter`` /
+    ``exit`` / ``in`` / ``out`` pass the dest room directly so castle
+    mouths and portal pockets pull the party instead of leaving mates
+    at the threshold.
 
     Walked breadth-first from a plain list used as a queue, with a `moved`
     id-set guard: `following` is a single pointer but nothing stops two
@@ -1242,17 +1420,39 @@ def _pull_followers(leader, origin, direction, game):
 
     Pulls online players **and** Echo / idlemode companions (`acts_as_echo`)
     still standing in the leader's ORIGIN room -- Cadence hunt partners
-    (e.g. Echo Sam trailing Dean) must walk and board together. Spirits
-    still never pull; anyone who already left some other way is left alone.
+    (e.g. Echo Sam trailing Dean) must walk and board together. Ordinary
+    spirits still never pull (genuine discorporate linger). A Mantle whose
+    ``vessel_host_key`` is the leader (possession rider, not a generic
+    spirit follower) does pull so ``enter homestead`` does not leave them
+    on the yard. Anyone who already left some other way is left alone.
     """
+    if leader is None or origin is None or dest is None:
+        return
     moved = {id(leader)}
-    queue = list(leader.followers)
+    queue = list(getattr(leader, "followers", None) or [])
     while queue:
         follower = queue.pop(0)
         if id(follower) in moved:
             continue
         moved.add(id(follower))
-        if follower.location is not origin or follower.spirit:
+        if follower.spirit:
+            # Possession-only: host walked into a pocket while the riding
+            # Mantle spirit still stands on the yard cell. Do not pull every
+            # discorporate linger -- only this host↔rider link (1506).
+            rider_host = getattr(follower, "vessel_host_key", None)
+            if not (
+                rider_host
+                and rider_host == getattr(leader, "key", None)
+            ):
+                continue
+        # Cars sit in a cabin Room, not the street. Count them as "here"
+        # when their ride is still parked (or overlanding) at origin.
+        if getattr(follower, "location", None) is not origin and (
+            not follow_shares_origin(follower, origin, game)
+            and not follow_pull_homestead_plot(
+                follower, leader, origin, dest, game,
+            )
+        ):
             continue
         # Own living vessel husks must never trail the Mantle via follow
         # pulls -- a desynced vacant shell reads as a naked NPC (826).
@@ -1278,7 +1478,16 @@ def _pull_followers(leader, origin, direction, game):
         # yanked when the companion leader walks for food (hooked).
         if follow_pull_skip(follower, leader, game):
             continue
-        dest = origin.exits.get(direction)
+        # Boarded followers: park their own ride at dest (horse enter
+        # sunrise) instead of yanking the rider off the saddle.
+        if follow_pull_handled(follower, origin, dest, game):
+            queue.extend(list(getattr(follower, "followers", None) or []))
+            continue
+        # Household pets trail owners through homestead porch exits and
+        # yard gates (can_enter_home), not Lebanon town gateways.
+        if follow_pull_household_pet(follower, leader, origin, dest, game):
+            queue.extend(list(getattr(follower, "followers", None) or []))
+            continue
         # Same gates a manual move would hit (jail cells, hunter-safe
         # sanctuaries, ...) -- immersion parity (AGENTS.md rule 9): a
         # follower being dragged along must not slip through a gate that
@@ -1286,7 +1495,7 @@ def _pull_followers(leader, origin, direction, game):
         # move_gate_block hook cmd_move itself calls, so this stays
         # supers-agnostic (Phase 2b) instead of importing supers.slayer
         # directly the way this helper used to.
-        if dest is not None and move_gate_block(follower, origin, dest, game):
+        if move_gate_block(follower, origin, dest, game):
             if follower.session is not None:
                 follower.session.send(
                     "Something in you recoils -- that place is claimed "
@@ -1294,9 +1503,12 @@ def _pull_followers(leader, origin, direction, game):
                     "trespass."
                 )
             continue
-        _move_one(follower, direction, dest, game)
+        hub_key = getattr(leader, "zone_entry_hub_key", None)
+        if hub_key:
+            follower.zone_entry_hub_key = hub_key
+        _move_one(follower, direction or "in", dest, game)
         queue.extend(list(getattr(follower, "followers", None) or []))
-    _pull_staff_tailers(leader, origin, direction, game)
+    _pull_staff_tailers(leader, origin, direction or "in", game, dest=dest)
     # Party must share a room -- disband stragglers the pull could not move.
     try:
         from engine import group as group_mod
@@ -1470,6 +1682,9 @@ def _find_item(query, items, character=None):
     When ``character`` is passed and several items match without an ordinal,
     the game hook ``inventory_item_match_rank`` sorts candidates so carried
     (not worn) copies win over equipped duplicates.
+
+    Staff INUM tags (``AD00001``) are **not** matched here -- players must
+    never target instance numbers. Use :func:`find_staff_item_by_inum`.
     """
     from engine.char_identity import parse_target_ordinal, pick_ordinal
 
@@ -1487,6 +1702,39 @@ def _find_item(query, items, character=None):
             key=lambda item: hooks.inventory_item_match_rank(character, item),
         )
     return matches[0]
+
+
+def find_staff_item_by_inum(character, query, *, room=None, can_see=True):
+    """Exact INUM lookup for staff look / inspect. Players get None.
+
+    Searches carried inventory (including nested bags) and, when the
+    viewer can see, floor items in ``room``. Never a player targeting path.
+    """
+    from engine.item_inum import parse_inum, persist_inum_text, walk_item_tree
+    from engine.world import Item
+
+    if not staff_room_vnums_in_look(character):
+        return None
+    if not parse_inum(query):
+        return None
+    want = str(query).strip().upper()
+    pool = []
+    inv = getattr(character, "inventory", None) or [] if character else []
+    pool.extend(inv)
+    gear = getattr(character, "gear_bag", None) or [] if character else []
+    pool.extend(gear)
+    if can_see and room is not None:
+        pool.extend(
+            obj for obj in getattr(room, "contents", ()) or ()
+            if isinstance(obj, Item)
+        )
+    for obj in pool:
+        if not isinstance(obj, Item):
+            continue
+        for node in walk_item_tree(obj):
+            if persist_inum_text(node) == want:
+                return node
+    return None
 
 
 def _find_item_prefer_locked(query, items, character=None):
@@ -1698,9 +1946,9 @@ def is_linked_self(actor, other):
 def _viewport_staff_body_pref(game, query):
     """Prefer the Ash viewport play body over world ``Ash`` name collisions.
 
-    Crashgate viewport opens as staff account Ash while the corporeal play
-    body may be a random hunter key (not ``Ash``). ``gm force Ash`` must not
-    hit immersion cast ``Ash Riley`` when the viewport harness is active.
+    Crashgate viewport opens as staff account Ash. ``gm force Ash`` /
+    ``summon Ash`` / ``gm stats Ash`` must hit the staff-login Roadhouse
+    fixture, not a player Angel named Ash Riley (bug report 1213).
     """
     raw = (query or "").strip()
     if not raw or game is None:
@@ -1715,6 +1963,11 @@ def _viewport_staff_body_pref(game, query):
     low = raw.lower()
     if low not in (staff.lower(), "ash"):
         return None
+    from engine.accounts import resolve_staff_login_cast
+
+    fixture = resolve_staff_login_cast(game, "Ash")
+    if fixture is not None:
+        return fixture
     char = getattr(session, "character", None)
     if char is None:
         return None
@@ -1734,13 +1987,13 @@ def resolve_gm_target_character(game, query):
     offline).
 
     Resolution order:
-      0. Active Ash viewport staff token (``Ash`` / ``staff_account``)
+      0. Active Ash viewport: staff-login fixture, then occupy body
       1. ``game.find_character`` -- keys, faces, NPCs, Echoes, ordinals
       2. ``find_login_character`` -- bare roster keys / unique given names
       3. Account name → online session character on that account
       4. Account name → first playable roster body (Echo / offline)
     """
-    raw = (query or "").strip()
+    raw = unwrap_name_quotes(query)
     if not raw or game is None:
         return None
 
@@ -1887,6 +2140,7 @@ def verb_target_token(actor, target, game=None):
         character_surname,
         humanize_storage_key,
         legal_public_name,
+        surname_is_targetable,
     )
 
     def _humanize_if_mash(label, storage_key):
@@ -1911,7 +2165,7 @@ def verb_target_token(actor, target, game=None):
 
         given = character_given_name(subject).strip()
         sur = character_surname(subject).strip()
-        if given and sur:
+        if given and sur and surname_is_targetable(subject):
             labels.append(f"{given} {sur}")
         elif given:
             labels.append(_humanize_if_mash(given, storage_key))
@@ -1979,6 +2233,28 @@ def _collect_character_matches(query, characters, self_character=None):
     hits = []
     for char in characters:
         matched = False
+        # Unpierced archangel deep cover: only the mask (Loki) matches,
+        # not the true key or archangel kit tokens (bug report 1278).
+        if (
+            getattr(char, "deep_cover_active", False)
+            and self_character is not None
+        ):
+            try:
+                from engine.hooks import presence_face_for
+                mask = presence_face_for(self_character, char)
+            except Exception:
+                mask = None
+                _log_hook_error(
+                    "presence_face_for (cover)",
+                    getattr(char, "key", None),
+                )
+            true_key = (getattr(char, "key", None) or "").lower()
+            if mask and true_key and true_key not in str(mask).lower():
+                if needle in str(mask).lower():
+                    matched = True
+                if matched and char not in hits:
+                    hits.append(char)
+                continue
         for label in identity_match_needles(char):
             if needle in label:
                 matched = True
@@ -2025,8 +2301,9 @@ def sort_character_target_matches(matches):
 
     def _sort_key(ch):
         is_twin = bool(getattr(ch, "god_twin", False))
+        is_dream = bool(getattr(ch, "is_sleep_dream_clone", False))
         key = (getattr(ch, "key", "") or "").lower()
-        return (1 if is_twin else 0, key)
+        return (1 if is_twin or is_dream else 0, key)
 
     return sorted(matches, key=_sort_key)
 
@@ -2188,6 +2465,16 @@ def _is_gm(character):
                     return True
             except Exception:
                 _log_hook_error("gm check staff_account", staff_name)
+    # Visible cast occupy survives copyover on the body blob before Session
+    # restamp (bug report 1417).
+    occupy = (getattr(character, "staff_occupy_account", None) or "").strip()
+    if occupy and game is not None:
+        try:
+            from engine.accounts import find_account, account_is_staff
+            if account_is_staff(find_account(game, occupy)):
+                return True
+        except Exception:
+            _log_hook_error("gm check staff_occupy_account", occupy)
     # When session is on a GM spirit, gm_mode_body may hold the login body
     # whose account we should check; spirit also copies gm_rank.
     if game is not None:
@@ -2244,6 +2531,8 @@ def _is_staff_gm(character):
 
     Same filter as `who`'s GM strip -- used for evil-spawn tier scaling so
     a high-tier head GM online does not crank city threat to peak+1.
+    Occupying staff still pass ``_is_gm`` (and gateway bind
+    ``session_is_staff_gm``); do not reuse this filter for copyover stitch.
     """
     return _is_gm(character) and not getattr(character, "immersion", False)
 

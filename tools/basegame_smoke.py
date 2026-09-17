@@ -280,7 +280,7 @@ def main():
 
     from engine.systems import civic_shops as civic_shops_mod
 
-    civic_shops_mod.ensure_demo_newsstand(game)
+    record = civic_shops_mod.ensure_demo_newsstand(game)
     plaza = game.rooms.get("NB00001")
     assert plaza is not None, "Main Street hub NB00001 missing"
     assert (plaza.zone_entries or {}).get("newsstand") is not None, (
@@ -289,7 +289,8 @@ def main():
     walker.move_to(plaza)
     _FakeSession([]).attach(walker)
     dispatch(walker, "enter newsstand", game)
-    assert walker.location.key == "BGNewsstandHub", walker.location.key
+    hub_key = (record or {}).get("hub_room_key") or "BGNewsstandHub"
+    assert walker.location.key == hub_key, walker.location.key
     dispatch(walker, "exit", game)
     assert walker.location is plaza
 

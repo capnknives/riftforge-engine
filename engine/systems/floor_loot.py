@@ -50,11 +50,43 @@ def stamp_floor_drop(game, item):
     if item is None:
         return
     if getattr(item, "floor_dropped_tick", None) is not None:
+        note_severed_head_on_floor(game, item)
         return
     now = 0
     if game is not None:
         now = int(getattr(game, "game_time_ticks", 0) or 0)
     item.floor_dropped_tick = now
+    note_severed_head_on_floor(game, item)
+
+
+def note_severed_head_on_floor(game, item):
+    """Remember a trophy so maint TTL does not walk the whole map."""
+    if game is None or item is None:
+        return
+    if not is_severed_head_floor_item(item):
+        return
+    idx = getattr(game, "_severed_head_floor_index", None)
+    if not isinstance(idx, set):
+        # Leave None so the next tick still rebuilds unindexed legacy piles.
+        return
+    idx.add(item)
+
+
+def _rebuild_severed_head_floor_index(game):
+    """One map walk to seed the trophy index (boot / first maint slot)."""
+    idx = set()
+    rooms = getattr(game, "rooms", None) or {}
+    if isinstance(rooms, dict):
+        for room in rooms.values():
+            if room is None or is_lost_item_vault(room):
+                continue
+            for obj in list(getattr(room, "contents", None) or []):
+                if is_severed_head_floor_item(obj):
+                    if getattr(obj, "location", None) is None:
+                        obj.location = room
+                    idx.add(obj)
+    game._severed_head_floor_index = idx
+    return idx
 
 
 def stamp_vault_arrival(game, item):
@@ -230,40 +262,50 @@ def tick_severed_head_floor_decay(game):
     TTL owns that room). Uses ``floor_dropped_tick``; unstamped legacy heads
     get stamped on first sight so they clear after one window. Returns how
     many Items were removed.
+
+    Walks the stamped trophy index, not every room -- maint_phase0 on
+    crashgate billed ~590ms walking 15k empty tiles for this backup TTL.
     """
     from world import Item
 
     if game is None:
         return 0
-    rooms = getattr(game, "rooms", None) or {}
-    if not isinstance(rooms, dict):
-        return 0
+    idx = getattr(game, "_severed_head_floor_index", None)
+    if not isinstance(idx, set):
+        idx = _rebuild_severed_head_floor_index(game)
     now = int(getattr(game, "game_time_ticks", 0) or 0)
     from engine import game_clock_tuning as clock_mod
     age = clock_mod.ticks_for_wall_seconds(
         SEVERED_HEAD_FLOOR_DECAY_SECONDS, game,
     )
     removed = 0
-    for room in list(rooms.values()):
-        if room is None or is_lost_item_vault(room):
+    stale = []
+    for obj in list(idx):
+        if not isinstance(obj, Item) or not is_severed_head_floor_item(obj):
+            stale.append(obj)
             continue
-        for obj in list(getattr(room, "contents", None) or []):
-            if not isinstance(obj, Item):
-                continue
-            if not is_severed_head_floor_item(obj):
-                continue
-            dropped = getattr(obj, "floor_dropped_tick", None)
-            if dropped is None:
-                # Legacy pile -- start the clock so it clears once.
-                stamp_floor_drop(game, obj)
-                continue
-            if now < int(dropped) + age:
-                continue
-            room.remove(obj)
-            removed += 1
-            if room.characters():
-                room.broadcast(
-                    "A discarded trophy softens into the wet brick and is gone.",
-                    exclude=None,
-                )
+        room = getattr(obj, "location", None)
+        if room is None or is_lost_item_vault(room):
+            stale.append(obj)
+            continue
+        if obj not in getattr(room, "contents", []):
+            stale.append(obj)
+            continue
+        dropped = getattr(obj, "floor_dropped_tick", None)
+        if dropped is None:
+            # Legacy pile -- start the clock so it clears once.
+            stamp_floor_drop(game, obj)
+            continue
+        if now < int(dropped) + age:
+            continue
+        room.remove(obj)
+        stale.append(obj)
+        removed += 1
+        if room.characters():
+            room.broadcast(
+                "A discarded trophy softens into the wet brick and is gone.",
+                exclude=None,
+            )
+    for obj in stale:
+        idx.discard(obj)
     return removed

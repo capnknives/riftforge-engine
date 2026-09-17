@@ -8,6 +8,7 @@ Layout::
 
     backups/YYYY-MM-DD/
       riftforge.db
+      player-items/          -- per-player gear JSON (nightly extract)
       manifest.json
       content/maps/
       content/zones/
@@ -23,7 +24,7 @@ Env (optional):
 - ``RIFTFORGE_BACKUP_RETENTION_DAYS`` -- prune older trees (default ``14``)
 - ``RIFTFORGE_BACKUP_ACK_SECONDS`` -- wait for game save ack (default ``20``)
 - ``RIFTFORGE_PRE_DEPLOY_SNAPSHOT_KEEP`` -- how many ``backups/pre-deploy/``
-  same-day rollback snapshots to keep (default ``10``); see lag P11 finding
+  same-day rollback snapshots to keep (default ``5``); see lag P11 finding
   below for why this must not be unbounded.
 
 ``backups/pre-deploy/<timestamp>/`` holds one full SQLite copy per
@@ -58,7 +59,7 @@ DEFAULT_HOUR = 0
 DEFAULT_MINUTE = 5
 DEFAULT_RETENTION_DAYS = 14
 DEFAULT_ACK_SECONDS = 20.0
-DEFAULT_PRE_DEPLOY_SNAPSHOT_KEEP = 10
+DEFAULT_PRE_DEPLOY_SNAPSHOT_KEEP = 5
 
 
 def _repo_root():
@@ -311,6 +312,12 @@ def prune_pre_deploy_snapshots(*, root=None):
             f"[backup] pruned {len(removed)} old pre-deploy snapshot(s)",
             flush=True,
         )
+        try:
+            from engine.hakai_archive import reset_scan_caches
+
+            reset_scan_caches()
+        except Exception:
+            pass
     return removed
 
 
@@ -419,15 +426,31 @@ def run_backup(*, root=None, triggered_by="scheduler", force=False):
             catalog_count += 1
     copied["catalogs"] = catalog_count
 
+    at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    nightly_items = {}
+    if db_ok and os.path.isfile(dest_db):
+        try:
+            from engine.nightly_player_items import extract_nightly_player_items
+
+            nightly_items = extract_nightly_player_items(
+                dest_db, today, root=root, at_utc=at_utc,
+            )
+        except Exception as exc:
+            print(
+                f"[backup] nightly player-items extract failed: {exc!r}",
+                flush=True,
+            )
+
     manifest = {
         "date": today,
         "sha": current_head_sha(root),
-        "at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "at_utc": at_utc,
         "triggered_by": triggered_by,
         "consistent": bool(ack_ok and db_ok),
         "ack": ack_ok,
         "db_ok": db_ok,
         "copied": copied,
+        "nightly_player_items": nightly_items,
         "path": dest_root,
     }
     manifest_path = os.path.join(dest_root, "manifest.json")

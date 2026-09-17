@@ -17,6 +17,7 @@ import json
 from engine import hooks
 from engine import map_hud
 from engine.room_vnum import internal_room_key, label_is_bare_vnum
+from engine.systems import occult_marks as occult_marks_mod
 
 # FIFO cap on persisted visited room keys (internal ids only).
 VISITED_ROOM_CAP = 1500
@@ -260,7 +261,7 @@ def _room_dto(room, game, zone: str) -> dict | None:
         return None
     x, y, _z = xyz
     area = getattr(room, "area_type", None) or "city"
-    return {
+    dto = {
         "x": x,
         "y": y,
         "n": _player_room_name(room),
@@ -268,6 +269,11 @@ def _room_dto(room, game, zone: str) -> dict | None:
         "ex": _visible_exit_tokens(room, game),
         "m": _is_zone_mouth(room, zone),
     }
+    ticks = int(getattr(game, "game_time_ticks", 0) or 0) if game else 0
+    marks = occult_marks_mod.room_marks_for_hud(room, ticks)
+    if marks:
+        dto["marks"] = marks
+    return dto
 
 
 def _payload_size(payload: dict) -> int:

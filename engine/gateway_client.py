@@ -396,23 +396,26 @@ class GatewayBridge:
 
         try:
             await deploy_notify.on_resume(self.game)
+            await hooks.gateway_resume_hook(self.game)
+            # Import gateway stitch rings before the veil opens or rewrite
+            # ready fires — bare ooc replay and ooc.log must see copyover lines
+            # first (bug 1473).
+            try:
+                await self.notify_chat_history()
+            except Exception as exc:
+                print(
+                    f"[gateway_client] chat_history sync skipped: {exc!r}",
+                    flush=True,
+                )
             if reload:
                 # Diku copyover_recover: players type before zone resets.
                 hooks.open_veil_playable(self.game)
-            await hooks.gateway_resume_hook(self.game)
             await hooks.run_deferred_boot_seed_async(self.game)
             deploy_notify.announce_rewrite_ready(self.game)
             swept = sweep_duplicate_session_attaches(self.game)
             if swept:
                 print(
                     f"[gateway_client] swept {swept} duplicate session row(s)",
-                    flush=True,
-                )
-            try:
-                await self.notify_chat_history()
-            except Exception as exc:
-                print(
-                    f"[gateway_client] chat_history sync skipped: {exc!r}",
                     flush=True,
                 )
             from engine import copyover as copyover_mod
@@ -446,10 +449,21 @@ class GatewayBridge:
         """Push the game's channel rings to the gateway stitch buffers."""
         from engine import channel_history
 
+        loop = asyncio.get_running_loop()
+        self._chat_history_ack = loop.create_future()
         snapshot = channel_history.export_gateway_snapshot(self.game)
         await self.send_frame(
             encode_ctrl({"op": "chat_history", "channels": snapshot})
         )
+        try:
+            await asyncio.wait_for(self._chat_history_ack, timeout=5.0)
+        except asyncio.TimeoutError:
+            print(
+                "[gateway_client] chat_history_ack timed out — continuing boot",
+                flush=True,
+            )
+        finally:
+            self._chat_history_ack = None
 
     def schedule_channel_mirror(self, channel_name: str, plain_line: str) -> None:
         """Mirror one plain channel line to the gateway stitch buffer."""
@@ -611,6 +625,20 @@ class GatewayBridge:
                                 f"[gateway_client] stitch import save failed: {exc2!r}",
                                 flush=True,
                             )
+        elif op == "chat_history_ack":
+            ack = getattr(self, "_chat_history_ack", None)
+            if ack is not None and not ack.done():
+                ack.set_result(True)
+        elif op == "chat_transcript":
+            from engine import channels
+
+            channel_name = str((msg or {}).get("channel") or "")
+            plain = str((msg or {}).get("line") or "")
+            # Never let a missing helper abort the new child after a long
+            # copyover boot (trivia ship dropped the symbol once).
+            record = getattr(channels, "record_gateway_stitch_plain", None)
+            if callable(record):
+                record(self.game, channel_name, plain)
 
     async def _open_session(
         self,

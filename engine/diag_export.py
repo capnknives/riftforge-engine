@@ -260,11 +260,15 @@ def append_auto_capture_event(game, data, *, reason="tick_overrun"):
 
 
 def maybe_notify_auto_capture(game, total_ms):
-    """Optional head-GM [GM] ping when an auto-capture row lands."""
+    """[GM] ping when an auto-capture row lands (staff in GM form only).
+
+    Uses ``ping_gms`` so account-rank GMs still hear it, but
+    ``gm_form_only`` skips occupied / gm-off bodies (suggestion 488).
+    ``gm staffnotify off`` still silences it for that staffer.
+    """
     if game is None:
         return
     try:
-        from world import Character
         from engine import gm_notify
     except Exception:
         return
@@ -272,13 +276,10 @@ def maybe_notify_auto_capture(game, total_ms):
         f"auto-diag captured (tick {total_ms:.0f}ms) -- "
         "see gm diaglog analyze"
     )
-    for session in list(getattr(game, "sessions", None) or ()):
-        body = getattr(session, "character", None)
-        if body is None or not isinstance(body, Character):
-            continue
-        if getattr(body, "gm_rank", None) != "head_gm":
-            continue
-        gm_notify.send_gm_player_line(body, msg)
+    try:
+        gm_notify.ping_gms(game, msg, gm_form_only=True)
+    except Exception as exc:
+        print(f"[diag_export] auto-capture ping failed: {exc!r}", flush=True)
 
 
 def append_copyover_abort_event(payload):
@@ -615,6 +616,42 @@ def _http_json(method, url, payload, token):
         return resp.status, body
 
 
+def tick_hitch_payload(game):
+    """Scalars + subphases for auto-capture / tick_summary (lag P23c telemetry)."""
+    if game is None:
+        return {}
+    out = {}
+    sub = getattr(game, "_lag_hitch_subphases", None)
+    if isinstance(sub, dict) and sub:
+        out["hitch_subphases"] = dict(sub)
+    for key, attr in (
+        ("fighter_n", "fighter_n"),
+        ("fighters_prep_ms", "_fighters_prep_ms"),
+        ("combat_swing_deferred", "_combat_swing_deferred"),
+        ("orphan_slot", "_orphan_reap_slot"),
+        ("orphan_reap_ms", "_orphan_reap_ms"),
+        ("helper_seek_ms", "_helper_seek_ms"),
+    ):
+        val = getattr(game, attr, None)
+        if val is not None:
+            out[key] = val
+    autosave = getattr(game, "_last_autosave_stats", None) or {}
+    if autosave.get("wall_budget_hit"):
+        out["wall_budget_hit"] = True
+    slow_detail = autosave.get("slow_char_detail")
+    if slow_detail:
+        out["slow_char_detail"] = list(slow_detail)[:8]
+    fuel_bd = getattr(game, "_last_fuel_phase_breakdown", None) or {}
+    fuel_phases = fuel_bd.get("phases") or {}
+    if fuel_phases.get("fuel_companions_ms") is not None:
+        out["fuel_companions_ms"] = fuel_phases.get("fuel_companions_ms")
+    humanity_bd = getattr(game, "_last_humanity_phase_breakdown", None) or {}
+    hum_phases = humanity_bd.get("phases") or {}
+    if hum_phases.get("roster_ms") is not None:
+        out["humanity_roster_ms"] = hum_phases.get("roster_ms")
+    return out
+
+
 def build_tick_summary(game, *, log_text=None):
     """Compact text from ``game._tick_stats`` + Cadence budget + autosave.
 
@@ -673,6 +710,25 @@ def build_tick_summary(game, *, log_text=None):
             parts.append(f"chars={autosave.get('n_changed_chars')}")
         if autosave.get("n_deferred_chars"):
             parts.append(f"deferred_chars={autosave.get('n_deferred_chars')}")
+        if autosave.get("wall_budget_hit"):
+            parts.append("wall_budget_hit=1")
+        slow_detail = autosave.get("slow_char_detail") or []
+        if slow_detail:
+            top = slow_detail[0]
+            frag = ""
+            keys = top.get("blob_top_keys") or []
+            if keys:
+                frag = " top=" + ",".join(
+                    f"{row.get('key')}:{row.get('approx_bytes')}"
+                    for row in keys[:3]
+                )
+            parts.append(
+                f"slow_char={top.get('name')}"
+                f" blob={top.get('blob_ms')}ms"
+                f" dumps={top.get('dumps_ms')}ms"
+                f" bytes={top.get('blob_bytes')}"
+                f"{frag}"
+            )
         if autosave.get("game_meta_slices_written") is not None:
             parts.append(f"meta_wrote={autosave.get('game_meta_slices_written')}")
         if autosave.get("game_meta_slices_skipped") is not None:
@@ -699,12 +755,58 @@ def build_tick_summary(game, *, log_text=None):
                 f"wal_bytes={autosave.get('wal_file_bytes_before')}"
                 f"->{autosave.get('wal_file_bytes_after')}"
             )
+        if autosave.get("wall_budget_hit"):
+            parts.append("wall_budget_hit=1")
+        slow_detail = autosave.get("slow_char_detail")
+        if slow_detail:
+            names = ", ".join(
+                f"{row.get('name')}={row.get('total_ms')}ms"
+                for row in slow_detail[:4]
+                if isinstance(row, dict)
+            )
+            if names:
+                parts.append(f"slow_char_detail=[{names}]")
         lines.append("autosave last=" + " ".join(str(p) for p in parts))
         running = bool(getattr(game, "_autosave_running", False))
         if running:
             lines.append("autosave running=1")
     else:
         lines.append("autosave last=(none yet)")
+    lag_parking_ms = getattr(game, "_lag_parking_write_ms", None)
+    if lag_parking_ms is not None:
+        lines.append(
+            "parking_write last="
+            f"write_ms={lag_parking_ms} "
+            f"vehicles={getattr(game, '_lag_parking_vehicles', '?')} "
+            f"bytes={getattr(game, '_lag_parking_bytes', '?')} "
+            f"skipped={getattr(game, '_lag_parking_skipped', 0)}"
+        )
+    hitch = tick_hitch_payload(game)
+    if hitch:
+        scalar_bits = []
+        for key in (
+            "fighter_n",
+            "fighters_prep_ms",
+            "combat_swing_deferred",
+            "orphan_slot",
+            "orphan_reap_ms",
+            "helper_seek_ms",
+            "wall_budget_hit",
+            "fuel_companions_ms",
+            "humanity_roster_ms",
+        ):
+            if hitch.get(key) is not None:
+                scalar_bits.append(f"{key}={hitch.get(key)}")
+        if scalar_bits:
+            lines.append("hitch " + " ".join(scalar_bits))
+        sub = hitch.get("hitch_subphases") or {}
+        if sub:
+            parts = []
+            for name, row in sorted(sub.items()):
+                if isinstance(row, dict):
+                    parts.append(f"{name}={row.get('ms')}ms")
+            if parts:
+                lines.append("hitch_subphases " + " ".join(parts[:12]))
     overlap = tick_save_overlap_hint(game)
     if overlap:
         lines.append(overlap)
@@ -996,10 +1098,14 @@ def summarize_ndjson(text):
     cadence_total = []
     cadence_cpu = []
     cadence_paused = []
+    cadence_unaccounted = []
     phase_ms = {key: [] for key in _CADENCE_PHASE_STAT_KEYS}
     slow_total = []
     autosave_ms = []
     autosave_lock_wait = []
+    parking_write_ms = []
+    hitch_subphase_ms = defaultdict(list)
+    wall_budget_hits = 0
     handler_ms = defaultdict(list)
     worst_slow = None
     save_busy_ticks = 0
@@ -1022,6 +1128,8 @@ def summarize_ndjson(text):
             cadence_total.append(float(data.get("total_ms") or data.get("wall_ms") or 0))
             cadence_cpu.append(float(data.get("cpu_ms") or 0))
             cadence_paused.append(float(data.get("paused_ms") or 0))
+            if data.get("unaccounted_ms") is not None:
+                cadence_unaccounted.append(float(data.get("unaccounted_ms") or 0))
             phases = data.get("phases") or {}
             echo_ms.append(float(phases.get("echo_ms") or 0))
             town_ms.append(float(phases.get("town_ms") or 0))
@@ -1039,6 +1147,13 @@ def summarize_ndjson(text):
                     "top_handlers": (data.get("top_handlers") or [])[:6],
                     "autosave_running": bool(data.get("autosave_running")),
                     "cadence_budget": data.get("cadence_budget"),
+                    "hitch_subphases": data.get("hitch_subphases"),
+                    "fighter_n": data.get("fighter_n"),
+                    "fighters_prep_ms": data.get("fighters_prep_ms"),
+                    "orphan_slot": data.get("orphan_slot"),
+                    "helper_seek_ms": data.get("helper_seek_ms"),
+                    "wall_budget_hit": data.get("wall_budget_hit"),
+                    "slow_char_detail": (data.get("slow_char_detail") or [])[:4],
                 }
             if total >= 2000.0 and (
                 data.get("autosave_running")
@@ -1059,6 +1174,13 @@ def summarize_ndjson(text):
             lock = data.get("lock_wait_ms")
             if lock is not None:
                 autosave_lock_wait.append(float(lock))
+            if data.get("wall_budget_hit"):
+                wall_budget_hits += 1
+        elif msg == "parking_write_ms":
+            parking_write_ms.append(float(data.get("write_ms") or 0))
+        elif msg == "hitch_subphase":
+            sub_name = data.get("name") or "?"
+            hitch_subphase_ms[sub_name].append(float(data.get("ms") or 0))
 
     deploy_corr = correlate_deploy_autosave(text)
 
@@ -1097,6 +1219,7 @@ def summarize_ndjson(text):
         "cadence_total_ms": _stat(cadence_total),
         "cadence_cpu_ms": _stat(cadence_cpu),
         "cadence_paused_ms": _stat(cadence_paused),
+        "cadence_unaccounted_ms": _stat(cadence_unaccounted),
         "echo_ms": _stat(echo_ms),
         "town_ms": _stat(town_ms),
         "cadence_phases": phase_stats,
@@ -1106,6 +1229,11 @@ def summarize_ndjson(text):
         "slow_tick_total_ms": _stat(slow_total),
         "autosave_ms": _stat(autosave_ms),
         "autosave_lock_wait_ms": _stat(autosave_lock_wait),
+        "parking_write_ms": _stat(parking_write_ms),
+        "wall_budget_hit_ticks": wall_budget_hits,
+        "hitch_subphases": {
+            name: _stat(xs) for name, xs in hitch_subphase_ms.items() if xs
+        },
         "save_busy_cadence_spikes": save_busy_ticks,
         "worst_slow_tick": worst_slow,
         "top_handlers_by_avg": top_handlers,
@@ -1144,6 +1272,14 @@ def format_analyze_summary(stats):
                 pause=cadence_pause.get("avg"),
             )
         )
+    cadence_hole = stats.get("cadence_unaccounted_ms") or {}
+    if cadence_hole.get("avg") is not None:
+        lines.append(
+            "cadence unaccounted_avg={avg}ms max={mx}ms".format(
+                avg=cadence_hole.get("avg"),
+                mx=cadence_hole.get("max"),
+            )
+        )
     for row in (stats.get("top_cadence_phases_by_avg") or [])[:5]:
         lines.append(
             f"phase {row.get('phase')} avg={row.get('avg')}ms max={row.get('max')}ms"
@@ -1177,6 +1313,23 @@ def format_analyze_summary(stats):
         lines.append(
             f"autosave avg={autosave.get('avg')}ms max={autosave.get('max')}ms"
         )
+    parking = stats.get("parking_write_ms") or {}
+    if parking.get("avg") is not None:
+        lines.append(
+            f"parking_write avg={parking.get('avg')}ms max={parking.get('max')}ms"
+        )
+    if stats.get("wall_budget_hit_ticks"):
+        lines.append(f"wall_budget_hit_ticks={stats.get('wall_budget_hit_ticks')}")
+    hitch = stats.get("hitch_subphases") or {}
+    top_hitch = sorted(
+        hitch.items(),
+        key=lambda pair: -float((pair[1] or {}).get("avg") or 0),
+    )[:6]
+    for name, row in top_hitch:
+        if (row or {}).get("avg") is not None:
+            lines.append(
+                f"hitch {name} avg={row.get('avg')}ms max={row.get('max')}ms"
+            )
     if stats.get("save_busy_cadence_spikes"):
         lines.append(
             f"save_busy_cadence_spikes={stats.get('save_busy_cadence_spikes')} "

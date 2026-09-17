@@ -1,0 +1,114 @@
+{
+  "_comment": "Basegame fishing tables -- stripped SUPERS shape (no spooky body, no week runs).",
+  "junk": [
+    {"id": "fishing_tin_can", "weight": 40, "label": "a dented tin can"},
+    {"id": "fishing_old_boot", "weight": 25, "label": "a waterlogged old boot"},
+    {"id": "fishing_tangled_line", "weight": 20, "label": "a tangled fishing line"},
+    {"id": "fishing_rusty_hook", "weight": 15, "label": "a rusty hook"}
+  ],
+  "bodies": {
+    "lake": {
+      "label": "inland lake",
+      "common": [
+        {"id": "fish_perch", "weight": 50},
+        {"id": "fish_bluegill", "weight": 35},
+        {"id": "fish_catfish", "weight": 25}
+      ],
+      "uncommon": [
+        {"id": "fish_bass", "weight": 12}
+      ],
+      "rare": [],
+      "junk_weight": 18
+    },
+    "river": {
+      "label": "river",
+      "common": [
+        {"id": "fish_trout", "weight": 45},
+        {"id": "fish_catfish", "weight": 30}
+      ],
+      "uncommon": [
+        {"id": "fish_bass", "weight": 14}
+      ],
+      "rare": [],
+      "junk_weight": 15
+    },
+    "pier": {
+      "label": "town pier",
+      "common": [
+        {"id": "fish_perch", "weight": 40},
+        {"id": "fish_catfish", "weight": 35}
+      ],
+      "uncommon": [
+        {"id": "fish_bass", "weight": 15}
+      ],
+      "rare": [],
+      "junk_weight": 20
+    },
+    "inshore": {
+      "label": "coastal shallows",
+      "common": [
+        {"id": "fish_perch", "weight": 40}
+      ],
+      "uncommon": [
+        {"id": "fish_bass", "weight": 15}
+      ],
+      "rare": [],
+      "junk_weight": 22
+    },
+    "pond": {
+      "label": "homestead pond",
+      "common": [
+        {"id": "fish_bluegill", "weight": 55},
+        {"id": "fish_perch", "weight": 30}
+      ],
+      "uncommon": [
+        {"id": "fish_bass", "weight": 12}
+      ],
+      "rare": [],
+      "junk_weight": 12
+    },
+    "offshore": {
+      "label": "deep offshore",
+      "common": [
+        {"id": "fish_bass", "weight": 35}
+      ],
+      "uncommon": [],
+      "rare": [],
+      "junk_weight": 25,
+      "requires_boat": true
+    }
+  },
+  "time_modifiers": {
+    "night": {"junk_weight_delta": -5, "rare_mult": 1.3},
+    "dawn": {"junk_weight_delta": -3, "rare_mult": 1.1},
+    "fog": {"junk_weight_delta": 5, "rare_mult": 1.5, "spooky_table": true}
+  },
+  "season_modifiers": {
+    "spring": {"rare_mult": 1.0},
+    "summer": {"rare_mult": 1.1},
+    "fall": {"rare_mult": 1.15},
+    "winter": {"junk_weight_delta": 8, "rare_mult": 0.9}
+  },
+  "weather_modifiers": {
+    "clear": {"rare_mult": 1.0},
+    "cloudy": {"rare_mult": 1.0},
+    "rain": {"junk_weight_delta": -4, "rare_mult": 1.15},
+    "storm": {"junk_weight_delta": 8, "rare_mult": 1.25},
+    "fog": {"junk_weight_delta": 5, "rare_mult": 1.5, "spooky_table": true},
+    "snow": {"junk_weight_delta": 10, "rare_mult": 0.85}
+  },
+  "bait": {
+    "fishing_worms": {
+      "label": "grocery worms",
+      "aliases": ["worms", "worm", "nightcrawlers"],
+      "junk_weight_delta": -6,
+      "rare_mult": 1.15
+    },
+    "fishing_fly": {
+      "label": "a tied fly",
+      "aliases": ["fly", "flies", "lure"],
+      "junk_weight_delta": -10,
+      "rare_mult": 1.35
+    }
+  }
+}

@@ -356,6 +356,12 @@ class ViewportHub:
             if accounts_mod.account_is_staff(found):
                 session.staff_account = found.name
                 return
+        # Fresh sidecar sqlite has no login accounts. Mint the playtest
+        # Ash head_gm row so gm on is not "You aren't a GM."
+        if char_key == "ash":
+            minted = accounts_mod.ensure_playtest_staff_account(game)
+            if accounts_mod.account_is_staff(minted):
+                session.staff_account = minted.name
 
     def occupy_like_cast(self, char) -> None:
         """Match telnet Cast occupy: staff stamp + drop idle fixture NPC flags.
@@ -378,11 +384,20 @@ class ViewportHub:
                 char.idle_mode = False
 
     def resolve_body(self, name: str):
-        """Find the playable / immersion body (Ash by default)."""
+        """Find the playable / immersion body (Ash by default).
+
+        Bare ``Ash`` must occupy the staff-login Roadhouse fixture, not a
+        player Angel named Ash Riley (bug report 1213).
+        """
         raw = (name or DEFAULT_CHARACTER).strip() or DEFAULT_CHARACTER
         game = self.game
         if game is None:
             return None
+        from engine import accounts as accounts_mod
+
+        fixture = accounts_mod.resolve_staff_login_cast(game, raw)
+        if fixture is not None:
+            return fixture
         finder = getattr(game, "find_login_character", None)
         char = finder(raw) if callable(finder) else None
         if char is None:
@@ -495,24 +510,22 @@ class ViewportHub:
         return turn
 
     async def reset_playtest(self) -> dict[str, Any]:
-        """Place Ash in a known lobby, clear authored quests, staff setup."""
+        """Place Ash in a known lobby, clear authored quests, staff setup.
+
+        ``gm on`` first, then seat the **spirit** in the Sheriff lobby and
+        ``look``. Moving the mortal before form used to report Roadhouse
+        from the opening auto-look while Cadence walked the Echo (bug
+        report 1213). Trust the room after this last look.
+        """
         self.mode = "staff"
         session, key = await self.attach(DEFAULT_CHARACTER)
-        char = session.character
-        self.occupy_like_cast(char)
-        lobby = _find_room_name_parts(self.game, ("sheriff", "lobby"))
-        if lobby is not None and getattr(char, "location", None) is not lobby:
-            try:
-                char.move_to(lobby)
-            except Exception as exc:
-                from engine import log_util
-
-                log_util.ops("viewport", "reset move failed", exc=exc)
+        occupy = session.character
+        self.occupy_like_cast(occupy)
         try:
             from engine.systems import quests as quests_mod
-            for qid in list(quests_mod.active_quest_ids(char) or []):
+            for qid in list(quests_mod.active_quest_ids(occupy) or []):
                 try:
-                    quests_mod.abandon(char, qid, game=self.game, confirm=True)
+                    quests_mod.abandon(occupy, qid, game=self.game, confirm=True)
                 except Exception as exc:
                     from engine import log_util
 
@@ -528,9 +541,20 @@ class ViewportHub:
         last = {}
         for line in RESET_STAFF_LINES:
             last = await self.send_line(line, timeout=20.0)
+        actor = session.character
+        lobby = _find_room_name_parts(self.game, ("sheriff", "lobby"))
+        if lobby is not None and getattr(actor, "location", None) is not lobby:
+            try:
+                actor.move_to(lobby)
+            except Exception as exc:
+                from engine import log_util
+
+                log_util.ops("viewport", "reset move failed", exc=exc)
+        last = await self.send_line("look", timeout=20.0)
+        play = _play_body_character(session)
         return {
-            "character": key,
-            "room": _room_label(char),
+            "character": getattr(play, "key", None) or key,
+            "room": _room_label(actor),
             "turn": last,
         }
 
@@ -542,6 +566,32 @@ def hub_for(game) -> ViewportHub:
         hub = ViewportHub(game)
         game.viewport_hub = hub
     return hub
+
+
+def _play_body_character(session) -> Any:
+    """Occupy / parked mortal for inspect -- not the GM spirit key.
+
+    After ``gm on`` the Session rides ``gmspirit:…``. Agents still need
+    the staff-login Ash key (bug report 1213), not a sibling Cadence PC.
+    """
+    char = getattr(session, "character", None) if session else None
+    if char is None:
+        return None
+    body = getattr(char, "gm_mode_body", None)
+    if body is not None:
+        return body
+    return_key = getattr(char, "gm_return_body_key", None)
+    if isinstance(return_key, str) and return_key.strip():
+        game = getattr(session, "game", None)
+        if game is not None:
+            found = game.find_character(return_key.strip())
+            if found is not None:
+                return found
+            finder = getattr(game, "find_login_character", None)
+            found = finder(return_key.strip()) if callable(finder) else None
+            if found is not None:
+                return found
+    return char
 
 
 def _room_label(character) -> str:
@@ -576,24 +626,27 @@ def _find_room_name_parts(game, parts):
 def _inspect_payload(hub: ViewportHub) -> dict[str, Any]:
     session = hub.session
     char = getattr(session, "character", None) if session else None
+    play = _play_body_character(session)
     quests = []
     try:
         from engine.systems import quests as quests_mod
-        quests = list(quests_mod.active_quest_ids(char) or [])
+        quests = list(quests_mod.active_quest_ids(play or char) or [])
     except Exception as exc:
         from engine import log_util
 
         log_util.ops("viewport", "inspect failed field=quests", exc=exc)
         quests = []
     turn = hub.last_turn()
-    hp = getattr(char, "hp", None)
-    max_hp = getattr(char, "max_hp", None)
+    hp = getattr(play, "hp", None) if play is not None else getattr(char, "hp", None)
+    max_hp = getattr(play, "max_hp", None) if play is not None else getattr(char, "max_hp", None)
     return {
         "ok": True,
         "op": "inspect",
         "seq": hub.seq,
         "turn": turn,
-        "character": getattr(char, "key", None),
+        "character": getattr(play, "key", None),
+        "session_character": getattr(char, "key", None),
+        "play_body": getattr(play, "key", None),
         "room": _room_label(char),
         "staff_account": getattr(session, "staff_account", None) if session else None,
         "gm_mode": bool(getattr(char, "gm_mode", False)),

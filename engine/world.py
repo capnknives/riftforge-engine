@@ -126,6 +126,10 @@ class Item(GameObject):
         self.body_path = None
         # Opaque harvest profile copied at make_body (morphology + flags).
         self.body_type = None
+        self.body_alignment = None
+        self.body_tier = None
+        self.body_celestial_allegiance = None
+        self.body_celestial_title = None
         self.body_no_blood = False
         self.body_yields_meat = None
         self.body_yields_hide = None
@@ -140,6 +144,12 @@ class Item(GameObject):
         # bed (soft claim / hotel lease) -- None = unowned.
         self.furniture = bool(furniture)
         self.owner_key = None
+        # Catalog prototype id (``{"item": "rusted_sword"}``). Not unique
+        # per copy -- instance identity is ``inum`` (staff INUM).
+        self.catalog_id = None
+        # Staff item instance tag (AD00001). Dual-written in the persist
+        # container blob. Players never see it; do not put it in holder_key.
+        self.inum = None
         # Celestial spirit gear: stays on the Mantle when vessel-free in
         # Heaven / Hell (supers/ethereal_item.py). Players bless with
         # ``mark item <gear>``.
@@ -147,6 +157,9 @@ class Item(GameObject):
         # Spirit mirror gear (idea #141): ghost copy; vanishes on re-embody.
         self.is_spirit_mirror = False
         self.spirit_mirror_source_key = None
+        # God bilocate twin clothing (suggestion report 465): look-only copy;
+        # vanishes when the twin is dismissed; not lootable gear.
+        self.is_god_twin_visual = False
         # Corpse worn gear (spirit anchor bodies keep equipped refs).
         self.body_equipment = {}
         self.body_clothing = {}
@@ -409,9 +422,30 @@ class Room(GameObject):
             return "Somewhere"
         return key
 
-    def add(self, obj):
+    def add(self, obj, *, dedupe=True, track_floor=True):
         # Put an object in this room, but guard against adding it twice.
-        if obj not in self.contents:
+        #
+        # ``dedupe`` / ``track_floor`` are opt-out knobs for bulk boot load
+        # (``engine.persistence.load_world``), not something normal runtime
+        # callers (pickup, drop, spawn, ...) should ever pass:
+        #
+        # - ``dedupe=False`` skips the ``obj not in self.contents`` identity
+        #   scan. That scan is O(len(self.contents)) *every* call -- fine
+        #   for a handful of runtime adds, but load_world calls ``add()``
+        #   once per freshly-constructed Item row, so a room that
+        #   accumulates many floor items (a lost-item vault, a popular
+        #   floor-loot spot, ...) turned the whole item-load phase
+        #   quadratic instead of linear. A brand-new Item object can never
+        #   already be in ``contents`` by identity, so the scan is
+        #   guaranteed to find nothing there anyway.
+        # - ``track_floor=False`` skips ``note_floor_item_room`` /
+        #   ``mark_floor_room_dirty`` below. ``load_world`` runs a full
+        #   ``rebuild_floor_item_room_index`` (one O(rooms) pass) right
+        #   after, and sets ``game._persist_force_full = True`` for the
+        #   whole boot, so per-item dirty-marking during load is
+        #   redundant work thrown away before an incremental save could
+        #   ever read it.
+        if not dedupe or obj not in self.contents:
             self.contents.append(obj)
         # Keep Game.characters in sync (engine/char_index.py) so tick
         # handlers never walk ~12k rooms to rediscover ~50 actors.
@@ -428,9 +462,13 @@ class Room(GameObject):
             obj.location = self
             game = getattr(self, "game", None)
             if game is not None and isinstance(obj, Item):
-                from engine import persistence as persistence_mod
-                if persistence_mod._persistable_floor_item(obj):
-                    persistence_mod.note_floor_item_room(game, self)
+                from engine.item_index import register_unique_item
+                register_unique_item(game, obj)
+            if track_floor:
+                if game is not None and isinstance(obj, Item):
+                    from engine import persistence as persistence_mod
+                    if persistence_mod._persistable_floor_item(obj):
+                        persistence_mod.note_floor_item_room(game, self)
 
     def remove(self, obj):
         # Take an object out, but only if it's actually here (avoids an error).
@@ -447,6 +485,8 @@ class Room(GameObject):
             obj.location = None
             game = getattr(self, "game", None)
             if game is not None and isinstance(obj, Item):
+                from engine.item_index import unregister_unique_item
+                unregister_unique_item(game, obj)
                 from engine import persistence as persistence_mod
                 if persistence_mod._persistable_floor_item(obj):
                     persistence_mod.release_floor_item_room(game, self)
@@ -465,7 +505,7 @@ class Room(GameObject):
         listener), so they don't get a third-person line about themselves
         when they already received a second-person version. Sleeping
         characters (Character.asleep) are also skipped -- sleep closes the
-        outside world (lodging); dream content will plug in later.
+        outside world (lodging), unless ``sleep_dream_tour`` is set.
 
         ``predicate`` (optional): callable ``fn(watcher) -> bool``. When
         set, only watchers for whom it returns True receive the line
@@ -495,9 +535,15 @@ class Room(GameObject):
             if id(char) in skip:
                 continue
             # Asleep = world closed (supers.lodging); do not deliver room
-            # prose until they wake.
+            # prose until they wake. Dream-selves (and in-place lucid
+            # sleepers already on the Dream plane) still hear their room.
+            # The frozen Earth husk with a clone stamped stays silent.
             if getattr(char, "asleep", False):
-                continue
+                hears = bool(getattr(char, "is_sleep_dream_clone", False))
+                if not hears and getattr(char, "sleep_dream_tour", False):
+                    hears = not getattr(char, "sleep_dream_clone_key", None)
+                if not hears:
+                    continue
             # Possession consciousness exile: mind is in a personal
             # Heaven/Hell pocket -- Earth room traffic stays silent
             # (docs/plans/personal_afterlife.md).
@@ -518,7 +564,21 @@ class Room(GameObject):
                 text = message
             from engine import hooks
             text = hooks.room_broadcast_transform(char, self, text, game)
-            if char.session:
+            # Inside a buffered beat (a combat round), room lines join that
+            # viewer's single block instead of racing the swing prose --
+            # per-swing side effects like gore spatter used to interleave.
+            # Outside a beat stage() returns False and delivery is unchanged.
+            from engine import output_packet
+            if output_packet.is_open():
+                # Preserve the spacing preference below: the block gets one
+                # trailing blank when this caller or `config spacing` wants
+                # the paragraph gap.
+                want_blank = blank_after
+                if not want_blank and char.session:
+                    from engine import display_prefs
+                    want_blank = display_prefs.wants_airy_spacing(char)
+                output_packet.stage(char, text, blank_after=want_blank)
+            elif char.session:
                 char.session.send(text)
                 if blank_after:
                     char.session.send("")
@@ -551,6 +611,10 @@ class Room(GameObject):
                     logger.seen(text)
                 except Exception:
                     _log_activity_error("logger.seen", char)
+        from engine import hooks
+        hooks.room_broadcast_after(
+            self, message, game=getattr(self, "game", None), exclude=exclude,
+        )
 
 
 class Character(GameObject):
@@ -634,6 +698,9 @@ class Character(GameObject):
         self.ranged_shot_from = None          # direction incoming shots arrive from
         self.last_scan_direction = None       # recon bonus for spotting
         self.combat_intent = None         # None | "press" | "guard" | "feint"
+        # Momentum reserved when a player queues press/guard/weave/unleash;
+        # spent on the resolving beat even if the live meter dips (fight-only).
+        self.momentum_intent_lock = 0.0
         self.feint_exposed = False
         # Vanguard protect (group_combat_mechanics.md): standing ally you
         # try to intercept hits for. Character or None; fight-ephemeral,
@@ -660,6 +727,17 @@ class Character(GameObject):
         # the current tick so DPM stays one action per heartbeat. Not
         # persisted -- fight punctuation only (-1 = never).
         self.last_instant_action_tick = -1
+        # Turns-mode signature pulse (round number, not game_time_ticks).
+        self.last_instant_action_round = -1
+        # Per-beat / per-turn action economy (docs/plans/combat_dual_mode.md).
+        # Action only spends ``move`` (approach/retreat); Turns spends all three.
+        self.combat_slots = {"move": True, "offense": True, "defense": True}
+        self.combat_queued_reaction = None  # "parry" when defense was spent
+        # Standing preference: action | turns. Fight stamps at creation.
+        self.combat_mode_pref = "action"
+        # PvP handshake: defender yield-turns target key; attacker accept.
+        self.turns_yield_to = None
+        self.turns_accept_from = None
         # Perspective rendering (section 7 item 4, D17): which pronoun the
         # prose renderer's small conjugation helper uses in third person
         # ("he"/"she"/"they" -- combat_prose.py's ONLY consumer so far).
@@ -739,12 +817,17 @@ class Character(GameObject):
         self.online_ticks = 0
         # Lodging (rest vs sleep): awake resting recovers slowly and still
         # hears the room; asleep recovers faster and Room.broadcast skips
-        # this character (world closed). dreaming is a stub for a future
-        # dream-state pass -- never set True yet. sleep_bed_id is id(bed)
-        # while asleep on furniture (transient, not persisted).
+        # this character (world closed) unless sleep_dream_tour is set
+        # (awareness on the Dream plane). sleep_bed_id is id(bed) while
+        # asleep on furniture (transient, not persisted).
         self.resting = False
         self.asleep = False
         self.dreaming = False
+        self.sleep_dream_tour = False
+        self.sleep_dream_full = False
+        self.sleep_dream_clone_key = None
+        self.sleep_dream_owner_key = None
+        self.is_sleep_dream_clone = False
         self.sleep_bed_id = None
         # Sit / stand: pure posture flavor (bug #58), same transient
         # treatment as resting/asleep above -- always starts standing,
@@ -974,6 +1057,19 @@ def make_body(character):
         body.body_origin = str(origin).strip().lower()
     if path:
         body.body_path = str(path).strip().lower()
+    alignment = getattr(character, "alignment", None)
+    if alignment:
+        body.body_alignment = str(alignment).strip().lower()
+    try:
+        body.body_tier = int(getattr(character, "tier", 0) or 0)
+    except (TypeError, ValueError):
+        body.body_tier = 0
+    allegiance = getattr(character, "celestial_allegiance", None)
+    if allegiance:
+        body.body_celestial_allegiance = str(allegiance).strip().lower()
+    title = getattr(character, "celestial_title", None)
+    if title:
+        body.body_celestial_title = str(title).strip().lower()
     body_type = getattr(character, "body_type", None)
     if body_type:
         body.body_type = str(body_type).strip().lower()
@@ -990,6 +1086,9 @@ def make_body(character):
         listed = [str(x).strip() for x in raw_yields if str(x).strip()]
         if listed:
             body.body_butcher_yields = listed
+    from engine.item_inum import ensure_item_inum
+
+    ensure_item_inum(body)
     return body
 
 

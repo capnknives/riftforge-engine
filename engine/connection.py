@@ -57,6 +57,20 @@ def _log_connection(message):
     log_util.ops("connection", message)
 
 
+def _log_command_exception(line, exc):
+    """Tagged stderr for a player command that raised (Docker grep ``[command]``).
+
+    ``npc_do`` already logs ``[npc_act]``. Player ``Session.play`` used to
+    print an untagged traceback, so lag/crash greps missed the verb.
+    """
+    from engine import log_util
+
+    preview = line if isinstance(line, str) else str(line or "")
+    if len(preview) > 80:
+        preview = preview[:77] + "..."
+    log_util.ops("command", f"failed line={preview!r}", exc=exc)
+
+
 def history_line_for_storage(line):
     """Return a history line safe to keep in Session.history / bug reports.
 
@@ -320,6 +334,10 @@ class Session:
         # RPC cast grant ride: account name + PC key to return to on playcast off.
         self.cast_grant_account = None
         self.cast_grant_return_key = None
+        # Staff playcast: GM verbs stay live on the occupied body (not invis spirit).
+        self.playcast_gm_tools = False
+        # Staff cast occupy: False = player/cast look+who; True = GM chrome.
+        self.gm_eyes_staff_view = False
         self.alive = True         # flips to False on quit/disconnect; ends the loop
         # Coalesce duplicate blank lines (see Session.send).
         self._last_output_empty = False
@@ -356,8 +374,11 @@ class Session:
         # commands.cmd_bug/cmd_suggest (which starts it) and
         # play()/_handle_report_capture_line below (which ends it).
         # Optional ``on_finish`` / ``on_cancel`` callables let other paste
-        # UIs (GM MOTD editor) reuse this gate without going through
-        # bug_filing -- engine stays generic; the game sets the callbacks.
+        # UIs (GM MOTD editor, homestead remodel custom) reuse this gate
+        # without going through bug_filing -- engine stays generic; the
+        # game sets the callbacks.
+        # ``finish_on_first_line``: one Enter ends capture (room name /
+        # yes-no), instead of waiting for a lone ``.``.
         self.report_capture = None
         # Modal helpfile line editor (GM `hedit` command; docs/plans/
         # helpfile_editing_system.md). Same shape of gate as report_capture
@@ -401,8 +422,12 @@ class Session:
         # Account name to prefer for the soft-logout character pick
         # (skip re-typing ``account`` when the body was linked).
         self._soft_logout_account = None
-        # Character key of whoever last sent this Session a tell (for ``reply``).
+        # Whoever last sent this Session a tell (for ``reply``).
+        # ``last_tell_from`` is a player-typable name; ``last_tell_from_key``
+        # is the resolved body label when the face alone would miss (occupy,
+        # deep cover, stranger short-desc -- bug report 1720).
         self.last_tell_from = None
+        self.last_tell_from_key = None
         # Nesting depth for read_password_line telnet ECHO masking. While >0,
         # handle_negotiate may accept DO ECHO; during normal play we refuse
         # server-side echo so clients keep local keystroke echo (bug report 423).
@@ -466,22 +491,13 @@ class Session:
         Always bind the **login body** name, never ``gmspirit:`` / ``husk:``.
         """
         from engine.command_support import strip_ephemeral_storage_prefix
-        bind = strip_ephemeral_storage_prefix(name)
-        char = getattr(self, "character", None)
-        if char is not None:
-            body_key = getattr(char, "gm_body_key", None)
-            if body_key:
-                bind = strip_ephemeral_storage_prefix(body_key)
-            elif getattr(char, "gm_spirit", False) or getattr(
-                char, "gm_mode", False
-            ):
-                # Spirit storage key is gmspirit:Login -- peel to Login.
-                # Do NOT use the raw spirit key as the bind name.
-                bind = strip_ephemeral_storage_prefix(
-                    getattr(char, "key", None) or bind
-                )
-            else:
-                # Corporeal body (including gm_away Echo after quit intent).
+        from engine.session_bind import session_copyover_bind_name
+
+        bind = session_copyover_bind_name(self)
+        if not bind:
+            bind = strip_ephemeral_storage_prefix(name)
+            char = getattr(self, "character", None)
+            if char is not None:
                 bind = strip_ephemeral_storage_prefix(
                     getattr(char, "key", None) or bind
                 )
@@ -610,6 +626,14 @@ class Session:
             ):
                 from engine import style
                 message = style.strip_ansi(message)
+            # Combat beats buffer through output_packet. A raw session.send
+            # during an open packet used to hit the wire immediately, so
+            # autoloot / tap / fightlog-end arrived before [EXECUTE]
+            # (bug report 1743). Stage here; flush delivers one ordered block.
+            if self.character is not None:
+                from engine import output_packet as output_packet_mod
+                if output_packet_mod.intercept_send(self.character, message):
+                    return
             is_empty = not str(message).strip()
             # Coalesce duplicate blanks -- callers (Room.broadcast's
             # blank_after, look's trailing "", send_prompt's leading "")
@@ -988,11 +1012,10 @@ class Session:
         _activity_logger_call(self.character, "note", "SESSION", "start")
         try:
             dispatch(self.character, "look", self.game)   # show them the room right away
-        except Exception:
+        except Exception as exc:
             # Same guard as the command loop below -- a look/weather bug must
             # not kill the session on login (live: off-plane macro None crash).
-            import traceback
-            traceback.print_exc()
+            _log_command_exception("look", exc)
             self.send("Something went wrong showing the room -- you are still in.")
         await self._flush_deferred_session_attach()
         await self._flush_deferred_login_save()
@@ -1052,16 +1075,23 @@ class Session:
                 dispatch(self.character, line, self.game)
             except Exception as exc:
                 # A bug in ONE command shouldn't kill the player's whole session.
-                # We print the error to the server console for debugging and tell
-                # the player something went wrong. During development you might
-                # prefer to remove this try/except so errors surface loudly.
-                # Also stash the traceback on the history entry so a later
-                # 'bug'/'suggest' report already carries the repro context.
+                # Tagged ``[command]`` stderr (plus traceback via log_util)
+                # so Docker grep matches npc_act. Stash the traceback on the
+                # history entry so a later 'bug'/'suggest' already carries it.
                 import traceback
                 entry[1] = traceback.format_exc()
-                traceback.print_exc()
+                _log_command_exception(entry[0], exc)
                 _activity_logger_call(self.character, "error", exc)
                 self.send("Something went wrong with that command.")
+                try:
+                    from engine import gm_notify
+
+                    gm_notify.ping_command_exception(
+                        self.game, self.character, exc,
+                        command=entry[0],
+                    )
+                except Exception:
+                    pass
             # GATE / FLAG after dispatch (including failed commands).
             _activity_logger_call(
                 self.character, "after_cmd", entry[0], self.game,
@@ -1137,6 +1167,15 @@ class Session:
                 on_cancel(self.character, self.game)
                 return
             self.send("Cancelled -- nothing logged.")
+            return
+        capture = self.report_capture or {}
+        # Single-line prompts (remodel custom name / yes-no) finish on
+        # Enter instead of a lone ``.``.
+        if capture.get("finish_on_first_line"):
+            on_finish = capture.get("on_finish")
+            self.report_capture = None
+            if callable(on_finish):
+                on_finish(self.character, self.game, (line or "").strip())
             return
         self.report_capture["lines"].append(line)
 
@@ -1500,6 +1539,24 @@ class Session:
         if leaving is not None:
             _activity_logger_call(leaving, "note", "SESSION", f"end reason={reason}")
         if self.character:
+            # Sleep-astral: Echo the Earth husk. The dream-self stays in
+            # the Threshold as scenery (same as a sleeping NPC).
+            if getattr(self.character, "is_sleep_dream_clone", False):
+                owner_key = getattr(self.character, "sleep_dream_owner_key", None)
+                owner = None
+                if owner_key:
+                    finder = getattr(self.game, "find_character", None)
+                    if callable(finder):
+                        owner = finder(owner_key)
+                if owner is not None:
+                    clone = self.character
+                    clone.session = None
+                    clone.is_npc = True
+                    owner.session = self
+                    self.character = owner
+                    leaving = owner
+                    from engine.command_support import _presence_face
+                    disconnect_name = _presence_face(owner)
             # Drop any snoop THIS character was running (they're leaving);
             # keep snoopers aimed *at* them -- an Echo is still watchable.
             from engine import snoop
@@ -1586,6 +1643,15 @@ class Session:
                 echo_body.session = None    # the character is now an Echo
                 break_follows(echo_body)
                 from engine import hooks
+                # Session detach without Room.remove: the body is already
+                # in the Cadence cache ``seen`` set (as a live player), so
+                # op=add would no-op. rebuild drops membership so the next
+                # collect classifies this body as an Echo. Engine must not
+                # import supers; the fuel-loop hook multiplexes the drop.
+                # (_on_echo_begin is the lifestyle hook, not the cache choke.)
+                hooks.fuel_loop_roster_notify(
+                    self.game, echo_body, op="rebuild",
+                )
                 hooks.on_echo_begin(echo_body, self.game)
                 if echo_body.location:
                     # session is already None, so the Echo itself can't receive this.
@@ -1691,6 +1757,10 @@ class Session:
                 hooks.park_gm_spirit_on_disconnect(char, self.game)
             else:
                 char.session = None
+            # Last-resort detach also skips Room.remove. Same rebuild
+            # notify as disconnect() so the body is reclassified as Echo.
+            from engine import hooks
+            hooks.fuel_loop_roster_notify(self.game, char, op="rebuild")
         self.character = None
         self.alive = False
         sessions = getattr(self.game, "sessions", None)

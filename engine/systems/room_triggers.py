@@ -8,8 +8,12 @@ the same way quests.py's complete_when types are SUPERS-extensible.
 
 from __future__ import annotations
 
+import json
+import os
+
 _ACTIONS: dict[str, callable] = {}
 _TRIGGERS_BY_ROOM: dict[str, list] = {}
+_TRIGGERS_DIR = None
 
 
 def register_action(effect_type: str, fn) -> None:
@@ -22,21 +26,80 @@ def load_triggers(directory=None) -> None:
 
     ``directory`` is required; a bare engine has no default game path.
     """
-    import json
-    import os
+    global _TRIGGERS_DIR
 
     _TRIGGERS_BY_ROOM.clear()
-    if not directory or not os.path.isdir(directory):
+    if directory:
+        _TRIGGERS_DIR = directory
+    if not _TRIGGERS_DIR or not os.path.isdir(_TRIGGERS_DIR):
         return
-    for name in sorted(os.listdir(directory)):
+    for name in sorted(os.listdir(_TRIGGERS_DIR)):
         if not name.endswith(".json"):
             continue
-        with open(os.path.join(directory, name), encoding="utf-8") as fh:
+        with open(os.path.join(_TRIGGERS_DIR, name), encoding="utf-8") as fh:
             trigger = json.load(fh)
         room_key = (trigger.get("attach") or {}).get("room")
         if not room_key:
             continue
         _TRIGGERS_BY_ROOM.setdefault(room_key, []).append(trigger)
+
+
+def trigger_content_path(trigger_id, directory=None):
+    """Absolute path for one trigger JSON file (filename stem = id)."""
+    from engine.content_store import require_snake_id
+
+    require_snake_id(trigger_id, what="Trigger id")
+    directory = directory or _TRIGGERS_DIR
+    if not directory:
+        raise ValueError("room.trigger directory is not set.")
+    return os.path.join(directory, f"{trigger_id}.json")
+
+
+def get_trigger(trigger_id, *, directory=None):
+    """Load one trigger file by id, or None if the file is missing."""
+    from engine.content_store import load_json
+
+    directory = directory or _TRIGGERS_DIR
+    if not directory:
+        return None
+    try:
+        path = trigger_content_path(trigger_id, directory=directory)
+    except ValueError:
+        return None
+    if not os.path.isfile(path):
+        return None
+    data = load_json(path)
+    return dict(data) if isinstance(data, dict) else None
+
+
+def upsert_trigger(trigger_id, data, *, directory=None):
+    """Validate-free write of one trigger file, then reload the in-memory index.
+
+    Called by OLC / content_new after validate_kind passes. One file per
+    trigger, same shape as authored quests.
+    """
+    from engine.content_store import require_snake_id, save_json
+
+    require_snake_id(trigger_id, what="Trigger id")
+    directory = directory or _TRIGGERS_DIR
+    if not directory:
+        raise ValueError("room.trigger directory is not set.")
+    os.makedirs(directory, exist_ok=True)
+    path = trigger_content_path(trigger_id, directory=directory)
+    row = dict(data)
+    row["id"] = trigger_id
+    if os.path.isfile(path):
+        from engine.content_store import load_json
+
+        existing = load_json(path)
+        if isinstance(existing, dict):
+            merged = dict(existing)
+            merged.update(row)
+            merged["id"] = trigger_id
+            row = merged
+    save_json(path, row)
+    load_triggers(directory)
+    return path
 
 
 def triggers_for_room(room_key):
@@ -76,8 +139,10 @@ def tick_timer_triggers(game) -> None:
     if game is None:
         return
     now = int(getattr(game, "game_time_ticks", 0) or 0)
+    from engine.room_vnum import lookup_room
+
     for room_key, triggers in _TRIGGERS_BY_ROOM.items():
-        room = game.rooms.get(room_key)
+        room = lookup_room(game, room_key)
         if room is None:
             continue
         occupants = list(getattr(room, "contents", None) or [])
@@ -143,7 +208,9 @@ def resume_effects(game, *, effects, character_key, room_key, trigger_id) -> Non
     from engine.char_index import find_character_by_key
 
     character = find_character_by_key(game, character_key)
-    room = game.rooms.get(room_key) if room_key else None
+    from engine.room_vnum import lookup_room
+
+    room = lookup_room(game, room_key) if room_key else None
     if character is None or room is None:
         return
     _run_effects(effects, character, room, game, trigger_id=trigger_id)

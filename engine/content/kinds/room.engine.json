@@ -22,6 +22,24 @@
       "doc": "Engine room stamp: bars entrants the game layer classifies as vulnerable to this ward's material (meaning is entirely game-defined).",
       "default": false
     },
+    "devils_trap": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp: devil's trap (pentagram-in-circle folklore ward). Policy in engine/systems/occult_marks.py.",
+      "default": false
+    },
+    "salt_line": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp: salt line across the threshold (folklore occult mark).",
+      "default": false
+    },
+    "holy_water_ward": {
+      "type": "bool",
+      "required": false,
+      "doc": "Engine room stamp: holy-water blessing on the room (folklore reagent site).",
+      "default": false
+    },
     "god_ward": {
       "type": "bool",
       "required": false,
@@ -148,6 +166,12 @@
       "type": "list",
       "required": false,
       "doc": "Exit directions that must NOT be treated as doors (open archway).",
+      "default": null
+    },
+    "exit_descs": {
+      "type": "object",
+      "required": false,
+      "doc": "Map exit direction to custom prose shown on look <dir>.",
       "default": null
     },
     "boat_ramp": {
@@ -282,6 +306,12 @@
       "doc": "Prison perimeter escape surface.",
       "default": false
     },
+    "prison_solitary": {
+      "type": "bool",
+      "required": false,
+      "doc": "Federal solitary cell; inmates stay put until the timer lifts.",
+      "default": false
+    },
     "online_terminal": {
       "type": "bool",
       "required": false,
@@ -312,6 +342,17 @@
       ],
       "default": "merge",
       "doc": "merge = union auto-catalog with vendor_stock; explicit = authored list only."
+    },
+    "unmanned_vendor": {
+      "type": "bool",
+      "required": false,
+      "doc": "Room vendor_stock stays buy/list-able without an on-duty clerk (secured self-service counter).",
+      "default": false
+    },
+    "unmanned_vendor_label": {
+      "type": "string",
+      "required": false,
+      "doc": "Player-facing counter name for unmanned_vendor list/buy prose (defaults to room name)."
     },
     "zoning": {
       "type": "string",

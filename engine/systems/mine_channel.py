@@ -56,6 +56,10 @@ def join_channel(game, mouth, from_room_id, direction, character):
     key = getattr(character, "key", None) or str(character)
     if key in joiners:
         return True, "You are already working that face."
+    # One miner, one face -- drop this key from every other wall first.
+    leave_all_channels_for_character(game, key)
+    ch = get_active_channel(face)
+    joiners = list(ch.get("joiners") or [])
     if len(joiners) >= graph_mod.MAX_CHANNEL_JOINERS:
         return False, "Too many people are already working that wall."
 
@@ -73,7 +77,10 @@ def join_channel(game, mouth, from_room_id, direction, character):
     ch["progress_max"] = max(int(ch.get("progress_max") or 100), 1)
     graph_mod._touch_activity(game, mouth)
     game._mine_graphs_dirty = True
-    return True, f"You set to work on the {direction} face."
+    return True, (
+        f"You set to work on the {direction} face. Keep at it -- the wall "
+        "gives after a short stretch of work."
+    )
 
 
 def leave_channel(mouth, from_room_id, direction, character_key):
@@ -101,6 +108,16 @@ def leave_all_channels_for_character(game, character_key):
     game._mine_graphs_dirty = True
 
 
+def _announce_room(game, mouth_key, room_id, text):
+    """Tell everyone in a remounted mine room (tick/join feedback)."""
+    from engine.systems import mine_rooms as rooms_mod
+
+    room = rooms_mod.get_mine_room(game, mouth_key, room_id)
+    if room is None:
+        return
+    room.broadcast(str(text), exclude=None)
+
+
 def tick_mine_channels(game):
     """Advance all active channels; complete faces when timer elapses."""
     now = int(getattr(game, "game_time_ticks", 0) or 0)
@@ -121,6 +138,10 @@ def tick_mine_channels(game):
                 ch["progress"] = progress
                 if progress < int(ch.get("progress_max") or 100):
                     ch["ends_at_tick"] = now + _channel_ticks(game, len(joiners))
+                    _announce_room(
+                        game, mouth_key, rid,
+                        f"Your work on the {direction} face continues.",
+                    )
                     continue
                 miner = joiners[0]
                 dest, _msg = graph_mod.complete_carve(
@@ -130,6 +151,10 @@ def tick_mine_channels(game):
                 ch["progress"] = 0
                 ch["ends_at_tick"] = None
                 face["carve_hp"] = face.get("carve_hp_max", 100)
+                _announce_room(
+                    game, mouth_key, rid,
+                    f"The {direction} face gives way -- a new drift opens.",
+                )
                 if dest:
                     from engine.systems import mine_rooms as rooms_mod
                     rooms_mod.get_mine_room(game, mouth_key, dest["id"])

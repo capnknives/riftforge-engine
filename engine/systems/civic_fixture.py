@@ -249,6 +249,8 @@ def stamp_hub_layout(host, hub, offset):
 # ---------------------------------------------------------------------------
 
 FIXTURE_KEY_PREFIX = "fixture:"
+# Pre-P6b player-shop curb copies used ``building:<shop_id>`` Item keys.
+LEGACY_FIXTURE_KEY_PREFIX = "building:"
 
 
 def _item_storage_key(obj):
@@ -257,13 +259,14 @@ def _item_storage_key(obj):
 
 
 def fixture_id_from_item(obj):
-    """Return fixture_id from markers or a ``fixture:<id>`` Item key."""
+    """Return fixture_id from markers or a fixture Item key."""
     fid = getattr(obj, "fixture_id", None)
     if fid:
         return str(fid).strip()
     key = _item_storage_key(obj)
-    if key.startswith(FIXTURE_KEY_PREFIX):
-        return key[len(FIXTURE_KEY_PREFIX) :].strip()
+    for prefix in (FIXTURE_KEY_PREFIX, LEGACY_FIXTURE_KEY_PREFIX):
+        if key.startswith(prefix):
+            return key[len(prefix) :].strip()
     return ""
 
 
@@ -286,7 +289,10 @@ def is_fixture_item(obj):
     if bool(getattr(obj, "civic_fixture", False)):
         return True
     # Legacy floor copies keep the key but lose civic_fixture on reload.
-    return _item_storage_key(obj).startswith(FIXTURE_KEY_PREFIX)
+    key = _item_storage_key(obj)
+    return key.startswith(FIXTURE_KEY_PREFIX) or key.startswith(
+        LEGACY_FIXTURE_KEY_PREFIX
+    )
 
 
 def is_fixture_key_for(obj, fixture_id):
@@ -296,7 +302,11 @@ def is_fixture_key_for(obj, fixture_id):
         return False
     if is_fixture_item(obj) and fixture_id_from_item(obj) == fid:
         return True
-    return _item_storage_key(obj) == f"{FIXTURE_KEY_PREFIX}{fid}"
+    key = _item_storage_key(obj)
+    return key in (
+        f"{FIXTURE_KEY_PREFIX}{fid}",
+        f"{LEGACY_FIXTURE_KEY_PREFIX}{fid}",
+    )
 
 
 def fixtures_on_room(room):
@@ -308,17 +318,98 @@ def fixtures_on_room(room):
     return out
 
 
+def collapse_duplicate_fixtures(host, *, keep_fixture_id=None):
+    """Remove stacked floor copies that share one ``fixture_id``.
+
+    Save/load and legacy ``building:`` keys can leave dozens of identical
+    curb Items on one host street. Keeps one copy per id (preferring
+    ``keep_fixture_id`` when set). Returns how many copies were removed.
+    """
+    if host is None:
+        return 0
+    keep_id = str(keep_fixture_id or "").strip()
+    by_id = {}
+    orphans = []
+    for obj in list(getattr(host, "contents", None) or []):
+        if not is_fixture_item(obj):
+            continue
+        fid = fixture_id_from_item(obj)
+        if not fid:
+            orphans.append(obj)
+            continue
+        restore_fixture_item(obj, fid)
+        by_id.setdefault(fid, []).append(obj)
+    removed = 0
+    for fid, copies in by_id.items():
+        if len(copies) <= 1:
+            continue
+        keeper = None
+        if keep_id and fid == keep_id:
+            keeper = copies[0]
+        if keeper is None:
+            keeper = copies[-1]
+        for obj in copies:
+            if obj is keeper:
+                continue
+            host.remove(obj)
+            removed += 1
+    # Unmarked legacy keys with no fixture_id: drop all but the last copy.
+    if len(orphans) > 1:
+        for obj in orphans[:-1]:
+            host.remove(obj)
+            removed += 1
+    return removed
+
+
+def enforce_host_fixture_cap(host, *, max_fixtures=1, preferred_fixture_id=None):
+    """Keep at most ``max_fixtures`` distinct civic fixtures on ``host``.
+
+    When a host street already has a live shop mouth, refuse a second
+    fixture (bug report 1464). Returns how many extras were removed.
+    """
+    if host is None or int(max_fixtures or 0) <= 0:
+        return 0
+    preferred = str(preferred_fixture_id or "").strip()
+    fixtures = fixtures_on_room(host)
+    if len(fixtures) <= int(max_fixtures):
+        return 0
+    ranked = []
+    for obj in fixtures:
+        fid = fixture_id_from_item(obj) or ""
+        score = 0
+        if preferred and fid == preferred:
+            score += 100
+        ranked.append((score, fid, obj))
+    ranked.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    keep = {id(row[2]) for row in ranked[: int(max_fixtures)]}
+    removed = 0
+    for obj in fixtures:
+        if id(obj) in keep:
+            continue
+        host.remove(obj)
+        removed += 1
+    return removed
+
+
+def floor_items_excluding_fixtures(items):
+    """Drop curb fixtures from a floor-item list (look uses room_look_extras)."""
+    return [obj for obj in items if not is_fixture_item(obj)]
+
+
 def fixture_for_id(room, fixture_id):
     """Find the fixture Item for ``fixture_id`` in a host room, if any."""
     if room is None or not fixture_id:
         return None
     fid = str(fixture_id).strip()
-    target_key = f"{FIXTURE_KEY_PREFIX}{fid}"
+    target_keys = (
+        f"{FIXTURE_KEY_PREFIX}{fid}",
+        f"{LEGACY_FIXTURE_KEY_PREFIX}{fid}",
+    )
     for obj in list(getattr(room, "contents", None) or []):
         if is_fixture_item(obj) and fixture_id_from_item(obj) == fid:
             restore_fixture_item(obj, fid)
             return obj
-        if _item_storage_key(obj) == target_key:
+        if _item_storage_key(obj) in target_keys:
             restore_fixture_item(obj, fid)
             return obj
     return None
@@ -355,13 +446,12 @@ def fixture_look_line(
 
 def place_fixture(host, item):
     """Ensure ``item`` is the only fixture with its ``fixture_id`` in
-    ``host.contents`` (replaces a stale copy, e.g. after a stat change)."""
+    ``host.contents`` (replaces stale copies, e.g. after save/load stacks)."""
     if host is None:
         return
     fixture_id = getattr(item, "fixture_id", None)
-    existing = fixture_for_id(host, fixture_id)
-    if existing is not None:
-        host.remove(existing)
+    if fixture_id:
+        remove_fixture(host, fixture_id)
     host.add(item)
 
 
@@ -413,6 +503,28 @@ def create_hub_room(hub_key, description, *, fixture_id=None):
     hub.no_random_spawn = True
     if fixture_id is not None:
         hub.zone = fixture_id
+    return hub
+
+
+def install_runtime_hub(game, hub):
+    """Index a newly created fixture hub and stamp a VNUM identity.
+
+    Authored map rooms already live under a VNUM ``key`` -- do not send
+    those through here. Runtime pockets (newsstand, player-shop interiors)
+    start under a legacy hub_key; ``stamp_hand_room`` rekeys them so
+    persist ``room_key`` can follow VNUM. Returns ``hub``.
+    """
+    from engine.room_vnum import stamp_hand_room
+
+    if game is None or hub is None:
+        return hub
+    rooms = getattr(game, "rooms", None)
+    old_key = getattr(hub, "key", "") or ""
+    if isinstance(rooms, dict) and old_key:
+        existing = rooms.get(old_key)
+        if existing is not hub:
+            rooms[old_key] = hub
+    stamp_hand_room(game, hub)
     return hub
 
 
@@ -474,7 +586,9 @@ def breach_defender_into_fixture(
 
     if not safe_place(character, hub):
         return False
-    character.zone_entry_hub_key = hub.key
+    from engine.room_vnum import internal_room_key
+
+    character.zone_entry_hub_key = internal_room_key(hub) or hub.key
     if landing_line:
         hub.broadcast(landing_line, exclude=character)
     session = getattr(character, "session", None)

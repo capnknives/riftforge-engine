@@ -115,6 +115,59 @@
       "required": false,
       "doc": "Unique artifact combat lexicon pool id."
     },
+    "true_artifact": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "World-original mythic (First Blade, Mjolnir). Not Pit shade loot."
+    },
+    "shade_artifact": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "Pit-forged replica of a true_artifact row."
+    },
+    "bound_owner_key": {
+      "type": "string",
+      "required": false,
+      "doc": "Immersion/storage key of the rightful bearer (Thor, Odin, …)."
+    },
+    "worthy_wield": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "If true, only the bound owner (or a stamped worthy flag) can equip it."
+    },
+    "recall_bound": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "Bound owner may call it to hand with recallrelic (Mjolnir-class)."
+    },
+    "elemental_damage": {
+      "type": "enum",
+      "required": false,
+      "values": ["fire", "water", "air", "earth", "ice", "lightning"],
+      "doc": "Typed damage while this weapon is wielded (Mjolnir lightning)."
+    },
+    "never_miss": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "Gungnir-class: miss, dodge, parry, and blink cannot fire. Block and crit still can."
+    },
+    "cuts_warded": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "Khadga-class: ignore gear/innate armor soak and Magic ward incoming soak."
+    },
+    "breaks_wards": {
+      "type": "bool",
+      "required": false,
+      "default": false,
+      "doc": "Parashu-class: a landed hit shatters live wards and player-laid folklore barriers."
+    },
     "max_ammo": {
       "type": "int",
       "required": false,

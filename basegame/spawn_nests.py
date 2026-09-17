@@ -150,7 +150,9 @@ def _spawn_hostile(game, room, spec):
         getattr(game, "game_time_ticks", 0) or 0
     )
     hostile.home_zone = getattr(room, "zone", None)
-    hostile.home_room_key = getattr(room, "key", None)
+    from engine.room_vnum import internal_room_key
+
+    hostile.home_room_key = internal_room_key(room) or getattr(room, "key", None)
     if hasattr(hostile, "move_to"):
         hostile.move_to(room)
     else:

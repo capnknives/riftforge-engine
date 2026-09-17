@@ -311,6 +311,7 @@ def format_sms_thread_list(character, game):
         tail = f" — {preview}" if preview else ""
         lines.append(f"  {idx}. {label} ({count} msg){tail}")
     lines.append("  phone texts <n>  -- read a thread")
+    lines.append("  phone texts clear  -- wipe all threads on this handset")
     return "\r\n".join(lines)
 
 
@@ -414,6 +415,67 @@ def delete_voicemail(character, index):
     return True, f"{tag_phone(character)} Deleted voicemail #{n}."
 
 
+def clear_sms_threads(character):
+    """Wipe every SMS thread on the primary handset. Returns (ok, message)."""
+    phone = primary_handset(character)
+    if phone is None:
+        return False, "You are not carrying a voice handset."
+    threads = _ensure_sms_threads(phone)
+    if not threads:
+        return True, (
+            f"{tag_phone(character)} No text threads to clear."
+        )
+    count = len(threads)
+    threads.clear()
+    return True, (
+        f"{tag_phone(character)} Cleared {count} text thread"
+        f"{'' if count == 1 else 's'} from your handset."
+    )
+
+
+def handset_has_sms_threads(item):
+    """True when a portable handset Item already holds one or more threads."""
+    if item is None or not is_portable_phone(item):
+        return False
+    return bool(_ensure_sms_threads(item))
+
+
+def pickup_threads_nudge(character, item):
+    """Short inbox hint after get/unstow when threads live on the handset."""
+    if not handset_has_sms_threads(item):
+        return None
+    return (
+        f"{tag_phone(character)} Texts waiting on this handset — "
+        "phone texts."
+    )
+
+
+def _garment_holding_handset(character, handset):
+    """Return worn clothing when ``handset`` is tucked in that garment's pocket."""
+    if character is None or handset is None:
+        return None
+    from engine.systems import clothing_pockets as pocket_mod
+    from engine.systems.wearables import iter_worn_clothing
+
+    for _slot, garment in iter_worn_clothing(character):
+        if handset in pocket_mod.pocket_contents(garment):
+            return garment
+    return None
+
+
+def _pocket_text_buzz_room_line(character, garment):
+    """Third-person line when an inbound SMS buzzes a pocketed handset."""
+    face = getattr(character, "key", "Someone")
+    try:
+        from command_support import _display_name
+
+        face = _display_name(character, None) or face
+    except Exception:
+        pass
+    gname = getattr(garment, "key", None) or "their clothes"
+    return f"{face}'s phone buzzes in {gname}."
+
+
 def _append_pending_text(character, line):
     """Queue a formatted one-way SMS line for login / ``phone`` flush."""
     pending = getattr(character, "pending_phone_texts", None)
@@ -421,6 +483,71 @@ def _append_pending_text(character, line):
         character.pending_phone_texts = []
         pending = character.pending_phone_texts
     pending.append(line)
+
+
+def _queue_plane_sms(holder, sender, notify_line):
+    """Hold one inbound SMS buzz until sender and holder share a plane."""
+    if holder is None or sender is None:
+        return
+    pending = getattr(holder, "pending_plane_sms", None)
+    if not isinstance(pending, list):
+        holder.pending_plane_sms = []
+        pending = holder.pending_plane_sms
+    sender_key = (getattr(sender, "key", None) or "").strip()
+    if not sender_key:
+        return
+    row = {
+        "sender_key": sender_key,
+        "line": (notify_line or "").strip(),
+    }
+    if row["line"]:
+        pending.append(row)
+
+
+def _deliver_plane_sms_row(holder, row, game):
+    """Deliver one queued plane SMS when the sender is reachable."""
+    if holder is None or not row:
+        return False
+    sender_key = (row.get("sender_key") or "").strip()
+    line = (row.get("line") or "").strip()
+    if not sender_key or not line:
+        return True
+    finder = getattr(game, "find_character", None)
+    sender = finder(sender_key) if callable(finder) else None
+    if sender is None or not same_plane(holder, sender):
+        return False
+    _deliver_text_line(holder, line)
+    return True
+
+
+def flush_cross_plane_phone_texts(character, game):
+    """Deliver plane-queued SMS after login, move, or ``phone``."""
+    if character is None or game is None:
+        return
+    pending = getattr(character, "pending_plane_sms", None)
+    if isinstance(pending, list) and pending:
+        still = []
+        for row in pending:
+            if not _deliver_plane_sms_row(character, row, game):
+                still.append(row)
+        character.pending_plane_sms = still
+    my_key = (getattr(character, "key", None) or "").strip()
+    if not my_key:
+        return
+    for other in list(getattr(game, "characters", ()) or ()):
+        if other is character:
+            continue
+        opending = getattr(other, "pending_plane_sms", None)
+        if not isinstance(opending, list) or not opending:
+            continue
+        still_other = []
+        for row in opending:
+            if (row.get("sender_key") or "").strip() != my_key:
+                still_other.append(row)
+                continue
+            if not _deliver_plane_sms_row(other, row, game):
+                still_other.append(row)
+        other.pending_plane_sms = still_other
 
 
 # Handset cosmetic pings (mirror supers/phone_apps allowlists; engine reads Item fields).
@@ -472,16 +599,41 @@ def incoming_ringtone_line(character):
 
 
 def _deliver_text_line(character, line):
-    """Deliver one SMS line now, or queue when ``session`` is None."""
+    """Deliver one SMS line now, or queue when offline / asleep.
+
+    Sleep is world-closed (bug report 1550): a sleeping character does not
+    read text content, but a text still stirs them toward waking rather
+    than vanishing unnoticed. It flushes in full on ``wake``.
+    """
     session = getattr(character, "session", None)
-    if session is not None:
+    if session is not None and not getattr(character, "asleep", False):
         from engine import snoop as snoop_module
+
+        # Pocketed primary handsets buzz audibly in the room (bug 1069 path)
+        # while the owner still gets the private tone + SMS body.
+        handset = primary_handset(character)
+        garment = _garment_holding_handset(character, handset)
+        if garment is not None:
+            room = getattr(character, "location", None)
+            if room is not None:
+                room.broadcast(
+                    _pocket_text_buzz_room_line(character, garment),
+                    exclude=character,
+                )
         tone = incoming_text_tone_line(character)
         if tone:
             snoop_module.tell_paragraph(character, tone)
         snoop_module.tell_paragraph(character, line)
         return True
     _append_pending_text(character, line)
+    if session is not None and getattr(character, "asleep", False):
+        from engine import snoop as snoop_module
+
+        snoop_module.tell_paragraph(
+            character,
+            "Something stirs at the edge of your dreams, tugging you "
+            "toward waking.",
+        )
     return True
 
 
@@ -519,7 +671,7 @@ def send_player_text(sender, target_raw, body, game):
         return ok, msg
 
     if not has_portable_phone(sender):
-        return _done(False, "You need a phone in hand to text.")
+        return _done(False, "You need a phone on you to text.")
     label = (target_raw or "").strip()
     text = (body or "").strip()
     if not label or not text:
@@ -535,6 +687,14 @@ def send_player_text(sender, target_raw, body, game):
         return _done(False, "That does not look like a phone number or saved alias.")
     item, holder, _room = find_item_by_number(game, number)
     if item is None or holder is None:
+        stashed_holder = _holder_with_phone_in_unworn_bag(game, number)
+        if stashed_holder is not None:
+            return _done(
+                False,
+                f"{tag_phone(sender)} That number is stashed in an unworn bag "
+                "-- they cannot receive texts until they wear the bag or "
+                "carry the handset.",
+            )
         return _done(False, f"{tag_phone(sender)} No handset at that number.")
     if is_payphone_item(item):
         return _done(False, "Payphones are not SMS inboxes.")
@@ -544,11 +704,6 @@ def send_player_text(sender, target_raw, body, game):
         return _done(
             False,
             f"{tag_phone(sender)} They are not carrying a phone.",
-        )
-    if not same_plane(sender, holder):
-        return _done(
-            False,
-            f"{tag_phone(sender)} No signal — that phone is on another plane.",
         )
     my_phone = primary_handset(sender)
     from_number = (
@@ -575,15 +730,26 @@ def send_player_text(sender, target_raw, body, game):
     msg = (
         f"{tag_phone(holder)} SMS from {sender_name} ({from_number}): {text}"
     )
-    _deliver_text_line(holder, msg)
+    on_shared_plane = same_plane(sender, holder)
+    if on_shared_plane:
+        _deliver_text_line(holder, msg)
+    else:
+        _queue_plane_sms(holder, sender, msg)
     session = getattr(holder, "session", None)
+    if not on_shared_plane:
+        return _done(
+            True,
+            f"You text {number}. It will deliver when you share a plane.",
+        )
     if session is None:
         return _done(True, f"You text {number}. It will arrive when they log in.")
     return _done(True, f"You text {number}.")
 
 
-def flush_pending_phone_texts(character):
+def flush_pending_phone_texts(character, game=None):
     """Deliver queued one-way texts after login or on ``phone``."""
+    if game is not None:
+        flush_cross_plane_phone_texts(character, game)
     pending = getattr(character, "pending_phone_texts", None)
     if not pending:
         return
@@ -903,7 +1069,7 @@ def claim_number(character, number, game) -> tuple[bool, str]:
         return False, "Special lines cannot be claimed."
     phone = primary_handset(character)
     if phone is None:
-        return False, "You need a flip phone in hand to claim a number."
+        return False, "You need a flip phone on you to claim a number."
     if game is None:
         return False, "No exchange is open to claim that number."
     ensure_phone_pool(game)
@@ -982,7 +1148,7 @@ def transfer_number(character, game, raw_args="") -> tuple[bool, str]:
     if len(phones) < 2:
         return (
             False,
-            "You need two handsets in hand to transfer a number "
+            "You need two handsets on you to transfer a number "
             "(buy a new flip or smartphone, then phone transfer).",
         )
     bits = (raw_args or "").strip().split()
@@ -1157,6 +1323,39 @@ def has_portable_phone(character):
     return bool(portable_phones_held(character))
 
 
+def _phone_in_unworn_bags(character, number):
+    """True when ``number`` is on a handset inside a carried but unworn bag."""
+    want = normalize_number(number)
+    if not want or character is None:
+        return False
+    from engine.systems import containers as containers_mod
+
+    worn_ids = {id(bag) for bag in containers_mod.worn_bags(character)}
+    for piece in list(getattr(character, "inventory", None) or []):
+        if id(piece) in worn_ids:
+            continue
+        inner_rows = containers_mod.bag_contents(piece)
+        if not inner_rows and getattr(piece, "bag_contents", None) is None:
+            continue
+        for inner in inner_rows:
+            if not is_portable_phone(inner):
+                continue
+            got = normalize_number(getattr(inner, "phone_number", None))
+            if got == want:
+                return True
+    return False
+
+
+def _holder_with_phone_in_unworn_bag(game, number):
+    """Character holding ``number`` only inside an unworn kit bag, if any."""
+    if game is None:
+        return None
+    for ch in iter_characters(game):
+        if _phone_in_unworn_bags(ch, number):
+            return ch
+    return None
+
+
 def _ensure_handset_uid(item):
     """Allocate a stable uid on a handset when missing (old saves / loot)."""
     uid = getattr(item, "uid", None)
@@ -1182,6 +1381,21 @@ def note_phone_attempt(character, *, kind, ok, detail=None):
     character._last_phone_attempt = row
 
 
+def _pick_default_primary_handset(phones):
+    """Prefer a smartphone over a starter flip when order would lie.
+
+    ``portable_phones_held`` lists open inventory before clothing pockets,
+    so a pocketed smartphone can sit after a loose flip -- outbound SMS and
+    ``phone number`` must not silently switch to the flip (bug reports 1306/1307).
+    """
+    if not phones:
+        return None
+    for piece in phones:
+        if getattr(piece, "is_smartphone", False):
+            return piece
+    return phones[0]
+
+
 def primary_handset(character):
     """Preferred portable for speak/text/apps; ring-all uses every number."""
     phones = portable_phones_held(character)
@@ -1192,9 +1406,8 @@ def primary_handset(character):
         for piece in phones:
             if getattr(piece, "uid", None) == want_uid.strip():
                 return piece
-    primary = phones[0]
-    if not want_uid:
-        character.phone_primary_uid = _ensure_handset_uid(primary)
+    primary = _pick_default_primary_handset(phones)
+    character.phone_primary_uid = _ensure_handset_uid(primary)
     return primary
 
 
@@ -1205,8 +1418,8 @@ def set_primary_handset(character, item, game=None):
         return False, "Which handset?"
     if not is_portable_phone(item):
         return False, "That is not a portable handset."
-    inventory = list(getattr(character, "inventory", None) or [])
-    if item not in inventory:
+    held = portable_phones_held(character)
+    if item not in held:
         return False, "You are not carrying that handset."
     uid = _ensure_handset_uid(item)
     character.phone_primary_uid = uid
@@ -1240,7 +1453,7 @@ def can_place_call(character, game):
     return (
         False,
         None,
-        "You need a phone in hand, a house/motel landline, or a payphone here.",
+        "You need a phone on you, a house/motel landline, or a payphone here.",
     )
 
 
@@ -1338,7 +1551,9 @@ def find_item_by_number(game, number):
         return None, None, None
     rooms = getattr(game, "rooms", None) or {}
     for ch in iter_characters(game):
-        for piece in list(getattr(ch, "inventory", None) or []):
+        # Same body scope as ``portable_phones_held`` (inventory, bags,
+        # clothing pockets, wallet) so pocketed handsets still ring (1069/1306).
+        for piece in portable_phones_held(ch):
             if not is_phone_item(piece):
                 continue
             got = normalize_number(getattr(piece, "phone_number", None))
@@ -1718,23 +1933,44 @@ def connect_call(caller, callee):
 
 
 def peer_on_call(character, game):
-    """Return the other Character on an active call, or None."""
+    """Return the other Character on an active call, or None.
+
+    1:1 calls require reciprocal ``peer_key``. Conference calls stamp a
+    shared ``members`` list — any other live member counts as the peer so
+    ``phone ask`` does not report a dead line on a three-way.
+    """
     call = active_call(character)
     if not call:
         return None
-    key = call.get("peer_key")
-    if not key:
-        return None
     finder = getattr(game, "find_character", None)
     if not callable(finder):
+        return None
+    my_key = getattr(character, "key", None)
+    members = call.get("members")
+    if isinstance(members, list) and len(members) >= 2:
+        for key in members:
+            if not key or key == my_key:
+                continue
+            peer = finder(key)
+            if peer is None:
+                continue
+            peer_call = active_call(peer)
+            if not peer_call:
+                continue
+            peer_members = peer_call.get("members")
+            if isinstance(peer_members, list) and my_key in peer_members:
+                return peer
+            if peer_call.get("peer_key") == my_key:
+                return peer
+        return None
+    key = call.get("peer_key")
+    if not key:
         return None
     peer = finder(key)
     if peer is None:
         return None
     peer_call = active_call(peer)
-    if not peer_call or peer_call.get("peer_key") != getattr(
-        character, "key", None
-    ):
+    if not peer_call or peer_call.get("peer_key") != my_key:
         return None
     return peer
 
@@ -1987,7 +2223,7 @@ def phone_request_song(character, game, song):
 
 def status_text(character, game):
     """Bare ``phone`` cheat-sheet / status."""
-    flush_pending_phone_texts(character)
+    flush_pending_phone_texts(character, game)
     lines = [f"{tag_phone(character)} Phone"]
     phones = portable_phones_held(character)
     primary = primary_handset(character)

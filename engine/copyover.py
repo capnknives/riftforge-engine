@@ -62,6 +62,12 @@ SKIP_DEFERRED_NAME = ".copyover_skip_deferred"
 READY_NAME = ".copyover_ready"
 # Last failed rewrite after MSG_BEFORE (gm copyover last / MCP).
 ABORT_LOG_NAME = ".copyover_last_abort.json"
+# Last successful Veil-ready stamp (bug-report runtime honesty).
+OK_LOG_NAME = ".copyover_last_ok.json"
+# Append-only rewrite history (watch mtime, GM, abort). gm copyover last.
+JOURNAL_NAME = ".copyover_journal.jsonl"
+JOURNAL_KEEP = 80
+JOURNAL_SHOW = 12
 
 
 def _stamp_root(root=None):
@@ -85,6 +91,86 @@ def _ready_path(root=None):
 def abort_log_path(root=None):
     """Checkout file for the last cancelled Veil rewrite."""
     return os.path.join(_stamp_root(root), ABORT_LOG_NAME)
+
+
+def ok_log_path(root=None):
+    """Checkout file for the last successful Veil-ready stamp."""
+    return os.path.join(_stamp_root(root), OK_LOG_NAME)
+
+
+def journal_path(root=None):
+    """Checkout JSONL of recent copyover triggers (mtime / GM / abort)."""
+    return os.path.join(_stamp_root(root), JOURNAL_NAME)
+
+
+def append_journal_event(
+    kind,
+    *,
+    reason="",
+    files=None,
+    detail="",
+    by="",
+    root=None,
+):
+    """Append one rewrite-history row; keep the last JOURNAL_KEEP lines.
+
+    ``kind`` is ``watch``, ``gm``, or ``abort``. Write failures are logged
+    and ignored so a journal miss never blocks SIGUSR1 or a save abort.
+    """
+    payload = {
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "kind": str(kind or "watch"),
+    }
+    reason = (reason or "").strip()
+    if reason:
+        payload["reason"] = reason[:240]
+    detail = (detail or "").strip()
+    if detail:
+        payload["detail"] = detail[:400]
+    by = (by or "").strip()
+    if by:
+        payload["by"] = by[:80]
+    clean_files = []
+    for path in list(files or ()):
+        text = str(path or "").replace("\\", "/").strip()
+        if text and text not in clean_files:
+            clean_files.append(text)
+        if len(clean_files) >= 40:
+            break
+    if clean_files:
+        payload["files"] = clean_files
+        payload["n_files"] = len(clean_files)
+    path = journal_path(root)
+    try:
+        rows = []
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(row, dict):
+                        rows.append(row)
+        rows.append(payload)
+        rows = rows[-JOURNAL_KEEP:]
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, separators=(",", ":")))
+                handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(
+            f"[copyover] journal append failed path={path!r}: {exc!r}",
+            flush=True,
+        )
+    return payload
 
 
 def mark_skip_deferred_boot(*, root=None):
@@ -134,6 +220,43 @@ def mark_copyover_ready(*, root=None):
             os.fsync(handle.fileno())
     except OSError:
         pass
+    # Best-effort ok stamp for bug-report runtime (does not block ready).
+    record_last_ok(root=root)
+
+
+def record_last_ok(*, root=None):
+    """Persist when copyover became safe to queue (mirrors record_last_abort).
+
+    Payload shape is ``{at, sha?}`` written to ``OK_LOG_NAME``. The optional
+    ``sha`` is a cheap read of ``.git/HEAD`` (no subprocess) when available.
+    Write failures are logged and ignored so copyover never aborts on this.
+    """
+    payload = {
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    sha = None
+    try:
+        # Lazy import avoids any copyover ↔ report_context cycle at import.
+        from engine.report_context import _head_sha_cheap
+
+        sha = _head_sha_cheap(root)
+    except Exception:
+        sha = None
+    if sha:
+        payload["sha"] = str(sha)
+    path = ok_log_path(root)
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        print(
+            f"[copyover] ok log write failed path={path!r}: {exc!r}",
+            flush=True,
+        )
+    return payload
 
 
 def copyover_ready_since(spawn_wall, *, root=None):
@@ -174,11 +297,19 @@ def record_last_abort(reason, *, detail="", traceback_text=""):
         diag_export.append_copyover_abort_event(payload)
     except Exception as exc:
         print(f"[copyover] abort diag append failed: {exc!r}", flush=True)
+    try:
+        append_journal_event(
+            "abort",
+            reason=str(reason or "unknown"),
+            detail=str(detail or "")[:400],
+        )
+    except Exception as exc:
+        print(f"[copyover] abort journal append failed: {exc!r}", flush=True)
     return payload
 
 
 def format_last_abort(*, root=None):
-    """Staff-facing dump for ``gm copyover last``."""
+    """Staff-facing dump of the last cancelled Veil rewrite only."""
     path = abort_log_path(root)
     if not os.path.isfile(path):
         return (
@@ -210,30 +341,155 @@ def format_last_abort(*, root=None):
     return "\n".join(lines)
 
 
-def _notify_staff_abort(game, reason, detail):
-    """One-line [GM] ping so staff do not have to grep docker logs."""
-    if game is None:
-        return
-    try:
-        from world import Character
-        from engine import gm_notify
-    except Exception:
-        return
+def _format_journal_row(row):
+    """One staff line for a journal event."""
+    at = row.get("at") or "?"
+    kind = row.get("kind") or "watch"
+    reason = (row.get("reason") or "").strip()
+    by = (row.get("by") or "").strip()
+    n_files = row.get("n_files")
+    files = row.get("files") or []
+    line = f"{at}  {kind}"
+    if reason:
+        line = f"{line}  {reason}"
+    if by:
+        line = f"{line}  by {by}"
+    if files:
+        shown = files[:8]
+        extra = (n_files or len(files)) - len(shown)
+        names = ", ".join(shown)
+        if extra > 0:
+            names = f"{names} +{extra} more"
+        line = f"{line}\n    files: {names}"
+    return line
+
+
+def format_copyover_last(*, root=None):
+    """Staff dump for ``gm copyover last``: journal + last ok + last abort.
+
+    Mystery overnight Veils (bug report 1471) never hit the abort file --
+    staff need the watcher's file list, not only cancel reasons.
+    """
+    lines = []
+    journal = journal_path(root)
+    rows = []
+    if os.path.isfile(journal):
+        try:
+            with open(journal, encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(row, dict):
+                        rows.append(row)
+        except OSError as exc:
+            lines.append(f"Could not read rewrite journal: {exc!r}")
+            rows = []
+    if rows:
+        lines.append("Recent rewrites (newest last):")
+        for row in rows[-JOURNAL_SHOW:]:
+            lines.append(_format_journal_row(row))
+    else:
+        lines.append(
+            "No rewrite journal yet. Watcher copyovers, GM copyover, "
+            "and cancelled Veils append here."
+        )
+    ok_path = ok_log_path(root)
+    if os.path.isfile(ok_path):
+        try:
+            with open(ok_path, encoding="utf-8") as handle:
+                ok = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            ok = None
+        if isinstance(ok, dict):
+            at = ok.get("at") or "?"
+            sha = (ok.get("sha") or "")[:12]
+            bit = f"Last ready stamp: {at}"
+            if sha:
+                bit = f"{bit}  sha={sha}"
+            lines.append("")
+            lines.append(bit)
+    lines.append("")
+    lines.append(format_last_abort(root=root))
+    return "\n".join(lines)
+
+
+def format_copyover_hub(*, root=None):
+    """Staff dump for bare ``gm copyover``: command list + rewrite status.
+
+    Bare copyover used to start a Veil (staff typed it expecting a log).
+    The hub never rewrites; ``gm copyover start`` is the fire verb.
+    """
+    lines = [
+        "copyover -- Veil rewrite hub (bare does not rewrite)",
+        "",
+        "  gm copyover              this sheet",
+        "  gm copyover status      same as bare",
+        "  gm copyover last        recent rewrites + last abort (also: why / log)",
+        "  gm copyover start       hot-reload now (players stay connected)",
+        "",
+        format_copyover_last(root=root),
+    ]
+    return "\n".join(lines)
+
+
+def _staff_abort_message(reason, detail):
+    """One-line reason staff can type into ``gm copyover last``."""
     short = (detail or "").split("\n", 1)[0].strip()[:160]
     msg = f"rewrite cancelled ({reason}) -- gm copyover last"
     if short:
         msg = f"rewrite cancelled ({reason}: {short}) -- gm copyover last"
-    for session in list(getattr(game, "sessions", None) or ()):
-        body = getattr(session, "character", None)
-        if body is None or not isinstance(body, Character):
-            continue
-        if getattr(body, "gm_rank", None) != "head_gm":
-            continue
-        gm_notify.send_gm_player_line(body, msg)
+    return msg
+
+
+def _notify_staff_abort(game, reason, detail):
+    """[GM] ping + ops webhook + wiznet history so staff actually see it.
+
+    Do **not** walk ``character.gm_rank == head_gm`` on the session body.
+    After account migration that field is empty, and occupy (Gabriel / Ash)
+    is an immersion cast -- those pings never arrived (live 2026-09-10).
+    ``ping_gms`` uses ``_receives_staff_ops`` (account rank + playcast).
+    """
+    msg = _staff_abort_message(reason, detail)
+    print(f"[copyover] {msg}", flush=True)
+    if game is None:
+        return
+    try:
+        from engine import gm_notify
+        from engine import ops_webhook
+    except Exception as exc:
+        print(f"[copyover] abort notify skipped: {exc!r}", flush=True)
+        return
+    try:
+        gm_notify.ping_gms(game, msg)
+    except Exception as exc:
+        print(f"[copyover] abort ping_gms failed: {exc!r}", flush=True)
+    try:
+        gm_notify.append_wiznet_history(game, f"[WIZ] {msg}")
+    except Exception as exc:
+        print(f"[copyover] abort wiznet history failed: {exc!r}", flush=True)
+    try:
+        ops_webhook.schedule_ops_alert(
+            "copyover_abort",
+            msg,
+            reason=str(reason or ""),
+            detail=str(detail or "")[:500],
+        )
+    except Exception as exc:
+        print(f"[copyover] abort ops webhook failed: {exc!r}", flush=True)
 
 
 def _cancel_rewrite(game, reason, detail=""):
-    """Record + staff-ping + player MSG_CANCEL (HB-19)."""
+    """Record + staff-ping + player MSG_CANCEL (HB-19).
+
+    Also restarts the P30 persist writer if the terminating save already
+    shut it down -- abort stays up, so later autosave must not fall back
+    to on-loop apply until the next game-only restart.
+    """
     import traceback as traceback_mod
 
     tb = traceback_mod.format_exc()
@@ -242,6 +498,38 @@ def _cancel_rewrite(game, reason, detail=""):
     record_last_abort(reason, detail=detail, traceback_text=tb)
     _notify_staff_abort(game, reason, detail)
     _announce_cancel(game)
+    if game is not None:
+        game._copyover_in_flight = False
+    # Abort stays in this process -- do not leave .planned_restart armed or
+    # the hang killer will skip forever (L-10 is only for an in-flight Veil).
+    from engine import crash_recovery
+
+    crash_recovery.clear_planned_restart()
+    _restore_persistence_writer_after_abort(game)
+
+
+def _restore_persistence_writer_after_abort(game):
+    """Start the persist writer again after a Veil abort that stayed up.
+
+    ``save_world_before_process_exit`` always ``shutdown_persistence_writer``
+    before the sync snapshot. Skip-saved login PCs abort *after* that kill
+    and keep the process running -- without this restart, ``save_async``
+    applies SQLite on the asyncio loop until someone restarts the game.
+    """
+    if game is None:
+        return
+    try:
+        from engine.lag_threads import sync_threads_to_env
+
+        notes = sync_threads_to_env(game)
+    except Exception as exc:
+        print(
+            f"[copyover] persist-writer restore after abort failed: {exc!r}",
+            flush=True,
+        )
+        return
+    for note in notes or ():
+        print(f"[copyover] {note}", flush=True)
 
 # Player-facing lines (plain tags -- never color alone). Shared by classic
 # execv copyover, gateway graceful restart, and gateway reattach.
@@ -291,7 +579,18 @@ def trigger(game):
     `copyover` command (commands.py) call -- neither runs inside a
     coroutine itself (a signal callback and a synchronous command handler,
     respectively), so both need create_task rather than an `await`.
+
+    Coalesce stacked SIGUSR1 / gm copyover while a Veil is already
+    running -- a second ``_perform`` would send MSG_BEFORE twice, force-
+    full save twice, and race abort vs exit.
     """
+    if getattr(game, "_copyover_in_flight", False):
+        print(
+            "[copyover] already in flight -- ignoring stacked trigger",
+            flush=True,
+        )
+        return
+    game._copyover_in_flight = True
     asyncio.create_task(_perform(game))
 
 
@@ -325,6 +624,64 @@ async def _announce_before(game):
                 f"({key}): {exc!r}",
                 flush=True,
             )
+
+
+def _heal_occupy_sessions_before_copyover_persist(game):
+    """Point sessions at occupy cast bodies before save / bind rows."""
+    from engine import hooks
+
+    for session in _iter_copyover_sessions(game):
+        char = getattr(session, "character", None)
+        if char is None:
+            continue
+        try:
+            hooks.heal_staff_occupy_session_desync(char, game)
+        except Exception:
+            pass
+
+
+async def _flush_gateway_session_binds(game):
+    """Push corrected reattach keys before gateway-mode copyover exit."""
+    from engine.gateway_client import gateway_enabled
+    from engine.session_bind import session_copyover_bind_name
+
+    if not gateway_enabled():
+        return
+    pending = []
+    for session in _iter_copyover_sessions(game):
+        char = getattr(session, "character", None)
+        if char is None:
+            continue
+        try:
+            from engine import hooks
+
+            char = hooks.heal_staff_occupy_session_desync(char, game)
+        except Exception:
+            pass
+        bind = session_copyover_bind_name(session)
+        if not bind or bind == "?":
+            continue
+        bridge = getattr(session, "gateway_bridge", None)
+        sid = getattr(session, "gateway_session_id", None)
+        if bridge is None or not sid:
+            continue
+        notify = getattr(bridge, "notify_bound", None)
+        if not callable(notify):
+            continue
+        from engine import ooc_channel
+
+        pending.append(
+            notify(
+                sid,
+                bind,
+                ooc_face=ooc_channel.speaker_face_for_session(session, game),
+                head_gm=ooc_channel.session_is_head_gm(session, game),
+                staff_gm=ooc_channel.session_is_staff_gm(session, game),
+                gmcp_supports=dict(getattr(session, "gmcp_supports", None) or {}),
+            )
+        )
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 async def _notify_gateway_planned_restart(game):
@@ -376,12 +733,29 @@ def reload_world_save_modules():
     holds older bytecode -- without a reload, ``game.save()`` would skip
     God twins and omit new blob fields (bug report 152).
 
-    Reload ``engine.hooks`` *before* ``engine.persistence``. Persistence
-    imports hook callables at module top; if we reload persistence first
-    while the in-memory hooks module still lacks a newly added name
-    (e.g. ``heal_force_unspirit``), ``importlib.reload`` raises
-    ``ImportError`` and copyover aborts — the game process never exits,
-    so overlays never become live bytecode (bug report 387).
+    Reload ``engine.hooks``, then ``engine.char_identity``, then
+    ``engine.persistence``. Persistence imports hook callables at module
+    top; if we reload persistence first while the in-memory hooks module
+    still lacks a newly added name (e.g. ``heal_force_unspirit``),
+    ``importlib.reload`` raises ``ImportError`` and copyover aborts —
+    the game process never exits, so overlays never become live bytecode
+    (bug report 387).
+
+    Persistence save-path helpers also import names from
+    ``engine.char_identity`` (``is_account_linked_body``). Auto-deploy can
+    land those names on disk while this process still holds the old
+    identity module -- reload(persistence) then ImportError's after the
+    Veil rewrite announce (live 2026-09-10, reason ``save``).
+
+    Homestead collect/apply live in the game package. ``game_select``
+    reloads that module after persistence so a new ``owner_cnum``
+    INSERT cannot pair with an old wipe-rewrite that NULLs the column.
+
+    ``supers.persist_meta`` imports the root ``persistence`` facade, not
+    ``engine.persistence``. Auto-deploy can refresh ``engine.persistence``
+    on disk while this process still holds a stale facade missing new
+    ``save_*`` re-exports — copyover save then AttributeError's (e.g.
+    ``save_ground_item_decay_tuning``).
     """
     import importlib
 
@@ -407,7 +781,15 @@ def reload_world_save_modules():
     # Hooks first: persistence's top-level ``from engine.hooks import …``
     # must see the on-disk hooks module, not the pre-overlay cache.
     importlib.reload(hooks)
+    # Identity next: persistence function-level imports bind to the
+    # in-memory module object. Reload it from disk before persistence.
+    from engine import char_identity as ci
+
+    importlib.reload(ci)
     ep = importlib.reload(ep)
+    import persistence as persistence_facade
+
+    importlib.reload(persistence_facade)
     # reload(hooks) clears bootstrap callbacks; re-register the active game's
     # persist_blob codec before copyover save (empty blobs wiped live, #2096).
     try:
@@ -433,6 +815,11 @@ async def _perform(game):
 
     from engine import crash_recovery
     crash_recovery.mark_planned_restart()
+
+    from engine import persistence
+
+    await persistence.wait_collect_idle_async(game)
+    await persistence.wait_writer_idle_async()
 
     from engine.gateway_client import gateway_enabled
 
@@ -518,6 +905,7 @@ async def _perform(game):
     try:
         # SQLite busy/locked during a laggy rewrite used to cancel the
         # Veil after one try. Retry a couple of times before aborting.
+        _heal_occupy_sessions_before_copyover_persist(game)
         last_save_exc = None
         for attempt in range(3):
             try:
@@ -538,6 +926,12 @@ async def _perform(game):
                 await asyncio.sleep(0.4 * (attempt + 1))
         if last_save_exc is not None:
             raise last_save_exc
+        stats = getattr(game, "_last_world_save_stats", None) or {}
+        if stats.get("skipped") or stats.get("writer_pending"):
+            raise RuntimeError(
+                "copyover save did not apply world snapshot "
+                f"(stats={stats!r})"
+            )
     except Exception as exc:
         import traceback
 
@@ -569,6 +963,7 @@ async def _perform(game):
     mark_skip_deferred_boot()
 
     if gateway_enabled():
+        await _flush_gateway_session_binds(game)
         # Watcher holds :4000; exiting is the reload. Players already got
         # MSG_BEFORE; MSG_AFTER lands on gateway reattach in connection.py.
         # Tell the gateway first so WKNZ Discord does not treat this as a
@@ -598,11 +993,18 @@ async def _perform(game):
         inheritable_fds.append(fd)
         # Freeze the login body name -- never gmspirit:Key -- so resume
         # finds the corporeal Character; after_session_attach restores
-        # gm on when gm_staff_form is set.
-        from engine.command_support import strip_ephemeral_storage_prefix
-        actor = session.character
-        bind_name = getattr(actor, "gm_body_key", None) or actor.key
-        bind_name = strip_ephemeral_storage_prefix(bind_name)
+        # gm on when gm_staff_form is set. Cast occupy uses Gabriel, not
+        # the ranked PC on the parked spirit (bug report 1380).
+        from engine import hooks
+        from engine.session_bind import session_copyover_bind_name
+
+        try:
+            hooks.heal_staff_occupy_session_desync(session.character, game)
+        except Exception:
+            pass
+        bind_name = session_copyover_bind_name(session)
+        if not bind_name:
+            continue
         creating = getattr(session, "login_stage", None) == "creating"
         # Playing bodies with a leftover chargen_draft flag stay in play
         # (bug report 837). Mid-create seats use login_stage == "creating".

@@ -170,6 +170,23 @@ def clamp_macro(x, y):
     return 0 <= x < MACRO_WIDTH and 0 <= y < MACRO_HEIGHT
 
 
+def coords_on_atlas(atlas, nx, ny):
+    """True when ``(nx, ny)`` sits on ``atlas`` (America or 1861).
+
+    ``clamp_macro`` follows whichever atlas last mutated the module
+    globals. Scenic horse rides must clamp the camera they are actually
+    on, or a Frontierland cruise can look like an America edge refuse.
+    """
+    if atlas is None:
+        return clamp_macro(nx, ny)
+    try:
+        width = int(getattr(atlas, "width", None) or MACRO_WIDTH)
+        height = int(getattr(atlas, "height", None) or MACRO_HEIGHT)
+        return 0 <= int(nx) < width and 0 <= int(ny) < height
+    except (TypeError, ValueError):
+        return clamp_macro(nx, ny)
+
+
 def overland_mode(character):
     """Return 'vehicle' | 'flying' | 'on_foot' | 'zone' for dual-layer routing.
 
@@ -199,59 +216,69 @@ def is_virtual_room(room):
     return bool(getattr(room, "virtual_overland", False))
 
 
-def _is_foreign_overland_grid(room):
-    """True when ``room`` reuses this dual-layer *shape* for a private grid.
+def _is_frontierland_overland_grid(room):
+    """True when ``room`` is a 1861 *atlas cell*, not a Sunrise street.
 
-    Other systems (a God's demesne, ``supers/demesne/overland.py``) stamp
-    their own macro/micro grid onto ephemeral rooms and set
-    ``virtual_overland`` so shared move dispatch / look extras pick them
-    up -- but their ``overland_macro`` / ``overland_micro`` coordinates
-    are local to that private grid, never indices into the real, shared
-    ``game.overland_atlas``. Engine code must not import ``supers``
-    (purity), so this checks the plain ``demesne_id`` attribute those
-    rooms stamp on themselves rather than importing the demesne module.
-
-    The 1861 Frontierland atlas is a second CONUS grid on another plane.
-    Its numeric cells must never be mistaken for live America Overland.
-
-    Any function here that reads a room's overland coords to look up
-    real atlas terrain/cities, or that calls :func:`place_on_overland`
-    with coords borrowed from a room, must skip these rooms first --
-    otherwise a God standing in their demesne gets silently relocated
-    onto the real America atlas at the same numeric coordinates.
+    Town / camp pockets share plane ``earth_frontierland_1861`` with the
+    trail. Treating every 1861 room as a grid cell hid Samuel in the
+    trail-mouth Rail Camp and skipped FY00023 (bug reports 1424 / 1425).
     """
     if room is None:
         return False
-    if bool(getattr(room, "demesne_id", None)):
-        return True
-    plane = str(getattr(room, "plane", None) or "").strip().lower()
-    if plane == FRONTIERLAND_PLANE:
-        return True
-    map_id = str(getattr(room, "map_id", None) or "").strip().lower()
-    if map_id == FRONTIERLAND_MAP_ID:
-        return True
-    from engine.systems.water_atlas import is_water_map_id
-
-    if is_water_map_id(map_id) or bool(getattr(room, "water_atlas", False)):
-        return True
     prefix = str(getattr(room, "grid_prefix", None) or "").strip()
     if prefix == FRONTIERLAND_PREFIX:
         return True
     parsed = map_ui.parse_grid_key(getattr(room, "key", "") or "")
     if parsed and parsed[0] == FRONTIERLAND_PREFIX:
         return True
+    if is_virtual_room(room):
+        map_id = str(getattr(room, "map_id", None) or "").strip().lower()
+        return map_id == FRONTIERLAND_MAP_ID
     return False
 
 
-def is_real_overland_room(room):
-    """True when this is a live cell of the shared, real-world atlas.
+def _is_private_overland_grid(room):
+    """True when ``room`` reuses dual-layer shape for a private grid.
 
-    Like :func:`is_virtual_room` but excludes private grids (demesnes)
-    that reuse the same dual-layer shape. Prefer this over
-    ``is_virtual_room`` whenever the caller is about to touch
-    ``game.overland_atlas`` or re-place the character on it.
+    Demesne wilds and water atlases own their macro/micro coords -- they
+    must never be mistaken for America or Frontierland CONUS indices.
     """
-    return is_virtual_room(room) and not _is_foreign_overland_grid(room)
+    if room is None:
+        return False
+    if bool(getattr(room, "demesne_id", None)):
+        return True
+    map_id = str(getattr(room, "map_id", None) or "").strip().lower()
+    from engine.systems.water_atlas import is_water_map_id
+
+    if is_water_map_id(map_id) or bool(getattr(room, "water_atlas", False)):
+        return True
+    return False
+
+
+def _is_foreign_to_america_atlas(room):
+    """Never treat this room's overland coords as America Overland indices."""
+    return _is_private_overland_grid(room) or _is_frontierland_overland_grid(room)
+
+
+def _is_foreign_overland_grid(room):
+    """Backward-compatible alias for non-America overland grids.
+
+    Callers that block *America* coord travel (``walk 44 32`` from a
+    demesne or the 1861 pocket) should keep using this name. Adoption and
+    virtual-room routing use the narrower helpers above instead.
+    """
+    return _is_foreign_to_america_atlas(room)
+
+
+def is_real_overland_room(room):
+    """True when this is a live cell of a shared CONUS atlas (America or 1861).
+
+    Like :func:`is_virtual_room` but excludes private grids (demesnes,
+    water) that reuse the same dual-layer shape. Prefer this over
+    ``is_virtual_room`` whenever the caller is about to touch a plane's
+    atlas or re-place the character on it.
+    """
+    return is_virtual_room(room) and not _is_private_overland_grid(room)
 
 
 def is_aerial_room(room):
@@ -265,6 +292,26 @@ def ensure_overland_defaults(character):
         character.macro_pos = None
     if not hasattr(character, "micro_pos"):
         character.micro_pos = None
+    if not hasattr(character, "overland_plane"):
+        character.overland_plane = None
+
+
+def stamp_overland_plane(character, plane=None, room=None):
+    """Remember which atlas a dual-layer foot cell belongs to.
+
+    Earth and 1861 wilderness rooms share the persist title
+    ``Wilderness (mx,my)/ux,uy``. Copyover must not guess the century
+    from that string alone.
+    """
+    ensure_overland_defaults(character)
+    if plane is not None:
+        character.overland_plane = str(plane).strip().lower() or None
+        return
+    loc = room if room is not None else getattr(character, "location", None)
+    if loc is not None and is_real_overland_room(loc):
+        character.overland_plane = _overland_plane_for_room(loc)
+        return
+    character.overland_plane = None
 
 
 def clear_overland_coords(character):
@@ -272,6 +319,7 @@ def clear_overland_coords(character):
     ensure_overland_defaults(character)
     character.macro_pos = None
     character.micro_pos = None
+    character.overland_plane = None
 
 
 def parse_wilderness_room_key(key):
@@ -293,9 +341,8 @@ def america_macro_from_room(room, game=None):
     """Return America macro (x, y) for a grid / virtual / gate Room, or None."""
     if room is None:
         return None
-    if _is_foreign_overland_grid(room):
-        # A demesne's own macro coords must never be mistaken for real
-        # America Overland coordinates just because the numbers clamp.
+    if _is_foreign_to_america_atlas(room):
+        # Frontierland / demesne coords must never read as America cells.
         return None
     pair = _parse_pos_pair(getattr(room, "overland_macro", None))
     if pair is not None and clamp_macro(*pair):
@@ -327,6 +374,39 @@ def america_macro_from_room(room, game=None):
     return None
 
 
+def frontierland_macro_from_room(room, game=None):
+    """Return Frontierland macro (x, y) for a grid / virtual Room, or None."""
+    if room is None:
+        return None
+    if not _is_frontierland_overland_grid(room):
+        return None
+    pair = _parse_pos_pair(getattr(room, "overland_macro", None))
+    if pair is not None and clamp_macro(*pair):
+        return pair
+    parsed = map_ui.parse_grid_key(getattr(room, "key", "") or "")
+    if parsed and parsed[0] == FRONTIERLAND_PREFIX:
+        try:
+            mx, my = int(parsed[1]), int(parsed[2])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if clamp_macro(mx, my):
+            return (mx, my)
+    wild = parse_wilderness_room_key(getattr(room, "key", "") or "")
+    if wild is not None:
+        return wild[0]
+    key = (getattr(room, "key", "") or "").strip()
+    if key.startswith("Gates of ") and game is not None:
+        ensure_game_frontierland(game)
+        atlas = getattr(game, "frontierland_atlas", None)
+        needle = key[len("Gates of "):].strip().lower()
+        if atlas is not None and needle:
+            for (mx, my), landmark in (atlas.landmarks or {}).items():
+                visible = str(landmark.get("visible_as") or "").strip().lower()
+                if visible and visible == needle:
+                    return (mx, my)
+    return None
+
+
 def adopt_foot_overland_presence(character, game):
     """Put a character onto the dual-layer foot grid when standing on America.
 
@@ -347,7 +427,11 @@ def adopt_foot_overland_presence(character, game):
         macro = _parse_pos_pair(character.macro_pos)
         micro = _parse_pos_pair(character.micro_pos)
         if macro and micro:
-            place_on_overland(character, game, macro, micro)
+            loc = getattr(character, "location", None)
+            plane = _overland_plane_for_room(loc) if loc is not None else "earth"
+            place_on_overland(
+                character, game, macro, micro, plane=plane,
+            )
             return True
         return False
     # Aboard: do not yank drivers onto foot mid-cruise.
@@ -359,10 +443,8 @@ def adopt_foot_overland_presence(character, game):
     room = getattr(character, "location", None)
     if room is None:
         return False
-    if _is_foreign_overland_grid(room):
-        # Standing in a private grid (demesne) that reuses the dual-layer
-        # shape -- its own movement dispatch owns this, never the real
-        # America atlas. Leave the character exactly where they are.
+    if _is_private_overland_grid(room):
+        # Demesne / water grids own their own movement dispatch.
         return False
 
     # Live virtual cell missing coords (cleared mid-session) -- rehydrate.
@@ -380,10 +462,17 @@ def adopt_foot_overland_presence(character, game):
 
     # Classic America Overland pad / Gates of … stub.
     macro = america_macro_from_room(room, game)
-    if macro is None:
+    if macro is not None:
+        return bool(place_on_overland(character, game, macro, LANDMARK_MICRO))
+    # 1861 Frontierland grid mouth -- same micro layer, separate atlas.
+    fl_macro = frontierland_macro_from_room(room, game)
+    if fl_macro is None:
         return False
-    # Gate / pad occupancy -> landmark center (same as boot heal).
-    return bool(place_on_overland(character, game, macro, LANDMARK_MICRO))
+    return bool(
+        place_on_overland(
+            character, game, fl_macro, LANDMARK_MICRO, plane=FRONTIERLAND_PLANE,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +491,7 @@ class OverlandAtlas:
         """Stamp width/height/prefix/terrain/landmarks from one map dict."""
         grid = data.get("grid") or {}
         self.map_id = data.get("id") or EARTH_AMERICA_ID
+        self.plane = str(data.get("plane") or "earth").strip().lower() or "earth"
         self.prefix = grid.get("key_prefix") or AMERICA_PREFIX
         self.width = int(grid.get("width") or MACRO_WIDTH)
         self.height = int(grid.get("height") or MACRO_HEIGHT)
@@ -434,6 +524,7 @@ class OverlandAtlas:
                         "water_view": bool(override.get("water_view")),
                         "land_view": bool(override.get("land_view")),
                         "max_water_band": override.get("max_water_band"),
+                        "resources": list(override.get("resources") or []),
                     }
         else:
             for key, override in (grid.get("cell_overrides") or {}).items():
@@ -460,6 +551,7 @@ class OverlandAtlas:
                     "water_view": bool(override.get("water_view")),
                     "land_view": bool(override.get("land_view")),
                     "max_water_band": override.get("max_water_band"),
+                    "resources": list(override.get("resources") or []),
                 }
         # macro (x,y) -> landmark dict
         self.landmarks = {}
@@ -494,6 +586,11 @@ class OverlandAtlas:
         if cell and cell.get("bestiary_categories") is not None:
             return list(cell.get("bestiary_categories") or [])
         return list(self.bestiary_categories or [])
+
+    def resources_at(self, mx, my):
+        """Return resource tags stamped on one macro cell (may be empty)."""
+        cell = self.terrain.get((mx, my)) or {}
+        return list(cell.get("resources") or [])
 
     def description_at(self, mx, my):
         """Return authored cell description or a terrain pool blurb."""
@@ -588,6 +685,117 @@ def ensure_game_overland(game):
     game.overland_rooms = {}  # 4D key -> ephemeral Room
     game.overland_ground = {}  # 4D key -> [Item, ...]
     game._overland_ready = True
+
+
+def load_frontierland_atlas():
+    """Load OverlandAtlas from content/maps/earth_frontierland_1861.json."""
+    path = os.path.join(_content_maps_dir(), "earth_frontierland_1861.json")
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    return OverlandAtlas(data)
+
+
+def ensure_game_frontierland(game):
+    """Stamp 1861 Frontierland atlas + virtual-room manager (idempotent)."""
+    if getattr(game, "_frontierland_overland_ready", False):
+        return
+    game.frontierland_atlas = load_frontierland_atlas()
+    # Isolated Prime-parity mouths (Rail Camp at Fossil Butte) sit off
+    # the 1861 highland. Paint wagon trail so walk/ride/horse n can
+    # actually reach them (bug reports 1423 / 1427).
+    bridge_isolated_atlas_landmarks(game.frontierland_atlas)
+    game.frontierland_rooms = {}
+    game.frontierland_ground = {}
+    game._frontierland_overland_ready = True
+
+
+def frontierland_cell_key(mx, my):
+    """Canonical Frontierland Overland Room key."""
+    return f"{FRONTIERLAND_PREFIX} ({mx}, {my})"
+
+
+def _overland_plane_for_room(room):
+    """Atlas plane id for a stamped grid / virtual cell / 1861 town room."""
+    if room is None:
+        return "earth"
+    plane = str(getattr(room, "plane", None) or "").strip().lower()
+    if plane == FRONTIERLAND_PLANE:
+        return FRONTIERLAND_PLANE
+    map_id = str(getattr(room, "map_id", None) or "").strip().lower()
+    if map_id == FRONTIERLAND_MAP_ID:
+        return FRONTIERLAND_PLANE
+    if _is_frontierland_overland_grid(room):
+        return FRONTIERLAND_PLANE
+    return "earth"
+
+
+def _atlas_bundle_for_plane(game, plane):
+    """Return (atlas, ephemeral_rooms, ground_stash) for one plane."""
+    if str(plane or "").strip().lower() == FRONTIERLAND_PLANE:
+        ensure_game_frontierland(game)
+        return (
+            game.frontierland_atlas,
+            game.frontierland_rooms,
+            game.frontierland_ground,
+        )
+    ensure_game_overland(game)
+    return game.overland_atlas, game.overland_rooms, game.overland_ground
+
+
+def _atlas_bundle_for_room(room, game):
+    """Resolve atlas storage from a Room's plane / map stamps."""
+    return _atlas_bundle_for_plane(game, _overland_plane_for_room(room))
+
+
+def _atlas_bundle_for_character(character, game):
+    """Resolve atlas storage from the actor's current location."""
+    loc = getattr(character, "location", None)
+    if loc is not None:
+        return _atlas_bundle_for_room(loc, game)
+    ensure_game_overland(game)
+    return game.overland_atlas, game.overland_rooms, game.overland_ground
+
+
+def atlas_for_character(character, game):
+    """Return the CONUS OverlandAtlas the viewer is standing on.
+
+    1861 Frontierland is a second camera (same 96x60 cells, wagon trails).
+    Web / Mudlet HUDs must switch to that atlas while the body is on that
+    plane -- never keep painting live America cities over the 1861 @.
+    """
+    if game is None:
+        return None
+    loc = getattr(character, "location", None) if character is not None else None
+    if loc is not None and (
+        _is_frontierland_overland_grid(loc)
+        or str(getattr(loc, "plane", "") or "").strip().lower()
+        == FRONTIERLAND_PLANE
+        or str(getattr(loc, "map_id", "") or "").strip().lower()
+        == FRONTIERLAND_MAP_ID
+    ):
+        ensure_game_frontierland(game)
+        return getattr(game, "frontierland_atlas", None)
+    return getattr(game, "overland_atlas", None)
+
+
+def _apply_atlas_paint_to_room(room, cell):
+    """Copy HUD overlay stamps from an atlas terrain dict onto a Room."""
+    cell = cell or {}
+    glyph = str(cell.get("map_glyph") or "").strip()
+    if glyph:
+        room.map_glyph = glyph[0]
+    layer = str(cell.get("map_layer") or "").strip().lower()
+    if layer:
+        room.map_layer = layer
+    base = str(cell.get("terrain_base") or "").strip().lower()
+    if base:
+        room.terrain_base = base
+    room.water_view = bool(cell.get("water_view"))
+    room.land_view = bool(cell.get("land_view"))
+    room.highland = bool(cell.get("highland"))
+    resources = list(cell.get("resources") or [])
+    if resources:
+        room.resources = resources
 
 
 def _quad_key(macro, micro):
@@ -762,8 +970,7 @@ def virtual_exit_dest_label(room, direction, game=None):
         return "map edge (hard bounce)"
     atlas = None
     if game is not None:
-        ensure_game_overland(game)
-        atlas = getattr(game, "overland_atlas", None)
+        atlas = _atlas_bundle_for_room(room, game)[0]
     landmark = atlas.landmark_at(*n_macro) if atlas is not None else None
     area = atlas.terrain_at(*n_macro) if atlas is not None else "wilderness"
     if landmark and (nx, ny) == LANDMARK_MICRO:
@@ -807,8 +1014,7 @@ def look_nearby_zone_lines(room, game):
     """Extra look lines: nearby settlement bearings for virtual tiles."""
     if not is_real_overland_room(room):
         return []
-    ensure_game_overland(game)
-    atlas = getattr(game, "overland_atlas", None)
+    atlas = _atlas_bundle_for_room(room, game)[0]
     macro = getattr(room, "overland_macro", None)
     micro = getattr(room, "overland_micro", None)
     if atlas is None or macro is None or micro is None:
@@ -820,21 +1026,32 @@ def look_nearby_zone_lines(room, game):
     return ["Nearby zones:"] + lines
 
 
-def get_virtual_room(game, macro, micro):
+def get_virtual_room(game, macro, micro, *, plane="earth"):
     """Return (create if needed) the ephemeral Room for these 4D coords.
 
     Never written to map JSON / SQLite as a permanent room. Ground stash
     items are hydrated into contents on create.
     """
-    ensure_game_overland(game)
-    atlas = game.overland_atlas
+    mx, my = int(macro[0]), int(macro[1])
+    ux, uy = int(micro[0]), int(micro[1])
+    # 1861 authored grid cells are the SoT mouth. A virtual twin at the
+    # same landmark micro left Samuel on one Rail Camp and the rider on
+    # another -- gm goto vs player enter camp (bug reports 1424 / 1425).
+    if str(plane or "").strip().lower() == FRONTIERLAND_PLANE and (
+        ux, uy
+    ) == LANDMARK_MICRO:
+        persist = (getattr(game, "rooms", None) or {}).get(
+            frontierland_cell_key(mx, my)
+        )
+        if persist is not None:
+            return persist
+    atlas, overland_rooms, overland_ground = _atlas_bundle_for_plane(
+        game, plane,
+    )
     key = _quad_key(macro, micro)
-    existing = game.overland_rooms.get(key)
+    existing = overland_rooms.get(key)
     if existing is not None:
         return existing
-
-    mx, my = macro
-    ux, uy = micro
     area = atlas.terrain_at(mx, my)
     landmark = atlas.landmark_at(mx, my)
     title = f"Wilderness ({mx},{my})/{ux},{uy}"
@@ -868,11 +1085,14 @@ def get_virtual_room(game, macro, micro):
     room.area_type = area
     room.wilderness = area not in ("city",)
     room.outdoor = True
-    room.plane = "earth"
+    if str(plane or "").strip().lower() == FRONTIERLAND_PLANE:
+        room.plane = FRONTIERLAND_PLANE
+    else:
+        room.plane = "earth"
     room.realm = "prime"
     room.map_id = atlas.map_id
     room.zone = None
-    room.highland = bool((atlas.terrain.get((mx, my)) or {}).get("highland"))
+    _apply_atlas_paint_to_room(room, atlas.terrain.get((mx, my)))
     room.bestiary_categories = atlas.bestiary_at(mx, my)
     # Compass exits are virtual markers -- move handler ignores them and
     # recomputes from coords. Eight-way so look / screenreader list ne/nw
@@ -907,12 +1127,12 @@ def get_virtual_room(game, macro, micro):
     hooks.on_virtual_room_created(game, room)
 
     # Hydrate dropped items for this 4D cell.
-    for item in list(game.overland_ground.get(key) or []):
+    for item in list(overland_ground.get(key) or []):
         if item not in room.contents:
             room.contents.append(item)
             item.location = room
 
-    game.overland_rooms[key] = room
+    overland_rooms[key] = room
     return room
 
 
@@ -928,17 +1148,20 @@ def resolve_wilderness_saved_room_key(game, room_key):
     if parsed is None:
         return None
     macro, micro = parsed
-    try:
-        return get_virtual_room(game, macro, micro)
-    except Exception as exc:
-        from engine import log_util
+    for plane in ("earth", FRONTIERLAND_PLANE):
+        try:
+            room = get_virtual_room(game, macro, micro, plane=plane)
+            if room is not None:
+                return room
+        except Exception as exc:
+            from engine import log_util
 
-        log_util.ops(
-            "overland",
-            f"materialize failed key={room_key!r}",
-            exc=exc,
-        )
-        return None
+            log_util.ops(
+                "overland",
+                f"materialize failed key={room_key!r} plane={plane}",
+                exc=exc,
+            )
+    return None
 
 
 def resolve_virtual_overland_room_key(game, room_key):
@@ -958,15 +1181,18 @@ def resolve_virtual_overland_room_key(game, room_key):
     if wild is not None:
         return wild
     if key.startswith("Gates of "):
-        ensure_game_overland(game)
-        atlas = getattr(game, "overland_atlas", None)
         needle = key[len("Gates of "):].strip().lower()
-        if atlas is not None and needle:
+        for plane in ("earth", FRONTIERLAND_PLANE):
+            atlas = _atlas_bundle_for_plane(game, plane)[0]
+            if atlas is None or not needle:
+                continue
             for macro, landmark in (atlas.landmarks or {}).items():
                 visible = str(landmark.get("visible_as") or "").strip().lower()
                 if visible and visible == needle:
                     try:
-                        return get_virtual_room(game, macro, LANDMARK_MICRO)
+                        return get_virtual_room(
+                            game, macro, LANDMARK_MICRO, plane=plane,
+                        )
                     except Exception as exc:
                         from engine import log_util
 
@@ -976,10 +1202,13 @@ def resolve_virtual_overland_room_key(game, room_key):
                             exc=exc,
                         )
                         return None
-    overland_rooms = getattr(game, "overland_rooms", None) or {}
-    for candidate in overland_rooms.values():
-        if (getattr(candidate, "key", None) or "") == key:
-            return candidate
+    for rooms in (
+        getattr(game, "overland_rooms", None) or {},
+        getattr(game, "frontierland_rooms", None) or {},
+    ):
+        for candidate in rooms.values():
+            if (getattr(candidate, "key", None) or "") == key:
+                return candidate
     return None
 
 
@@ -1049,10 +1278,13 @@ def place_aerial_overland(character, game, macro):
     return True
 
 
-def place_on_overland(character, game, macro, micro):
+def place_on_overland(character, game, macro, micro, *, plane=None):
     """Bind character to the dual layer at macro + micro (on foot)."""
     ensure_overland_defaults(character)
-    ensure_game_overland(game)
+    if plane is None:
+        loc = getattr(character, "location", None)
+        plane = _overland_plane_for_room(loc) if loc is not None else "earth"
+    _atlas_bundle_for_plane(game, plane)
     mx, my = macro
     # Vehicle macro cruises pass micro=None (aboard, not on foot). Default to
     # landmark center so tick_drives cannot crash unpacking None.
@@ -1060,22 +1292,33 @@ def place_on_overland(character, game, macro, micro):
     if pair is None:
         pair = LANDMARK_MICRO
     ux, uy = pair
-    if not clamp_macro(mx, my):
+    atlas = None
+    if str(plane or "").strip().lower() == FRONTIERLAND_PLANE:
+        ensure_game_frontierland(game)
+        atlas = getattr(game, "frontierland_atlas", None)
+    else:
+        ensure_game_overland(game)
+        atlas = getattr(game, "overland_atlas", None)
+    if atlas is not None:
+        if not coords_on_atlas(atlas, mx, my):
+            return False
+    elif not clamp_macro(mx, my):
         return False
     if not (0 <= ux < MICRO_SIZE and 0 <= uy < MICRO_SIZE):
         return False
     character.macro_pos = (mx, my)
     character.micro_pos = (ux, uy)
-    room = get_virtual_room(game, (mx, my), (ux, uy))
+    room = get_virtual_room(game, (mx, my), (ux, uy), plane=plane)
+    stamp_overland_plane(character, plane=plane, room=room)
     character.move_to(room)
     return True
 
 
 def sync_ground_stash(game, room):
-    """Persist floor items from a virtual room into game.overland_ground."""
+    """Persist floor items from a virtual room into the plane ground stash."""
     if not is_virtual_room(room):
         return
-    ensure_game_overland(game)
+    _, _, overland_ground = _atlas_bundle_for_room(room, game)
     macro = getattr(room, "overland_macro", None)
     micro = getattr(room, "overland_micro", None)
     if macro is None or micro is None:
@@ -1084,9 +1327,9 @@ def sync_ground_stash(game, room):
     from world import Item
     items = [obj for obj in room.contents if isinstance(obj, Item)]
     if items:
-        game.overland_ground[key] = items
-    elif key in game.overland_ground:
-        del game.overland_ground[key]
+        overland_ground[key] = items
+    elif key in overland_ground:
+        del overland_ground[key]
 
 
 def prune_virtual_room_if_empty(game, room):
@@ -1098,13 +1341,13 @@ def prune_virtual_room_if_empty(game, room):
     """
     if game is None or room is None or not is_virtual_room(room):
         return
-    ensure_game_overland(game)
+    _, overland_rooms, _ = _atlas_bundle_for_room(room, game)
     macro = getattr(room, "overland_macro", None)
     micro = getattr(room, "overland_micro", None)
     if macro is None or micro is None:
         return
     key = _quad_key(macro, micro)
-    live = (getattr(game, "overland_rooms", None) or {}).get(key)
+    live = overland_rooms.get(key)
     if live is None or live is not room:
         return
     sync_ground_stash(game, room)
@@ -1113,7 +1356,7 @@ def prune_virtual_room_if_empty(game, room):
         return
     if hooks_mod.overland_room_influenced(room, game):
         return
-    game.overland_rooms.pop(key, None)
+    overland_rooms.pop(key, None)
 
 
 def prune_empty_virtual_rooms(game):
@@ -1234,7 +1477,7 @@ def pathfind_vehicle_macro(atlas, start, goal, *, cost_fn=None, max_steps=4000):
     goal = _parse_pos_pair(goal)
     if start is None or goal is None:
         return None
-    if not clamp_macro(*start) or not clamp_macro(*goal):
+    if not coords_on_atlas(atlas, *start) or not coords_on_atlas(atlas, *goal):
         return None
     if not _vehicle_can_enter(atlas, *start):
         return None
@@ -1313,6 +1556,117 @@ def pathfind_vehicle_macro(atlas, start, goal, *, cost_fn=None, max_steps=4000):
         node = came_from.get(node)
     path.reverse()
     return path
+
+
+def bridge_isolated_macro(atlas, src_macro, dest_macro):
+    """Paint a short trail through void so an isolated atlas mouth is reachable.
+
+    Rail Camp sits on Fossil Butte's Prime cell. The 1861 highland
+    silhouette leaves that cell a one-tile forest island, so walk/ride
+    died with water in the way (bug reports 1423 / 1427). Scenic cruise
+    and foot/horse compass share this corridor.
+
+    ``src`` should be a cell on the connected landmass (Sunrise, a town).
+    ``dest`` is the island mouth. No-op when a path already exists.
+    """
+    from collections import deque
+
+    if atlas is None:
+        return
+    src = _parse_pos_pair(src_macro)
+    dest = _parse_pos_pair(dest_macro)
+    if src is None or dest is None:
+        return
+    if pathfind_vehicle_macro(atlas, src, dest) is not None:
+        return
+    width = int(getattr(atlas, "width", 0) or 0)
+    height = int(getattr(atlas, "height", 0) or 0)
+    steps = _VEHICLE_STEPS
+    # Flood land reachable from the seed without crossing void.
+    land = {src}
+    queue = deque([src])
+    while queue:
+        x, y = queue.popleft()
+        for dx, dy in steps:
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < width and 0 <= ny < height):
+                continue
+            if (nx, ny) in land:
+                continue
+            if not _vehicle_can_enter(atlas, nx, ny):
+                continue
+            land.add((nx, ny))
+            queue.append((nx, ny))
+    # Walk void-only from the isolated dest until we touch that land.
+    came = {dest: None}
+    queue = deque([dest])
+    hit = None
+    while queue:
+        x, y = queue.popleft()
+        if (x, y) in land:
+            hit = (x, y)
+            break
+        for dx, dy in steps:
+            nx, ny = x + dx, y + dy
+            if not (0 <= nx < width and 0 <= ny < height):
+                continue
+            if (nx, ny) in came:
+                continue
+            area = atlas.terrain_at(nx, ny)
+            if (nx, ny) not in land and area != "void":
+                continue
+            came[(nx, ny)] = (x, y)
+            queue.append((nx, ny))
+    if hit is None:
+        return
+    cell = hit
+    while cell is not None:
+        if not _vehicle_can_enter(atlas, *cell):
+            atlas.terrain[cell] = dict(atlas.terrain.get(cell) or {})
+            atlas.terrain[cell]["area_type"] = "trail"
+        cell = came.get(cell)
+
+
+def bridge_isolated_atlas_landmarks(atlas):
+    """Connect every landmark to the largest landmass on this atlas.
+
+    Picks the landmark whose land-flood is biggest (the continent), then
+    paints void trails to every other mouth. Idempotent when paths exist.
+    """
+    if atlas is None:
+        return
+    marks = list((getattr(atlas, "landmarks", None) or {}).keys())
+    if len(marks) < 2:
+        return
+    best_src = None
+    best_size = -1
+    for mx, my in marks:
+        if not _vehicle_can_enter(atlas, mx, my):
+            continue
+        # Flood size: how much land this mouth can already reach.
+        size = 0
+        from collections import deque
+
+        seen = {(mx, my)}
+        queue = deque([(mx, my)])
+        while queue:
+            x, y = queue.popleft()
+            size += 1
+            for dx, dy in _VEHICLE_STEPS:
+                nx, ny = x + dx, y + dy
+                if (nx, ny) in seen:
+                    continue
+                if not _vehicle_can_enter(atlas, nx, ny):
+                    continue
+                seen.add((nx, ny))
+                queue.append((nx, ny))
+        if size > best_size:
+            best_size = size
+            best_src = (mx, my)
+    if best_src is None:
+        return
+    for dest in marks:
+        bridge_isolated_macro(atlas, best_src, dest)
 
 
 def offroad_fraction(atlas, path, road_areas=None):
@@ -1397,11 +1751,39 @@ def classic_zone_room_blocks_overland_move(character):
     parsed = map_ui.parse_grid_key(getattr(room, "key", "") or "")
     if parsed and parsed[0] in _AMERICA_PREFIXES:
         return False
+    if parsed and parsed[0] == FRONTIERLAND_PREFIX:
+        return False
     # Aboard on open America: vehicle cabins are classic zone rooms but
     # drivers steer via macro hops, not Room.exits (bug report 993).
     if getattr(character, "in_vehicle", None) and overland_mode(character) == "vehicle":
         return False
     return True
+
+
+def resolve_character_road_macro(character, game):
+    """America macro for taxi/drive distance from the actor's real location.
+
+    Taxi drops, portal hops, and GM ``goto`` can leave a stale ``macro_pos``
+    from an old overland hike while the body stands indoors in another town
+    (bug report 1346: Grants Pass portal + seek mother still cruised ~38
+    tiles from Lebanon). When the body is on the classic zone layer, ignore
+    leftover coords and derive the mouth from the current room / zone hub.
+    """
+    ensure_overland_defaults(character)
+    if not classic_zone_room_blocks_overland_move(character):
+        macro = _parse_pos_pair(getattr(character, "macro_pos", None))
+        if macro is not None:
+            return macro
+    room = getattr(character, "location", None)
+    if room is None:
+        return None
+    zone_macro = current_zone_macro(game, room)
+    if zone_macro is not None:
+        return zone_macro
+    stamped = _parse_pos_pair(getattr(room, "overland_exit_macro", None))
+    if stamped is not None:
+        return stamped
+    return america_macro_from_room(room, game)
 
 
 def _apply_relocate_hooks_before(character):
@@ -1450,12 +1832,16 @@ def try_overland_move(character, direction, game):
     if mode == "zone":
         if adopt_foot_overland_presence(character, game):
             mode = overland_mode(character)
+        elif hooks_mod.overland_vehicle_compass_as_foot(character, game):
+            # Horse on a persist atlas cell: mount cleared coords so
+            # overland_mode is zone. Drop onto the 10x10 so n steers
+            # instead of the cabin move-gate (bug reports 1427 / 1429).
+            mode = overland_mode(character)
         else:
             return False
     if mode == "zone":
         return False
-    ensure_game_overland(game)
-    atlas = game.overland_atlas
+    atlas, _, _ = _atlas_bundle_for_character(character, game)
     delta = _DIR_DELTA.get(direction)
     if delta is None:
         # Vertical / named doors (down, up, out, 3a, …) belong to Room.exits.
@@ -1467,14 +1853,19 @@ def try_overland_move(character, direction, game):
         return False
 
     if mode == "vehicle":
-        if hooks_mod.overland_queue_vehicle_macro_move(
-            character, direction, game,
-        ):
+        # Game policy may drop a boarded rider onto the foot micro grid
+        # (horses steer like walking). Cars stay on paced macro hops.
+        if hooks_mod.overland_vehicle_compass_as_foot(character, game):
+            mode = overland_mode(character)
+        if mode == "vehicle":
+            if hooks_mod.overland_queue_vehicle_macro_move(
+                character, direction, game,
+            ):
+                lag_watch.stamp_move_phase(game, "ov_veh", t_ov)
+                return True
+            _send(character, "You cannot drive that way right now.")
             lag_watch.stamp_move_phase(game, "ov_veh", t_ov)
             return True
-        _send(character, "You cannot drive that way right now.")
-        lag_watch.stamp_move_phase(game, "ov_veh", t_ov)
-        return True
 
     if mode == "flying":
         nx, ny = macro[0] + dx, macro[1] + dy
@@ -1536,14 +1927,21 @@ def try_overland_move(character, direction, game):
         return True
 
     from engine import hooks
-    block_msg = hooks.blocked_foot_step(game, (mx, my), (ux, uy))
+    block_msg = hooks.blocked_foot_step(
+        game, (mx, my), (ux, uy), character,
+    )
     if block_msg:
         _send(character, block_msg)
         return True
 
     from engine.systems import water_atlas as water_atlas_mod
 
-    seam = water_atlas_mod.seam_dest_for_america_cell(game, mx, my)
+    on_frontierland = atlas.map_id == FRONTIERLAND_MAP_ID
+    seam = (
+        None
+        if on_frontierland
+        else water_atlas_mod.seam_dest_for_america_cell(game, mx, my)
+    )
     if seam is not None:
         map_id, wx, wy = seam
         import time as _time
@@ -1571,6 +1969,11 @@ def try_overland_move(character, direction, game):
                     f"{face} arrives from the {_opposite(direction)}.",
                     exclude=character,
                 )
+            from command_support import _pull_followers_to
+
+            _pull_followers_to(
+                character, old_room, new_room, game, direction=direction,
+            )
             _overland_auto_look(character, game, after_move=True)
             from engine.npc_act import is_live_session
 
@@ -1597,7 +2000,8 @@ def try_overland_move(character, direction, game):
             exclude=character,
         )
     was_working = _apply_relocate_hooks_before(character)
-    place_on_overland(character, game, (mx, my), (ux, uy))
+    plane = _overland_plane_for_room(old_room) if old_room is not None else "earth"
+    place_on_overland(character, game, (mx, my), (ux, uy), plane=plane)
     lag_watch.stamp_move_phase(game, "ov_place", t_place)
     new_room = character.location
     t_after = _time.perf_counter()
@@ -1609,6 +2013,9 @@ def try_overland_move(character, direction, game):
             f"{_opposite(direction)}.",
             exclude=character,
         )
+    from command_support import _pull_followers_to
+
+    _pull_followers_to(character, old_room, new_room, game, direction=direction)
     t_look = _time.perf_counter()
     _overland_auto_look(character, game, after_move=True)
     lag_watch.stamp_move_phase(game, "ov_look", t_look)
@@ -1666,8 +2073,7 @@ def try_enter_landmark(character, args, game):
     """
     if overland_mode(character) != "on_foot":
         return False
-    ensure_game_overland(game)
-    atlas = game.overland_atlas
+    atlas, _, _ = _atlas_bundle_for_character(character, game)
     macro = _parse_pos_pair(character.macro_pos)
     micro = _parse_pos_pair(character.micro_pos)
     if macro is None or micro is None:
@@ -1721,15 +2127,13 @@ def try_enter_landmark(character, args, game):
         _send(character, "That settlement isn't open yet.")
         return True
     from engine.verbs.basic import _do_transition, stamp_zone_entry
-    from command_support import _presence_face
     from engine.room_vnum import describe_room
     clear_overland_coords(character)
     stamp_zone_entry(character, hub)
-    face = _presence_face(character)
     _do_transition(
         character, hub, game,
-        f"{face} enters {describe_room(hub)}.",
-        f"{face} arrives.",
+        f"{{name}} enters {describe_room(hub)}.",
+        "{name} arrives.",
     )
     from engine import hooks as hooks_mod
 
@@ -1758,19 +2162,62 @@ def _room_zone_exit_macro(room):
         parsed = map_ui.parse_grid_key(dest.key)
         if parsed and parsed[0] in _AMERICA_PREFIXES:
             return (parsed[1], parsed[2])
+        if parsed and parsed[0] == FRONTIERLAND_PREFIX:
+            return (parsed[1], parsed[2])
+    return None
+
+
+def find_pocket_zone_exit(start):
+    """Same-zone ``zone_exit`` mouth reachable from ``start``, or ``None``.
+
+    Walks ``exits`` and ``zone_entries`` inside this pocket only -- O(the
+    rooms you can actually walk), never a scan of every room in ``game``.
+    Does not follow ``zone_exit_to`` onto the America grid; the mouth Room
+    itself carries ``zone_exit``.
+    """
+    if start is None:
+        return None
+    if getattr(start, "zone_exit", False):
+        return start
+    zone = getattr(start, "zone", None)
+    seen = {id(start)}
+    queue = [start]
+    idx = 0
+    while idx < len(queue):
+        room = queue[idx]
+        idx += 1
+        hops = []
+        exits = getattr(room, "exits", None) or {}
+        if isinstance(exits, dict):
+            hops.extend(exits.values())
+        entries = getattr(room, "zone_entries", None) or {}
+        if isinstance(entries, dict):
+            hops.extend(entries.values())
+        for neighbor in hops:
+            if neighbor is None or id(neighbor) in seen:
+                continue
+            neighbor_zone = getattr(neighbor, "zone", None)
+            if zone and neighbor_zone and neighbor_zone != zone:
+                continue
+            seen.add(id(neighbor))
+            if getattr(neighbor, "zone_exit", False):
+                return neighbor
+            queue.append(neighbor)
     return None
 
 
 def current_zone_macro(game, room):
     """America macro (x, y) for the zone ``room`` sits in, or ``None``.
 
-    Every real classic-zone room shares its ``zone`` name with exactly one
-    ``zone_exit`` mouth Room -- this resolves that mouth's macro cell so
-    callers (the atlas ``@`` marker, ``map big``'s center-room lookup) can
-    place a character at the right cell even while they're standing deep
-    inside a town/dungeon, not literally on the overland grid (where
-    ``macro_pos`` is intentionally ``None`` -- see ``clear_overland_coords``).
+    Prefers a pocket BFS from ``room`` to that zone's ``zone_exit`` mouth
+    (O(pocket)). Falls back to scanning ``game.rooms`` only when the mouth
+    is not wired through exits -- atlas ``@`` still needs a cell then.
     """
+    exit_room = find_pocket_zone_exit(room)
+    if exit_room is not None:
+        macro = _room_zone_exit_macro(exit_room)
+        if macro is not None:
+            return macro
     zone = getattr(room, "zone", None)
     if not zone:
         return None
@@ -1786,6 +2233,43 @@ def current_zone_macro(game, room):
     return None
 
 
+def step_out_of_zone_to_road(character, game):
+    """Put this body on the America foot grid for the pocket they stand in.
+
+    Indoor / shrine rooms are not dual-layer cells, so
+    ``adopt_foot_overland_presence`` is a no-op there. Find this pocket's
+    ``zone_exit`` (O(pocket)), then land on that mouth's America cell.
+
+    Returns True when this call newly placed them on the road.
+    """
+    if character is None or game is None:
+        return False
+    ensure_overland_defaults(character)
+    ensure_game_overland(game)
+    here = getattr(character, "location", None)
+    if overland_mode(character) == "on_foot" or (
+        here is not None and getattr(here, "virtual_overland", False)
+    ):
+        adopt_foot_overland_presence(character, game)
+        return False
+    if adopt_foot_overland_presence(character, game):
+        return True
+    exit_room = find_pocket_zone_exit(here)
+    if exit_room is None:
+        return False
+    if here is exit_room and try_exit_to_overland(character, game):
+        return True
+    macro = _room_zone_exit_macro(exit_room)
+    if macro is None:
+        return False
+    plane = _overland_plane_for_room(exit_room)
+    return bool(
+        place_on_overland(
+            character, game, macro, LANDMARK_MICRO, plane=plane,
+        )
+    )
+
+
 def try_exit_to_overland(character, game):
     """exit from a pocket mouth back onto micro (5,5) of its macro cell.
 
@@ -1798,7 +2282,7 @@ def try_exit_to_overland(character, game):
     macro = _room_zone_exit_macro(room)
     if macro is None:
         return False
-    ensure_game_overland(game)
+    plane = _overland_plane_for_room(room)
     from command_support import _presence_face, is_staff_stealth_presence
     face = _presence_face(character)
     stealth = is_staff_stealth_presence(character)
@@ -1808,7 +2292,7 @@ def try_exit_to_overland(character, game):
             f"{face} exits to the overland.",
             exclude=character,
         )
-    place_on_overland(character, game, macro, LANDMARK_MICRO)
+    place_on_overland(character, game, macro, LANDMARK_MICRO, plane=plane)
     new = character.location
     if new is not None and not stealth:
         new.broadcast(
@@ -1830,15 +2314,37 @@ def stamp_pocket_overland_exits(game):
     ensure_game_overland(game)
     atlas = game.overland_atlas
     rooms = getattr(game, "rooms", {}) or {}
+    from engine.room_vnum import lookup_room
+
     for (mx, my), landmark in atlas.landmarks.items():
         hub_key = landmark.get("hub_room")
-        hub = rooms.get(hub_key)
+        hub = lookup_room(game, hub_key)
         if hub is None:
             continue
         hub.overland_exit_macro = (mx, my)
         hub.zone_exit = True
         # Destination Room for non-America / classic exit path.
         cell_key = f"America Overland ({mx}, {my})"
+        cell = rooms.get(cell_key)
+        if cell is not None:
+            hub.zone_exit_to = cell
+
+
+def stamp_frontierland_pocket_overland_exits(game):
+    """Stamp overland_exit_macro onto 1861 pocket mouths (Frontierland atlas)."""
+    ensure_game_frontierland(game)
+    atlas = game.frontierland_atlas
+    rooms = getattr(game, "rooms", {}) or {}
+    from engine.room_vnum import lookup_room
+
+    for (mx, my), landmark in atlas.landmarks.items():
+        hub_key = landmark.get("hub_room")
+        hub = lookup_room(game, hub_key)
+        if hub is None:
+            continue
+        hub.overland_exit_macro = (mx, my)
+        hub.zone_exit = True
+        cell_key = frontierland_cell_key(mx, my)
         cell = rooms.get(cell_key)
         if cell is not None:
             hub.zone_exit_to = cell
@@ -1876,14 +2382,25 @@ def home_return_room_key(actor, game):
     """Best settlement room key for Cadence return from overland."""
     if actor is None or game is None:
         return None
-    rooms = getattr(game, "rooms", None) or {}
+    from engine.room_vnum import lookup_room, canonical_persisted_room_key
+
+    def _ident(token):
+        room = lookup_room(game, token)
+        if room is None:
+            return None
+        return canonical_persisted_room_key(game, token) or room.key
+
     # Echo dest lock (scheduled city stay) outranks the claimed house.
     dest_park = getattr(actor, "echo_dest_anchor_park", None)
-    if dest_park and dest_park in rooms:
-        return dest_park
+    if dest_park:
+        ident = _ident(dest_park)
+        if ident:
+            return ident
     home_key = getattr(actor, "home_room_key", None)
-    if home_key and home_key in rooms:
-        return home_key
+    if home_key:
+        ident = _ident(home_key)
+        if ident:
+            return ident
     zone = getattr(actor, "home_zone", None)
     plaza_key, hub_key, _bunker_pad = _starter_keys()
     if zone == "men-of-letters":
@@ -1892,18 +2409,21 @@ def home_return_room_key(actor, game):
             "Bunker Gatehouse",
             "Bunker Overflow Bunks",
         ):
-            if key in rooms:
-                return key
+            ident = _ident(key)
+            if ident:
+                return ident
     if zone == "harvelles-roadhouse":
         for key in ("HX00003", "HX00001"):
-            room = rooms.get(key)
-            if room is not None:
-                return room.key
+            ident = _ident(key)
+            if ident:
+                return ident
     if zone == "lebanon-town" or not zone:
-        if plaza_key in rooms:
-            return plaza_key
-        if hub_key in rooms:
-            return hub_key
+        ident = _ident(plaza_key)
+        if ident:
+            return ident
+        ident = _ident(hub_key)
+        if ident:
+            return ident
     return None
 
 
@@ -1913,6 +2433,7 @@ def home_hub_macro(game, actor):
         return None
     ensure_game_overland(game)
     stamp_pocket_overland_exits(game)
+    stamp_frontierland_pocket_overland_exits(game)
     rooms = getattr(game, "rooms", None) or {}
     _plaza_key, _hub_key, bunker_overland_key = _starter_keys()
 
@@ -1945,7 +2466,9 @@ def home_hub_macro(game, actor):
         return (44, 33)
     # Lebanon default.
     _, hub_key, _ = _starter_keys()
-    mouth = rooms.get(hub_key)
+    from engine.room_vnum import lookup_room
+
+    mouth = lookup_room(game, hub_key)
     if mouth is not None:
         macro = _parse_macro_pair(getattr(mouth, "overland_exit_macro", None))
         if macro is not None:
@@ -1994,7 +2517,9 @@ def _enter_alias_at_landmark(game, actor, dest_room_key=None):
     # Prefer an entry whose hub matches home_zone / dest room.
     dest = None
     if dest_room_key and game is not None:
-        dest = (getattr(game, "rooms", None) or {}).get(dest_room_key)
+        from engine.room_vnum import lookup_room
+
+        dest = lookup_room(game, dest_room_key)
     for alias, hub in entries.items():
         if dest is not None and hub is dest:
             npc_do(actor, f"enter {alias}", game)
@@ -2186,20 +2711,23 @@ def heal_stranded_overland_cadence(game):
         return stats
     ensure_game_overland(game)
     stamp_pocket_overland_exits(game)
+    stamp_frontierland_pocket_overland_exits(game)
     from world import Character
     plaza_key, hub_key, _bunker_pad = _starter_keys()
 
     rooms = getattr(game, "rooms", None) or {}
-    plaza = rooms.get(plaza_key) or getattr(
+    from engine.room_vnum import lookup_room
+
+    plaza = lookup_room(game, plaza_key) or getattr(
         game, "start_room", None
     )
     bunker = (
-        rooms.get("Bunker Overflow Bunks")
-        or rooms.get("Bunker Gatehouse")
-        or rooms.get("Bunker Library Stacks")
+        lookup_room(game, "Bunker Overflow Bunks")
+        or lookup_room(game, "Bunker Gatehouse")
+        or lookup_room(game, "Bunker Library Stacks")
     )
-    lebanon_mouth = rooms.get(hub_key)
-    harvelles_lot = rooms.get("HX00001")
+    lebanon_mouth = lookup_room(game, hub_key)
+    harvelles_lot = lookup_room(game, "HX00001")
     bunker_mouth = None
     for room in rooms.values():
         if (
@@ -2236,14 +2764,19 @@ def heal_stranded_overland_cadence(game):
         if dest is None:
             continue
         stamped = getattr(char, "zone_entry_hub_key", None)
-        if stamped and stamped not in rooms:
-            char.zone_entry_hub_key = None
-            stats["cleared_entry"] += 1
+        if stamped:
+            from engine.room_vnum import lookup_room
+
+            if lookup_room(game, stamped) is None:
+                char.zone_entry_hub_key = None
+                stats["cleared_entry"] += 1
         dest_key = getattr(dest, "key", None)
         if cadence_homeward_from_overland(game, char, dest_room_key=dest_key):
             stats["homeward"] += 1
         if overland_mode(char) == "zone" and mouth is not None:
-            char.zone_entry_hub_key = mouth.key
+            from engine.room_vnum import internal_room_key
+
+            char.zone_entry_hub_key = internal_room_key(mouth) or mouth.key
         elif is_far_from_home_hub(game, char):
             stats["still_stranded"] += 1
     return stats
@@ -2261,6 +2794,7 @@ def heal_dual_layer_positions(game):
     """
     ensure_game_overland(game)
     stamp_pocket_overland_exits(game)
+    stamp_frontierland_pocket_overland_exits(game)
     from world import Character
 
     moved = 0
@@ -2279,7 +2813,8 @@ def heal_dual_layer_positions(game):
             macro = _parse_pos_pair(char.macro_pos)
             micro = _parse_pos_pair(char.micro_pos)
             if macro and micro:
-                place_on_overland(char, game, macro, micro)
+                plane = _overland_plane_for_room(room) if room else "earth"
+                place_on_overland(char, game, macro, micro, plane=plane)
             continue
         if overland_mode(char) == "vehicle":
             continue

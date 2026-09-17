@@ -268,6 +268,116 @@ def ensure_session_defaults(character):
         character.group_focus_key = None
     if not hasattr(character, "_group_focus_picks"):
         character._group_focus_picks = []
+    # Persisted follow leader (copyover / save). Live ``following`` pointer
+    # is rebuilt from this after load via ``heal_follow_bonds``.
+    if not hasattr(character, "following_leader_key"):
+        character.following_leader_key = None
+    # Player/Echo typed unfollow / group leave -- blocks Cadence re-glue
+    # until they voluntarily ``follow`` again (bug report 1574).
+    if not hasattr(character, "follow_declined_leader_key"):
+        character.follow_declined_leader_key = None
+
+
+def follow_declined(follower, leader):
+    """True when ``follower`` explicitly peeled off ``leader`` recently."""
+    if follower is None or leader is None:
+        return False
+    ensure_session_defaults(follower)
+    declined = str(getattr(follower, "follow_declined_leader_key", "") or "").strip()
+    if not declined:
+        return False
+    leader_key = str(getattr(leader, "key", "") or "").strip()
+    return bool(leader_key) and declined == leader_key
+
+
+def record_follow_declined(follower, leader, game=None):
+    """Stamp explicit unfollow so pack / companion Cadence cannot re-glue."""
+    if follower is None or leader is None:
+        return
+    ensure_session_defaults(follower)
+    leader_key = str(getattr(leader, "key", "") or "").strip()
+    if leader_key:
+        follower.follow_declined_leader_key = leader_key
+    from engine import hooks
+
+    hooks.stamp_follow_declined_companion_cooldown(follower, leader, game)
+
+
+def clear_follow_declined_for(follower, leader):
+    """Clear declined stamp when the player voluntarily follows again."""
+    if follower is None or leader is None:
+        return
+    ensure_session_defaults(follower)
+    declined = str(getattr(follower, "follow_declined_leader_key", "") or "").strip()
+    leader_key = str(getattr(leader, "key", "") or "").strip()
+    if declined and leader_key and declined == leader_key:
+        follower.follow_declined_leader_key = None
+
+
+def _resolve_character_key(game, key):
+    """Find a live Character by key (game.find_character or roster scan)."""
+    if not key or game is None:
+        return None
+    find = getattr(game, "find_character", None)
+    if callable(find):
+        found = find(key)
+        if found is not None:
+            return found
+    try:
+        from engine.char_index import iter_characters
+
+        for obj in iter_characters(game):
+            if getattr(obj, "key", None) == key:
+                return obj
+    except ImportError:
+        pass
+    return None
+
+
+def restore_follow_bond(character, game):
+    """Rebuild ``following`` from ``following_leader_key`` when safe.
+
+    Called after world load and on session attach (copyover). Skips when
+    the bond already exists, the leader is missing, the player declined
+    unfollow, or Cadence pair-solo gates block regroup.
+    """
+    if character is None or game is None:
+        return False
+    ensure_session_defaults(character)
+    key = str(getattr(character, "following_leader_key", "") or "").strip()
+    if not key:
+        return False
+    if getattr(character, "following", None) is not None:
+        return True
+    leader = _resolve_character_key(game, key)
+    if leader is None or leader is character:
+        return False
+    if follow_declined(character, leader):
+        return False
+    if cadence_regroup_blocked(character, leader, game):
+        return False
+    from engine.command_support import start_following
+
+    return start_following(character, leader)
+
+
+def heal_follow_bonds(game):
+    """After all characters load, restore every persisted follow bond."""
+    if game is None:
+        return 0
+    try:
+        from engine.char_index import iter_characters
+
+        roster = list(iter_characters(game))
+    except ImportError:
+        roster = list(getattr(game, "characters", None) or [])
+        if isinstance(roster, dict):
+            roster = list(roster.values())
+    count = 0
+    for obj in roster:
+        if restore_follow_bond(obj, game):
+            count += 1
+    return count
 
 
 def group_seek_blocked(a, b, game=None):
@@ -459,6 +569,58 @@ def _group_tick(game):
     return int(getattr(game, "game_time_ticks", 0) or 0)
 
 
+def _group_event_rooms(members):
+    """Map each party member key to their current room key (bug-report context).
+
+    ``note_group_event`` stores this as ``rooms`` so triage can see who stood
+    where when the bond broke (apart-disband vs colocated leave).
+    """
+    rooms = {}
+    for member in members or ():
+        if member is None:
+            continue
+        member_key = getattr(member, "key", None)
+        if not member_key:
+            continue
+        room = getattr(member, "location", None)
+        room_key = getattr(room, "key", None) if room is not None else None
+        if room_key is not None:
+            rooms[str(member_key)] = str(room_key)
+    return rooms
+
+
+def _stamp_group_events(members, game, *, reason):
+    """Stamp Wave 0 group lifecycle events on every body in ``members``.
+
+    Called once per split/disband *before* follow bonds are cleared so the
+    roster and room map still match the party that just broke.
+    """
+    bodies = [m for m in (members or ()) if m is not None]
+    if len(bodies) < 2:
+        return
+    # Lazy import keeps report_debug optional at import time and SUPERS-free.
+    from engine.report_debug import note_group_event
+
+    leader = bodies[0]
+    leader_key = getattr(leader, "key", None)
+    member_keys = [
+        str(getattr(m, "key"))
+        for m in bodies
+        if getattr(m, "key", None)
+    ]
+    rooms = _group_event_rooms(bodies)
+    tick = _group_tick(game)
+    for member in bodies:
+        note_group_event(
+            member,
+            tick=tick,
+            reason=reason,
+            leader=leader_key,
+            members=member_keys,
+            rooms=rooms,
+        )
+
+
 def _character_plane(character):
     """Plane id for colocation rules (default earth when unknown)."""
     room = getattr(character, "location", None)
@@ -472,6 +634,25 @@ def mates_share_group_plane(a, b):
     if a is None or b is None:
         return False
     return _character_plane(a) == _character_plane(b)
+
+
+def _colocation_game(a, b):
+    """Best-effort Game for travel-spot colocation (Echoes / NPCs)."""
+    for who in (a, b):
+        if who is None:
+            continue
+        g = getattr(who, "game", None)
+        if g is not None:
+            return g
+        sess = getattr(who, "session", None)
+        g = getattr(sess, "game", None) if sess is not None else None
+        if g is not None:
+            return g
+        loc = getattr(who, "location", None)
+        g = getattr(loc, "game", None) if loc is not None else None
+        if g is not None:
+            return g
+    return None
 
 
 def mates_share_group_location(a, b):
@@ -492,7 +673,9 @@ def mates_share_group_location(a, b):
     b_vid = getattr(b, "in_vehicle", None)
     if a_vid and b_vid and a_vid == b_vid:
         return True
-    return False
+    from engine.hooks import group_share_travel_spot
+
+    return group_share_travel_spot(a, b, _colocation_game(a, b))
 
 
 def all_members_colocated(character):
@@ -533,10 +716,16 @@ def _clear_apart_stamp(leader):
 
 
 def live_present(character):
-    """True when a body has an active player Session (not Echo / idlemode)."""
+    """True when a body has an active player Session (not Echo / idlemode).
+
+    Cadence ``npc_do`` and ``gm force`` on Echoes attach SilentSession --
+    that is not a live player and must not lock group movement.
+    """
     if character is None:
         return False
-    if getattr(character, "session", None) is None:
+    from engine.npc_act import is_live_session
+
+    if not is_live_session(getattr(character, "session", None)):
         return False
     if hasattr(character, "acts_as_echo") and character.acts_as_echo():
         return False
@@ -601,14 +790,30 @@ def live_move_blocked_message(character):
 
     Echo / idlemode bodies use Cadence pathing -- gated separately in
     ``cadence_may_step``. Returns None when movement is allowed.
+
+    A follow bond to a GM, idle Echo, NPC, or other non-live leader
+    does not trap a live climber (Ash viewport snoop + force Castiel
+    ``up`` while following Ash). Two live players still glue: only the
+    live leader walks.
     """
     if character is None:
         return None
-    if getattr(character, "session", None) is None:
+    if not live_present(character):
+        return None
+    if getattr(character, "gm_mode", False) or getattr(
+        character, "gm_spirit", False
+    ):
         return None
     if not in_group(character):
         return None
     if is_leader(character):
+        return None
+    leader = resolve_leader(character)
+    if leader is None or not live_present(leader):
+        return None
+    if getattr(leader, "gm_mode", False) or getattr(leader, "gm_spirit", False):
+        return None
+    if getattr(leader, "is_npc", False):
         return None
     ensure_session_defaults(character)
     return (
@@ -657,8 +862,18 @@ def try_leave_group(character, game, *, confirm=False):
     if is_leader(character):
         return try_disband_group(character, game, confirm=confirm)
     if not confirm:
-        warn_group_leave(character, as_leader=False)
-        return "blocked"
+        leader = resolve_leader(character)
+        # Live-on-live parties still need confirm. Following a GM, Echo,
+        # or idle body should not trap you behind a second confirm hop.
+        need_confirm = live_present(character) and live_present(leader)
+        if leader is not None and (
+            getattr(leader, "gm_mode", False)
+            or getattr(leader, "gm_spirit", False)
+        ):
+            need_confirm = False
+        if need_confirm:
+            warn_group_leave(character, as_leader=False)
+            return "blocked"
     character.group_leave_confirm_pending = False
     _peel_from_group(character, game, reason="group_leave")
     sess = getattr(character, "session", None)
@@ -684,8 +899,19 @@ def try_disband_group(character, game, *, confirm=False):
     return "left"
 
 
-def _peel_from_group(member, game, *, reason="group_split"):
-    """Remove one body from the follow tree + companion glue."""
+def _peel_from_group(member, game, *, reason="group_split", stamp_event=True):
+    """Remove one body from the follow tree + companion glue.
+
+    When ``stamp_event`` is True (default), a real party split (two or more
+    bodies still bonded) writes Wave 0 debug stamps *before* the peel.
+    ``disband_group`` passes ``stamp_event=False`` because it already stamped
+    the whole roster once for the disband.
+    """
+    if member is None:
+        return
+    # Capture the follow tree while bonds still exist.
+    if stamp_event and in_group(member):
+        _stamp_group_events(group_members(member), game, reason=reason)
     from engine.command_support import stop_following
 
     # Delegate companion cleanup to engine.hooks so engine stays SUPERS-free
@@ -693,7 +919,8 @@ def _peel_from_group(member, game, *, reason="group_split"):
 
     if getattr(member, "companion_leader_key", None):
         hooks.clear_companion_duty(member, game, reason=reason, silent=True)
-    stop_following(member, silent=True)
+    stop_following(member, silent=True, declined=True, game=game)
+
 
 def disband_group(leader, game, *, reason="separated"):
     """Break follow bonds for the whole party.
@@ -707,6 +934,20 @@ def disband_group(leader, game, *, reason="separated"):
     members = members_of(leader)
     if len(members) < 2:
         return
+    # One ops line per disband (not per member) plus per-body report stamps.
+    from engine import log_util
+
+    leader_key = getattr(leader, "key", "?")
+    dropped = [
+        str(getattr(m, "key", "?"))
+        for m in members[1:]
+    ]
+    log_util.ops(
+        "group",
+        f"split reason={reason} leader={leader_key} "
+        f"dropped={','.join(dropped)}",
+    )
+    _stamp_group_events(members, game, reason=reason)
     solo_pairs = []
     if reason == "separated":
         msg = (
@@ -736,7 +977,7 @@ def disband_group(leader, game, *, reason="separated"):
     else:
         msg = "[Group] The party disbands."
     for member in list(members):
-        _peel_from_group(member, game, reason=reason)
+        _peel_from_group(member, game, reason=reason, stamp_event=False)
         ensure_session_defaults(member)
         member.group_leave_confirm_pending = False
         sess = getattr(member, "session", None)
@@ -760,13 +1001,16 @@ def validate_group_colocation(anchor, game):
 
 
 def heal_group_on_session_attach(character, game):
-    """Live login / reconnect: clear stale apart follow bonds (crash #256).
+    """Live login / reconnect: restore follow bonds + clear stale apart glue.
 
-    Echo and idlemode bodies keep apart grace -- Cadence may still catch
-    up. A present player must not walk solo with a ghost party roster.
+    Persisted ``following_leader_key`` is re-linked first (copyover bug
+    report 1573). Echo and idlemode bodies keep apart grace -- Cadence
+    may still catch up. A present player reconnecting apart from the
+    party still peels (crash #256).
     """
     if character is None or game is None:
         return
+    restore_follow_bond(character, game)
     if not live_present(character):
         return
     if not in_group(character):

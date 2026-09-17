@@ -887,7 +887,10 @@ def _format_who_entry_row(entry, width):
 def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
                moral_balance=None, lean="", eclipse=False,
                echo_entries=None, gm_names=None, unknown_count=0,
-               unknown_label="Unknown Count", screenreader=False):
+               unknown_label="Unknown Count", screenreader=False,
+               monster_entries=None, mortal_entries=None,
+               power_entries=None,
+               monster_hidden=0, mortal_hidden=0, power_hidden=0):
     """Build the plan's Mortals & Monsters who list.
 
     `entries` is an iterable of dicts::
@@ -895,28 +898,37 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
         {"badge": "Vampire", "badge_color": "dark_red",
          "name": "Alaric", "status": "Brooding in the Crypt"}
 
+    When ``monster_entries`` / ``mortal_entries`` are passed, the live
+    list splits into Monsters then Powers then Mortals (suggestion
+    report 432; bug report 1282 keeps revealed Gods off Mortals).
+    Hidden counts are whohide tallies for players (named rows stay
+    omitted; the count is the only leak).
+
     Badge color is a COLORS key; name/status stay plain labels (a11y).
-
-    When `moral_balance` is an int (-100..+100), a World Tide meter is
-    rendered under the souls/time footer (Evil Strikes Back).
-
-    Optional `echo_entries` (same dict shape) adds a second ECHOES section
-    when the viewer's `whofull` toggle is on -- logout / idle Echoes still
-    walking the map (see cmd_whofull / cmd_who).
-
-    Optional `gm_names` (list of character keys) adds a GM section at the
-    top listing online, non-immersion-cast staff as `[GM] Name`. The count
-    matches that list (online only; cast members with gm_rank are omitted).
-
-    ``unknown_count`` is the player-facing hole: veiled + unintroduced
-    souls that would otherwise appear on this viewer's list. Staff may
-    override the footer label (e.g. ``Offline Echoes`` via ``gm whomode``).
-
-    ``screenreader=True`` (prefs #30 / #32) flattens wrought rules into
-    semantic headers and vertical lists.
     """
     w = max(40, int(width))
     unknown = max(0, int(unknown_count or 0))
+    split = (
+        monster_entries is not None
+        or mortal_entries is not None
+        or power_entries is not None
+    )
+    monsters = list(monster_entries or [])
+    powers = list(power_entries or [])
+    mortals = list(mortal_entries if mortal_entries is not None else (
+        [] if split else list(entries or [])
+    ))
+    hid_m = max(0, int(monster_hidden or 0))
+    hid_p = max(0, int(power_hidden or 0))
+    hid_h = max(0, int(mortal_hidden or 0))
+
+    def _hidden_phrase(n):
+        if n <= 0:
+            return ""
+        if n == 1:
+            return "(one hidden)"
+        return f"({n} hidden)"
+
     if screenreader:
         lines = ["", "Who list.", ""]
         gm_list = list(gm_names) if gm_names else []
@@ -925,15 +937,52 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
             for name in gm_list:
                 lines.append(f"  GM: {name}.")
             lines.append("")
-        lines.append("Mortals and Monsters:")
-        if not entries:
-            lines.append("  None online.")
+        if split:
+            lines.append("Monsters:")
+            if not monsters:
+                lines.append("  None online.")
+            else:
+                for entry in monsters:
+                    badge = entry.get("badge") or "Monster"
+                    name = entry.get("name") or "?"
+                    status = entry.get("status") or ""
+                    lines.append(f"  {badge}: {name}. {status}".rstrip() + ".")
+            if hid_m:
+                lines.append(f"  {_hidden_phrase(hid_m)}.")
+            lines.append("")
+            lines.append("Powers:")
+            if not powers:
+                lines.append("  None online.")
+            else:
+                for entry in powers:
+                    badge = entry.get("badge") or "Power"
+                    name = entry.get("name") or "?"
+                    status = entry.get("status") or ""
+                    lines.append(f"  {badge}: {name}. {status}".rstrip() + ".")
+            if hid_p:
+                lines.append(f"  {_hidden_phrase(hid_p)}.")
+            lines.append("")
+            lines.append("Mortals:")
+            if not mortals:
+                lines.append("  None online.")
+            else:
+                for entry in mortals:
+                    badge = entry.get("badge") or "Mortal"
+                    name = entry.get("name") or "?"
+                    status = entry.get("status") or ""
+                    lines.append(f"  {badge}: {name}. {status}".rstrip() + ".")
+            if hid_h:
+                lines.append(f"  {_hidden_phrase(hid_h)}.")
         else:
-            for entry in entries:
-                badge = entry.get("badge") or "Mortal"
-                name = entry.get("name") or "?"
-                status = entry.get("status") or ""
-                lines.append(f"  {badge}: {name}. {status}".rstrip() + ".")
+            lines.append("Mortals and Monsters:")
+            if not entries:
+                lines.append("  None online.")
+            else:
+                for entry in entries:
+                    badge = entry.get("badge") or "Mortal"
+                    name = entry.get("name") or "?"
+                    status = entry.get("status") or ""
+                    lines.append(f"  {badge}: {name}. {status}".rstrip() + ".")
         if echo_entries is not None:
             lines.append("")
             lines.append("Echoes:")
@@ -951,7 +1000,6 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
         lines.append(f"{label}: {unknown}.")
         if moral_balance is not None:
             bal = int(moral_balance)
-            # Same Tide prose as format_moral_meter(screenreader=True).
             lines.append(_tts_period("World Tide"))
             lines.append(_tts_period(f"Balance: {bal:+d}"))
             lines.append(_tts_period(moral_tide_caption(bal, lean)))
@@ -961,7 +1009,6 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
 
     rule = paint("dark_grey", wrought_rule(w))
     lines = []
-    # Staff first -- online real GMs only (immersion cast filtered by caller).
     gm_list = list(gm_names) if gm_names else []
     if gm_list:
         lines.append(rule)
@@ -973,17 +1020,36 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
         count_label = "1 online" if count == 1 else f"{count} online"
         lines.append(paint("muted", f"  ({count_label})"))
         for name in gm_list:
-            # Plain `[GM] Name` -- rank detail stays on gmlist; a11y without
-            # color alone (brackets + letters carry the meaning).
             lines.append(render(f"  <dark_grey>[<gold>GM<dark_grey>] <slate_grey>{name}"))
         lines.append("")
-    title = paint("dark_magenta", pad("M O R T A L S   &   M O N S T E R S", w, "center"))
-    lines.extend([rule, title, rule, ""])
-    if not entries:
-        lines.append(paint("muted", "  (none online)"))
+
+    def _band(title, rows, hidden):
+        lines.append(rule)
+        lines.append(paint("dark_magenta", pad(title, w, "center")))
+        lines.append(rule)
+        lines.append("")
+        if not rows:
+            lines.append(paint("muted", "  (none online)"))
+        else:
+            for entry in rows:
+                lines.append(_format_who_entry_row(entry, w))
+        if hidden:
+            lines.append(paint("muted", f"  {_hidden_phrase(hidden)}"))
+
+    if split:
+        _band("M O N S T E R S", monsters, hid_m)
+        lines.append("")
+        _band("P O W E R S", powers, hid_p)
+        lines.append("")
+        _band("M O R T A L S", mortals, hid_h)
     else:
-        for entry in entries:
-            lines.append(_format_who_entry_row(entry, w))
+        title = paint("dark_magenta", pad("M O R T A L S   &   M O N S T E R S", w, "center"))
+        lines.extend([rule, title, rule, ""])
+        if not entries:
+            lines.append(paint("muted", "  (none online)"))
+        else:
+            for entry in entries:
+                lines.append(_format_who_entry_row(entry, w))
     # Optional Echoes block (whofull toggle) -- same column layout, own banner.
     if echo_entries is not None:
         lines.append("")
@@ -1005,14 +1071,12 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
         f"<dark_purple> Visible Souls: <silver>{souls}"
     )
     time_bit = render(f"<dark_purple> Time: <silver>{time_label or '--'}")
-    # Two-column footer; pad middle with spaces.
     gap = max(2, w - visible_len(souls_bit) - visible_len(time_bit))
     lines.append(souls_bit + (" " * gap) + time_bit)
     unknown_bit = render(
         f"<dark_purple> {unknown_label or 'Unknown Count'}: <silver>{unknown}"
     )
     lines.append(unknown_bit)
-    # World Good/Evil meter sits under souls/time, still inside wrought rules.
     if moral_balance is not None:
         lines.append(rule)
         lines.extend(
@@ -1021,8 +1085,6 @@ def format_who(entries, *, souls=0, time_label="", width=WHO_WIDTH,
             )
         )
     lines.append(rule)
-    # Trailing blank so the wrought footer does not glue onto the next
-    # prompt / command output.
     lines.append("")
     return lines
 

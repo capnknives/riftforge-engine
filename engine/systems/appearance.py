@@ -243,11 +243,22 @@ def a_or_an(word):
 
 
 def with_article(rest, *, capitalize=False):
-    """Prefix *rest* with a/an based on its first word."""
+    """Prefix *rest* with a/an based on its first word.
+
+    Catalog keys and combat weapon lines often ship with a leading article
+    already (``a steel guandao``, ``an angel blade``). Leave those alone so
+    templates that wrap ``with {…}`` do not emit ``an a steel …`` doubles.
+    """
     cleaned = " ".join(str(rest or "").split())
     if not cleaned:
         article = "a"
         return article.capitalize() if capitalize else article
+    low = cleaned.lower()
+    for prefix in ("a ", "an ", "the "):
+        if low.startswith(prefix):
+            if capitalize:
+                return cleaned[0].upper() + cleaned[1:]
+            return cleaned
     first = cleaned.split(None, 1)[0]
     article = a_or_an(first)
     if capitalize:
@@ -300,10 +311,13 @@ def say_voice_phrase(appearance, *, kit=None):
 
 
 def is_complete(appearance):
-    """True when every core appearance slot has a non-None value."""
+    """True when every core appearance slot has a filled value."""
     if not appearance:
         return False
-    return all(appearance.get(slot) is not None for slot in CORE_SLOTS)
+    # Empty strings persist after a partial chargen / copyover and must
+    # not pass -- ``display()`` returns None for falsy ids, then
+    # ``build_description`` would ``.lower()`` that None.
+    return all(appearance.get(slot) not in (None, "") for slot in CORE_SLOTS)
 
 
 def normalize_short_desc(text):
@@ -414,10 +428,10 @@ def build_description(appearance, pronoun, age=None, *, kit=None):
     if not is_complete(appearance):
         return None
     person = person_word_for(pronoun, kit=kit)
-    height = display("height", appearance["height"], kit=kit).lower()
-    physique = display("physique", appearance["physique"], kit=kit).lower()
-    skin = display("skin_tone", appearance["skin_tone"], kit=kit).lower()
-    eyes = display("eye_color", appearance["eye_color"], kit=kit).lower()
+    height = (display("height", appearance["height"], kit=kit) or "").lower()
+    physique = (display("physique", appearance["physique"], kit=kit) or "").lower()
+    skin = (display("skin_tone", appearance["skin_tone"], kit=kit) or "").lower()
+    eyes = (display("eye_color", appearance["eye_color"], kit=kit) or "").lower()
     hair_style = appearance["hair_style"]
     style_shown = display("hair_style", hair_style, kit=kit)
     age_bit = ""
@@ -449,10 +463,10 @@ def build_description(appearance, pronoun, age=None, *, kit=None):
             f"{lead}, {physique} {person}{age_bit} with {skin} {matter}, "
             f"{no_crown[1]}, and {eyes} eyes{ext_suffix}."
         )
-    hair_color = display(
-        "hair_color", appearance["hair_color"], kit=kit
+    hair_color = (
+        display("hair_color", appearance["hair_color"], kit=kit) or ""
     ).lower()
-    style = style_shown.lower()
+    style = (style_shown or "").lower()
     return (
         f"{lead}, {physique} {person}{age_bit} with {skin} {matter}, "
         f"{hair_color} {style} {crown}, and {eyes} eyes{ext_suffix}."

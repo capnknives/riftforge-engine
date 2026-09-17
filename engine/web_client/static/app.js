@@ -78,7 +78,7 @@
   // Bump this string with each shipped client change so bug reports about
   // "the web client" can be matched to a build (help/ops QoL, not a version
   // negotiation -- GMCP Core.Hello version above is the protocol number).
-  const CLIENT_BUILD = "2026-09-05c";
+  const CLIENT_BUILD = "2026-09-16-atlas-wsdrain";
 
   const MAX_LINES = 8000;
   const MAX_COMM_LINES = 500;
@@ -115,10 +115,13 @@
     "Char.Vitals 1",
     "Room 1",
     "Room.Info 1",
+    "Room.Occupants 1",
     "Comm 1",
     "Comm.Channel 1",
     "RiftForge.Map 1",
     "RiftForge.Map.Atlas 1",
+    "RiftForge.Map.Here 1",
+    "RiftForge.Map.View 1",
     "RiftForge.Zone 1",
     "RiftForge.Combat 1",
   ];
@@ -154,6 +157,7 @@
   let atlasCountry = null;
   let hoverCell = null;
   let zoneState = null;
+  let zoneWho = [];
   let zoneBounds = null;
   let zoneHover = null;
   let gagStored = false;
@@ -1060,6 +1064,11 @@
     if (!storyHydrated || passwordMode || !output || !window.indexedDB) {
       return;
     }
+    // Copyover [WAIT] dumps a lot of HTML; skip IDB while the world is down
+    // so the main thread is not rewriting up to 800KB mid-rewrite.
+    if (statusEl && statusEl.className === "wait") {
+      return;
+    }
     const html = storyHtmlForStore();
     if (!html) {
       return;
@@ -1277,6 +1286,8 @@
   }
 
   function sendCmd(line) {
+    // Typing or tapping compass cancels an in-progress map walk.
+    cancelWalk();
     sendEnvelope({ op: "cmd", data: line });
   }
 
@@ -1627,7 +1638,7 @@
     }
   }
 
-  function drawAtlas() {
+  function paintAtlas() {
     if (!atlasCanvas) {
       return;
     }
@@ -1656,14 +1667,35 @@
     function canvasY(gameY) {
       return h - 1 - gameY;
     }
-    for (let r = 0; r < h; r++) {
-      const row = rows[r] || "";
-      for (let x = 0; x < w; x++) {
-        const chGlyph = row.charAt(x) || " ";
-        ctx.fillStyle = ATLAS_GLYPH_BG[chGlyph] || "#1a2848";
-        ctx.fillRect(x * cw, r * ch, cw + 0.5, ch + 0.5);
+    // Country glyphs are stable between Here pings. Cache that layer so
+    // drive steps only composite @ / marks (Pass 25 G36).
+    const countrySig = [
+      atlasCountry.id || "",
+      w,
+      h,
+      rows.length,
+      cssW,
+      cssH,
+      dpr,
+    ].join("|");
+    if (!atlasCountryLayer || atlasCountrySig !== countrySig) {
+      const layer = document.createElement("canvas");
+      layer.width = Math.round(cssW * dpr);
+      layer.height = Math.round(cssH * dpr);
+      const lctx = layer.getContext("2d");
+      lctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      for (let r = 0; r < h; r++) {
+        const row = rows[r] || "";
+        for (let x = 0; x < w; x++) {
+          const chGlyph = row.charAt(x) || " ";
+          lctx.fillStyle = ATLAS_GLYPH_BG[chGlyph] || "#1a2848";
+          lctx.fillRect(x * cw, r * ch, cw + 0.5, ch + 0.5);
+        }
       }
+      atlasCountryLayer = layer;
+      atlasCountrySig = countrySig;
     }
+    ctx.drawImage(atlasCountryLayer, 0, 0, cssW, cssH);
     (st.marks || []).forEach(function (m) {
       ctx.fillStyle = "rgba(201,162,39,0.55)";
       ctx.fillRect(m.x * cw, canvasY(m.y) * ch, cw, ch);
@@ -1697,6 +1729,21 @@
     } else if (st.map === "earth_america") {
       atlasTitle.textContent = "America";
     }
+  }
+
+  // Map + Atlas + Here often arrive in the same tick (copyover / Supports).
+  // Coalesce O(W×H) fillRect paints to one frame.
+  let atlasPaintRaf = 0;
+  let atlasCountryLayer = null;
+  let atlasCountrySig = "";
+  function drawAtlas() {
+    if (atlasPaintRaf) {
+      return;
+    }
+    atlasPaintRaf = window.requestAnimationFrame(function () {
+      atlasPaintRaf = 0;
+      paintAtlas();
+    });
   }
 
   function applyCountryAtlas(payload) {
@@ -1752,6 +1799,29 @@
     drawAtlas();
   }
 
+  function applyMapHere(payload) {
+    // Compact you-are-here ping -- move @ without waiting for a new Atlas.
+    if (!payload || typeof payload !== "object") {
+      return;
+    }
+    if (!atlasState) {
+      atlasState = {};
+    }
+    if (payload.you !== undefined) {
+      atlasState.you = payload.you;
+    }
+    drawAtlas();
+  }
+
+  function applyMapView(payload) {
+    // Viewport camera (Mudlet onView). Browser atlas is the country
+    // bitmap -- honor you/origin without rebuilding glyphs.
+    if (!payload || typeof payload !== "object") {
+      return;
+    }
+    applyMapHere(payload);
+  }
+
   function zoneRoomAt(x, y) {
     const rooms = (zoneState && zoneState.rooms) || [];
     let found = null;
@@ -1768,6 +1838,199 @@
       }
     }
     return found;
+  }
+
+  function roomHasDevilsTrapMark(room) {
+    if (!room || !Array.isArray(room.marks)) {
+      return false;
+    }
+    for (let i = 0; i < room.marks.length; i++) {
+      if (room.marks[i] === "devils_trap") {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function cardinalWalkDir(youX, youY, tx, ty) {
+    // North is +y (same as zone_hud / drawZone canvasY flip).
+    const dx = tx - youX;
+    const dy = ty - youY;
+    if (dx === 0 && dy === 1) return "north";
+    if (dx === 0 && dy === -1) return "south";
+    if (dx === 1 && dy === 0) return "east";
+    if (dx === -1 && dy === 0) return "west";
+    return null;
+  }
+
+  function shortExitToken(dir) {
+    if (dir === "north") return "n";
+    if (dir === "south") return "s";
+    if (dir === "east") return "e";
+    if (dir === "west") return "w";
+    return null;
+  }
+
+  function youRoomHasExit(dir) {
+    if (!zoneState || !Array.isArray(zoneState.you)) return false;
+    const here = zoneRoomAt(zoneState.you[0], zoneState.you[1]);
+    const tok = shortExitToken(dir);
+    if (!here || !tok) return false;
+    const ex = here.ex || [];
+    return ex.indexOf(tok) >= 0;
+  }
+
+  // Cardinal steps only (same as Later B). North is +y.
+  const WALK_DIRS = [
+    ["north", 0, 1, "n"],
+    ["south", 0, -1, "s"],
+    ["east", 1, 0, "e"],
+    ["west", -1, 0, "w"],
+  ];
+  const WALK_PATH_CAP = 48;
+  let walkQueue = [];
+  let walkExpect = null;
+  let walkPending = false;
+
+  function walkRoomKey(x, y) {
+    return String(x) + "," + String(y);
+  }
+
+  function neighborAfter(x, y, dir) {
+    for (let i = 0; i < WALK_DIRS.length; i++) {
+      if (WALK_DIRS[i][0] === dir) {
+        return [x + WALK_DIRS[i][1], y + WALK_DIRS[i][2]];
+      }
+    }
+    return null;
+  }
+
+  function cancelWalk() {
+    walkQueue = [];
+    walkExpect = null;
+    walkPending = false;
+  }
+
+  function zoneWalkPath(rooms, fromX, fromY, toX, toY) {
+    // BFS on mapped interior-map cells. Missing rooms are fog — not walkable.
+    if (fromX === toX && fromY === toY) {
+      return [];
+    }
+    if (!Array.isArray(rooms)) {
+      return null;
+    }
+    const byXY = {};
+    for (let i = 0; i < rooms.length; i++) {
+      const r = rooms[i];
+      byXY[walkRoomKey(r.x, r.y)] = r;
+    }
+    const startK = walkRoomKey(fromX, fromY);
+    const goalK = walkRoomKey(toX, toY);
+    if (!byXY[startK] || !byXY[goalK]) {
+      return null;
+    }
+    const q = [[fromX, fromY]];
+    const prev = {};
+    prev[startK] = null;
+    let qi = 0;
+    while (qi < q.length) {
+      const cur = q[qi++];
+      const here = byXY[walkRoomKey(cur[0], cur[1])];
+      if (!here) {
+        continue;
+      }
+      const ex = here.ex || [];
+      for (let d = 0; d < WALK_DIRS.length; d++) {
+        const name = WALK_DIRS[d][0];
+        const tok = WALK_DIRS[d][3];
+        if (ex.indexOf(tok) < 0) {
+          continue;
+        }
+        const nx = cur[0] + WALK_DIRS[d][1];
+        const ny = cur[1] + WALK_DIRS[d][2];
+        const nk = walkRoomKey(nx, ny);
+        if (prev[nk] !== undefined) {
+          continue;
+        }
+        if (!byXY[nk]) {
+          continue;
+        }
+        prev[nk] = { x: cur[0], y: cur[1], dir: name };
+        if (nx === toX && ny === toY) {
+          const dirs = [];
+          let k = nk;
+          while (prev[k]) {
+            const p = prev[k];
+            dirs.push(p.dir);
+            k = walkRoomKey(p.x, p.y);
+          }
+          dirs.reverse();
+          if (dirs.length > WALK_PATH_CAP) {
+            return null;
+          }
+          return dirs;
+        }
+        q.push([nx, ny]);
+      }
+    }
+    return null;
+  }
+
+  function sendNextWalk() {
+    if (!walkQueue.length) {
+      walkPending = false;
+      walkExpect = null;
+      return;
+    }
+    if (!zoneState || !Array.isArray(zoneState.you) || zoneState.you.length !== 2) {
+      cancelWalk();
+      return;
+    }
+    const dir = walkQueue[0];
+    const nxt = neighborAfter(zoneState.you[0], zoneState.you[1], dir);
+    if (!nxt || !youRoomHasExit(dir)) {
+      cancelWalk();
+      if (zoneCaption) {
+        zoneCaption.textContent = "No walkable path there.";
+      }
+      return;
+    }
+    walkExpect = nxt;
+    walkPending = true;
+    sendEnvelope({ op: "cmd", data: dir });
+    if (zoneCaption) {
+      const left = walkQueue.length;
+      zoneCaption.textContent =
+        left > 1
+          ? "Walking " + dir + " (" + left + " steps)."
+          : "Walking " + dir + ".";
+    }
+  }
+
+  function continueWalkFromZone() {
+    if (!walkPending || !walkExpect) {
+      return;
+    }
+    if (!zoneState || !Array.isArray(zoneState.you) || zoneState.you.length !== 2) {
+      cancelWalk();
+      return;
+    }
+    const yx = zoneState.you[0];
+    const yy = zoneState.you[1];
+    if (yx !== walkExpect[0] || yy !== walkExpect[1]) {
+      // Occupants / same-room Zone refresh — keep waiting.
+      return;
+    }
+    walkQueue.shift();
+    walkPending = false;
+    walkExpect = null;
+    if (!walkQueue.length) {
+      if (zoneCaption) {
+        zoneCaption.textContent = "You arrive.";
+      }
+      return;
+    }
+    sendNextWalk();
   }
 
   function zoneCaptionFor(room) {
@@ -1798,6 +2061,9 @@
     ) {
       text = "You are here: " + text;
     }
+    if (roomHasDevilsTrapMark(room)) {
+      text += " — warded";
+    }
     return text;
   }
 
@@ -1816,11 +2082,59 @@
       "Streets plus places you have been. Click a room to name it.";
   }
 
+  function formatOccupantsCaption(who) {
+    if (!Array.isArray(who) || !who.length) {
+      return "";
+    }
+    const names = [];
+    for (let i = 0; i < who.length && names.length < 3; i++) {
+      const row = who[i];
+      if (row && row.name) {
+        names.push(String(row.name));
+      }
+    }
+    const extra = who.length - names.length;
+    let text = "Here: " + names.join(", ");
+    if (extra > 0) {
+      text += " and " + extra + " more";
+    }
+    return text;
+  }
+
+  function occupantsCaptionWithWard(who) {
+    let text = formatOccupantsCaption(who);
+    if (!text || !zoneState || !zoneState.you || zoneState.you.length !== 2) {
+      return text;
+    }
+    const here = zoneRoomAt(zoneState.you[0], zoneState.you[1]);
+    if (here && roomHasDevilsTrapMark(here)) {
+      text += " (warded)";
+    }
+    return text;
+  }
+
+  function applyOccupants(payload) {
+    if (!payload || typeof payload !== "object") {
+      return;
+    }
+    if (payload.visible === false) {
+      zoneWho = [];
+    } else {
+      zoneWho = Array.isArray(payload.who) ? payload.who : [];
+    }
+    if (!zoneState) {
+      return;
+    }
+    zoneState.who = zoneWho;
+    drawZone();
+  }
+
   function applyZone(payload) {
     if (!zonePanel) {
       return;
     }
     if (!payload || typeof payload !== "object") {
+      cancelWalk();
       zonePanel.hidden = true;
       zoneState = null;
       return;
@@ -1830,15 +2144,24 @@
       payload.hidden === true || !Array.isArray(rooms) || !rooms.length;
     zonePanel.hidden = hide;
     if (hide) {
+      cancelWalk();
       zoneState = null;
       zoneBounds = null;
       return;
     }
     zoneState = payload;
+    if (!Array.isArray(zoneState.who) || !zoneState.who.length) {
+      if (zoneWho.length) {
+        zoneState.who = zoneWho;
+      }
+    } else {
+      zoneWho = zoneState.who;
+    }
     if (zoneTitle && payload.title) {
       zoneTitle.textContent = payload.title;
     }
     drawZone();
+    continueWalkFromZone();
   }
 
   function drawZone() {
@@ -1933,6 +2256,15 @@
         ctx.textBaseline = "middle";
         ctx.fillText("E", pos.x + cw / 2, pos.y + ch / 2);
       }
+      if (roomHasDevilsTrapMark(room)) {
+        ctx.fillStyle = "#e8e8e8";
+        ctx.font = Math.max(8, Math.floor(Math.min(cw, ch) * 0.55)) + "px monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        const trapX = room.m ? pos.x + cw * 0.78 : pos.x + cw / 2;
+        const trapY = room.m ? pos.y + ch * 0.78 : pos.y + ch / 2;
+        ctx.fillText("+", trapX, trapY);
+      }
     }
     if (you && you.length === 2) {
       const pos = canvasXY(you[0], you[1]);
@@ -1946,14 +2278,39 @@
         cw * 0.4,
         ch * 0.4
       );
+      const whoList = zoneState.who;
+      if (Array.isArray(whoList) && whoList.length) {
+        const occupants = whoList.slice(0, 8);
+        const cols = Math.max(1, Math.ceil(Math.sqrt(occupants.length)));
+        const sq = Math.min(cw, ch) * 0.18;
+        for (let oi = 0; oi < occupants.length; oi++) {
+          const col = oi % cols;
+          const row = Math.floor(oi / cols);
+          const ox = pos.x + 2 + col * (sq + 1);
+          const oy = pos.y + 2 + row * (sq + 1);
+          ctx.fillStyle = occupants[oi].you ? "#c9a227" : "#8aa4c9";
+          ctx.fillRect(ox, oy, sq, sq);
+          ctx.strokeStyle = "#e8e8e8";
+          ctx.lineWidth = 0.5;
+          ctx.strokeRect(ox, oy, sq, sq);
+        }
+        if (zoneCaption) {
+          zoneCaption.textContent = occupantsCaptionWithWard(whoList);
+        }
+      }
     }
     if (zoneHover) {
       const pos = canvasXY(zoneHover.x, zoneHover.y);
       ctx.strokeStyle = "#7ec8a8";
       ctx.lineWidth = 1.5;
       ctx.strokeRect(pos.x + 0.5, pos.y + 0.5, Math.max(1, cw - 1), Math.max(1, ch - 1));
-    }
-    if (!zoneHover) {
+    } else if (
+      Array.isArray(zoneState.who) &&
+      zoneState.who.length &&
+      zoneCaption
+    ) {
+      zoneCaption.textContent = occupantsCaptionWithWard(zoneState.who);
+    } else {
       setZoneCaptionDefault();
     }
   }
@@ -1990,8 +2347,14 @@
       applyCountryAtlas(payload);
     } else if (name === "RiftForge.Map") {
       applyMap(payload);
+    } else if (name === "RiftForge.Map.Here") {
+      applyMapHere(payload);
+    } else if (name === "RiftForge.Map.View") {
+      applyMapView(payload);
     } else if (name === "RiftForge.Zone") {
       applyZone(payload);
+    } else if (name === "Room.Occupants") {
+      applyOccupants(payload);
     } else if (name === "Comm.Channel") {
       applyComm(payload);
     } else if (name === "Char.Status") {
@@ -2042,6 +2405,51 @@
     appendOutput(text);
   }
 
+  // Post-hitch WS bursts used to apply every GMCP/text frame synchronously
+  // on the message event (Pass 25 G38). Keep order, keep every line --
+  // just spend at most ~8ms per animation frame so the tab stays live.
+  let wsPending = [];
+  let wsRead = 0;
+  let wsDrainTimer = 0;
+
+  function scheduleWsDrain() {
+    if (wsDrainTimer) {
+      return;
+    }
+    const hidden =
+      typeof document !== "undefined" && document.hidden;
+    if (hidden || typeof window.requestAnimationFrame !== "function") {
+      wsDrainTimer = window.setTimeout(function () {
+        wsDrainTimer = 0;
+        drainWsFrames();
+      }, 0);
+      return;
+    }
+    wsDrainTimer = window.requestAnimationFrame(function () {
+      wsDrainTimer = 0;
+      drainWsFrames();
+    });
+  }
+
+  function drainWsFrames() {
+    const start = performance.now();
+    while (wsRead < wsPending.length && performance.now() - start < 8) {
+      handleFrame(wsPending[wsRead]);
+      wsRead += 1;
+    }
+    if (wsRead >= wsPending.length) {
+      wsPending = [];
+      wsRead = 0;
+      return;
+    }
+    scheduleWsDrain();
+  }
+
+  function queueWsFrame(raw) {
+    wsPending.push(raw);
+    scheduleWsDrain();
+  }
+
   function connect() {
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
@@ -2086,7 +2494,7 @@
       if (typeof ev.data !== "string") {
         return;
       }
-      handleFrame(ev.data);
+      queueWsFrame(ev.data);
     });
     opened.addEventListener("close", function () {
       if (socket !== opened) {
@@ -2758,6 +3166,38 @@
         return;
       }
       const room = zoneRoomAt(cell.x, cell.y);
+      if (
+        zoneState &&
+        zoneState.you &&
+        zoneState.you.length === 2 &&
+        room
+      ) {
+        const yx = zoneState.you[0];
+        const yy = zoneState.you[1];
+        if (yx === room.x && yy === room.y) {
+          cancelWalk();
+        } else {
+          const path = zoneWalkPath(
+            zoneState.rooms,
+            yx,
+            yy,
+            room.x,
+            room.y
+          );
+          if (path && path.length) {
+            walkQueue = path;
+            walkExpect = null;
+            walkPending = false;
+            sendNextWalk();
+            return;
+          }
+          if (zoneCaption) {
+            zoneCaption.textContent =
+              "No walkable path there. " + zoneCaptionFor(room);
+            return;
+          }
+        }
+      }
       if (zoneCaption) {
         zoneCaption.textContent = room
           ? zoneCaptionFor(room)

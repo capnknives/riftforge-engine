@@ -97,6 +97,19 @@ def parse_mouth_key(key):
         return None
 
 
+def plane_for_mouth_key(mouth_key):
+    """Overland plane this mouth sits on (1861 atlas vs Prime Earth)."""
+    parsed = parse_mouth_key(mouth_key)
+    if parsed is None:
+        return "earth"
+    from engine.systems.overland import FRONTIERLAND_MAP_ID, FRONTIERLAND_PLANE
+
+    map_id = str(parsed[0] or "").strip().lower()
+    if map_id == FRONTIERLAND_MAP_ID:
+        return FRONTIERLAND_PLANE
+    return "earth"
+
+
 def is_mine_capable_area(area_type):
     """True when this wilderness macro terrain may host a mine mouth."""
     return str(area_type or "").lower() in MINE_CAPABLE_AREA_TYPES
@@ -238,11 +251,14 @@ def _normalize_face(face):
     gate = face.get("gate") or {}
     if not isinstance(gate, dict):
         gate = {}
+    dest = face.get("dest_room_id")
+    dest_id = str(dest).strip() if dest else ""
     return {
         "carved": bool(face.get("carved")),
         "carve_hp": max(0, int(face.get("carve_hp") or 0)),
         "carve_hp_max": max(1, int(face.get("carve_hp_max") or 100)),
         "blocked_collapse": bool(face.get("blocked_collapse")),
+        "dest_room_id": dest_id or None,
         "channel": {
             "joiners": joiners[:MAX_CHANNEL_JOINERS],
             "progress": max(0, int(channel.get("progress") or 0)),
@@ -403,6 +419,8 @@ def link_rooms(mouth, room_a_id, direction, room_b_id):
     face_b = get_face(room_b, opp)
     face_a["carved"] = True
     face_b["carved"] = True
+    face_a["dest_room_id"] = room_b_id
+    face_b["dest_room_id"] = room_a_id
     face_a["carve_hp"] = face_a.get("carve_hp_max", 100)
     face_b["carve_hp"] = face_b.get("carve_hp_max", 100)
 

@@ -211,13 +211,8 @@ class Game:
                 print(f"[boot] patch notes retry skipped: {exc}", flush=True)
         boot_profile_mod.mark("changelog_ledger")
         # Pre-warm the in-memory ``changes`` cache here, before any player
-        # can connect. ``_load_unreleased_entries`` parses every
-        # CHANGELOG.d fragment on its first call in a fresh process
-        # (~a few hundred ms with today's fragment count); without this,
-        # whoever types ``changes`` or logs in first after a copyover /
-        # game-only restart pays that cost inline, blocking the single
-        # asyncio loop for everyone. Paying it once during boot instead
-        # costs nothing players notice.
+        # can connect. List rows come from the changelog ledger (SQLite);
+        # fragment markdown is not parsed at boot.
         try:
             from engine.verbs import basic as basic_verbs_mod
 
@@ -237,6 +232,20 @@ class Game:
         # Monster/Celestial fuel-loop subset (supers/fuel.py) -- kept in sync
         # via engine.hooks fuel_loop_roster_notify on register/despawn.
         self.fuel_loop_characters = set()
+        # Worship-apex God subset (supers/faith.py) -- same roster hook.
+        self.faith_loop_characters = set()
+        # Lethal-drop / psychopomp spirits (supers/death.py) -- timer loop
+        # only. Heal-stuck-0-HP still walks the full living roster.
+        self.death_spirit_loop_characters = set()
+        # Magic heartbeat subset (supers/magic.py) -- casters + bodies with
+        # live ward/hex timers. Online mundanes stay off this set; their
+        # rooms are on the Magic room index instead. Empty set is a real
+        # index -- first tick must not rescan everyone.
+        self.magic_loop_characters = set()
+        # Bonded pets / elemental summons / owners with pet_key (supers/pet.py).
+        # Same roster hook as fuel -- empty set is a real index.
+        self.pet_loop_bodies = set()
+        self.pet_loop_owners = set()
         # Authored-room cache generation -- RoomMap bumps this on real
         # map/dungeon insert/delete, not on overland virtual cells.
         self._static_room_graph_gen = 0
@@ -371,6 +380,30 @@ class Game:
                     loop = asyncio.new_event_loop()
                 start_persistence_writer(db_path, loop=loop)
         boot_profile_mod.mark("db_connect")
+        # Copyover duration diagnosis: does load_world run against a large
+        # un-checkpointed -wal sidecar on a reload boot? Copyover already
+        # forces a TRUNCATE checkpoint right after its save (server.py
+        # _save_snapshot -> persistence.maybe_wal_checkpoint_after_save),
+        # so this should normally read near-zero on a reload -- logging it
+        # confirms that instead of guessing. One-line, only under the
+        # profiling flag so it stays silent by default.
+        if boot_profile_mod.enabled():
+            try:
+                from engine import sqlite_wal as _sqlite_wal_probe
+
+                _wal_bytes = _sqlite_wal_probe.wal_file_bytes(db_path)
+                _journal_mode = (
+                    "memory" if db_path == ":memory:"
+                    else _sqlite_wal_probe.journal_mode(self.db)
+                )
+                print(
+                    "[boot_profile] wal_at_connect "
+                    f"boot_kind={getattr(self, '_boot_kind', '?')} "
+                    f"journal_mode={_journal_mode} wal_bytes={_wal_bytes}",
+                    flush=True,
+                )
+            except Exception:
+                pass
         # Lag P31.4 Cadence planner thread (second hard-rule-3 exception --
         # docs/plans/lag_p31_4_cadence_planner_thread_2026-08-23.md).
         # Production compose / live .env default the flag on; Python
@@ -465,6 +498,8 @@ class Game:
         self.outgoing_damage_tuning = {}
         # GM nest/hub body decay TTLs (``gm bodydecay``) -- empty = defaults.
         self.corpse_decay_tuning = {}
+        # GM ground-item decay TTL (``gm itemdecay``) -- empty = defaults.
+        self.ground_item_decay_tuning = {}
         # GM Hell exile TTL (``gm hellexile``) -- empty = defaults.
         self.hell_exile_tuning = {}
         # GM Purgatory pit loot knobs (``gm pit drops``) -- empty = defaults.
@@ -479,8 +514,13 @@ class Game:
         # Sparse GM overrides for chargen account-point SKUs (catalog 0).
         self.chargen_sku_costs = {}
         # GM runtime verb blocks (``gm disable <verb>``) -- in-memory toggle set.
-        # ``dothepit`` starts disabled; staff toggle with ``gm disable``.
+        # ``dothepit`` defaults disabled; staff ``gm pit autopilot on|off``
+        # writes a sidecar so copyover / restart keep the last choice.
         self.disabled_verbs = {"dothepit"}
+        if db_path != ":memory:" and _HAS_SUPERS:
+            from supers.purgatory_dungeon import autopilot_flag as pit_ap_mod
+
+            pit_ap_mod.apply_to_game(self)
         self.homestead_plots = {}
         self.player_shops = {}
         self.demesnes = {}
@@ -506,22 +546,44 @@ class Game:
         # so character room_key / floor items inside a shack resolve.
         # Demesnes must load before homesteads: demesne wilds plots wire
         # their enter mouth via game.demesnes (see homestead._resolve_mouth_room).
+        # Copyover duration diagnosis: these six loaders used to share two
+        # boot_profile buckets, hiding which one actually costs anything.
+        # Direct benchmark ruled out load_gather_nodes (~10ms @ 18,657 rows,
+        # in-memory and on-disk WAL alike) -- a code audit flagged
+        # load_homesteads (per-plot Room() + yard-footprint materialization
+        # + a full America-atlas remap/rewire pass) and load_personal_realms
+        # (docs/plans/personal_realm_orphan_cleanup.md: ~770 rows, ~21 with
+        # a living owner, live 2026-08-01) as the real suspects. Marking
+        # each loader on its own lets the next profiled boot name the
+        # actual culprit with numbers instead of another guess.
         if _HAS_SUPERS:
             from supers.demesne import load_demesnes
             load_demesnes(self.db, self)
+        boot_profile_mod.mark("load_demesnes")
+        if _HAS_SUPERS:
             from supers import homestead as homestead_mod
-            from supers import gathering as gathering_mod
             homestead_mod.load_homesteads(self.db, self)
+        boot_profile_mod.mark("load_homesteads")
+        if _HAS_SUPERS:
+            from supers import gathering as gathering_mod
             gathering_mod.load_gather_nodes(self.db, self)
+        boot_profile_mod.mark("load_gather_nodes")
+        if _HAS_SUPERS:
             from supers import player_shops as player_shops_mod
             player_shops_mod.load_player_shops(self.db, self)
+        boot_profile_mod.mark("load_player_shops")
+        if _HAS_SUPERS:
             from supers import township as township_mod
             township_mod.load_townships(self.db, self)
+        boot_profile_mod.mark("load_townships")
+        if _HAS_SUPERS:
             from supers import personal_realm as personal_realm_mod
             personal_realm_mod.load_personal_realms(self.db, self)
+        boot_profile_mod.mark("load_personal_realms")
+        if _HAS_SUPERS:
             from supers import dream_pocket as dream_pocket_mod
             dream_pocket_mod.load_dream_pockets(self.db, self)
-        boot_profile_mod.mark("load_personal_realms")
+        boot_profile_mod.mark("load_dream_pockets")
 
         # Persistable runtime rooms (vehicle interiors, charter cabins, …)
         # must exist before load_world.  Register new surfaces in
@@ -533,7 +595,9 @@ class Game:
         if persistence.is_seeded(self.db):
             # A returning world: restore every character (as an Echo) and every
             # item to wherever they were when the server last saved.
+            game_heartbeat.touch_heartbeat("pre_load_world")
             persistence.load_world(self.db, self)
+            game_heartbeat.touch_heartbeat("post_load_world")
             if _HAS_SUPERS:
                 from supers import eve as eve_mod
                 eve_mod.ensure_cast_after_characters(self)
@@ -562,25 +626,110 @@ class Game:
         if _HAS_SUPERS:
             from supers import cadence_cultivator as cult_cadence_mod
             cult_cadence_mod.rebuild_cultivator_rival_index(self)
+            from supers import cultivator_intro as cult_intro_mod
+            cult_intro_mod.heal_cultivator_rival_identity(self)
         if persistence.is_seeded(self.db):
             persistence_mod.seed_snapshot_hashes_after_load(self)
+        boot_profile_mod.mark("persist_seed_hashes")
 
         # Engine accounts: load after characters so back-pointers reconcile.
         persistence.load_accounts(self.db, self)
         try:
             from engine import accounts as accounts_mod
-            accounts_mod.reconcile_accounts(self)
-            accounts_mod.migrate_legacy_gm_ranks(self)
+            from engine.world_backup import prune_pre_deploy_snapshots
+            from supers import boot_migrations as boot_mig_mod
+
+            def _accounts_heal(name, fn):
+                """Time one load_accounts heal and poke the watcher heartbeat.
+
+                Live 2026-09-11 sat frozen on post_load_world for 200+ seconds
+                (the pfile archive scan) and the watcher scored a healthy boot
+                as hung. No heal in this block may go silent for minutes.
+                """
+                game_heartbeat.touch_heartbeat(f"load_accounts_{name}")
+                t0 = time.perf_counter()
+                try:
+                    return fn()
+                finally:
+                    boot_profile_mod.accum(
+                        "load_accounts",
+                        name,
+                        (time.perf_counter() - t0) * 1000.0,
+                    )
+
+            _accounts_heal("reconcile_accounts", lambda: accounts_mod.reconcile_accounts(self))
             # After load: recreate known wiped player accounts (e.g. Matt)
             # so the next save keeps them -- never race SQLite while the
             # live process still holds an older in-memory accounts dict.
-            accounts_mod.heal_restored_player_accounts(self)
-            accounts_mod.heal_drifted_staff_ranks(self)
-            # Second pass: roster relinks / staff-rank heal may have moved
-            # legacy body ranks onto accounts after the first migrate.
-            accounts_mod.migrate_legacy_gm_ranks(self)
-            accounts_mod.heal_empty_account_passwords(self)
-            accounts_mod.heal_account_created_at_stamps(self)
+            # This is a hardcoded-roster backfill (_RESTORED_PLAYER_ACCOUNTS),
+            # not an ongoing drift heal -- run_once so a clean world stops
+            # re-checking a fixed 3-name list every boot forever (fast
+            # copyover boot plan 4b). A future wipe of one of those specific
+            # accounts is rare enough to repair via a manual
+            # ``boot_migrations`` ledger reset, not an every-boot scan.
+            _accounts_heal(
+                "heal_restored_player_accounts",
+                lambda: boot_mig_mod.run_once(
+                    self,
+                    boot_mig_mod.HEAL_RESTORED_PLAYER_ACCOUNTS_V1,
+                    accounts_mod.heal_restored_player_accounts,
+                ),
+            )
+            _accounts_heal(
+                "heal_drifted_staff_ranks",
+                lambda: accounts_mod.heal_drifted_staff_ranks(self),
+            )
+            # Do NOT call heal_all_roster_pfile_overwrites OR
+            # heal_all_account_linked_playable_flags here.
+            # normalize_character_after_load already ran both the pfile
+            # restore heal AND heal_account_linked_playable_flags per body
+            # during load_world -- a second full-roster walk here just
+            # repeats that work (2026-09-11 outage was the pfile half of
+            # this same mistake). Both functions stay for `gm restore pfile`
+            # and manual repair.
+            #
+            # migrate_legacy_gm_ranks used to run twice (once here, once
+            # below) around the two heals above so it would catch both
+            # already-linked characters and newly-linked ones. It is a
+            # legacy migration (moves a per-character gm_rank onto the
+            # account once, then clears the character field), so a single
+            # run_once pass placed *after* heal_restored_player_accounts /
+            # heal_drifted_staff_ranks covers both cases in one go.
+            # heal_drifted_staff_ranks still calls migrate_legacy_gm_ranks
+            # directly (ungated) whenever it heals real drift, so future
+            # rank drift is still caught without this every-boot pass.
+            _accounts_heal(
+                "migrate_legacy_gm_ranks",
+                lambda: boot_mig_mod.run_once(
+                    self,
+                    boot_mig_mod.MIGRATE_LEGACY_GM_RANKS_V1,
+                    accounts_mod.migrate_legacy_gm_ranks,
+                ),
+            )
+            _accounts_heal(
+                "heal_empty_account_passwords",
+                lambda: accounts_mod.heal_empty_account_passwords(self),
+            )
+            # One-time created_at backfill for accounts minted before the
+            # field shipped -- run_once (fast copyover boot plan 4b).
+            _accounts_heal(
+                "heal_account_created_at_stamps",
+                lambda: boot_mig_mod.run_once(
+                    self,
+                    boot_mig_mod.HEAL_ACCOUNT_CREATED_AT_STAMPS_V1,
+                    accounts_mod.heal_account_created_at_stamps,
+                ),
+            )
+            # Cap leftovers from deploys that skipped prune (24 x 330MB
+            # on live the morning of the outage). Read-only restore still
+            # never opens the live DB from a second process.
+            _accounts_heal(
+                "prune_pre_deploy_snapshots",
+                lambda: prune_pre_deploy_snapshots(
+                    root=getattr(self, "report_dir", None),
+                ),
+            )
+            boot_profile_mod.print_accum("load_accounts")
         except Exception:
             print("[server] account reconcile/migrate failed:", flush=True)
             traceback.print_exc()
@@ -647,13 +796,16 @@ class Game:
              gone)
           3. Exact ``assumed_face`` / ``husk_display_name`` / given_name
              (and given+surname) match
-          4. Substring / ordinal collect via identity needles
+          4. Unique substring / kind-alias collect via identity needles
+             (``summon appaloosa`` finds ``gabriel's appaloosa``). Ordinals
+             (``1.horse``) pick among several matches.
         """
         from engine.char_identity import (
             character_given_name,
             character_surname,
             parse_target_ordinal,
             pick_ordinal,
+            surname_is_targetable,
         )
         from engine.command_support import (
             _collect_character_matches,
@@ -668,6 +820,12 @@ class Game:
         needle = (rest or "").strip().lower()
         if not needle:
             return None
+
+        # CNUM is an exact identity tag (DN00001), never a name substring.
+        from engine.char_cnum import parse_cnum
+        if parse_cnum(rest):
+            from engine.char_identity import find_character_by_cnum
+            return find_character_by_cnum(self, rest)
 
         def _parked_gm_spirit(obj):
             """True for an off-grid, sessionless staff GM spirit.
@@ -699,6 +857,7 @@ class Game:
         # Two-pass exact: never let an ephemeral prefix steal a bare key.
         face_hit = None
         given_hits = []
+        surname_hits = []
         ephemeral_hit = None
         for obj in self.characters:
             key = (getattr(obj, "key", None) or "").lower()
@@ -723,10 +882,20 @@ class Game:
             sur = character_surname(obj).lower()
             if given == needle:
                 given_hits.append(obj)
-            elif sur and f"{given} {sur}" == needle:
+            elif (
+                surname_is_targetable(obj)
+                and sur
+                and f"{given} {sur}" == needle
+            ):
                 given_hits.append(obj)
-            elif sur and f"{given}{sur}" == needle:
+            elif (
+                surname_is_targetable(obj)
+                and sur
+                and f"{given}{sur}" == needle
+            ):
                 given_hits.append(obj)
+            elif surname_is_targetable(obj) and sur and sur == needle:
+                surname_hits.append(obj)
         if ephemeral_hit is not None:
             return ephemeral_hit
         if face_hit is not None:
@@ -736,6 +905,17 @@ class Game:
         if len(given_hits) > 1:
             # Ambiguous without ordinal -- stable mantle-before-twin order.
             return sort_character_target_matches(given_hits)[0]
+        if len(surname_hits) == 1:
+            return surname_hits[0]
+        # Unique substring / kind alias (horse, breed, Origin tokens).
+        # Several hits stay unresolved so the caller can ask for an ordinal
+        # instead of yanking a random Captain Moss when staff typed "pilot".
+        pool = [o for o in self.characters if not _parked_gm_spirit(o)]
+        matches = sort_character_target_matches(
+            _collect_character_matches(rest, pool)
+        )
+        if len(matches) == 1:
+            return matches[0]
         return None
 
     def find_login_character(self, name):
@@ -890,14 +1070,20 @@ class Game:
             # for the "next autosave" that never comes -- skill gains and
             # other late mutations vanish on reload (bug report 372). Force
             # a full world rewrite so every live character hits SQLite.
-            if ep.persist_background_writer_enabled():
-                from engine.persistence_writer import shutdown_persistence_writer
-
-                shutdown_persistence_writer(
-                    timeout=ep.persist_writer_drain_timeout_s(),
+            # Skip-saved login PCs must abort this save (process stays up)
+            # rather than DELETE FROM characters around them (bug report 1509).
+            self._persist_copyover_save = True
+            try:
+                ep.save_world_before_process_exit(
+                    self.db, self, reason="copyover",
                 )
-            self._persist_force_full = True
-            ep.save_world(self.db, self)
+            finally:
+                self._persist_copyover_save = False
+            try:
+                ep.archive_online_login_checkpoints(self.db, self)
+            except Exception:
+                print("[server] copyover login checkpoints failed:", flush=True)
+                traceback.print_exc()
             ep.save_game_time(self.db, self.game_time_ticks)
             ep.save_calendar_epoch_day(
                 self.db, getattr(self, "calendar_epoch_day", 0)
@@ -1044,8 +1230,13 @@ class Game:
                 from engine import public_status as public_status_mod
 
                 public_status_mod.maybe_publish(self)
-            except Exception:
-                pass
+            except Exception as exc:
+                from engine import log_util
+
+                log_util.ops_once_per_tick(
+                    self, "public_status", "public_status",
+                    "maybe_publish failed", exc=exc,
+                )
             from engine import world_backup
             if world_backup.backup_request_pending():
                 try:
@@ -1066,8 +1257,13 @@ class Game:
         try:
             from engine import disk_health
             disk_health.maybe_tick_disk_health(self)
-        except Exception:
-            pass
+        except Exception as exc:
+            from engine import log_util
+
+            log_util.ops_once_per_tick(
+                self, "disk_health", "disk_health",
+                "maybe_tick_disk_health failed", exc=exc,
+            )
         await self._maybe_autosave_async()
         await self._maybe_flush_deferred_deploy_save()
 
@@ -1775,6 +1971,8 @@ class Game:
             # Lag P12: name the slow character(s), not just an aggregate
             # collect_ms -- see docs/plans/lag_p12_collect_profile.md.
             "slow_chars": world.get("slow_chars"),
+            "slow_char_detail": world.get("slow_char_detail"),
+            "wall_budget_hit": world.get("wall_budget_hit"),
             "char_build_total_ms": world.get("char_build_total_ms"),
             "char_build_count": world.get("char_build_count"),
             "char_build_avg_ms": world.get("char_build_avg_ms"),

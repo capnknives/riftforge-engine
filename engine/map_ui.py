@@ -1031,7 +1031,9 @@ def atlas_overlay_sgr(area_type, map_layer=None, terrain_base=None,
 
     ``water_view`` paints void-margin HUD cells as ocean/lake fill without
     changing sim ``area_type`` (still void on America).
-    ``land_view`` paints Canada land the same way (timber/prairie glyphs).
+    ``land_view`` paints Canada land the same way on the *local* minimap.
+    Country silhouettes (``atlas`` / ``map big`` / GMCP Atlas) skip that
+    layer so the lower forty-eight stays familiar.
     """
     from engine.atlas_layers import ROAD_OVERLAY_LAYERS
 
@@ -1081,12 +1083,20 @@ def atlas_overlay_sgr(area_type, map_layer=None, terrain_base=None,
     return fg, bg
 
 
-def _room_display_glyph(room):
+def _room_display_glyph(room, *, hide_hud_land=False):
     """Pick the ASCII glyph for one room on minimap / full atlas.
 
     Priority: authored ``map_glyph`` (city letter, highway =) >
     glyph_set / area_type table. Always a single printable character.
+
+    ``hide_hud_land`` (country camera / full dump) treats HUD Canada
+    land as off-map void. Local ``map`` keeps the timber/prairie paint.
     """
+    from engine.atlas_layers import is_hud_foreign_land
+
+    if hide_hud_land and is_hud_foreign_land(room):
+        glyph_set = getattr(room, "glyph_set", None)
+        return _cell_glyph("void", glyph_set=glyph_set)
     authored = getattr(room, "map_glyph", None)
     if authored:
         text = str(authored).strip()
@@ -1100,7 +1110,7 @@ def _room_display_glyph(room):
     return _cell_glyph(getattr(room, "area_type", "plains"), glyph_set=glyph_set)
 
 
-def _room_display_color(room):
+def _room_display_color(room, *, hide_hud_land=False):
     """ANSI prefix for one atlas/minimap cell, or empty string.
 
     Atlas maps (``glyph_set == "atlas"``) render as FILLED colored blocks:
@@ -1110,7 +1120,20 @@ def _room_display_color(room):
     escape. Non-atlas maps keep the old foreground-only palette so the
     Wastes / elemental reaches look exactly as before. Glyph stays the
     primary signal (section 8 a11y); color only accents.
+
+    ``hide_hud_land`` matches ``_room_display_glyph``: country cameras
+    paint HUD Canada as void, local minimaps keep the land fill.
     """
+    from engine.atlas_layers import is_hud_foreign_land
+
+    if hide_hud_land and is_hud_foreign_land(room):
+        if getattr(room, "glyph_set", None) == "atlas":
+            fg, bg = atlas_overlay_sgr("void", None, None, None)
+            return f"\x1b[{fg};{bg}m"
+        return _cell_color(
+            getattr(room, "plane", "earth"),
+            "void",
+        )
     if getattr(room, "glyph_set", None) == "atlas":
         fg, bg = atlas_overlay_sgr(
             getattr(room, "area_type", "plains"),
@@ -1240,6 +1263,7 @@ def render_minimap(rooms, center_room, radius=MINIMAP_RADIUS, use_color=True):
                 cells.append(" ")
                 continue
             seen_rooms.append(neighbor)
+            # Local closer window -- keep HUD Canada land near a border.
             glyph = _room_display_glyph(neighbor)
             if use_color:
                 color = _room_display_color(neighbor)
@@ -1276,9 +1300,11 @@ _LOCAL_MAP_SUPPRESSED_AREA_TYPES = frozenset({"city", "city_street"})
 
 
 def local_map_suppressed(room):
-    """True when the local minimap must not render for *room*.
+    """True when look/mapmove must not embed a local ASCII window.
 
-    Town interiors (city / city_street hand rooms) stay text-only on look.
+    Town interiors (city / city_street hand rooms) stay text-only on look
+    so America overland never bleeds into a plaza. Bare ``map`` still
+    generates an exit-graph neighborhood for those rooms.
     Grid cells and non-town pockets are unaffected.
     """
     if room is None:
@@ -1289,12 +1315,24 @@ def local_map_suppressed(room):
     return area in _LOCAL_MAP_SUPPRESSED_AREA_TYPES
 
 
+def _is_castle_mouth(room):
+    """True when this layout cell is a keep mouth (``enter castle``)."""
+    if room is None:
+        return False
+    if getattr(room, "portal_castle_mouth", False):
+        return True
+    entries = getattr(room, "zone_entries", None) or {}
+    return "castle" in entries
+
+
 def _town_room_glyph(room):
     """Single glyph for a town neighbor on the local map.
 
-    Prefers authored map_glyph, else first letter of the look title,
-    else '#'. Always one printable character.
+    Prefers a castle mouth (C), then authored map_glyph, else first
+    letter of the look title, else '#'. Always one printable character.
     """
+    if _is_castle_mouth(room):
+        return "C"
     authored = getattr(room, "map_glyph", None)
     if authored:
         text = str(authored).strip()
@@ -1398,6 +1436,7 @@ def render_layout_minimap(
         lz = 0
     index = _rooms_by_layout(rooms, map_id, lz)
     rows = []
+    saw_castle = _is_castle_mouth(center_room)
     for dy in range(radius, -radius - 1, -1):
         cells = []
         for dx in range(-radius, radius + 1):
@@ -1408,6 +1447,8 @@ def render_layout_minimap(
             if neighbor is None:
                 cells.append(" ")
                 continue
+            if _is_castle_mouth(neighbor):
+                saw_castle = True
             glyph = _town_room_glyph(neighbor)
             if use_color:
                 color = _room_display_color(neighbor)
@@ -1418,6 +1459,8 @@ def render_layout_minimap(
     label = getattr(center_room, "zone", None) or map_id
     header = f"{label}  (@ = you)"
     legend = "@=you  letter=nearby room  (layout)"
+    if saw_castle:
+        legend = "@=you  C=castle  letter=nearby room  (layout)"
     return "\n".join([header, *rows, legend])
 
 
@@ -1505,12 +1548,20 @@ def render_local_map(
     windows default to TOWN_MINIMAP_RADIUS.
 
     ``compact`` (look embed): smaller radius and no header/legend so the
-    room sheet stays short; bare ``map`` leaves this False.
+    room sheet stays short; bare ``map`` leaves this False. Compact also
+    keeps city interiors text-only (no America bleed on look).
 
     When ``character`` is set, exit-graph maps honor the same hidden-exit
     and closed-gate filters as ``look`` / ``cmd_move``.
+
+    If no authored grid or Studio layout exists, generate an exit-graph
+    neighborhood so every room can show ``map`` (towns, pockets, keeps).
     """
-    if center_room is None or local_map_suppressed(center_room):
+    if center_room is None:
+        return None
+    # Look embed stays text-only in city interiors (bug report 44).
+    # Bare ``map`` still generates a local exit-graph below.
+    if compact and local_map_suppressed(center_room):
         return None
     edge_ok = None
     if character is not None:
@@ -1523,10 +1574,16 @@ def render_local_map(
             ):
                 return False
             return hooks.look_exit_visible(dest, game)
+    skip_overland = local_map_suppressed(center_room)
     is_grid = (
-        getattr(center_room, "grid_prefix", None) is not None
-        or parse_grid_key(getattr(center_room, "key", "") or "") is not None
+        not skip_overland
+        and (
+            getattr(center_room, "grid_prefix", None) is not None
+            or parse_grid_key(getattr(center_room, "key", "") or "")
+            is not None
+        )
     )
+    rendered = None
     if is_grid:
         if radius is None:
             r = LOOK_GRID_MINIMAP_RADIUS if compact else MINIMAP_RADIUS
@@ -1535,17 +1592,17 @@ def render_local_map(
         rendered = render_minimap(
             rooms, center_room, radius=r, use_color=use_color,
         )
-    else:
+    if not rendered:
         if radius is None:
             town_r = (
                 LOOK_TOWN_MINIMAP_RADIUS if compact else TOWN_MINIMAP_RADIUS
             )
         else:
             town_r = radius
-        rendered = None
         # Prefer authored Studio layout when both x and y are stamped.
         if (
-            getattr(center_room, "layout_x", None) is not None
+            not skip_overland
+            and getattr(center_room, "layout_x", None) is not None
             and getattr(center_room, "layout_y", None) is not None
         ):
             rendered = render_layout_minimap(
@@ -1656,9 +1713,9 @@ def render_full_grid(
                 cells.append(" ")
                 continue
             seen_rooms.append(neighbor)
-            glyph = _room_display_glyph(neighbor)
+            glyph = _room_display_glyph(neighbor, hide_hud_land=True)
             if use_color:
-                color = _room_display_color(neighbor)
+                color = _room_display_color(neighbor, hide_hud_land=True)
                 if color:
                     glyph = f"{color}{glyph}{ANSI_RESET}"
             cells.append(glyph)
@@ -1846,7 +1903,7 @@ def render_viewport_grid(
                     ROUTE_GLYPH_OFFROAD if is_offroad else ROUTE_GLYPH_ONROAD
                 )
             else:
-                glyph = _room_display_glyph(neighbor)
+                glyph = _room_display_glyph(neighbor, hide_hud_land=True)
             raw_cells.append(glyph)
             if use_color:
                 if on_route:
@@ -1854,7 +1911,9 @@ def render_viewport_grid(
                         neighbor, offroad=is_offroad,
                     )
                 elif neighbor is not None:
-                    color = _room_display_color(neighbor)
+                    color = _room_display_color(
+                        neighbor, hide_hud_land=True,
+                    )
                 else:
                     color = ""
                 if color:

@@ -23,6 +23,7 @@ import time
 
 STABLE_FILENAME = ".boot_stable.json"
 HISTORY_FILENAME = ".boot_stable_history.json"
+BOOT_DISK_QUIESCE_NAME = ".boot_disk_quiescing"
 DEFAULT_STABLE_TICKS = 10
 MAX_STABLE_HISTORY = 5
 
@@ -132,6 +133,43 @@ def previous_stable_sha(*, root=None, skip_sha=None):
     return None
 
 
+def boot_disk_quiesce_path(root=None):
+    """Absolute path to the boot-heal mtime-absorb marker."""
+    return os.path.join(root or _repo_root(), BOOT_DISK_QUIESCE_NAME)
+
+
+def boot_disk_quiesce_active(root=None):
+    """True while a boot disk heal is absorbing its own catalog mtimes.
+
+    Boot heals (``heal_canon_item_overrides_on_disk`` and siblings) may
+    rewrite watched JSON under ``supers/content/`` / ``content/npcs/``.
+    The watcher would otherwise treat that write as a code change and
+    fire a copyover (live 2026-09-11: one extra Veil from ``items.json``).
+    Cleared by ``write_stable`` once the child has ticked healthy.
+    """
+    return os.path.isfile(boot_disk_quiesce_path(root))
+
+
+def touch_boot_disk_quiesce(root=None):
+    """Mark that a boot heal just wrote watched files (watcher should absorb)."""
+    path = boot_disk_quiesce_path(root)
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n"
+            )
+    except OSError:
+        pass
+
+
+def clear_boot_disk_quiesce(root=None):
+    """Drop the boot-heal quiesce marker (stable boot, or abort)."""
+    try:
+        os.remove(boot_disk_quiesce_path(root))
+    except FileNotFoundError:
+        pass
+
+
 def write_stable(*, root=None, ticks=None):
     """Persist the current HEAD as last stable boot."""
     root = root or _repo_root()
@@ -177,6 +215,9 @@ def write_stable(*, root=None, ticks=None):
             "clear_tree_sync_quiesce failed",
             exc=exc,
         )
+    # Boot heals that rewrote watched JSON (items.json, npc rosters, …)
+    # also need the watcher to stop absorbing once this child is stable.
+    clear_boot_disk_quiesce(root)
     print(
         f"[boot_stability] stable boot recorded at {sha[:12]} "
         f"({payload['ticks']} ticks)",

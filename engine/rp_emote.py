@@ -15,7 +15,10 @@ _AT_TOKEN = re.compile(
     re.IGNORECASE,
 )
 _ME_TOKEN = re.compile(r"\$me\b", re.IGNORECASE)
+# Suggestion report 413: @me places the actor mid-sentence (same as $me).
+_AT_ME_TOKEN = re.compile(r"@me\b", re.IGNORECASE)
 _ACTOR_PRONOUN = re.compile(r"\$(subj|obj|poss)\b", re.IGNORECASE)
+_HAS_SELF_TOKEN = re.compile(r"(?:\$me|@me)\b", re.IGNORECASE)
 
 _PRONOUN_TABLE = {
     "he": {"subj": "he", "obj": "him", "poss": "his"},
@@ -34,8 +37,23 @@ def _pronoun_keys(character):
 
 
 def _actor_face(actor, viewer, game):
-    """Emote subject label for *viewer* (You vs public name)."""
+    """Emote subject label for *viewer* (You vs public name).
+
+    Suggestion report 446: default self-view is the actor's public name;
+    ``config emote third off`` restores ``You``.
+    """
     if viewer is actor:
+        try:
+            from engine import display_prefs as display_prefs_mod
+
+            prefs = display_prefs_mod.preference_character(actor, game)
+            display_prefs_mod.ensure_display_defaults(prefs)
+            if getattr(prefs, "emote_third", False):
+                from engine.command_support import _display_name
+
+                return _display_name(actor, viewer=viewer)
+        except Exception:
+            pass
         return "You"
     try:
         from engine.command_support import _display_name
@@ -77,8 +95,14 @@ def _viewer_poss(character, viewer):
     return _pronoun_keys(character)["poss"]
 
 
-def _find_room_target(name, room, game):
-    """Resolve @token to a Character in *room* (prefix / exact key)."""
+def _find_room_target(name, room, game, self_character=None):
+    """Resolve @token to a Character in *room* (prefix / exact key).
+
+    Unpierced deep cover: the mask name (e.g. "Loki") matches, not the
+    true key, mirroring ``engine.command_support._collect_character_matches``
+    (bug report 1278's fix for generic target resolution -- emote's own
+    ``@name`` lookup needed the same branch, bug report 1622).
+    """
     if room is None:
         return None
     needle = (name or "").strip().lower()
@@ -91,6 +115,21 @@ def _find_room_target(name, room, game):
     for ch in chars:
         if not isinstance(ch, Character):
             continue
+        if getattr(ch, "deep_cover_active", False) and self_character is not None:
+            try:
+                from engine.hooks import presence_face_for
+
+                mask = presence_face_for(self_character, ch)
+            except Exception:
+                mask = None
+            true_key = (getattr(ch, "key", None) or "").lower()
+            if mask and true_key and true_key not in str(mask).lower():
+                mask_low = str(mask).lower()
+                if mask_low == needle:
+                    return ch
+                if mask_low.startswith(needle):
+                    partial.append(ch)
+                continue
         key = getattr(ch, "key", None) or ""
         low = key.lower()
         if low == needle:
@@ -121,7 +160,7 @@ def _substitute_tokens(text, actor, viewer, game, room):
         token = match.group(1)
         kind = (match.group(2) or "").lower()
         full = match.group(0)
-        target = _find_room_target(token, room, game)
+        target = _find_room_target(token, room, game, self_character=actor)
         if target is None:
             return full
         if full.endswith("'s"):
@@ -147,7 +186,8 @@ def _substitute_tokens(text, actor, viewer, game, room):
             return _viewer_obj(actor, viewer)
         return _viewer_poss(actor, viewer)
 
-    out = _AT_TOKEN.sub(_at_replace, text)
+    out = _AT_ME_TOKEN.sub(lambda _m: _actor_face(actor, viewer, game), text)
+    out = _AT_TOKEN.sub(_at_replace, out)
     out = _ME_TOKEN.sub(lambda _m: _actor_face(actor, viewer, game), out)
     out = _ACTOR_PRONOUN.sub(_actor_pronoun_replace, out)
     return out
@@ -175,7 +215,12 @@ def format_emote_line(actor, raw_args, viewer, game, *, mode="emote"):
     elif body.startswith("'s"):
         possessive = True
         body = body[2:].lstrip()
+    # When @me / $me is in the typed pose, skip the leading name so
+    # ``emote Turning, @me smiles.`` reads as a mid-sentence name.
+    embed_self = bool(_HAS_SELF_TOKEN.search(body))
     body = _substitute_tokens(body, actor, viewer, game, room)
+    if embed_self and not possessive:
+        return body
     face = _actor_face(actor, viewer, game)
     if possessive:
         if face == "You":

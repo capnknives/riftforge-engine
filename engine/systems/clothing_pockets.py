@@ -34,6 +34,9 @@ STOW_TOO_BULKY = "That is too bulky for a clothing pocket."
 STOW_NOT_POCKET_ITEM = "That does not fit in a clothing pocket."
 STOW_NOT_IN_POCKET = "That isn't in those pockets."
 STOW_NOT_CARRYING = "You aren't carrying that."
+STOW_ON_BODY = (
+    "You have that on your body -- unequip or remove it before moving it."
+)
 
 
 def _strip_articles(query):
@@ -192,6 +195,27 @@ def _is_bag_like(item):
     return False
 
 
+def _item_on_body(character, item):
+    """True when ``item`` is worn, equipped, or a slung bag (engine-side)."""
+    if character is None or item is None:
+        return False
+    if getattr(item, "container_worn", None) in (
+        "back", "shoulder", "hip", "pocket",
+    ):
+        return True
+    if getattr(item, "equipped", False):
+        return True
+    from engine.systems.wearables import ensure_clothing_map
+    clothing = ensure_clothing_map(character)
+    for stack in clothing.values():
+        if isinstance(stack, list) and item in stack:
+            return True
+    equipment = getattr(character, "equipment", None)
+    if isinstance(equipment, dict) and item in equipment.values():
+        return True
+    return False
+
+
 def stow_in_pocket(character, item, garment):
     """Move ``item`` from inventory into ``garment`` pockets.
 
@@ -218,6 +242,8 @@ def stow_in_pocket(character, item, garment):
     contents = pocket_contents(garment)
     if len(contents) >= cap:
         return False, POCKETS_FULL
+    if _item_on_body(character, item):
+        return False, STOW_ON_BODY
     inv.remove(item)
     contents.append(item)
     return True, f"You tuck {item.key} into {garment.key}."
@@ -239,4 +265,11 @@ def unstow_from_pocket(character, item, garment):
         character.inventory = []
         inv = character.inventory
     inv.append(item)
-    return True, f"You take {item.key} out of {garment.key}."
+    msg = f"You take {item.key} out of {garment.key}."
+    # Handset threads live on the Item — nudge after pocket pull (idea 455).
+    from engine.systems import phone as phone_mod
+
+    nudge = phone_mod.pickup_threads_nudge(character, item)
+    if nudge:
+        msg = f"{msg}\n{nudge}"
+    return True, msg

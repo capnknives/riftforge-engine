@@ -241,9 +241,126 @@ def migrate_character_cash_to_wallet(character):
     return True
 
 
+def _merge_wallet_into(target, donor):
+    """Merge donor wallet cash and papers into ``target``; clear ``donor``."""
+    if target is None or donor is None or target is donor:
+        return
+    spare_cash = wallet_total_cents(donor)
+    if spare_cash > 0:
+        credit_wallet_cash(target, spare_cash)
+        set_wallet_cash(donor, 0, 0)
+    spare_contents = wallet_contents(donor)
+    worn_contents = wallet_contents(target)
+    cap = wallet_capacity(target)
+    for inner in list(spare_contents):
+        if len(worn_contents) >= cap:
+            break
+        spare_contents.remove(inner)
+        worn_contents.append(inner)
+
+
+def safeguard_wallet_item_destruction(character, wallet_item):
+    """Spill cash and stowed papers before a wallet Item leaves play.
+
+    Possess / spill / duplicate consolidation must never zero migrated cash.
+    """
+    if character is None or wallet_item is None:
+        return
+    cash = wallet_total_cents(wallet_item)
+    if cash > 0:
+        try:
+            d0 = int(getattr(character, "dollars", 0) or 0)
+            c0 = int(getattr(character, "cents", 0) or 0)
+        except (TypeError, ValueError):
+            d0, c0 = 0, 0
+        total = d0 * 100 + c0 + cash
+        ld, lc = divmod(total, 100)
+        character.dollars = ld
+        character.cents = lc
+        set_wallet_cash(wallet_item, 0, 0)
+    inv = getattr(character, "inventory", None)
+    if inv is None:
+        character.inventory = []
+        inv = character.inventory
+    for piece in list(wallet_contents(wallet_item)):
+        wallet_contents(wallet_item).remove(piece)
+        if piece not in inv:
+            inv.append(piece)
+    wallet_item.container_worn = None
+    containers = ensure_containers_map(character)
+    if containers.get(WALLET_SLOT) is wallet_item:
+        containers[WALLET_SLOT] = None
+
+
+def transfer_worn_wallet_to_character(dest, source):
+    """Move the worn pocket wallet from ``source`` onto ``dest``.
+
+    Celestial discorporate leaves mortal wallet + cash on the living husk;
+    re-embody pulls it back onto the Mantle. Cash is never destroyed.
+    """
+    if dest is None or source is None:
+        return None
+    wallet = designated_wallet(source)
+    if wallet is None:
+        return None
+
+    src_containers = ensure_containers_map(source)
+    src_containers[WALLET_SLOT] = None
+    src_inv = getattr(source, "inventory", None) or []
+    if wallet in src_inv:
+        src_inv.remove(wallet)
+
+    dest_inv = getattr(dest, "inventory", None)
+    if dest_inv is None:
+        dest.inventory = []
+        dest_inv = dest.inventory
+
+    dest_wallet = designated_wallet(dest)
+    if dest_wallet is not None and dest_wallet is not wallet:
+        _merge_wallet_into(dest_wallet, wallet)
+        safeguard_wallet_item_destruction(source, wallet)
+        if wallet in src_inv:
+            src_inv.remove(wallet)
+        rebind_wallet_from_inventory(source)
+        rebind_wallet_from_inventory(dest)
+        return dest_wallet
+
+    dest_containers = ensure_containers_map(dest)
+    dest_containers[WALLET_SLOT] = wallet
+    wallet.container_worn = WALLET_SLOT
+    if wallet not in dest_inv:
+        dest_inv.append(wallet)
+    rebind_wallet_from_inventory(source)
+    rebind_wallet_from_inventory(dest)
+    return wallet
+
+
+def recover_orphan_wallet_cash(character):
+    """Re-wear a pocket wallet from inventory or merge its cash to loose bills."""
+    if character is None:
+        return False
+    if designated_wallet(character) is not None:
+        migrate_character_cash_to_wallet(character)
+        return False
+    wallets = _inventory_wallets(character)
+    if not wallets:
+        return False
+    richest = max(wallets, key=lambda piece: (wallet_total_cents(piece), id(piece)))
+    if wallet_total_cents(richest) > 0 or wallet_contents(richest):
+        wear_wallet(character, richest)
+        migrate_character_cash_to_wallet(character)
+        consolidate_duplicate_wallets(character)
+        return True
+    wear_wallet(character, richest)
+    return True
+
+
 def consolidate_duplicate_wallets(character):
     """Merge spare wallets into the worn one and drop empty duplicates."""
     wallet_item = designated_wallet(character)
+    if wallet_item is None:
+        recover_orphan_wallet_cash(character)
+        wallet_item = designated_wallet(character)
     if wallet_item is None:
         return 0
     inv = getattr(character, "inventory", None) or []
@@ -251,20 +368,9 @@ def consolidate_duplicate_wallets(character):
     for piece in list(inv):
         if piece is wallet_item or not is_wallet_item(piece):
             continue
-        spare_cash = wallet_total_cents(piece)
-        if spare_cash > 0:
-            credit_wallet_cash(wallet_item, spare_cash)
-            set_wallet_cash(piece, 0, 0)
-        spare_contents = wallet_contents(piece)
-        worn_contents = wallet_contents(wallet_item)
-        cap = wallet_capacity(wallet_item)
-        for inner in list(spare_contents):
-            if len(worn_contents) >= cap:
-                break
-            spare_contents.remove(inner)
-            worn_contents.append(inner)
+        _merge_wallet_into(wallet_item, piece)
         if wallet_total_cents(piece) == 0 and not wallet_contents(piece):
-            piece.container_worn = None
+            safeguard_wallet_item_destruction(character, piece)
             if piece in inv:
                 inv.remove(piece)
             removed += 1

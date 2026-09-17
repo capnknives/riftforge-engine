@@ -95,7 +95,7 @@ _TARGET_SPECS = {
     "fingers": ("hands", "body", "fingers", "deadened"),
     # Low line -- legs / feet, mobility.
     "hip": ("legs", "low", "hip", "unsteady"),
-    "lead_calf": ("legs", "low", "lead calf", "hobbled"),
+    "lead_calf": ("legs", "low", "calf", "hobbled"),
     "thigh": ("legs", "low", "thigh", "hobbled"),
     "knee": ("legs", "low", "knee", "hobbled"),
     "shin": ("legs", "low", "shin", None),
@@ -191,6 +191,8 @@ def resolve_called_shot(value):
         return "lower_ribs"
     if key in ("lower_rib",):
         return "lower_ribs"
+    if key in ("calf", "lead_calf"):
+        return "lead_calf"
     if key in TARGETS:
         return key
     for tid, spec in TARGETS.items():

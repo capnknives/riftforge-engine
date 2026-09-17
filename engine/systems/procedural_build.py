@@ -17,6 +17,7 @@ from engine import map_store
 from engine import world_maps
 from engine.command_support import DIRECTIONS
 from engine.room_naming import split_structured_title, street_hub_leaf
+from engine.room_vnum import lookup_room
 
 
 # Look-name pattern for apartment corridors: "Apartment Floor B" or
@@ -278,7 +279,7 @@ def _stamp_home_layouts(game, street_room, new_rooms):
 
 
 def _room_look_name(room):
-    """Player-facing room name (title preferred over storage key)."""
+    """Player-facing room name (title preferred over leftover alias)."""
     if room is None:
         return ""
     if hasattr(room, "look_title"):
@@ -676,6 +677,9 @@ def _find_street_home_room(rooms, street, addr, sub):
     hit = rooms.get(legacy)
     if hit is not None:
         return hit
+    for room in rooms.values():
+        if getattr(room, "legacy_key", None) == legacy:
+            return room
     addr_s = str(addr)
     sub_l = str(sub).lower()
     street_s = str(street)
@@ -886,6 +890,7 @@ def _porch_and_living_shell(
         porch["zone"] = zone
 
     living_seeds = [
+        {"item": "scarred_couch"},
         {"item": "battered_tv"},
         {"item": "tabletop_radio"},
         {"item": "house_landline"},
@@ -1311,7 +1316,7 @@ def _collect_wipe_keys(game, hub, keep):
         dest_key = getattr(dest, "key", None) if dest is not None else None
         if not dest_key or dest_key in blocked:
             continue
-        room = game.rooms.get(dest_key)
+        room = lookup_room(game, dest_key)
         if room is None:
             continue
         if not _is_neighborhood_wipe_candidate(room, hub):
@@ -1321,14 +1326,14 @@ def _collect_wipe_keys(game, hub, keep):
     seen = set(blocked) | doomed
     while queue:
         key = queue.pop()
-        room = game.rooms.get(key)
+        room = lookup_room(game, key)
         if room is None:
             continue
         for dest in (getattr(room, "exits", None) or {}).values():
             dest_key = getattr(dest, "key", None) if dest is not None else None
             if not dest_key or dest_key in seen:
                 continue
-            other = game.rooms.get(dest_key)
+            other = lookup_room(game, dest_key)
             if other is None:
                 continue
             if not _is_neighborhood_wipe_candidate(other, hub):
@@ -1478,8 +1483,8 @@ def populate_neighborhood(
             dug_fresh = True
             dest = (getattr(room, "exits", None) or {}).get(canon)
 
-        hub = dest if hasattr(dest, "exits") else game.rooms.get(
-            getattr(dest, "key", dest)
+        hub = dest if hasattr(dest, "exits") else lookup_room(
+            game, getattr(dest, "key", dest)
         )
         if hub is None:
             return False, (
@@ -1822,7 +1827,7 @@ def populate_fix_beds(game):
             if e.get("key")
         }
         for room_key in keys:
-            live = game.rooms.get(room_key)
+            live = lookup_room(game, room_key)
             entry = by_key.get(room_key)
             if live is None or entry is None:
                 continue
@@ -2060,8 +2065,8 @@ def heal_civic_plaza_street_homes(game):
 
     Civic construction and populate homes treated Town Square as a street
     because Square is an address suffix. Idempotent. Relocates occupants
-    onto the plaza, clears home_room_key, deletes the house rooms, and
-    rewrites zone JSON when map_store can resolve the file.
+    onto the plaza, clears ``home_room_key`` (plazas are not homes), and
+    deletes the house rooms in memory. Git SoT zone JSON is not rewritten.
 
     Returns a stats dict for logs / targeted smoke.
     """
@@ -2082,11 +2087,12 @@ def heal_civic_plaza_street_homes(game):
         for character in _iter_game_characters(game, rooms):
             home_key = getattr(character, "home_room_key", None)
             if home_key in doomed:
-                character.home_room_key = getattr(plaza, "key", None)
+                # Plazas are civic space, not lodging -- clear the stamp.
+                character.home_room_key = None
                 stats["cleared_homes"] += 1
         try:
             removed, _msg = map_store.delete_hand_rooms(
-                game, plaza, doomed, relocate_to=plaza,
+                game, plaza, doomed, relocate_to=plaza, persist=False,
             )
         except (ValueError, OSError, TypeError):
             removed = _purge_rooms_live(game, doomed, relocate=plaza)
@@ -2117,7 +2123,7 @@ def heal_stray_street_homes_on_invalid_hubs(game):
 
     Cemetery Road, Main Street spine, lake/forest connectors, and similar
     rooms match address suffixes but lack the ``populate neighborhood``
-    residential stamp. Idempotent; rewrites zone JSON when possible.
+    residential stamp. Idempotent. Live graph only — Git SoT is not rewritten.
     """
     stats = {"hubs": 0, "removed_rooms": 0, "cleared_homes": 0}
     if game is None:
@@ -2138,11 +2144,11 @@ def heal_stray_street_homes_on_invalid_hubs(game):
         for character in _iter_game_characters(game, rooms):
             home_key = getattr(character, "home_room_key", None)
             if home_key in doomed:
-                character.home_room_key = getattr(hub, "key", None)
+                character.home_room_key = None
                 stats["cleared_homes"] += 1
         try:
             removed, _msg = map_store.delete_hand_rooms(
-                game, hub, doomed, relocate_to=hub,
+                game, hub, doomed, relocate_to=hub, persist=False,
             )
         except (ValueError, OSError, TypeError):
             removed = _purge_rooms_live(game, doomed, relocate=hub)
@@ -2265,7 +2271,7 @@ def populate_fix_shell(game):
             if e.get("key")
         }
         for room_key in keys:
-            live = game.rooms.get(room_key)
+            live = lookup_room(game, room_key)
             entry = by_key.get(room_key)
             if live is None or entry is None:
                 continue
@@ -2274,7 +2280,7 @@ def populate_fix_shell(game):
             for direction, dest_key in (entry.get("exits") or {}).items():
                 if not str(direction).isdigit():
                     continue
-                dest = game.rooms.get(dest_key)
+                dest = lookup_room(game, dest_key)
                 if dest is not None:
                     live.exits[direction] = dest
 

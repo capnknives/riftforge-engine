@@ -77,6 +77,9 @@ class _Bullet(NamedTuple):
     known_id: int  # 0 when the bullet has no existing ``#N`` stamp
     sort_ts: str
     staff_only: bool
+    # Post-stamp remainder (tags + headline). Stored on the ledger so
+    # ``changes`` can list without re-parsing every fragment at boot.
+    summary: str
 
 
 def canonical_fragment_slug(name_or_path: str) -> str:
@@ -159,7 +162,10 @@ def _scan_bullet_file(path: str, *, unreleased_only: bool) -> list[_Bullet]:
     from engine.changelog_audience import summary_is_staff_only
 
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
+        # utf-8-sig drops a Windows UTF-8 BOM (PowerShell 5 Set-Content
+        # -Encoding utf8). A leading U+FEFF makes _BULLET_RE miss the line,
+        # so the fragment never mints and never shows in changes.
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
             lines = fh.readlines()
     except OSError:
         return []
@@ -190,6 +196,7 @@ def _scan_bullet_file(path: str, *, unreleased_only: bool) -> list[_Bullet]:
                 known_id=known_id,
                 sort_ts=sort_ts,
                 staff_only=staff_only,
+                summary=_staff_blob_from_match(match),
             )
         )
     return out
@@ -317,7 +324,9 @@ _SCAN_SIGNATURE_CACHE: dict[str, tuple] = {}
 # game-child process (every copyover) can skip ``_scan_bullets`` too.
 # The in-process cache is empty after ``os._exit`` / watcher respawn;
 # without this, Game() re-read every CHANGELOG.d fragment on each Veil.
-_SCAN_SIGNATURE_META_KEY = "dir_scan_signature_v1"
+# v2: force one full rescan after utf-8-sig mint (v1 skip could freeze a
+# BOM fragment that never produced a ledger row).
+_SCAN_SIGNATURE_META_KEY = "dir_scan_signature_v2"
 
 
 def reset_source_listing_memo() -> None:
@@ -578,8 +587,16 @@ def set_next_id(conn: sqlite3.Connection, sequence: str, next_id: int) -> None:
         raise
 
 
-def plan_new_assignments(root: str) -> dict[str, list[tuple[str, int, str]]]:
-    """Compute ``{sequence: [(slug, id, sort_ts), ...]}`` in mint order.
+def _audience_json_for_summary(summary: str) -> str:
+    """JSON list of game-package audience tags for a stored summary."""
+    from engine.changelog_audience import entry_audience, strip_leading_tags
+
+    tags, _rest = strip_leading_tags(summary or "")
+    return json.dumps(sorted(entry_audience(tags)))
+
+
+def plan_new_assignments(root: str) -> dict[str, list[tuple]]:
+    """Compute ``{sequence: [(slug, id, sort_ts, summary, audience), ...]}``.
 
     Ordering / continuity rule (oldest-first, per sequence):
 
@@ -605,7 +622,7 @@ def plan_new_assignments(root: str) -> dict[str, list[tuple[str, int, str]]]:
     bullets = _scan_bullets(root)
     already = slug_id_map(root)
 
-    plans: dict[str, list[tuple[str, int, str]]] = {"player": [], "staff": []}
+    plans: dict[str, list[tuple]] = {"player": [], "staff": []}
     used_ids: dict[str, set[int]] = {"player": set(), "staff": set()}
     next_free: dict[str, int] = {"player": 1, "staff": 1}
 
@@ -634,21 +651,40 @@ def plan_new_assignments(root: str) -> dict[str, list[tuple[str, int, str]]]:
             new_id = next_free[sequence]
         used_ids[sequence].add(new_id)
         next_free[sequence] = max(next_free[sequence], new_id + 1)
-        plans[sequence].append((slug, new_id, bullet.sort_ts))
+        plans[sequence].append(
+            (
+                slug,
+                new_id,
+                bullet.sort_ts,
+                bullet.summary,
+                _audience_json_for_summary(bullet.summary),
+            )
+        )
 
     return plans
 
 
 def apply_assignments(
-    root: str, plans: dict[str, list[tuple[str, int, str]]],
+    root: str, plans: dict[str, list[tuple]],
 ) -> int:
     """Insert planned rows and advance each sequence's counter."""
     conn = connect(root)
     inserted = 0
     try:
         for sequence, rows in plans.items():
-            for slug, entry_id, sort_ts in rows:
-                insert_with_known_id(conn, slug, sequence, entry_id, sort_ts=sort_ts)
+            for row in rows:
+                slug, entry_id, sort_ts = row[0], row[1], row[2]
+                summary = row[3] if len(row) > 3 else None
+                audience = row[4] if len(row) > 4 else None
+                insert_with_known_id(
+                    conn,
+                    slug,
+                    sequence,
+                    entry_id,
+                    sort_ts=sort_ts,
+                    summary=summary,
+                    audience=audience,
+                )
                 inserted += 1
             existing_max = max_id(root, sequence)
             if rows or existing_max:
@@ -656,6 +692,63 @@ def apply_assignments(
     finally:
         conn.close()
     return inserted
+
+
+def backfill_missing_prose(root: str | None = None, *, log_prefix: str | None = None) -> int:
+    """Fill empty ledger ``summary`` / ``audience`` from markdown (once).
+
+    Older mint rows stored only ``sort_ts``. ``changes`` now lists from the
+    ledger, so those columns must be populated. When every row already has
+    a summary this is a cheap SQL check and does not walk CHANGELOG.d.
+    """
+    root = root or _repo_root_from_here()
+    conn = connect(root)
+    try:
+        missing = conn.execute(
+            "SELECT slug FROM entries WHERE summary IS NULL OR TRIM(summary) = ''"
+        ).fetchall()
+        slugs = [row["slug"] for row in missing]
+    finally:
+        conn.close()
+    if not slugs:
+        return 0
+
+    bullets_by_slug = {}
+    for bullet in _scan_bullets(root):
+        slug = bullet.slug or _legacy_monolith_slug(bullet)
+        slug = canonical_fragment_slug(slug) or slug
+        bullets_by_slug[slug] = bullet
+
+    conn = connect(root)
+    updated = 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for slug in slugs:
+            bullet = bullets_by_slug.get(slug)
+            if bullet is None:
+                continue
+            summary = bullet.summary
+            audience = _audience_json_for_summary(summary)
+            conn.execute(
+                "UPDATE entries SET summary = ?, audience = ? WHERE slug = ?",
+                (summary, audience, slug),
+            )
+            updated += 1
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.close()
+    if log_prefix and updated:
+        print(
+            f"{log_prefix} changelog_ledger backfilled prose for {updated} row(s)",
+            flush=True,
+        )
+    return updated
 
 
 def _mixed_case_fragment_slugs(root: str) -> list[str]:
@@ -772,6 +865,7 @@ def assign_new_slugs(
 
     sig = _dir_signature(root)
     if _SCAN_SIGNATURE_CACHE.get(cache_key) == sig:
+        backfill_missing_prose(root, log_prefix=log_prefix)
         return 0
     encoded = _encode_scan_signature(sig)
     try:
@@ -780,6 +874,7 @@ def assign_new_slugs(
         persisted = None
     if persisted == encoded:
         _SCAN_SIGNATURE_CACHE[cache_key] = sig
+        backfill_missing_prose(root, log_prefix=log_prefix)
         return 0
 
     plans = plan_new_assignments(root)
@@ -792,12 +887,14 @@ def assign_new_slugs(
 
     if log_prefix and minted:
         for sequence, rows in plans.items():
-            for slug, entry_id, _sort_ts in rows:
+            for packed in rows:
+                slug, entry_id = packed[0], packed[1]
                 print(
                     f"{log_prefix} changelog_ledger minted #{entry_id} "
                     f"({sequence}) for {slug}",
                     flush=True,
                 )
+    backfill_missing_prose(root, log_prefix=log_prefix)
     return minted
 
 

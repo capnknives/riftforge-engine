@@ -72,6 +72,7 @@ _quest_idle_nudge_extra_handler = None
 _quest_begin_side_effect = None
 _quest_ensure_giver = None
 _quest_step_stamp_handler = None
+_quest_step_effects_handler = None
 _quest_npc_done_line_skip = None
 _quest_empty_log_hint = None
 _quest_no_offers_hint = None
@@ -164,6 +165,12 @@ def set_quest_step_stamp_handler(fn):
     """Register fn(character, game) when a deferred opener step is queued."""
     global _quest_step_stamp_handler
     _quest_step_stamp_handler = fn
+
+
+def set_quest_step_effects_handler(fn):
+    """Register fn(character, quest_id, step, game) for step ``effects``."""
+    global _quest_step_effects_handler
+    _quest_step_effects_handler = fn
 
 
 def set_quest_npc_done_line_skip(fn):
@@ -1156,6 +1163,16 @@ def _announce_current_step(character, quest_id, game=None, *, include_seek=False
     hint = step.get("hint")
     if hint:
         _send(character, _hint_line(character, hint), role="prose")
+    if _quest_step_effects_handler is not None:
+        try:
+            _quest_step_effects_handler(character, quest_id, step, game)
+        except Exception as exc:
+            _quest_ops(
+                game,
+                f"step_effects_{character.key}",
+                f"step effects failed char={character.key} quest={quest_id}",
+                exc=exc,
+            )
     try:
         if _quest_seek_tip_handler is not None:
             tip = _quest_seek_tip_handler(character, game)
@@ -1518,9 +1535,9 @@ def abandon(character, quest_id=None, game=None, *, confirm=False):
             "(or 'quests abandon confirm' when it is your only open case).",
         )
     pin_map = _get_flag(character, quest_id, "pin_map") or data.get("pin_npcs")
+    _set_status(character, quest_id, "abandoned")
     if pin_map and game is not None:
         _unpin_mentors(game, pin_map)
-    _set_status(character, quest_id, "abandoned")
     return True, f"You abandon the case: {data.get('title', quest_id)}."
 
 
@@ -1638,11 +1655,20 @@ def _match_when(character, when, event, payload, *, quest_id=None, game=None):
         want = (when.get("verb") or "").lower()
         got = (payload.get("verb") or "").lower()
         aliases = [a.lower() for a in (when.get("aliases") or [])]
-        return got == want or got in aliases
+        if got != want and got not in aliases:
+            return False
+        # Success-path notify only (commands.py verb dispatch has no ok).
+        if when.get("require_ok") and not payload.get("ok"):
+            return False
+        return True
     if kind == "any_verbs" and event == "verb":
         got = (payload.get("verb") or "").lower()
         verbs = [str(v).lower() for v in (when.get("verbs") or [])]
-        return got in verbs
+        if got not in verbs:
+            return False
+        if when.get("require_ok") and not payload.get("ok"):
+            return False
+        return True
     if kind == "true_form" and event == "verb":
         if (payload.get("verb") or "").lower() == "form":
             return bool(getattr(character, "true_form", False))
@@ -2126,6 +2152,11 @@ def _unpin_mentors(game, pin_map):
             continue
         if hasattr(npc, "_quest_mentor_post_key"):
             npc._quest_mentor_post_key = None
+    # Re-run reach with an empty map so SUPERS can drop stay_home parks
+    # now that this quest no longer needs those mentors.
+    from engine import hooks as hooks_mod
+
+    hooks_mod.ensure_quest_mentor_reach(game, {})
 
 
 def active_gate_step(character):
@@ -2210,15 +2241,16 @@ def restart(character, quest_id=None, game=None, *, confirm=False):
             f"'quests restart {shown} confirm'.",
         )
     entry = _entry(character, quest_id)
+    pin_map = None
     if entry and entry.get("status") == "active":
         pin_map = (entry.get("flags") or {}).get("pin_map") or data.get(
             "pin_npcs"
         )
-        if pin_map and game is not None:
-            _unpin_mentors(game, pin_map)
     prog = _progress(character)
     if quest_id in prog:
         del prog[quest_id]
+    if pin_map and game is not None:
+        _unpin_mentors(game, pin_map)
     return begin(character, quest_id, game=game, force=True)
 
 

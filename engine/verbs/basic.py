@@ -33,6 +33,7 @@ import re
 import engine.systems.economy as economy_wallet
 from engine import map_ui
 from engine import world_maps
+from engine.systems.civic_fixture import floor_items_excluding_fixtures
 
 from command_support import (
     _can_see_spirit,
@@ -41,6 +42,7 @@ from command_support import (
     floor_item_look_lines,
     format_floor_items_for_look,
     visible_floor_items,
+    split_shell_args,
     _find_character,
     _find_item,
     _find_carried_item_for_open,
@@ -56,6 +58,7 @@ from command_support import (
     _staff_tags_hidden_in_look,
     _move_one,
     _pull_followers,
+    _pull_followers_to,
     require_here,
     broadcast_here,
     send_if_online,
@@ -76,8 +79,9 @@ def _exit_dest_room(dest, game):
         return None
     if not isinstance(dest, str):
         return dest
-    rooms = getattr(game, "rooms", None) or {}
-    return rooms.get(dest)
+    from engine.room_vnum import lookup_room
+
+    return lookup_room(game, dest)
 
 
 def _exit_dest_look_title(dest, game, *, room, direction, character):
@@ -95,6 +99,26 @@ def _exit_dest_look_title(dest, game, *, room, direction, character):
     if isinstance(dest, str):
         return dest
     return None
+
+
+def _exit_label_for_look(dest, game, *, room, direction, character):
+    """Exit label + closed flag for look / exits / SR paths.
+
+    Closed structure doors never leak the destination chamber name --
+    only a shut-door label (bug report 1545).
+    """
+    from engine import hooks
+    from engine.systems import doors as doors_engine
+
+    closed = hooks.look_exit_door_closed(
+        room, direction, dest, game=game, character=character,
+    )
+    if closed:
+        return doors_engine.closed_exit_look_label(direction), True
+    title = _exit_dest_look_title(
+        dest, game, room=room, direction=direction, character=character,
+    )
+    return title, bool(closed)
 
 
 def _persist_or_warn(character, game, *, already_told=None):
@@ -171,7 +195,9 @@ def _look_room_section(character, game, section):
     if section == "items":
         floor_item_objs = visible_floor_items(
             character,
-            [o for o in room.contents if isinstance(o, Item)],
+            floor_items_excluding_fixtures(
+                [o for o in room.contents if isinstance(o, Item)],
+            ),
         )
         item_lines = format_floor_items_for_look(
             floor_item_look_lines(floor_item_objs, character),
@@ -299,6 +325,53 @@ def cmd_nearby(character, args, game):
     _look_room_section(character, game, "souls")
 
 
+_LOOK_WINDOW_ALIASES = frozenset({
+    "window", "windows", "out", "outside", "outdoors",
+    "out the window", "out window", "through the window",
+})
+
+
+def _look_out_window(character, game):
+    """Glance through glass -- indoor rooms only (OOC Hasao).
+
+    Uses an outdoor neighbor's prose when one is linked; otherwise a
+    short generic street glimpse. Never names VNUMs.
+    """
+    room = getattr(character, "location", None)
+    if room is None:
+        character.session.send("You have no window here.")
+        return
+    if getattr(room, "outdoor", False):
+        character.session.send(
+            "You're already outside. The sky does not need a window."
+        )
+        return
+    outdoor = None
+    exits = getattr(room, "exits", None) or {}
+    for dest in exits.values():
+        if dest is not None and getattr(dest, "outdoor", False):
+            outdoor = dest
+            break
+    if outdoor is not None:
+        prose = (getattr(outdoor, "description", None) or "").strip()
+        if prose:
+            clip = prose.split(".")[0].strip()
+            if clip:
+                character.session.send(
+                    f"Through the glass: {clip}."
+                )
+                return
+        from engine.room_vnum import room_name
+        character.session.send(
+            f"Through the glass you see {room_name(outdoor)}."
+        )
+        return
+    character.session.send(
+        "Glass shows the street beyond -- sky, whoever is walking past, "
+        "and the weather sitting on the curb."
+    )
+
+
 def cmd_look(character, args, game, *, after_move=False):
     """Show the room (no args), look in a body (`look in <body>`), or look
     at one thing/person here (`look bob`).
@@ -314,7 +387,11 @@ def cmd_look(character, args, game, *, after_move=False):
     minimap after look (unless ``config maplook`` already embedded it).
     """
     from engine.command_support import send_asleep_world_closed
+    from engine import hooks
 
+    aware = hooks.maybe_sleep_dream_awareness(character, game)
+    if aware is not None:
+        character = aware
     if send_asleep_world_closed(character):
         return
 
@@ -322,6 +399,9 @@ def cmd_look(character, args, game, *, after_move=False):
     if stripped:
         # `look items` / `look souls` -- section only (#163).
         lower = stripped.lower()
+        if lower in _LOOK_WINDOW_ALIASES:
+            _look_out_window(character, game)
+            return
         section = _LOOK_SECTION_ALIASES.get(lower)
         if section:
             _look_room_section(character, game, section)
@@ -409,7 +489,9 @@ def cmd_look(character, args, game, *, after_move=False):
             extras.append(vista_line)
     # Pocket zone travel is separate from cardinal / in-out moves.
     zone_entries = getattr(room, "zone_entries", None) or {}
-    zone_entries = hooks.filter_zone_entries(character, room, zone_entries, game)
+    zone_entries = hooks.filter_zone_entries_look(
+        character, room, zone_entries, game,
+    )
     if zone_entries:
         hints = world_maps.zone_entry_look_hints(zone_entries)
         if hints:
@@ -425,7 +507,17 @@ def cmd_look(character, args, game, *, after_move=False):
     # [TRAIL] clutter -- suggestion #115 / SR speed-read.
     brief_auto = after_move and getattr(prefs, "brief", False)
     if stamped_entry and room.key != stamped_entry:
-        if getattr(room, "zone", None) or getattr(room, "zone_exit_to", None):
+        # Homestead interiors stamp zone=plot_id for membership but only the
+        # porch mouth is a zone exit (bug report 1532 — hallway zone hint).
+        homestead_interior = bool(getattr(room, "homestead_plot_id", None))
+        in_pocket_zone = (
+            not homestead_interior
+            and (
+                getattr(room, "zone", None)
+                or getattr(room, "zone_exit_to", None)
+            )
+        )
+        if in_pocket_zone:
             hub_label = _player_place_label(
                 game, stamped_entry, fallback="the zone exit mouth",
             )
@@ -527,7 +619,7 @@ def cmd_look(character, args, game, *, after_move=False):
                 continue
             # Dual-layer wilderness: exits point at self -- label what that
             # step approaches (Lebanon / bunker / terrain) for sighted + SR.
-            title = _exit_dest_look_title(
+            title, closed = _exit_label_for_look(
                 dest, game, room=exit_room, direction=direction, character=character,
             )
             if not title:
@@ -535,13 +627,6 @@ def cmd_look(character, args, game, *, after_move=False):
             if str(direction).isdigit():
                 from engine.room_naming import strip_address_from_exit_label
                 title = strip_address_from_exit_label(direction, title)
-            closed = hooks.look_exit_door_closed(
-                exit_room, direction, dest, game=game, character=character,
-            )
-            if closed:
-                from engine.systems.doors import LOOK_DOOR_CLOSED_SUFFIX
-                if LOOK_DOOR_CLOSED_SUFFIX not in title:
-                    title = f"{title}{LOOK_DOOR_CLOSED_SUFFIX}"
             exits.append((direction, title, closed))
         for direction, title in hooks.room_look_virtual_exits(
             room, character, game,
@@ -555,7 +640,9 @@ def cmd_look(character, args, game, *, after_move=False):
         # Identical catalog stacks collapse to ``N X are here`` (digits).
         floor_item_objs = visible_floor_items(
             character,
-            [o for o in room.contents if isinstance(o, Item)],
+            floor_items_excluding_fixtures(
+                [o for o in room.contents if isinstance(o, Item)],
+            ),
         )
         floor_items = format_floor_items_for_look(
             floor_item_look_lines(floor_item_objs, character),
@@ -608,7 +695,8 @@ def cmd_look(character, args, game, *, after_move=False):
     from engine import room_vnum as room_vnum_mod
     plain_name = room_vnum_mod.room_name(room)
     staff_vnum = None
-    if getattr(prefs, "gm_mode", False):
+    from engine.command_support import staff_room_vnums_in_look
+    if staff_room_vnums_in_look(character):
         raw_v = getattr(room, "vnum", None)
         if raw_v is not None and str(raw_v).strip():
             try:
@@ -680,10 +768,10 @@ def cmd_look(character, args, game, *, after_move=False):
     )
     lag_watch.stamp_move_phase(game, "look_format", t_fmt)
     character.session.send("\r\n".join(lines))
-    # Soft fear nudge: weak player Vampires sense a co-located Slayer.
+    # Soft fear nudge: any monster senses a co-located Called Slayer.
     # (hook -- no-op / None without a game installed; Phase 2 purity.)
     from engine import hooks
-    fear = hooks.vampire_fear_message(character, room)
+    fear = hooks.monster_sense_message(character, room)
     if fear:
         character.session.send(fear)
     # Procurer case read / other game tells after bare look.
@@ -768,6 +856,9 @@ def cmd_exits(character, args, game):
             "but you cannot read the exits."
         )
         return
+    # Porch doors and interior links can vanish after stale world heals; the
+    # game may repair the plot graph once per session before we list exits.
+    hooks.ensure_homestead_plot_graph_for_actor(character, game)
     from engine.systems import vehicles as vehicles_mod
 
     exit_room = vehicles_mod.exit_source_room(game, room)
@@ -779,7 +870,7 @@ def cmd_exits(character, args, game):
             continue
         if not vision_mod.character_knows_exit(character, exit_room, direction):
             continue
-        title = _exit_dest_look_title(
+        title, closed = _exit_label_for_look(
             dest, game, room=exit_room, direction=direction, character=character,
         )
         if not title:
@@ -787,13 +878,6 @@ def cmd_exits(character, args, game):
         if str(direction).isdigit():
             from engine.room_naming import strip_address_from_exit_label
             title = strip_address_from_exit_label(direction, title)
-        closed = hooks.look_exit_door_closed(
-            exit_room, direction, dest, game=game, character=character,
-        )
-        if closed:
-            from engine.systems.doors import LOOK_DOOR_CLOSED_SUFFIX
-            if LOOK_DOOR_CLOSED_SUFFIX not in title:
-                title = f"{title}{LOOK_DOOR_CLOSED_SUFFIX}"
         lines.append((direction, title, closed))
     if not lines:
         character.session.send("Exits: none you can see.")
@@ -951,9 +1035,14 @@ def cmd_map(character, args, game):
         game=game,
     )
     if rendered is None:
-        character.session.send(
-            "No map here. (Need a room -- try looking first.)"
-        )
+        if room is None:
+            character.session.send(
+                "No map here. (Need a room -- try looking first.)"
+            )
+        else:
+            character.session.send(
+                "No map here. (This room has no exits to sketch.)"
+            )
         return
     # render_* joins with \\n; convert to telnet \\r\\n for the wire.
     character.session.send(rendered.replace("\n", "\r\n"))
@@ -1003,12 +1092,13 @@ def _grid_meta_for_room(game, room):
     height = meta.get("height")
     wrap = bool(meta.get("wrap"))
     if width is None or height is None:
-        atlas = getattr(game, "overland_atlas", None)
-        if atlas is not None and getattr(room, "grid_prefix", None) == getattr(
-            atlas, "prefix", None
-        ):
-            width = getattr(atlas, "width", None)
-            height = getattr(atlas, "height", None)
+        prefix = getattr(room, "grid_prefix", None)
+        for attr in ("overland_atlas", "frontierland_atlas"):
+            atlas = getattr(game, attr, None)
+            if atlas is not None and prefix == getattr(atlas, "prefix", None):
+                width = getattr(atlas, "width", None)
+                height = getattr(atlas, "height", None)
+                break
     return width, height, wrap
 
 
@@ -1153,7 +1243,7 @@ def _directional_map_lines(character, game):
             continue
         if not vision_mod.character_knows_exit(character, room, direction):
             continue
-        dest_name = _exit_dest_look_title(
+        dest_name, _closed = _exit_label_for_look(
             dest, game, room=room, direction=direction, character=character,
         )
         if dest_name:
@@ -1172,6 +1262,45 @@ def _directional_map_lines(character, game):
     )
     lines.append("")
     return lines
+
+
+def _split_look_detail_query(query):
+    """Split ``look 'Earl Jacobs' head`` into (who, extra).
+
+    Uses shell quoting so a two-word name stays one token. One-token
+    queries are not extras -- those stay ordinary look <name>.
+    """
+    tokens = split_shell_args(query)
+    if len(tokens) < 2:
+        return None, None
+    extra = (tokens[-1] or "").strip()
+    who = " ".join(tokens[:-1]).strip()
+    if not who or not extra:
+        return None, None
+    return who, extra
+
+
+def _try_look_person_detail(character, query, room, can_see):
+    """``look ayla head`` -- True when a person+extra was handled."""
+    who, extra = _split_look_detail_query(query)
+    if not who or not extra:
+        return False
+    chars = list(room.characters()) if room is not None else []
+    target = _find_character(who, chars, self_character=character)
+    if target is None:
+        return False
+    if target is not character:
+        if not can_see:
+            return False
+        if _is_presence_hidden(character, target):
+            if not _staff_tags_hidden_in_look(character, target):
+                return False
+    from engine import hooks
+    detail = hooks.look_detail_for(character, target, extra)
+    if detail is None:
+        return False
+    character.session.send(detail)
+    return True
 
 
 def _look_at(character, query):
@@ -1204,9 +1333,42 @@ def _look_at(character, query):
         return True
 
     room = character.location
+    # Authored exit look-desc (``look north``) before generic targeting.
+    if room is not None:
+        from engine.command_support import resolve_walk_direction
+
+        direction = resolve_walk_direction(query.strip().lower(), room)
+        if direction:
+            descs = getattr(room, "exit_descs", None) or {}
+            prose = None
+            if isinstance(descs, dict):
+                prose = descs.get(direction) or descs.get(direction.lower())
+            if prose:
+                character.session.send(prose)
+                return True
+        # Extra-descs wait until after people / items so ``look Mira``
+        # cannot hit an authored keyword that merely contains "mira".
     # Limbo is not a visible room -- walking ``room.characters()`` here
     # used to AttributeError. Inventory still works below (tactile).
     can_see = room is not None and vision_mod.can_see_room(character, room)
+
+    # Staff inspect by INUM (AD00001). Players never target instance numbers.
+    from engine.command_support import (
+        find_staff_item_by_inum,
+        staff_room_vnums_in_look,
+    )
+    from engine.item_inum import staff_item_label
+
+    staff_hit = find_staff_item_by_inum(
+        character, query, room=room, can_see=can_see,
+    )
+    if staff_hit:
+        character.session.send(staff_item_label(staff_hit))
+        character.session.send(staff_hit.description or "")
+        from engine import hooks
+        game = getattr(getattr(character, "session", None), "game", None)
+        hooks.after_look_item(character, staff_hit, game)
+        return True
 
     # When you can see the room, people here beat carried kit on substring
     # collisions (bug #344: ``look Mira`` must not hit a ``mirror`` in pack).
@@ -1248,10 +1410,18 @@ def _look_at(character, query):
     # you are holding). Floor loot waits until vision clears below.
     item = _find_item(query, character.inventory, character=character)
     if item:
+        if staff_room_vnums_in_look(character):
+            character.session.send(staff_item_label(item))
         character.session.send(item.description)
         from engine import hooks
         game = getattr(getattr(character, "session", None), "game", None)
         hooks.after_look_item(character, item, game)
+        return True
+
+    # look ayla head / look me thumb -- after a full-query miss. Self works
+    # in the dark; other people need light. Do this before floor items so
+    # a person in the room wins over a kit item named the same extra.
+    if _try_look_person_detail(character, query, room, can_see):
         return True
 
     if not can_see:
@@ -1278,11 +1448,24 @@ def _look_at(character, query):
                     character, "muted", "[SIGN] Wayfinding",
                 )
                 character.session.send(header)
+        if staff_room_vnums_in_look(character):
+            character.session.send(staff_item_label(item))
         character.session.send(desc)
         from engine import hooks
         game = getattr(getattr(character, "session", None), "game", None)
         hooks.after_look_item(character, item, game)
         return True
+
+    # Authored room extra-desc (look painting) — after people and items so
+    # a live character or floor object always wins the same keyword.
+    extra_descs = getattr(room, "extra_descs", None) or {}
+    if extra_descs:
+        from engine.map_store import match_extra_desc_keyword
+
+        _key, extra_prose = match_extra_desc_keyword(query, extra_descs)
+        if extra_prose:
+            character.session.send(extra_prose)
+            return True
 
     return False
 
@@ -1427,7 +1610,21 @@ def cmd_sit(character, args, game):
 
 
 def cmd_stand(character, args, game):
-    """Stand up from sitting (bug #58). Resting/asleep still need 'wake'."""
+    """Stand up from sitting, or leave awake rest (bug report 1300)."""
+    if getattr(character, "asleep", False):
+        character.session.send("You're asleep -- type 'wake' to get up.")
+        return
+    if getattr(character, "resting", False):
+        from engine import hooks
+        hooks.cancel_rest(character)
+        character.session.send("You stand up from rest.")
+        room = getattr(character, "location", None)
+        if room is not None:
+            room.broadcast(
+                f"{_presence_face(character)} stands up from rest.",
+                exclude=character,
+            )
+        return
     if getattr(character, "sitting", False):
         character.sitting = False
         character.session.send("You stand up.")
@@ -1437,9 +1634,6 @@ def cmd_stand(character, args, game):
                 f"{_presence_face(character)} stands up.",
                 exclude=character,
             )
-        return
-    if getattr(character, "asleep", False) or getattr(character, "resting", False):
-        character.session.send("You're resting -- type 'wake' to get up.")
         return
     character.session.send("You're already standing.")
 
@@ -1453,7 +1647,13 @@ def cmd_move(character, direction, game):
     if blocked:
         character.session.send(blocked)
         return
-    if getattr(character, "asleep", False):
+    if getattr(character, "asleep", False) and not (
+        getattr(character, "is_sleep_dream_clone", False)
+        or (
+            getattr(character, "sleep_dream_tour", False)
+            and not getattr(character, "sleep_dream_clone_key", None)
+        )
+    ):
         character.session.send(
             "You're asleep -- type 'wake' before you can move."
         )
@@ -1477,6 +1677,11 @@ def cmd_move(character, direction, game):
         character.session.send("You're nowhere.")
         return
     dest = room.exits.get(direction)   # .get() returns None if there's no such exit
+    if not dest:
+        # Broken homestead graphs can drop porch doors; repair at most once
+        # when the game reports it actually rewired exits (hook -- no-op lean).
+        if hooks.ensure_homestead_plot_graph_for_actor(character, game):
+            dest = room.exits.get(direction)
     if not dest:                       # None is falsy -> no exit that way
         character.session.send("You can't go that way.")
         return                         # stop here; nothing else to do
@@ -1508,10 +1713,14 @@ def cmd_follow(character, args, game):
     helpers (start_following / stop_following) so Echo companions trail
     too. Breaks on disconnect via world.break_follows.
 
-    Staff GMs use a separate diagnostic tail (``staff_tailing``) so
-    ``follow`` does not form a Group or touch pack glue.
+    Staff actually piloting GM form use a separate diagnostic tail
+    (``staff_tailing``) so ``follow`` does not form a Group or touch pack
+    glue -- a staff account playing an immersion cast body with GM powers
+    off gets ordinary follow/group behavior like any other player (bug
+    report 1574).
     """
     from engine.command_support import (
+        in_active_gm_form,
         start_following,
         start_staff_tail,
         stop_following,
@@ -1519,7 +1728,7 @@ def cmd_follow(character, args, game):
     )
     from engine import group as group_mod
     name = args.strip()
-    if _is_gm(character):
+    if in_active_gm_form(character):
         if not name:
             if getattr(character, "staff_tailing", None) is not None:
                 stop_staff_tail(character)
@@ -1603,7 +1812,7 @@ def cmd_unfollow(character, args, game):
             return
         if result == "left":
             return
-    stop_following(character)
+    stop_following(character, declined=True, game=game)
 
 
 def cmd_group(character, args, game):
@@ -1655,13 +1864,19 @@ def cmd_group(character, args, game):
                 "(same as party invite). See help group."
             )
             return
-        target = game.find_character(rest) if game is not None else None
+        target = party_mod.resolve_invite_target(character, rest)
         if target is None:
             character.session.send(f"No one here named {rest!r}.")
             return
         ok, msg = party_mod.invite(character, target, game)
         character.session.send(msg)
-        if ok and getattr(target, "session", None) is not None:
+        # Echo auto-join still has a Session in idlemode -- only prompt
+        # when a live handshake is actually pending.
+        if (
+            ok
+            and party_mod.invite_pending_accept(target)
+            and getattr(target, "session", None) is not None
+        ):
             target.session.send(
                 f"{character.key} invites you to a party. "
                 "Type 'party accept' or 'party decline'."
@@ -1673,7 +1888,7 @@ def cmd_group(character, args, game):
                 "Usage: group merge <name>  -- fold your group into theirs."
             )
             return
-        target = game.find_character(rest) if game is not None else None
+        target = party_mod.resolve_invite_target(character, rest)
         if target is None:
             character.session.send(f"No one here named {rest!r}.")
             return
@@ -1891,15 +2106,25 @@ def cmd_party(character, args, game):
         return
     parts = raw.split()
     verb = parts[0]
-    if verb == "invite" and len(parts) >= 2:
+    if verb == "invite":
+        if len(parts) < 2:
+            character.session.send(
+                "Usage: party invite <name>  -- ask someone in the room "
+                "(see 'help party')."
+            )
+            return
         name = " ".join(parts[1:]).strip()
-        target = game.find_character(name) if game is not None else None
+        target = party_mod.resolve_invite_target(character, name)
         if target is None:
             character.session.send(f"No one here named {name!r}.")
             return
         ok, msg = party_mod.invite(character, target, game)
         character.session.send(msg)
-        if ok and getattr(target, "session", None) is not None:
+        if (
+            ok
+            and party_mod.invite_pending_accept(target)
+            and getattr(target, "session", None) is not None
+        ):
             target.session.send(
                 f"{character.key} invites you to a party. "
                 "Type 'party accept' or 'party decline'."
@@ -1938,13 +2163,36 @@ def _stop_following(character, silent=False):
     stop_following(character, silent=silent)
 
 
+def _transition_presence_line(template, watcher, presence, game):
+    """Format a leave/arrive template with viewer-relative presence face."""
+    if not template:
+        return ""
+    if "{name}" not in template:
+        return template
+    from engine import hooks
+    from engine.command_support import _presence_face
+
+    fallback = _presence_face(presence)
+    try:
+        face = hooks.presence_face_for(watcher, presence)
+    except Exception:
+        face = None
+    return template.format(name=face or fallback)
+
+
 def _do_transition(character, dest, game, leave_text, arrive_text):
     """Shared leave/arrive/look/encounter for enter, exit, in, out."""
     from engine import hooks
     from engine import group as group_mod
     if group_mod.block_live_group_move(character):
         return False
-    if getattr(character, "asleep", False):
+    if getattr(character, "asleep", False) and not (
+        getattr(character, "is_sleep_dream_clone", False)
+        or (
+            getattr(character, "sleep_dream_tour", False)
+            and not getattr(character, "sleep_dream_clone_key", None)
+        )
+    ):
         send_if_online(
             character,
             "You're asleep -- type 'wake' before you can move.",
@@ -1961,8 +2209,6 @@ def _do_transition(character, dest, game, leave_text, arrive_text):
 
         key = dest
         dest = room_vnum_mod.lookup_room(game, key)
-        if dest is None and game is not None:
-            dest = (getattr(game, "rooms", None) or {}).get(key)
     if dest is None:
         send_if_online(character, "You can't go that way.")
         return False
@@ -1970,13 +2216,28 @@ def _do_transition(character, dest, game, leave_text, arrive_text):
     if block_message:
         send_if_online(character, block_message)
         return False
+    presence = hooks.move_presence_actor(character, game)
     # True-invis staff presence -- same stealth as compass leave/arrive.
     stealth = is_staff_stealth_presence(character)
     if not stealth:
-        broadcast_here(character, leave_text, exclude=character)
+        room.broadcast(
+            lambda watcher: _transition_presence_line(
+                leave_text, watcher, presence, game,
+            ),
+            exclude=character,
+        )
     character.move_to(dest)
     if not stealth:
-        dest.broadcast(arrive_text, exclude=character)
+        dest.broadcast(
+            lambda watcher: _transition_presence_line(
+                arrive_text, watcher, presence, game,
+            ),
+            exclude=character,
+        )
+    # Compass ``cmd_move`` already pulls the follow tree. enter / exit /
+    # in / out used to leave mates behind at the mouth (castle stairs,
+    # portal, taxi curb). Pull them to the same dest.
+    _pull_followers_to(character, room, dest, game, direction="in")
     # Cadence ``npc_do`` attaches SilentSession. Auto-look + encounter on
     # every pocket enter/exit froze Azure ashen-prey ``exit`` / ``enter
     # waystation`` at ~3.5s (billed as ashen_prey_ms). Live players still
@@ -2039,8 +2300,9 @@ def revalidate_zone_entry_stamp(character, game):
     if room is None:
         clear_zone_entry(character)
         return
-    rooms = getattr(game, "rooms", None) or {} if game else {}
-    hub = rooms.get(stamped)
+    from engine.room_vnum import lookup_room
+
+    hub = lookup_room(game, stamped)
     if hub is None:
         clear_zone_entry(character)
         return
@@ -2064,7 +2326,7 @@ def revalidate_zone_entry_stamp(character, game):
         return
     for landmark in atlas.landmarks.values():
         mouth_key = landmark.get("hub_room")
-        mouth = rooms.get(mouth_key) if mouth_key else None
+        mouth = lookup_room(game, mouth_key) if mouth_key else None
         if (
             mouth is not None
             and getattr(mouth, "zone", None) == zone
@@ -2162,6 +2424,8 @@ def cmd_enter(character, args, game):
             )
             return
         else:
+            if hooks.try_civic_fixture_enter(character, raw, game):
+                return
             character.session.send(
                 f"No zone named '{raw}' here. Try bare 'enter' for a list."
             )
@@ -2175,13 +2439,12 @@ def cmd_enter(character, args, game):
     # Leaving dual-layer wilderness into a classic zone.
     hooks.clear_overland_coords(character)
     stamp_zone_entry(character, dest)
-    face = _presence_face(character)
     from engine import room_vnum as room_vnum_mod
     place = room_vnum_mod.describe_room(dest, staff=False)
     _do_transition(
         character, dest, game,
-        f"{face} enters {place}.",
-        f"{face} arrives.",
+        f"{{name}} enters {place}.",
+        "{name} arrives.",
     )
     # Clear overland coords + soft-stamp dungeon hubs (game hook).
     hooks.after_zone_enter(character, game, dest)
@@ -2223,7 +2486,28 @@ def cmd_exit_zone(character, args, game):
             return
     # Dual-layer America: flagged mouth exits onto virtual overland.
     from engine import hooks
+    origin = room
     if hooks.try_exit_zone(character, game):
+        dest = character.location
+        # ``try_exit_zone`` / ``place_on_overland`` move only the leader.
+        # Graph ``zone_exit_to`` uses ``_do_transition`` (which pulls).
+        # Without this, grouped mates stay in town and ``live_move_blocked``
+        # locks their compass (bug report 1327).
+        if dest is not None and dest is not origin:
+            _pull_followers_to(
+                character, origin, dest, game, direction="out",
+            )
+            try:
+                from engine.systems import overland as overland_mod
+
+                overland_mod.adopt_foot_overland_presence(character, game)
+                for mate in list(dest.characters()):
+                    if mate is character:
+                        continue
+                    overland_mod.adopt_foot_overland_presence(mate, game)
+                    clear_zone_entry(mate)
+            except Exception:
+                pass
         clear_zone_entry(character)
         return
     dest = getattr(room, "zone_exit_to", None)
@@ -2234,11 +2518,10 @@ def cmd_exit_zone(character, args, game):
         )
         return
     clear_zone_entry(character)
-    face = _presence_face(character)
     _do_transition(
         character, dest, game,
-        f"{face} exits to the overland.",
-        f"{face} arrives.",
+        "{name} exits to the overland.",
+        "{name} arrives.",
     )
 
 
@@ -2286,13 +2569,16 @@ def cmd_go_in(character, args, game):
     # historically wired parent_exit='enter' -- accept that alias too.
     dest = room.exits.get("in") or room.exits.get("enter")
     if not dest:
+        from engine import hooks
+        if hooks.ensure_homestead_plot_graph_for_actor(character, game):
+            dest = room.exits.get("in") or room.exits.get("enter")
+    if not dest:
         character.session.send("You can't go in from here.")
         return
-    face = _presence_face(character)
     _do_transition(
         character, dest, game,
-        f"{face} goes in.",
-        f"{face} arrives.",
+        "{name} goes in.",
+        "{name} arrives.",
     )
 
 
@@ -2307,13 +2593,16 @@ def cmd_go_out(character, args, game):
         return
     dest = room.exits.get("out")
     if not dest:
+        from engine import hooks
+        if hooks.ensure_homestead_plot_graph_for_actor(character, game):
+            dest = room.exits.get("out")
+    if not dest:
         character.session.send("There's no way out from here.")
         return
-    face = _presence_face(character)
     _do_transition(
         character, dest, game,
-        f"{face} goes out.",
-        f"{face} arrives.",
+        "{name} goes out.",
+        "{name} arrives.",
     )
 
 def cmd_say(character, args, game):
@@ -2426,19 +2715,379 @@ def cmd_smote(character, args, game):
     rp_emote.broadcast_emote(character, text, game, mode="smote")
 
 
-def cmd_tell(character, args, game):
-    """Send a private message to one person anywhere in the world (unlike
-    'say', which is room-only). Uses game.find_character -- the same
-    exact-name, world-wide lookup GM commands like 'breaktier'/'setgravity'
-    already use to target someone outside the room.
+def _tell_account_label(game, character):
+    """Account name for tell -- used when the sender addressed an account."""
+    from engine.accounts import account_for_character
 
-    Bare ``tell`` replays your recent tell history (last 20 lines).
+    account = account_for_character(game, character)
+    if account is not None:
+        name = (getattr(account, "name", None) or "").strip()
+        if name:
+            return name
+    raw = (getattr(character, "account", None) or "").strip()
+    return raw or None
 
-    An offline Echo (session is None) can't hear anything -- logging off
-    doesn't delete a character (systems doc section 4-E), but it does mean
-    nobody's there to read a tell. That case gets the SAME message as "no
-    such name exists" so a 'tell' can't be used to probe who's an Echo vs.
-    who was never a character at all.
+
+def _tell_character_label(character):
+    """Character name for tell -- used when the sender addressed a body.
+
+    GM spirit sessions are ``gmspirit:Ash`` internally; players type Ash.
+    """
+    key = (getattr(character, "key", None) or "").strip()
+    if not key:
+        return None
+    if ":" in key:
+        prefix, rest = key.split(":", 1)
+        if prefix.lower() in ("gmspirit", "gm") and rest.strip():
+            return rest.strip()
+    return key
+
+
+def _tell_account_names(game, character):
+    """Lowercased account labels that reach this connected Session."""
+    names = []
+    seen = set()
+    label = _tell_account_label(game, character)
+    raw = (getattr(character, "account", None) or "").strip()
+    for name in (label, raw):
+        if not name:
+            continue
+        low = name.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        names.append(name)
+    return names
+
+
+def _tell_character_names(character):
+    """Names players can type to hit this body (key, plus GM spirit short)."""
+    names = []
+    seen = set()
+    key = (getattr(character, "key", None) or "").strip()
+    short = _tell_character_label(character)
+    for name in (key, short):
+        if not name:
+            continue
+        low = name.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        names.append(name)
+    return names
+
+
+def _tell_storage_key(character):
+    """Body label ``tell`` / ``reply`` resolve -- never ``gmspirit:`` keys."""
+    label = _tell_character_label(character)
+    if label:
+        return label
+    from command_support import strip_ephemeral_storage_prefix
+
+    peeled = strip_ephemeral_storage_prefix(
+        getattr(character, "key", None) or ""
+    )
+    text = (peeled or "").strip()
+    return text or None
+
+
+def _tell_incoming_speaker_label(viewer, speaker, game):
+    """Viewer-relative face on an incoming private tell."""
+    face = None
+    if viewer is not None and speaker is not None:
+        try:
+            from engine.hooks import presence_face_for
+
+            face = presence_face_for(viewer, speaker)
+        except Exception:
+            face = None
+    face = (face or "").strip()
+    if face and face not in ("?",):
+        return face
+    storage = _tell_storage_key(speaker)
+    if storage:
+        return storage
+    return "someone"
+
+
+def _tell_extra_character_labels(game, other, viewer):
+    """Additional ``tell`` needles for occupy / cover / public faces."""
+    extra = []
+    seen = set()
+    for name in (
+        _presence_face(other),
+        _tell_storage_key(other),
+    ):
+        if not name:
+            continue
+        low = name.lower()
+        if low in seen:
+            continue
+        seen.add(low)
+        extra.append(name)
+    if viewer is not None:
+        try:
+            from engine.hooks import presence_face_for
+
+            shown = presence_face_for(viewer, other)
+        except Exception:
+            shown = None
+        if shown:
+            low = str(shown).lower()
+            if low not in seen:
+                seen.add(low)
+                extra.append(str(shown))
+    return extra
+
+
+def _tell_reply_token(viewer, speaker, game, *, address_kind):
+    """Player-typable ``reply`` token that still reaches *speaker*."""
+    if address_kind == "account":
+        label = _tell_account_label(game, speaker) or "someone"
+        return "@" + label
+    needles = []
+    storage = _tell_storage_key(speaker)
+    if storage:
+        needles.append(storage)
+    shown = _tell_incoming_speaker_label(viewer, speaker, game)
+    if shown and shown.lower() != "someone":
+        needles.append(shown)
+    for name in _tell_extra_character_labels(game, speaker, viewer):
+        if name and name not in needles:
+            needles.append(name)
+    for needle in needles:
+        target, _label, kind = _find_connected_tell_target(
+            game, needle, viewer=viewer,
+        )
+        if target is speaker and kind == "character":
+            return needle
+    return storage or shown or "someone"
+
+
+def _tell_pick_live(matches):
+    """Prefer presence=live when several Sessions match the same name."""
+    if not matches:
+        return None
+    live = [
+        c for c in matches
+        if str(getattr(c, "presence", "") or "").lower() == "live"
+    ]
+    return (live or matches)[0]
+
+
+def _iter_connected_tell_bodies(game):
+    """Connected Sessions that can receive a tell."""
+    for session in list(getattr(game, "sessions", None) or []):
+        other = getattr(session, "character", None)
+        if other is None or getattr(other, "session", None) is None:
+            continue
+        yield other
+
+
+def _find_connected_tell_target(game, name, viewer=None):
+    """Resolve a connected tell target by character or account name.
+
+    Bare ``tell Matt`` prefers an exact character-name match, then an
+    exact account match. ``tell @Matt`` is account-only, so a character
+    named Matt and a GM account named Matt do not collide.
+
+    Returns ``(target, display_label, address_kind)`` where address_kind
+    is ``character`` or ``account``. Display labels follow how the sender
+    addressed them -- character names stay character names; account
+    names stay account names (never leak the other).
+    """
+    raw = (name or "").strip()
+    if not raw or game is None:
+        return None, None, None
+    force_account = raw.startswith("@")
+    needle = raw[1:].strip() if force_account else raw
+    if not needle:
+        return None, None, None
+    needle_l = needle.lower()
+
+    char_exact = []
+    acct_exact = []
+    for other in _iter_connected_tell_bodies(game):
+        char_labels = [n.lower() for n in _tell_character_names(other)]
+        for extra in _tell_extra_character_labels(game, other, viewer):
+            low = extra.lower()
+            if low and low not in char_labels:
+                char_labels.append(low)
+        if viewer is not None:
+            try:
+                from engine.hooks import presence_face_for
+
+                mask = presence_face_for(viewer, other)
+            except Exception:
+                mask = None
+            true_key = (getattr(other, "key", None) or "").lower()
+            if (
+                getattr(other, "deep_cover_active", False)
+                and mask
+                and true_key
+                and true_key not in str(mask).lower()
+            ):
+                # Cover hides the true name from public tell lookup.
+                # Reply still reaches them via last_tell_from (the mask)
+                # or last_tell_from_key (privileged storage match below).
+                char_labels = [str(mask).lower()]
+        acct_labels = [n.lower() for n in _tell_account_names(game, other)]
+        if needle_l in char_labels and other not in char_exact:
+            char_exact.append(other)
+        if needle_l in acct_labels and other not in acct_exact:
+            acct_exact.append(other)
+
+    if force_account:
+        target = _tell_pick_live(acct_exact)
+        if target is None:
+            return None, None, None
+        label = _tell_account_label(game, target) or needle
+        return target, label, "account"
+
+    if char_exact:
+        target = _tell_pick_live(char_exact)
+        label = _tell_character_label(target) or needle
+        return target, label, "character"
+    if acct_exact:
+        target = _tell_pick_live(acct_exact)
+        label = _tell_account_label(game, target) or needle
+        return target, label, "account"
+    return None, None, None
+
+
+def _whisper_ic_peer(character, game, name):
+    """Return (target, where) for an in-character whisper, or (None, None).
+
+    ``where`` is ``room`` (same room, bystanders hear a no-text line) or
+    ``group`` (follow party, even in another room). Remote, ungrouped
+    whispers stay OOC tell (bug reports 1296 / 1301).
+    """
+    from world import Character as CharType
+
+    needle = (name or "").strip()
+    if not needle or needle.startswith("@"):
+        return None, None
+    room = getattr(character, "location", None)
+    if room is not None:
+        occupants = [
+            obj for obj in room.contents
+            if isinstance(obj, CharType) and obj is not character
+        ]
+        here = _find_character(needle, occupants, self_character=character)
+        if here is not None and here is not character:
+            return here, "room"
+    from engine import group as group_mod
+
+    mates = [
+        mate for mate in group_mod.group_members(character)
+        if mate is not None and mate is not character
+    ]
+    mate = _find_character(needle, mates, self_character=character)
+    if mate is not None and mate is not character:
+        return mate, "group"
+    return None, None
+
+
+def _deliver_ic_whisper(character, target, message, game, *, where):
+    """Send IC whisper lines; room bystanders get no message text."""
+    from engine import display_prefs as display_prefs_mod
+    from engine import gmcp
+
+    speaker_label_for = lambda viewer: _display_name(character, viewer=viewer)
+    peer_label_for = lambda viewer: _display_name(target, viewer=viewer)
+    speaker_self = speaker_label_for(character)
+    peer_self = peer_label_for(character)
+    outgoing = display_prefs_mod.format_ic_whisper_chat(
+        character, outgoing=True, peer_face=peer_self, message=message,
+    )
+    incoming = display_prefs_mod.format_ic_whisper_chat(
+        target, outgoing=False, peer_face=speaker_self, message=message,
+    )
+    outgoing_line = display_prefs_mod.paint_channel_line(
+        character, "whisper", outgoing, default="whisper",
+    )
+    incoming_line = display_prefs_mod.paint_channel_line(
+        target, "whisper", incoming, default="whisper",
+    )
+    speaker_session = getattr(character, "session", None)
+    target_session = getattr(target, "session", None)
+    if speaker_session is not None:
+        gmcp.deliver_comm(
+            speaker_session, "whisper", message, speaker_self, outgoing_line,
+        )
+    else:
+        send_if_online(character, outgoing)
+    if target_session is not None:
+        gmcp.deliver_comm(
+            target_session, "whisper", message, speaker_self, incoming_line,
+        )
+        target_session.last_tell_from = _tell_reply_token(
+            target, character, game, address_kind="character",
+        )
+        target_session.last_tell_from_key = _tell_storage_key(character)
+    else:
+        send_if_online(target, incoming)
+    if where == "room":
+        def _bystander(watcher):
+            face = speaker_label_for(watcher)
+            peer = peer_label_for(watcher)
+            return f"{face} whispers to {peer}."
+
+        broadcast_here(character, _bystander, exclude=(character, target))
+    try:
+        from engine import rp_transcript as transcript_mod
+        transcript_mod.capture(character, outgoing)
+        transcript_mod.capture(target, incoming)
+    except Exception:
+        pass
+
+
+def cmd_whisper(character, args, game):
+    """IC whisper when close or grouped; otherwise OOC like tell.
+
+    Same room or same follow-group: private IC (bystanders in the room
+    see that you whispered, not the words). Remote and not grouped:
+    the OOC tell channel printed as whisper (bug reports 1296 / 1301).
+    ``say whisper …`` is a different, room-wide tone.
+    """
+    if not args or not args.strip():
+        character.session.send(
+            "Whisper whom what? Use a character name in the room or "
+            "your group, or a connected name for OOC whisper."
+        )
+        return
+    parts = args.split(maxsplit=1)
+    if len(parts) < 2:
+        character.session.send(
+            "Whisper whom what? Use a character name in the room or "
+            "your group, or a connected name for OOC whisper."
+        )
+        return
+    name, message = parts
+    target, where = _whisper_ic_peer(character, game, name)
+    if target is not None and where:
+        if getattr(target, "session", None) is None:
+            send_if_online(
+                character,
+                "No one by that name is available.",
+            )
+            return
+        _deliver_ic_whisper(character, target, message, game, where=where)
+        return
+    cmd_tell(character, args, game, voice="whisper")
+
+
+def cmd_tell(character, args, game, *, voice="tell"):
+    """Private OOC message to a connected character or account.
+
+    ``tell Ayla hello`` names the character on both sides. ``tell Andri``
+    or ``tell @Andri`` names the account and does not show which body
+    they are playing. ``@`` is the disambiguator when a character and an
+    account share a name. Works through sleep. Bare ``tell`` replays
+    the last 20 tells. ``whisper`` uses this same path with whisper verbs.
+
+    Offline Echoes cannot receive it. Misses use the same line as an
+    unknown name so tell cannot census who is online.
     """
     from engine import channels
 
@@ -2448,64 +3097,95 @@ def cmd_tell(character, args, game):
 
     parts = args.split(maxsplit=1)
     if len(parts) < 2:
-        character.session.send("Tell whom what?")
+        if str(voice or "").strip().lower() == "whisper":
+            character.session.send(
+                "Whisper whom what? Use a character name, an account name, "
+                "or @account."
+            )
+        else:
+            character.session.send(
+                "Tell whom what? Use a character name, an account name, "
+                "or @account."
+            )
         return
     name, message = parts
 
-    target = game.find_character(name)
-    if not target or target.session is None:
+    target, peer_label, kind = _find_connected_tell_target(
+        game, name, viewer=character,
+    )
+    if not target or target.session is None or not peer_label or not kind:
         character.session.send("No one by that name is available.")
         return
-    # Sleep closes the outside world -- tells don't land until they wake.
-    if getattr(target, "asleep", False):
-        character.session.send(
-            f"{target.key} is asleep and can't hear you right now."
-        )
-        return
+    _deliver_resolved_tell(
+        character, target, message, game, kind=kind, voice=voice,
+        peer_label=peer_label,
+    )
 
-    speaker_face = _display_name(character, viewer=target)
-    target_face = _display_name(target, viewer=character)
+
+def _deliver_resolved_tell(
+    character, target, message, game, *, kind, voice="tell", peer_label=None,
+):
+    """Send a private tell to an already-resolved connected body."""
+    from engine import channels
     from engine import display_prefs as display_prefs_mod
+    from engine import gmcp
 
+    if target is None or target.session is None:
+        return
+    if not peer_label:
+        if kind == "account":
+            peer_label = _tell_account_label(game, target) or "someone"
+        else:
+            peer_label = (
+                _tell_character_label(target)
+                or _tell_storage_key(target)
+                or "someone"
+            )
+    if kind == "account":
+        speaker_label = _tell_account_label(game, character) or "someone"
+        reply_token = "@" + speaker_label
+        target.session.last_tell_from_key = None
+    else:
+        speaker_label = _tell_incoming_speaker_label(target, character, game)
+        reply_token = _tell_reply_token(
+            target, character, game, address_kind="character",
+        )
+        target.session.last_tell_from_key = _tell_storage_key(character)
+    channel = "whisper" if str(voice or "").strip().lower() == "whisper" else "tell"
     incoming = display_prefs_mod.format_tell_chat(
-        target, outgoing=False, peer_face=speaker_face, message=message,
+        target, outgoing=False, peer_face=speaker_label, message=message,
+        voice=channel,
     )
     outgoing = display_prefs_mod.format_tell_chat(
-        character, outgoing=True, peer_face=target_face, message=message,
+        character, outgoing=True, peer_face=peer_label, message=message,
+        voice=channel,
     )
-    from engine import gmcp
     incoming_line = display_prefs_mod.paint_channel_line(
-        target, "tell", incoming, default="tell",
+        target, channel, incoming, default=channel,
     )
     outgoing_line = display_prefs_mod.paint_channel_line(
-        character, "tell", outgoing, default="tell",
+        character, channel, outgoing, default=channel,
     )
-    # Paragraph spacing (config spacing): a tell arrives unannounced
-    # between the target's own commands, same as a room event -- give it
-    # a trailing blank on airy so it does not glue onto whatever they
-    # were already looking at. The sender's own echo stays packed; their
-    # next prompt already adds the usual separator.
     if display_prefs_mod.wants_airy_spacing(target):
         gmcp.deliver_comm(
-            target.session, "tell", message, speaker_face, incoming_line, "",
+            target.session, channel, message, speaker_label, incoming_line, "",
         )
     else:
         gmcp.deliver_comm(
-            target.session, "tell", message, speaker_face, incoming_line,
+            target.session, channel, message, speaker_label, incoming_line,
         )
     gmcp.deliver_comm(
-        character.session, "tell", message, speaker_face, outgoing_line,
+        character.session, channel, message, speaker_label, outgoing_line,
     )
-    target.session.last_tell_from = character.key
-    from engine import channels
+    target.session.last_tell_from = reply_token
     channels.append_tell(
         character.session,
-        {"kind": "out", "peer": target_face, "message": message},
+        {"kind": "out", "peer": peer_label, "message": message},
         game=game,
     )
     channels.append_tell(
         target.session,
-        {"kind": "in", "peer": speaker_face, "message": message},
+        {"kind": "in", "peer": speaker_label, "message": message},
         game=game,
     )
     try:
@@ -2514,78 +3194,21 @@ def cmd_tell(character, args, game):
         transcript_mod.capture(target, incoming)
     except Exception:
         pass
-    # Comm.Channel is sent inside deliver_comm above (speaker + target).
 
 
 def cmd_ooctell(character, args, game):
-    """Send a private out-of-character message to one connected player.
+    """Retired alias -- ooctell is tell (account-name OOC).
 
-    Same reach as ``tell``, but uses OOC naming (``oocname`` pref) and OOC
-    channel color. Works through sleep -- OOC is out-of-character. Bare
-    ``ooctell`` replays the last 20 OOC tells (separate ring from IC tells).
+    Bare ``ooctell`` still replays the old OOC-tell ring if one exists,
+    then the shared tell history.
     """
     from engine import channels
-    from engine import display_prefs as display_prefs_mod
-    from engine import gmcp
-    from engine import ooc_channel
 
     if not args or not args.strip():
         channels.replay_ooctells(character, game)
+        channels.replay_tells(character, game)
         return
-
-    parts = args.split(maxsplit=1)
-    if len(parts) < 2:
-        character.session.send("OOC tell whom what?")
-        return
-    name, message = parts
-
-    target = game.find_character(name)
-    if not target or target.session is None:
-        character.session.send("No one by that name is available.")
-        return
-
-    speaker_face = ooc_channel.speaker_face_for_character(character, game)
-    target_face = ooc_channel.speaker_face_for_character(target, game)
-    incoming = display_prefs_mod.format_ooctell_chat(
-        target, outgoing=False, peer_face=speaker_face, message=message,
-    )
-    outgoing = display_prefs_mod.format_ooctell_chat(
-        character, outgoing=True, peer_face=target_face, message=message,
-    )
-    incoming_line = display_prefs_mod.paint_channel_line(
-        target, "ooc", incoming, default="ooc",
-    )
-    outgoing_line = display_prefs_mod.paint_channel_line(
-        character, "ooc", outgoing, default="ooc",
-    )
-    if display_prefs_mod.wants_airy_spacing(target):
-        gmcp.deliver_comm(
-            target.session, "ooc", message, speaker_face, incoming_line, "",
-        )
-    else:
-        gmcp.deliver_comm(
-            target.session, "ooc", message, speaker_face, incoming_line,
-        )
-    gmcp.deliver_comm(
-        character.session, "ooc", message, speaker_face, outgoing_line,
-    )
-    target.session.last_ooctell_from = character.key
-    channels.append_ooctell(
-        character.session,
-        {"kind": "out", "peer": target_face, "message": message},
-        game=game,
-    )
-    channels.append_ooctell(
-        target.session,
-        {"kind": "in", "peer": speaker_face, "message": message},
-        game=game,
-    )
-    try:
-        from engine import rp_transcript as transcript_mod
-        transcript_mod.capture(character, outgoing)
-        transcript_mod.capture(target, incoming)
-    except Exception:
-        pass
+    cmd_tell(character, args, game)
 
 
 def cmd_reply(character, args, game):
@@ -2594,23 +3217,95 @@ def cmd_reply(character, args, game):
     if not message:
         character.session.send("Reply what?")
         return
-    last_from = getattr(character.session, "last_tell_from", None)
-    if not last_from:
+    session = character.session
+    last_from = getattr(session, "last_tell_from", None) or getattr(
+        session, "last_ooctell_from", None
+    )
+    last_key = getattr(session, "last_tell_from_key", None)
+    if not last_from and not last_key:
         character.session.send("You have no one to reply to.")
         return
-    cmd_tell(character, f"{last_from} {message}", game)
+    # Prefer the stamped body key (occupy / cover) so reply does not
+    # re-parse a public face that tell lookup cannot resolve.
+    if last_key:
+        want = str(last_key).lower()
+        for other in _iter_connected_tell_bodies(game):
+            stored = (_tell_storage_key(other) or "").lower()
+            if stored == want and other.session is not None:
+                _deliver_resolved_tell(
+                    character, other, message, game, kind="character",
+                )
+                return
+    if last_from:
+        target, _label, kind = _find_connected_tell_target(
+            game, last_from, viewer=character,
+        )
+        if target is not None and target.session is not None and kind:
+            _deliver_resolved_tell(
+                character, target, message, game, kind=kind,
+            )
+            return
+    character.session.send("You have no one to reply to.")
 
 
 def _ooc_speaker_face(character, game):
     """OOC channel speaker label (feature D).
 
     When the speaker's Account prefers ``ooc_identity=account``, use the
-    account display name. Otherwise the character presence face. Account
+    occupying or linked account display name (assigned-cast occupy
+    included). Otherwise the character presence face. Account
     names are allowed on OOC (feature E).
     """
     from engine import ooc_channel
 
     return ooc_channel.speaker_face_for_character(character, game)
+
+
+def cmd_osay(character, args, game):
+    """Room-only out-of-character speech (local OOC).
+
+    Usage:
+      osay <message>   speak OOC to everyone in this room only
+
+    Global ``ooc`` still reaches every connected player. ``osay`` uses the
+    same ``((OOC)) [Name]:`` chrome and ``ooc`` channel color role so the
+    line never relies on color alone. Bare ``osay`` prints usage -- it does
+    not replay history (use bare ``say`` / ``ooc`` for room/global replay).
+    """
+    from engine import display_prefs
+    from engine import ooc_channel
+
+    display_prefs.ensure_display_defaults(character)
+    session = getattr(character, "session", None)
+    if session is None:
+        return
+
+    if not args or not args.strip():
+        session.send(
+            "Usage: osay <message>  (room OOC to everyone here; "
+            "see 'help osay')"
+        )
+        return
+
+    room = character.location
+    if room is None:
+        session.send("You're nowhere.")
+        return
+
+    message = args.strip()
+    face = ooc_channel.speaker_face_for_character(character, game)
+    from world import Character as CharType
+
+    # Only connected players in this room hear osay (Echoes offline skip).
+    for obj in list(getattr(room, "contents", []) or []):
+        if not isinstance(obj, CharType):
+            continue
+        viewer_session = getattr(obj, "session", None)
+        if viewer_session is None:
+            continue
+        line = ooc_channel.render_ooc_line(obj, face, message)
+        viewer_session.send(line)
+        viewer_session.send("")
 
 
 def cmd_ooc(character, args, game):
@@ -2921,6 +3616,13 @@ def cmd_config(character, args, game):
     # Mutation args (config brief on) fall through to the setters below.
     category = _config_resolve_category(key)
     rest_l = rest.strip().lower()
+
+    # config reset combat -- chargen defaults for one category (OOC Celtichawk).
+    if key in ("reset", "defaults", "default"):
+        _config_reset_dispatch(character, rest_l, game)
+        return
+
+    # Category pages: config combat / config brief / config full / …
     if category is not None and (
         not rest_l or rest_l in ("list", "status", "?", "show", "menu")
     ):
@@ -3050,6 +3752,7 @@ def cmd_config(character, args, game):
         choice = rest.split(None, 1)[0].lower()
         if choice == display_prefs.TRAFFIC_QUIET:
             character.traffic_mode = display_prefs.TRAFFIC_QUIET
+            display_prefs.mark_pref_manual(character, "traffic_mode")
             character.session.send(
                 "Traffic quiet -- NPC foot traffic is sampled in busy "
                 "rooms (you hear fewer leave/arrive lines). "
@@ -3057,12 +3760,14 @@ def cmd_config(character, args, game):
             )
         elif choice == display_prefs.TRAFFIC_NORMAL:
             character.traffic_mode = display_prefs.TRAFFIC_NORMAL
+            display_prefs.mark_pref_manual(character, "traffic_mode")
             character.session.send(
                 "Traffic normal -- plaza crowd sampling only; full "
                 "leave/arrive prose in shops."
             )
         elif choice == display_prefs.TRAFFIC_VERBOSE:
             character.traffic_mode = display_prefs.TRAFFIC_VERBOSE
+            display_prefs.mark_pref_manual(character, "traffic_mode")
             character.session.send(
                 "Traffic verbose -- hear every NPC leave and arrive "
                 "(watch room still helps in plazas)."
@@ -3094,10 +3799,10 @@ def cmd_config(character, args, game):
         if choice in ("airy", "roomy", "spaced", "on", "yes", "true", "1"):
             character.output_spacing = display_prefs.OUTPUT_SPACING_AIRY
             character.session.send(
-                "Spacing set to airy -- other people's room events and "
-                "incoming tells get a blank line after them, so a busy "
-                "room does not blur together. Your own command replies, "
-                "combat, lists, and maps stay packed either way."
+                "Spacing set to airy -- other people's room events, incoming "
+                "tells, and your fight rounds get a blank line between them. "
+                "Your own command replies, lists, score, who, and maps "
+                "stay packed. Screenreader ignores airy spacing."
             )
         elif choice in (
             "packed", "dense", "compact", "tight", "off", "no", "false", "0",
@@ -3105,7 +3810,7 @@ def cmd_config(character, args, game):
             character.output_spacing = display_prefs.OUTPUT_SPACING_PACKED
             character.session.send(
                 "Spacing set to packed -- no extra blank lines after room "
-                "events or tells."
+                "events, tells, or fight-round events."
             )
         else:
             character.session.send("Usage: config spacing airy|packed")
@@ -3120,9 +3825,11 @@ def cmd_config(character, args, game):
         choice = rest.split(None, 1)[0].lower()
         if choice in ("on", "yes", "true", "1"):
             character.show_minimap = True
+            display_prefs.mark_pref_manual(character, "show_minimap")
             character.session.send("ASCII minimap enabled.")
         elif choice in ("off", "no", "false", "0"):
             character.show_minimap = False
+            display_prefs.mark_pref_manual(character, "show_minimap")
             character.session.send("ASCII minimap disabled.")
         else:
             character.session.send("Usage: config map on|off")
@@ -3138,8 +3845,10 @@ def cmd_config(character, args, game):
         choice = rest.split(None, 1)[0].lower()
         if choice in ("on", "yes", "true", "1"):
             character.map_on_move = True
+            display_prefs.mark_pref_manual(character, "map_on_move")
             if not character.show_minimap:
                 character.show_minimap = True
+                display_prefs.mark_pref_manual(character, "show_minimap")
                 character.session.send(
                     "Map-on-move enabled (also turned config map on)."
                 )
@@ -3149,6 +3858,7 @@ def cmd_config(character, args, game):
                 )
         elif choice in ("off", "no", "false", "0"):
             character.map_on_move = False
+            display_prefs.mark_pref_manual(character, "map_on_move")
             character.session.send("Map-on-move disabled.")
         else:
             character.session.send("Usage: config mapmove on|off")
@@ -3257,8 +3967,10 @@ def cmd_config(character, args, game):
         choice = rest.split(None, 1)[0].lower()
         if choice in ("on", "yes", "true", "1"):
             character.map_on_look = True
+            display_prefs.mark_pref_manual(character, "map_on_look")
             if not character.show_minimap:
                 character.show_minimap = True
+                display_prefs.mark_pref_manual(character, "show_minimap")
                 character.session.send(
                     "Map-on-look enabled (also turned config map on)."
                 )
@@ -3268,6 +3980,7 @@ def cmd_config(character, args, game):
                 )
         elif choice in ("off", "no", "false", "0"):
             character.map_on_look = False
+            display_prefs.mark_pref_manual(character, "map_on_look")
             character.session.send("Map-on-look disabled.")
         else:
             character.session.send("Usage: config maplook on|off")
@@ -3296,6 +4009,38 @@ def cmd_config(character, args, game):
         else:
             character.session.send("Usage: config brief on|off")
         return
+    if key in ("emote", "emoteself", "emote_third"):
+        # Suggestion report 446: self-view as name vs You.
+        from engine import display_prefs as display_prefs_mod
+
+        prefs = display_prefs_mod.preference_character(character, game)
+        display_prefs_mod.ensure_display_defaults(prefs)
+        tokens = rest.split()
+        # ``config emote third on|off`` or ``config emote third``.
+        if tokens and tokens[0].lower() in ("third", "name", "self"):
+            tokens = tokens[1:]
+        if not tokens:
+            state = "on" if getattr(prefs, "emote_third", False) else "off"
+            character.session.send(
+                f"Emote third-person self-view is {state}. "
+                "Usage: config emote third on|off"
+            )
+            return
+        choice = tokens[0].lower()
+        if choice in ("on", "yes", "true", "1", "third"):
+            prefs.emote_third = True
+            character.session.send(
+                "Emote self-view: third person -- you see your name, "
+                "not You (config emote third off to restore)."
+            )
+        elif choice in ("off", "no", "false", "0", "you"):
+            prefs.emote_third = False
+            character.session.send(
+                "Emote self-view: You … (config emote third on for your name)."
+            )
+        else:
+            character.session.send("Usage: config emote third on|off")
+        return
     if key in ("exits", "exitstyle", "exits_verbose"):
         from engine import display_prefs
 
@@ -3309,7 +4054,7 @@ def cmd_config(character, args, game):
             )
             return
         choice = rest.split(None, 1)[0].lower()
-        if choice in ("compact", "short", "abbrev", "off", "0"):
+        if choice in ("compact", "short", "abbrev", "brief", "off", "0"):
             prefs.exits_verbose = False
             prefs.look_exits_rev = 1
             character.session.send(
@@ -3562,6 +4307,13 @@ def cmd_config(character, args, game):
         else:
             character.session.send("Autoloot is not available.")
         return
+    if key in ("autotap", "auto tap", "auto_tap"):
+        handler = hooks.config_handler("autotap")
+        if handler is not None:
+            handler(character, rest, game)
+        else:
+            character.session.send("Autotap is not available.")
+        return
     if key == "autosplit":
         handler = hooks.config_handler("autosplit")
         if handler is not None:
@@ -3585,7 +4337,7 @@ def cmd_config(character, args, game):
     if key in ("oocname", "oocidentity", "ooc_identity"):
         # Feature D: account vs character face on OOC.
         from engine import accounts as accounts_mod
-        account = accounts_mod.account_for_character(game, character)
+        account = accounts_mod.account_for_session_character(game, character)
         if account is None:
             character.session.send(
                 "Link an account first (type 'account' or create one at "
@@ -3624,11 +4376,13 @@ def cmd_config(character, args, game):
         if not _is_gm(character):
             character.session.send("That setting is for staff GMs.")
             return
-        account = accounts_mod.account_for_character(game, character)
+        account = accounts_mod.account_for_session_character(game, character)
         if account is None:
             body = getattr(character, "gm_mode_body", None)
             if body is not None:
-                account = accounts_mod.account_for_character(game, body)
+                account = accounts_mod.account_for_session_character(
+                    game, body
+                )
         if account is None:
             character.session.send(
                 "Link a staff account first. "
@@ -3757,6 +4511,8 @@ def cmd_config(character, args, game):
         "combatnumbers": "combatnumbers",
         "scoremeters": "scoremeters",
         "combatdiag": "combatdiag",
+        "combatterse": "combatterse",
+        "combatairy": "combatairy",
         "combatprose": "combatprose",
         "fightlog": "fightlog",
         "autoidle": "autoidle",
@@ -3842,6 +4598,7 @@ _CONFIG_SNAKE_KEYS = frozenset({
     "gm_see_accounts",
     "surname_alert",
     "surname_reminder",
+    "auto_tap",
 })
 
 
@@ -3857,7 +4614,7 @@ def _config_category_index():
         "  brief     -- brief look + items/vehicles/houses compact "
         "(alias: compact)",
         "  combat    -- gag, tags, hints, numbers, diag, fightlog, autokill",
-        "  autoloot  -- kill scoop, dungeon/relics, autosplit",
+        "  autoloot  -- kill scoop, dungeon/relics, autosplit, autotap",
         "  chat      -- config channel ooc|say|emote|tell|questions, "
         "plaincomms, tips, surname reminder",
         "  account   -- OOC name, staff seeaccounts",
@@ -3866,9 +4623,110 @@ def _config_category_index():
         "  full      -- every setting at once",
         "",
         "Examples: config brief | config combat | config channel | "
-        "config compact on | config vehicles compact on",
+        "config compact on | config vehicles compact on | "
+        "config reset combat",
+        "config reset <category> restores one page to chargen defaults "
+        "(no reset-all; screenreader stays on config screenreader).",
         "See also: help config | help formatting | help alias | help prompt",
     ]
+
+
+def _config_reset_dispatch(character, rest_l, game):
+    """Restore one config category to chargen defaults (OOC Celtichawk).
+
+    There is no reset-all. Display reset never flips screenreader -- use
+    config screenreader off for that. Autoloot reset applies the smart
+    scoop preset.
+    """
+    from engine import display_prefs
+    from engine import hooks
+
+    display_prefs.ensure_display_defaults(character)
+    token = (rest_l or "").split(None, 1)[0] if rest_l else ""
+    category = _config_resolve_category(token)
+    if not token or category is None:
+        character.session.send(
+            "Usage: config reset <category> -- display, brief, combat, "
+            "autoloot, chat, or who. There is no reset-all. "
+            "Screenreader stays on config screenreader on|off."
+        )
+        return
+    if category in ("account", "macros", "full"):
+        character.session.send(
+            "Config reset does not wipe account names, aliases, or "
+            "everything at once. Pick display, brief, combat, autoloot, "
+            "chat, or who -- or prompt default for the chargen prompt."
+        )
+        return
+    if category == "display":
+        character.use_color = True
+        character.color_depth = "ansi"
+        character.display_width = display_prefs.WIDTH_DEFAULT
+        character.pager_lines = 20
+        character.output_spacing = display_prefs.OUTPUT_SPACING_AIRY
+        character.traffic_mode = display_prefs.TRAFFIC_NORMAL
+        character.angel_radio_mode = display_prefs.RADIO_MODE_FULL
+        character.show_minimap = True
+        character.map_on_move = False
+        character.map_on_look = False
+        character.drive_map_full = True
+        character.map_view_full = False
+        character.mapzone_overlay = False
+        character.time_format = "24h"
+        for attr in (
+            "show_minimap", "map_on_move", "map_on_look", "traffic_mode",
+        ):
+            display_prefs.mark_pref_manual(character, attr)
+    elif category == "brief":
+        character.brief = False
+        character.compact_floor_items = False
+        character.compact_vehicles = False
+        character.compact_houses = False
+        character.exits_verbose = True
+    elif category == "combat":
+        character.combat_gag_other = False
+        character.show_combat_tags = True
+        character.show_combat_hints = True
+        character.autokill = False
+        character.combat_numbers = False
+        character.score_meters = True
+        character.combat_diag = False
+        character.combat_prose = False
+        character.combat_terse = False
+        character.combat_terse_airy = False
+        character.fightlog_enabled = False
+        display_prefs.mark_pref_manual(character, "fightlog_enabled")
+    elif category == "autoloot":
+        dispatch = hooks.get_dispatch()
+        if dispatch is not None:
+            dispatch(character, "autoloot smart", game)
+        character.autosplit = True
+        character.auto_tap = False
+        character.autoloot_ignored = []
+    elif category == "chat":
+        character.plaincomms = False
+        character.show_tips = True
+        character.suppress_surname_alert = False
+        character.channel_colors = {}
+    elif category == "who":
+        character.who_full = False
+        character.who_hide = False
+        character.auto_idle = True
+        character.idle_mode = False
+    else:
+        character.session.send(
+            "Usage: config reset <category> -- display, brief, combat, "
+            "autoloot, chat, or who."
+        )
+        return
+    character.session.send(
+        f"Config {category} restored to chargen defaults."
+    )
+    character.session.send(
+        "\r\n".join(
+            _config_status_lines(character, category=category)
+        )
+    )
 
 
 def _config_section_display(character, display_prefs):
@@ -3892,7 +4750,7 @@ def _config_section_display(character, display_prefs):
         "-- config radio full|quiet (Angel Radio; Angels and Gods)",
         f"  spacing: "
         f"{display_prefs.normalize_output_spacing(getattr(character, 'output_spacing', display_prefs.OUTPUT_SPACING_AIRY))}  "
-        "-- config spacing airy|packed",
+        "-- config spacing airy|packed (room, tells, and fight rounds)",
         f"  map: {'on' if character.show_minimap else 'off'}  "
         "-- config map on|off (bare map command)",
         f"  maplook: {'on' if character.map_on_look else 'off'}  "
@@ -3948,10 +4806,9 @@ def _config_section_brief(character):
 
 def _config_section_combat(character, display_prefs):
     """Combat chrome and autokill (not autoloot -- see autoloot page)."""
-    if getattr(character, "screenreader", False):
-        tags_state = "on (locked)"
-    else:
-        tags_state = "on" if character.show_combat_tags else "off"
+    tags_state = "on" if character.show_combat_tags else "off"
+    if getattr(character, "screenreader", False) and not character.show_combat_tags:
+        tags_state += "  (hit/miss still named in plain words)"
     return [
         "Combat:",
         f"  combatgag: "
@@ -3973,9 +4830,22 @@ def _config_section_combat(character, display_prefs):
         f"  combatdiag: "
         f"{'on' if getattr(character, 'combat_diag', False) else 'off'}  "
         "-- config combatdiag on|off",
+        f"  combatterse: "
+        f"{'on' if getattr(character, 'combat_terse', False) else 'off'}  "
+        "-- config combatterse on|off (sighted short colored lines)",
+        f"  spacing: "
+        f"{display_prefs.normalize_output_spacing(getattr(character, 'output_spacing', display_prefs.OUTPUT_SPACING_AIRY))}  "
+        "-- config spacing airy|packed (fight rounds too; combatairy is the same switch)",
         f"  combatprose: "
         f"{'on' if getattr(character, 'combat_prose', False) else 'off'}  "
-        "-- config combatprose on|off",
+        "-- config combatprose on|off"
+        # Screenreader players default to a short SVO line. combatprose is
+        # how they opt into the full cinematic wording without combatdiag's
+        # (role:pool) machinery -- say so here, because "how do I get the
+        # cool combat text" is the question this page keeps failing to
+        # answer (suggestion 383, OOC 2026-09-06).
+        + ("  (full cinematic wording instead of the short line)"
+           if getattr(character, "screenreader", False) else ""),
         f"  fightlog: "
         f"{'on' if getattr(character, 'fightlog_enabled', False) else 'off'}  "
         "-- config fightlog on|off (cinematic replay after fights)",
@@ -4021,6 +4891,9 @@ def _config_section_chat(character, display_prefs):
         f"  channel ooc: {ch}  -- config channel ooc <role>",
         f"  channel say: {character.channel_colors.get('say', 'say')}  "
         "-- config channel say <role>",
+        f"  emote third: "
+        f"{'on' if getattr(character, 'emote_third', False) else 'off'}  "
+        "-- config emote third on|off (see your name instead of You)",
         f"  channel emote: {character.channel_colors.get('emote', 'emote')}  "
         "-- config channel emote <role>",
         f"  channel tell: {character.channel_colors.get('tell', 'tell')}  "
@@ -4036,18 +4909,20 @@ def _config_section_account(character):
     lines = [
         "Account / OOC:",
         "  oocname: account|character  -- config oocname … "
-        "(requires a linked account)",
+        "(linked account or assigned-cast occupy)",
         "  seeaccounts: on|off  -- config seeaccounts … "
         "(staff GM form only)",
     ]
     try:
         from engine import accounts as accounts_mod
         game = getattr(getattr(character, "session", None), "game", None)
-        account = accounts_mod.account_for_character(game, character)
+        account = accounts_mod.account_for_session_character(game, character)
         if account is None:
             body = getattr(character, "gm_mode_body", None)
             if body is not None:
-                account = accounts_mod.account_for_character(game, body)
+                account = accounts_mod.account_for_session_character(
+                    game, body
+                )
         if account is not None:
             for i, line in enumerate(lines):
                 if line.startswith("  oocname:"):
@@ -4164,7 +5039,7 @@ def cmd_account(character, args, game):
     # Status / already-linked checks use the playable body when in GM form.
     link_body, body_err = accounts_mod.playable_link_target(game, character)
     body_for_acct = link_body if link_body is not None else character
-    account = accounts_mod.account_for_character(game, body_for_acct)
+    account = accounts_mod.account_for_session_character(game, body_for_acct)
 
     if not raw:
         if account is None:
@@ -4785,12 +5660,19 @@ def _changes_entry_unread_after_cursor(entry, cur_key):
     return True
 
 
-def _changelog_display_order_key(entry):
-    """List-line key: unstamped newest-first, then ``#N`` high-to-low.
+def _changelog_display_order_key(entry, display_id_map=None):
+    """List-line key: unstamped newest-first, then printed ``#N`` high-to-low.
 
-    Lookup numbers are minted oldest-ship-first, so high-to-low ``#N`` is
-    also newest-first. Unstamped rows (id 0) stay at the top until boot
-    mints them.
+    Player lists print a dense ``#N`` ranked by ``sort_ts`` (oldest visible
+    ship = 1), not the raw ledger mint id. Two fragments can mint out of
+    timestamp order when they land on different boots — ledger ``#3531``
+    might be the 15:34 ship while dense ``#3531`` is the 15:35 ship. When
+    *display_id_map* is set, order follows that printed number so
+    timestamps and ``#N`` both descend. Only the recent ``changes`` /
+    ``changes all`` feed should pass the map; unread paging must keep
+    ledger-id order (closed ``id\\tN`` window). Staff ``changes ops``
+    (no map) still uses the ledger id. Unstamped rows (id 0) stay at the
+    top until boot mints them.
     """
     cid = int(entry.get("id") or 0)
     date = entry.get("date") or _CHANGELOG_UNDATED
@@ -4799,15 +5681,26 @@ def _changelog_display_order_key(entry):
     if cid <= 0:
         # reverse=True: bucket 1 (unstamped) sorts above bucket 0 (numbered).
         return (1, sort_ts, slug)
+    if display_id_map is not None:
+        printed = _player_changes_display_n(entry, display_id_map)
+        return (0, printed, sort_ts, slug)
     return (0, cid, sort_ts, slug)
 
 
-def _changelog_arrange_display(entries):
-    """Arrange a ``changes`` window for the player list (``#N`` high-to-low).
+def _changelog_arrange_display(entries, display_id_map=None):
+    """Arrange a ``changes`` window high-to-low by the number on the line.
 
     Unstamped rows stay at the top of the page until copyover mints ``#N``.
+    Pass the player dense-id map so the page matches printed ``#N`` /
+    ``sort_ts``; omit it for staff ledger-id order.
     """
-    return sorted(entries, key=_changelog_display_order_key, reverse=True)
+    return sorted(
+        entries,
+        key=lambda row: _changelog_display_order_key(
+            row, display_id_map=display_id_map,
+        ),
+        reverse=True,
+    )
 
 
 def _changelog_display_stamp(entry):
@@ -5445,10 +6338,28 @@ def _changes_render_list_lines(
     is_gm=False,
     display_id_map=None,
     ops_mode=False,
+    list_order="ledger",
 ):
-    """Build the multi-line body for a ``changes`` list subcommand."""
+    """Build the multi-line body for a ``changes`` list subcommand.
+
+    ``list_order`` is ``ledger`` (mint id, default) or ``printed`` (dense
+    player ``#N``). Unread / search / ops stay on ledger order because
+    ``changes new`` paging is a closed ledger-id window (bugs 678 / 835 /
+    935 / copyover +1). Rearranging those pages by dense ``#N`` is how
+    earlier changelog ships undid unread. Only the recent ``changes`` /
+    ``changes all`` feed passes ``printed``.
+    """
     lines_out = [title]
-    for entry in _changelog_arrange_display(entries):
+    arrange_map = None
+    if (
+        list_order == "printed"
+        and not ops_mode
+        and display_id_map is not None
+    ):
+        arrange_map = display_id_map
+    for entry in _changelog_arrange_display(
+        entries, display_id_map=arrange_map,
+    ):
         unread = flag_unread and _changes_entry_is_new(entry, visit_ts)
         prefix = _format_changes_list_prefix(
             entry,
@@ -5560,6 +6471,8 @@ def _read_changelog_text(path):
     """
     with open(path, "rb") as fh:
         raw = fh.read()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -5651,21 +6564,58 @@ def _apply_ledger_ids(entries, root):
     return entries
 
 
+def _entries_from_ledger(root):
+    """Build ``changes`` list rows from the changelog ledger (no fragment walk).
+
+    ``full`` is left empty so ``changes N`` lazily reads one fragment file.
+    """
+    import json as json_mod
+
+    from engine import changelog_ledger
+
+    changelog_ledger.assign_new_slugs(root)
+    rows = changelog_ledger.list_entries(root)
+    if not rows:
+        return []
+    entries = []
+    for row in rows:
+        sort_ts = row.get("sort_ts") or ""
+        if sort_ts and "T" in sort_ts:
+            date = sort_ts.split("T", 1)[0]
+        else:
+            date = _CHANGELOG_UNDATED
+        audience = None
+        raw_aud = row.get("audience")
+        if raw_aud:
+            try:
+                parsed = json_mod.loads(raw_aud)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, list):
+                audience = parsed
+        entries.append({
+            "category": "",
+            "id": int(row.get("id") or 0),
+            "date": date,
+            "sort_ts": sort_ts,
+            "summary": row.get("summary") or "",
+            "full": None,
+            "file_index": 0,
+            "slug": row.get("slug") or "",
+            "audience": audience,
+            "staff_only": (row.get("sequence") == "staff"),
+        })
+    _enrich_changelog_entries(entries)
+    return entries
+
+
 def _load_unreleased_entries(repo_root=None):
     """Load Unreleased entries for in-game ``changes``.
 
-    Parses ``CHANGELOG.md`` + ``CHANGELOG.d/*.md`` for prose/category/date,
-    then overlays each fragment's ``#N`` from the changelog ledger — the
-    ledger is the only place an id is ever minted, so there is nothing left
-    to "rebuild" or "stamp" here. Cached per-process until the cheap
-    staleness signature changes.
-
-    Opening ``changelog.db`` (first tap in a process, or a freshly minted
-    slug) changes the ledger file's mtime. That used to bust the markdown
-    cache and re-walk every fragment; if only the ledger half of the key
-    moved, we overlay ids onto the already-parsed entries instead.
-    After a load we re-probe the key so a db file created mid-call does not
-    force a second miss on the very next tap.
+    List/unread rows come from the changelog ledger (``content/changelog.db``)
+    so boot does not parse every ``CHANGELOG.d`` fragment. Fragment bodies
+    load lazily when a player opens ``changes N``. Cached per-process until
+    the cheap staleness signature changes.
     """
     global _CHANGELOG_CACHE
     root = repo_root or _changelog_repo_root()
@@ -5674,23 +6624,14 @@ def _load_unreleased_entries(repo_root=None):
     if _CHANGELOG_CACHE is not None and _CHANGELOG_CACHE[0] == cache_key:
         return _CHANGELOG_CACHE[1]
 
-    if (
-        _CHANGELOG_CACHE is not None
-        and _changelog_cache_sources_unchanged(_CHANGELOG_CACHE[0], cache_key)
-    ):
-        entries = _CHANGELOG_CACHE[1]
+    entries = _entries_from_ledger(root)
+    if not entries:
+        # Tools / first touch before mint: keep the markdown path so the
+        # command still works without a Game() boot.
+        entries = _load_changelog_entries_from_sources(root)
+        _enrich_changelog_entries(entries)
         _apply_ledger_ids(entries, root)
-        entries.sort(key=_changelog_display_order_key, reverse=True)
-        _CHANGELOG_CACHE = (_changelog_cache_key(root), entries)
-        return entries
-
-    entries = _load_changelog_entries_from_sources(root)
-    _enrich_changelog_entries(entries)
-    _apply_ledger_ids(entries, root)
-    # After ids are overlaid, the player feed is lookup-number order so
-    # ``changes`` / ``changes all`` scroll #N, #(N-1), … with no jumps.
     entries.sort(key=_changelog_display_order_key, reverse=True)
-    # Re-probe: ``connect()`` may have just created ``changelog.db``.
     _CHANGELOG_CACHE = (_changelog_cache_key(root), entries)
     return entries
 
@@ -5954,6 +6895,14 @@ def _changelog_entry_full_lines(entry, repo_root=None):
             return list(frag_entries[0].get("full") or [])
         if frag_entries:
             return list(frag_entries[0].get("full") or [])
+        # Ledger row exists (boot minted #N) but the fragment is gone --
+        # typical after auto-deploy abort-held a tip and rolled the tree
+        # back. Do not fall through to CHANGELOG.md Unreleased: every
+        # ledger row uses file_index 0, which steals leftover monolith
+        # bullets (live 2026-09-11: homestead-deconstruct opened as
+        # "plans index rebuild").
+        summary = (entry.get("summary") or "").strip()
+        return [summary] if summary else []
     main_path = os.path.join(root, "CHANGELOG.md")
     try:
         main_entries = _parse_unreleased_entries(
@@ -5977,9 +6926,9 @@ def cmd_changes(character, args, game):
     should feed into an in-game 'changes' command like traditional MUDs,"
     instead of players having to go read CHANGELOG.md by hand.
 
-    Parses ``CHANGELOG.md`` + ``CHANGELOG.d/*.md`` for prose and overlays
-    each fragment's permanent ``#N`` from the changelog ledger
-    (``engine/changelog_ledger.py`` — the only place an id is ever minted).
+    Parses fragment summaries from the changelog ledger (permanent ``#N``
+    minted in ``engine/changelog_ledger.py``). Opening one ship still reads
+    that fragment's markdown for the 1-2 sentence body.
     Watermark updates use incremental account/character dirty flags — not a
     full world save.
 
@@ -5999,10 +6948,12 @@ def cmd_changes(character, args, game):
     description of what changed.
 
     Each bullet is tagged with its ship timestamp (``YYYY-MM-DD HH:MM`` UTC)
-    and a stable ``#N`` assigned on ``main`` after merge. The page is still
-    the newest ships by timestamp; those lines are listed by lookup number.
-    Type ``changes 12`` (or ``changes #12``) to open the player ship
-    numbered 12 on that list. Staff-only bullets keep ledger ids —
+    and a stable ``#N`` assigned on ``main`` after merge. The page is the
+    newest ships by timestamp; player lines print a dense list number
+    (no holes for hidden staff ships) and scroll that number high-to-low
+    so the clock and the ``#`` both count down. Type ``changes 12`` (or
+    ``changes #12``) to open the player ship numbered 12 on that list.
+    Staff-only bullets keep ledger ids —
     GMs type ``changes ops 12`` to open one (scrollback is
     ``changes ops all 25``, matching ``changes all 25``). Longer player
     headlines: ``changes all 25``.
@@ -6406,7 +7357,16 @@ def cmd_changes(character, args, game):
             )
             return
 
-    shown = entries[:n]
+    # Player recent-feed slice: newest *n* by printed #N (sort_ts rank),
+    # not the *n* highest ledger mint ids. Do not reorder ``entries``
+    # itself — ``changes new`` paging uses a closed ledger-# window.
+    if ops_mode:
+        shown = entries[:n]
+    else:
+        feed = _changelog_arrange_display(
+            entries, display_id_map=player_display_id_map,
+        )
+        shown = feed[:n]
     new_count = len(_changes_new_entries(entries, visit_ts))
     if ops_mode:
         title = "Recent staff changes (listed by lookup number):"
@@ -6431,6 +7391,7 @@ def cmd_changes(character, args, game):
         is_gm=is_gm,
         display_id_map=None if ops_mode else player_display_id_map,
         ops_mode=ops_mode,
+        list_order="ledger" if ops_mode else "printed",
     )
     lines_out.append(_changes_list_footer(ops_mode=ops_mode))
     character.session.send("\n".join(lines_out))
@@ -6524,6 +7485,64 @@ def _help_lookup_keys(verb):
         if candidate and candidate not in seen:
             seen.add(candidate)
             yield candidate
+
+
+def _help_prefix_matches(verb, topics, is_gm_viewer):
+    """Topic keys that start with the typed query (partial match list)."""
+    from engine import hooks as hooks_mod
+
+    raw = (verb or "").strip().lower()
+    if not raw or len(raw) < 2:
+        return []
+    hyphen = raw.replace(" ", "-")
+    under = raw.replace(" ", "_")
+    hits = []
+    seen = set()
+    for key in topics:
+        low = str(key or "").strip().lower()
+        if not low or low in seen:
+            continue
+        if hooks_mod.is_gm_only_help(low) and not is_gm_viewer:
+            continue
+        if (
+            low.startswith(raw)
+            or low.startswith(hyphen)
+            or low.startswith(under)
+        ):
+            seen.add(low)
+            hits.append(low)
+    hits.sort()
+    return hits
+
+
+def _send_help_disambiguation(character, verb, keys, help_w, sr):
+    """List several help pages instead of silently opening one."""
+    from engine import style
+
+    unique = []
+    seen = set()
+    for key in keys:
+        low = str(key or "").strip().lower()
+        if not low or low in seen:
+            continue
+        seen.add(low)
+        unique.append(low)
+    unique.sort()
+    lines = [
+        f"Several help pages match '{verb}'. Type one:",
+    ]
+    for key in unique[:12]:
+        lines.append(f"  help {key}")
+    if len(unique) > 12:
+        lines.append(f"  … and {len(unique) - 12} more.")
+    framed = style.format_tome(
+        "help -- which page?",
+        lines,
+        related="help topics",
+        width=help_w,
+        screenreader=sr,
+    )
+    _page_help(character, framed)
 
 
 def _resolve_help_topic(verb, topics, db, is_gm_viewer, game=None):
@@ -6986,6 +8005,36 @@ def cmd_help(character, args, game):
             from engine import hooks
             hooks.after_help_topic(character, resolved_verb, game)
             return
+        # Spaced names that are real topics (help archivist lore) must
+        # not fall through to "filter help archivist for lore".
+        if " " in verb:
+            for alt in (verb.replace(" ", "-"), verb.replace(" ", "_")):
+                if alt == verb:
+                    continue
+                alt_kind, alt_payload = _resolve_help_topic(
+                    alt, topics, db, is_gm_viewer, game,
+                )
+                if alt_kind == "db":
+                    _page_help(
+                        character, _format_help_db_entry(character, alt_payload),
+                    )
+                    from engine import hooks
+                    hooks.after_help_topic(character, alt, game)
+                    return
+                if alt_kind == "static":
+                    resolved_verb, topic = alt_payload
+                    _send_static_help_page(
+                        character, resolved_verb, topic, help_w=help_w, sr=sr,
+                    )
+                    from engine import hooks
+                    hooks.after_help_topic(character, resolved_verb, game)
+                    return
+        # Prefix / partial: list matches instead of picking one page
+        # (suggestion report 325).
+        prefix_hits = _help_prefix_matches(verb, topics, is_gm_viewer)
+        if len(prefix_hits) > 1:
+            _send_help_disambiguation(character, verb, prefix_hits, help_w, sr)
+            return
         # help <topic> <query> -- filter a long page (help gm criminal)
         # instead of looking up a topic named "gm criminal".
         if " " in verb:
@@ -7069,7 +8118,25 @@ def cmd_help(character, args, game):
             from engine import hooks as hooks_mod
             fts_entry = None
             if verb not in hooks_mod.get_help_fts_blocklist():
-                fts_entry = help_db.search_fts(db, verb, is_gm=is_gm_viewer)
+                fts_hits = help_db.search_fts_many(
+                    db, verb, is_gm=is_gm_viewer, limit=8,
+                )
+                keys = [
+                    str(hit.get("primary_keyword") or "").strip().lower()
+                    for hit in fts_hits
+                    if str(hit.get("primary_keyword") or "").strip()
+                ]
+                needle = verb.replace(" ", "-")
+                close = [
+                    key for key in keys
+                    if needle in key or verb in key.replace("-", " ")
+                ]
+                if len(close) > 1:
+                    _send_help_disambiguation(
+                        character, verb, close, help_w, sr,
+                    )
+                    return
+                fts_entry = fts_hits[0] if fts_hits else None
             if fts_entry:
                 _page_help(
                     character, _format_help_db_entry(character, fts_entry),
@@ -7604,7 +8671,14 @@ def cmd_get(character, args, game):
         from engine import hooks
         refusal = hooks.before_acquire_item(character, taken)
         if refusal:
-            loot.append(taken)
+            # Put the item back on the body. loot.append on the *local*
+            # visible list used to orphan it (P16-10).
+            stash = getattr(body, "loot", None)
+            if not isinstance(stash, list):
+                body.loot = []
+                stash = body.loot
+            if taken not in stash:
+                stash.append(taken)
             character.session.send(refusal)
             return
         # hook -- route into gear bag / hands / loot backpack (no pre-append).
@@ -7796,6 +8870,9 @@ def cmd_get(character, args, game):
 
     item = _find_item(args, items_here)
     if not item:
+        from engine import hooks
+        if hooks.try_get_unlisted(character, args, game):
+            return
         character.session.send("You don't see that here.")
         return
     if item.is_body:
@@ -7827,6 +8904,11 @@ def cmd_get(character, args, game):
     character.session.send(f"You pick up {item.key}.")
     if stow_msg:
         character.session.send(stow_msg)
+    from engine.systems import phone as phone_mod
+
+    nudge = phone_mod.pickup_threads_nudge(character, item)
+    if nudge:
+        character.session.send(nudge)
     room.broadcast(
         f"{_presence_face(character)} picks up {item.key}.",
         exclude=character,
@@ -8146,14 +9228,25 @@ def cmd_give(character, args, game):
     if len(given_units) > 1:
         item_label = f"{len(given_units)} {item_label}"
 
-    giver_face = _presence_face(character)
-    target_face = _presence_face(target)
-    character.session.send(f"You give {item_label} to {target_face}.")
+    # Viewer-relative faces (deep cover, introduce, guise) -- same policy
+    # as look / list / whisper; never leak true names via _presence_face.
+    giver_label_for = lambda viewer: _display_name(character, viewer=viewer)
+    target_label_for = lambda viewer: _display_name(target, viewer=viewer)
+    character.session.send(
+        f"You give {item_label} to {target_label_for(character)}."
+    )
     if getattr(target, "session", None):
-        target.session.send(f"{giver_face} gives you {item_label}.")
-    room.broadcast(
-        f"{giver_face} gives {item_label} to {target_face}.",
-        exclude=[character, target],
+        target.session.send(
+            f"{giver_label_for(target)} gives you {item_label}."
+        )
+
+    def _give_bystander_line(watcher):
+        giver = giver_label_for(watcher)
+        recip = target_label_for(watcher)
+        return f"{giver} gives {item_label} to {recip}."
+
+    broadcast_here(
+        character, _give_bystander_line, exclude=[character, target],
     )
     if stow_msgs and getattr(target, "session", None):
         for msg in stow_msgs:
@@ -8257,7 +9350,11 @@ def cmd_open(character, args, game):
     # math is SUPERS content -- see supers/world_ext.py).
     upgrade_legacy_container(item)
     force_open = bool(getattr(item, "locked", False))
-    if not force_open and not getattr(item, "loot", None):
+    if (
+        not force_open
+        and not getattr(item, "loot", None)
+        and not getattr(item, "loot_payloads", None)
+    ):
         character.session.send(f"{item.key} isn't locked.")
         return
 
@@ -8267,13 +9364,30 @@ def cmd_open(character, args, game):
     if hooks.before_open_container(character, item, holder, game):
         return
 
-    # holder is either a list (character.inventory) or a Room -- both
-    # support .remove(obj) with the same signature, so no branch is needed.
-    holder.remove(item)
+    from engine.systems import containers as containers_mod
+    from engine.systems.economy import can_receive_cash
+
+    preview_rows = list(getattr(item, "loot", None) or [])
+    preview_rows.extend(getattr(item, "loot_payloads", None) or [])
+    if any(
+        isinstance(row, dict) and economy_wallet.is_cash_loot_type(row.get("type"))
+        for row in preview_rows
+    ) and not can_receive_cash(character):
+        character.session.send(
+            "Your hands are too full to take the cash inside. "
+            "Wear a pocket wallet or free a stack first."
+        )
+        return
+
+    loot_rows, consumed = containers_mod.peel_open_reward_box(item)
+    if consumed:
+        # holder is either a list (character.inventory) or a Room -- both
+        # support .remove(obj) with the same signature, so no branch is needed.
+        holder.remove(item)
 
     gains = []
     from engine import hooks
-    for reward in item.loot:
+    for reward in loot_rows:
         if reward.get("type") == "growth":
             # Retired payout -- combat banks growth. Skip so old saved
             # strongboxes cannot still dump growth on open.
@@ -8313,8 +9427,13 @@ def cmd_open(character, args, game):
                             character.session.send(line)
                     gains.append(format_money(amount))
                     continue
-            apply_cash_reward(character, amount)
-            gains.append(format_money(amount))
+            if apply_cash_reward(character, amount):
+                gains.append(format_money(amount))
+            else:
+                character.session.send(
+                    "The cash inside will not fit — wear a pocket wallet "
+                    "or free a stack first."
+                )
         elif reward.get("type") == "item":
             # Catalog id via hooks.make_world_item (SUPERS items catalog
             # when a game is installed; None / no-op without one).
@@ -8339,10 +9458,21 @@ def cmd_open(character, args, game):
                                 character.session.send(line)
                         split_item = True
                 if not split_item:
-                    # Route like cmd_get -- do not pre-append; merge + gear bag
-                    # routing lives in after_acquire_item / route_acquired_item.
-                    hooks.after_acquire_item(character, made)
-                gains.append(made.key)
+                    # Route like cmd_get -- refuse before stow so a full
+                    # inventory does not orphan the kit (P16-13).
+                    refusal = hooks.before_acquire_item(character, made)
+                    if refusal:
+                        room = getattr(character, "location", None)
+                        if room is not None and hasattr(room, "contents"):
+                            room.contents.append(made)
+                            made.location = room
+                        character.session.send(refusal)
+                        gains.append(f"{made.key} (left on the floor)")
+                    else:
+                        hooks.after_acquire_item(character, made)
+                        gains.append(made.key)
+                else:
+                    gains.append(made.key)
             else:
                 gains.append("a ruined kit scrap (useless)")
 
@@ -8413,11 +9543,19 @@ def cmd_idlemode(character, args, game):
 
 
 def cmd_save(character, args, game):
-    """Flush this character's blob to SQLite now (not the whole world).
+    """Flush this character's blob to SQLite now (add ``realm``/``all`` for built sites too).
+
+    Bare ``save`` flushes only your body/inventory -- the common case, and
+    the cheap one. ``save realm`` or ``save all`` (same thing, two names so
+    either reads naturally) additionally upserts homesteads, demesnes,
+    shops, personal realms, and townships you own, and archives a JSON
+    recovery copy (suggestion report 513 -- players kept typing bare
+    ``save`` expecting it to be the light option and getting the full
+    site flush every time).
 
     Clears the autosave dirty queue for your body until you change again.
-    Cooldown prevents save spam. Dropped floor loot and world meta still
-    rely on the normal autosave pulse.
+    Cooldown prevents save spam. Dropped floor loot still relies on the
+    normal autosave pulse.
     """
     import time
 
@@ -8426,8 +9564,11 @@ def cmd_save(character, args, game):
         persist_save_character,
     )
 
-    if (args or "").strip():
-        character.session.send("Usage: save")
+    arg = (args or "").strip().lower()
+    if arg in ("", "realm", "all"):
+        player_checkpoint = arg in ("realm", "all")
+    else:
+        character.session.send("Usage: save (character only) | save realm | save all")
         return
 
     now = time.monotonic()
@@ -8446,7 +9587,7 @@ def cmd_save(character, args, game):
         return
 
     ok, msg = persist_save_character(
-        conn, game, character, player_checkpoint=True,
+        conn, game, character, player_checkpoint=player_checkpoint,
     )
     if ok:
         character._last_player_save_monotonic = now
@@ -9373,8 +10514,9 @@ def _cmd_my_reports(character, args, game, kind, *, noun, file_verb, cmd_name, t
     body = [style.paint("muted", f"({scope})")]
     if not entries and not show_all:
         keys = reports.reporter_keys_for_character(game, character)
+        cnums = reports.reporter_cnums_for_character(game, character)
         recent_resolved = reports.recently_resolved_for_keys(
-            kind, keys, game.report_dir,
+            kind, keys, game.report_dir, cnums=cnums,
         )
         if recent_resolved:
             body.append(
@@ -9469,9 +10611,10 @@ def _reports_section(header, label, entries, game=None):
         from engine import reports as reports_mod
         n_comments = reports_mod.comment_count(entry)
         comment_bit = f" [{n_comments} comments]" if n_comments else ""
+        badge_bit = reports_mod.staff_ticket_badges(entry)
         lines.append(
             f"  [{label} #{entry_id}] ({status}) {time} {reporter}: "
-            f"{description}{comment_bit}"
+            f"{description}{badge_bit}{comment_bit}"
         )
     return lines
 
@@ -9553,6 +10696,8 @@ def _reports_kind_noun(kind):
         return "typos"
     if kind == reports.HELP:
         return "help proposals"
+    if kind == reports.PREPORT:
+        return "player reports"
     return "reports"
 
 
@@ -9637,6 +10782,7 @@ def cmd_reports(character, args, game):
             reports.SUGGEST: "Ideas:",
             reports.TYPO: "Typos:",
             reports.HELP: "Help ideas:",
+            reports.PREPORT: "Player conduct:",
         }.get(kind_filter, f"{label}:")
         body = [style.paint("muted", f"({_scope_line(kind_filter)})")]
         body += _reports_section(header, label, entries, game=game)

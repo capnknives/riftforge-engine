@@ -634,6 +634,53 @@ def abort_holds_tip(root, remote_sha):
     return bool(held and want and held == want)
 
 
+def hold_failed_tip(root, tip_sha, *, actor="boot-probe", reason=""):
+    """Abort-hold *tip_sha* so the next poll does not re-sync a broken tip.
+
+    Used after ``reset --hard`` + boot-probe rollback. Without this, deploy
+    state can record the tip as shipped while HEAD is rolled back, and
+    ``_sync_head_to_tip_if_behind`` re-attempts the same broken commit every
+    poll (live 2026-09-11: ``ecedf1e1b`` ↔ ``9ff8d5199`` flip-flop).
+
+    Also drops catch-up / batch / heads-up flags so the catch-up path
+    (which runs *before* the abort-hold check) cannot retry the same tip.
+    """
+    root = root or _repo_root()
+    tip = (tip_sha or "").strip()
+    cancelled = []
+    if _load_batch_pending(root):
+        clear_batch_pending(root)
+        cancelled.append("batch")
+    if catchup_requested(root):
+        clear_catchup(root)
+        cancelled.append("catch-up flag")
+    if immediate_requested(root):
+        clear_immediate(root)
+        cancelled.append("immediate catch-up")
+    if _load_heads_up(root):
+        clear_heads_up(root)
+        cancelled.append("heads-up")
+    abort_announced_tree_sync(root)
+    payload = {
+        "aborted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "actor": actor,
+        "tip_sha": tip,
+        "heads_announced": False,
+        "reason": (reason or "boot probe failed after sync")[:400],
+    }
+    path = abort_path(root)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+        fh.write("\n")
+    extra = f" cancelled={', '.join(cancelled)}" if cancelled else ""
+    print(
+        f"[auto_deploy] abort-hold {tip[:12] or '?'} by {actor}: "
+        f"{payload['reason']}{extra}",
+        flush=True,
+    )
+    return payload
+
+
 def clear_abort(root=None):
     """Drop the abort hold (new commit, explicit catch-up, or successful ship)."""
     path = abort_path(root or _repo_root())
@@ -884,8 +931,15 @@ def clear_gateway_disconnect_imminent(root):
         pass
 
 
-def begin_announced_tree_sync(root):
-    """Players were warned in-game — skip watcher settle before copyover."""
+def arm_announced_copyover(root):
+    """Countdown is over — the watcher may SIGUSR1 on its next file poll.
+
+    Split out of :func:`begin_announced_tree_sync` so the staged-sync order
+    can hold this back. ``reset --hard`` + boot probe run *before* the Veil
+    countdown; only when the countdown actually reaches zero is the copyover
+    armed, so "the world rewrites in 5 seconds" is a promise about work that
+    is already done rather than work about to start.
+    """
     try:
         with open(_announced_copyover_path(root), "w", encoding="utf-8") as fh:
             json.dump({"time": time.time()}, fh)
@@ -894,6 +948,15 @@ def begin_announced_tree_sync(root):
             f"[auto_deploy] could not mark announced copyover: {exc!r}",
             flush=True,
         )
+
+
+def begin_tree_sync_quiesce(root):
+    """Absorb protect-restore mtime churn *without* arming a copyover.
+
+    ``reset --hard`` + protect restore rewrite hundreds of mtimes. The
+    watcher skips copyover triggers while this marker exists, which is what
+    lets the tree be staged silently ahead of the player-facing countdown.
+    """
     try:
         with open(_tree_syncing_path(root), "w", encoding="utf-8") as fh:
             fh.write("\n")
@@ -902,6 +965,16 @@ def begin_announced_tree_sync(root):
             f"[auto_deploy] could not touch tree-sync marker: {exc!r}",
             flush=True,
         )
+
+
+def begin_announced_tree_sync(root):
+    """Players were warned in-game — skip watcher settle before copyover.
+
+    Kept as the both-markers-at-once entry point for callers (and smokes)
+    that arm the copyover and open the mtime quiesce in one step.
+    """
+    arm_announced_copyover(root)
+    begin_tree_sync_quiesce(root)
 
 
 def announced_copyover_pending(root) -> bool:
@@ -939,6 +1012,77 @@ def abort_announced_tree_sync(root=None):
     root = root or _repo_root()
     clear_announced_copyover(root)
     clear_tree_sync_quiesce(root)
+
+
+def _stage_tree_before_countdown(root, sha, *, triggered_by="auto_deploy"):
+    """Move the tree to *sha* and boot-probe it, with copyover held back.
+
+    This is the slow half of a deploy: ``reset --hard``, protect stash and
+    restore, map heal, changelog stamp, and a throwaway ``Game()`` boot probe
+    (``RIFTFORGE_BOOT_PROBE_TIMEOUT``, default 600s). Because
+    ``try_auto_deploy`` runs inline on the watcher loop, every second spent
+    here is a second the watcher cannot fire the copyover — so it must happen
+    *before* players are told a number, not after.
+
+    Only :func:`begin_tree_sync_quiesce` is set (not the announced-copyover
+    marker), so the watcher absorbs the mtime churn and stays quiet.
+
+    Returns ``(ok, gateway_restart, previous_head)``. ``gateway_restart`` is
+    computed *before* HEAD moves — ``_advance_touches_gateway`` compares the
+    tree to the target and returns False once they match, so asking after the
+    sync would always predict a stay-connected copyover and the Veil would
+    never warn about a real client drop.
+    """
+    gateway_restart = _advance_touches_gateway(root, sha)
+    previous_head = _head_sha(root)
+    begin_tree_sync_quiesce(root)
+    _snapshot_db_before_tree_sync(root, triggered_by=triggered_by)
+    try:
+        if not _reset_hard_to(root, sha):
+            # ``hold_failed_tip`` (inside _reset_hard_to) already abort-held
+            # this tip and dropped both markers.
+            abort_announced_tree_sync(root)
+            return False, gateway_restart, previous_head
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        abort_announced_tree_sync(root)
+        print(f"[auto_deploy] staged tree sync failed: {exc}", flush=True)
+        return False, gateway_restart, previous_head
+    return True, gateway_restart, previous_head
+
+
+def _unstage_tree_after_abort(root, previous_head, *, reason):
+    """Put the tree back when the countdown never reached zero.
+
+    A GM abort (or a countdown that timed out because the game child never
+    answered) must not leave new code on disk while the running process holds
+    the old modules — that mixed state is exactly what the copyover exists to
+    resolve. Rolling back restores the pre-inversion behaviour, where an
+    aborted countdown left the tree untouched and the next poll retried.
+    """
+    if not previous_head:
+        # Nothing to roll back to; drop the markers so a leftover quiesce
+        # cannot swallow file-mtime copyovers forever.
+        abort_announced_tree_sync(root)
+        return
+    print(
+        f"[auto_deploy] {reason} — rolling staged tree back to "
+        f"{previous_head[:12]}",
+        flush=True,
+    )
+    try:
+        stash = _stash_protected_live_files(root)
+        try:
+            _run_git("reset", "--hard", previous_head, cwd=root)
+        finally:
+            _restore_protected_live_files(root, stash)
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        print(
+            f"[auto_deploy] staged rollback FAILED ({exc}) — tree may still "
+            f"hold new code; the watcher settle path will copyover it",
+            flush=True,
+        )
+    finally:
+        abort_announced_tree_sync(root)
 
 
 def _files_between_commits(root, old_sha, new_sha):
@@ -1021,6 +1165,25 @@ def read_override(root=None):
     return None
 
 
+def override_is_off(root=None):
+    """True when GM ``autodeploy off`` wrote ``.auto_deploy_override``.
+
+    This is the **same** override-off half of ``poll_skip_reason`` -- the
+    only parser is still ``read_override``. True for both GM
+    ``autodeploy off`` and a hold-written off. The watcher cannot use
+    ``poll_skip_reason`` itself as the auto-resume gate: that helper
+    returns ``revert hold active`` first, and auto-resume is *supposed*
+    to run while a hold is on (to pick up a real fix) unless **staff**
+    paused overlays. Live 2026-09-11 copyover loop: override ``off`` at
+    17:51 UTC did not stop ``maybe_auto_resume_hold``, which overwrote
+    the file to ``on`` and SIGUSR1'd ``announced deploy sync`` at 17:52
+    (``files=none``). Hold-vs-staff provenance is
+    ``crash_recovery.hold_set_override_off``.
+    """
+    override = read_override(root)
+    return override is not None and override != _OVERRIDE_ON
+
+
 def catchup_path(root=None):
     """Absolute path to the re-enable catch-up request flag."""
     return os.path.join(root or _repo_root(), CATCHUP_NAME)
@@ -1098,7 +1261,7 @@ def request_immediate_catchup(root=None):
     return path
 
 
-def set_override(value, root=None, *, queue_catchup=True):
+def set_override(value, root=None, *, queue_catchup=True, _from_hold=False):
     """Write the GM override file to 'on' or 'off'. Returns the path written.
 
     Turning **on** also queues a catch-up sync (``request_catchup``) so
@@ -1107,6 +1270,12 @@ def set_override(value, root=None, *, queue_catchup=True):
 
     Pass ``queue_catchup=False`` when restoring a prior override in tests
     so the staging/live tree does not get a spurious catch-up flag.
+
+    ``_from_hold=True`` is **internal** -- only ``crash_recovery.set_revert_hold``
+    may pass it. Every other caller (GM ``autodeploy on|off``, staff,
+    ``resume_after_crash_hold``) clears hold-written-off provenance so a
+    later staff ``autodeploy off`` wins over a hold that already wrote
+    off (2026-09-11 follow-up: hold-off must not look like staff-off).
 
     Raises ValueError if value is not on/off.
     """
@@ -1120,6 +1289,17 @@ def set_override(value, root=None, *, queue_catchup=True):
     path = override_path(root)
     with open(path, "w", encoding="utf-8") as f:
         f.write(normalized + "\n")
+    # Staff / GM / resume wrote this -- not the hold. Clear provenance
+    # so ``auto_resume_suppress_reason`` treats a later off as staff-off.
+    # The hold's own call passes ``_from_hold=True`` and stamps the flag
+    # itself after this returns.
+    if not _from_hold:
+        try:
+            from engine import crash_recovery
+
+            crash_recovery.clear_hold_auto_override_off(root=root)
+        except Exception:
+            pass
     # Re-enable → full tree catch-up; pause → cancel a pending catch-up *flag*.
     # A debounce batch or Veil countdown already running is **not** stopped
     # by off — GM ``autodeploy abort`` calls ``abort_planned_deploy``.
@@ -1168,10 +1348,10 @@ def poll_skip_reason(root=None):
 
     if crash_recovery.hold_active(root=root):
         return "revert hold active"
-    override = read_override(root)
-    if override is not None:
-        if override != _OVERRIDE_ON:
-            return "override off"
+    # Same GM-off check the watcher uses to suppress auto-resume.
+    if override_is_off(root):
+        return "override off"
+    if read_override(root) is not None:
         return None
     if not env_enabled():
         return "AUTO_DEPLOY env off"
@@ -1267,10 +1447,9 @@ def deploy_headline(root=None):
         reason = crash_recovery.read_hold_reason(root=root)
         return f"PAUSED (hold: {reason})" if reason else "PAUSED (hold)"
 
-    override = read_override(root)
-    if override is not None and override != _OVERRIDE_ON:
+    if override_is_off(root):
         return "PAUSED (override off)"
-    if not env_enabled() and override is None:
+    if not env_enabled() and read_override(root) is None:
         return "PAUSED (env off)"
 
     if (
@@ -1857,16 +2036,35 @@ def _verify_boot_probe_or_rollback(root, previous_head):
     full ``reset --hard`` syncs must pass the same bar or live would pick
     up broken ``main`` and crash-loop the game child (Dallas class).
 
-    Returns True when the tree is left at the synced tip (probe ok or
-    probe disabled). Returns False after rolling back to ``previous_head``.
+    Returns True when the tree is left at the synced tip (probe ok,
+    probe disabled, or probe *timed out* -- slow Game() is not a crash).
+    Returns False after rolling back to ``previous_head``.
     """
-    from engine.boot_probe import boot_probe_enabled, run_boot_probe_subprocess
+    from engine import env_file
 
-    if not boot_probe_enabled():
+    # Reload from disk so a just-synced tree's timeout / whitelist apply
+    # even if this watcher imported boot_probe days ago at 180s.
+    importlib.reload(env_file)
+    env_file.apply_repo_env(root)
+    from engine import boot_probe as boot_probe_mod
+
+    importlib.reload(boot_probe_mod)
+    if not boot_probe_mod.boot_probe_enabled():
         return True
-    ok, detail = run_boot_probe_subprocess(cwd=root)
+    ok, detail = boot_probe_mod.run_boot_probe_subprocess(cwd=root)
     if ok:
         print(f"[auto_deploy] boot probe ok: {detail or 'boot ok'}", flush=True)
+        return True
+    # A wall-clock timeout means Game() was still running -- live boot is
+    # often longer than the old 180s cap. Rolling back abort-holds a good
+    # tip and bounces players through a second rewrite. Crash recovery
+    # still catches a child that never heartbeats.
+    if boot_probe_mod.boot_probe_timed_out(detail):
+        print(
+            f"[auto_deploy] boot probe timed out after sync — leaving tip "
+            f"in place (slow Game() is not a crash): {detail}",
+            flush=True,
+        )
         return True
     prev = (previous_head or "")[:12] or "?"
     print(
@@ -1995,6 +2193,15 @@ def _reset_hard_to(root, sha):
         print(f"[auto_deploy] map heal skipped: {exc}", flush=True)
     _ensure_changelog_ledger_after_sync(root)
     if not _verify_boot_probe_or_rollback(root, previous_head):
+        # Probe failed and HEAD is back at previous_head. Hold the *target*
+        # tip so the next 30s poll cannot immediately reset --hard to it
+        # again (catch-up and HEAD-behind self-heal both retry otherwise).
+        hold_failed_tip(
+            root,
+            sha,
+            actor="boot-probe",
+            reason="boot probe failed after sync",
+        )
         return False
     _emit_deploy_diag(
         kind="reset",
@@ -2249,6 +2456,13 @@ def _sync_head_to_tip_if_behind(root, remote_sha, *, reason=""):
     head_sha = _head_sha(root)
     if not head_sha or head_sha == remote_sha:
         return True
+    if abort_holds_tip(root, remote_sha):
+        print(
+            f"[auto_deploy] HEAD sync skipped -- abort-hold on "
+            f"{remote_sha[:12]}",
+            flush=True,
+        )
+        return False
     if tree_sync_blocked(root):
         _maybe_log_tree_sync_deferred(
             root,
@@ -2839,20 +3053,47 @@ def _run_catchup_countdown(
 def _run_deploy_pipeline(
     root, *, commit_sha, bug_ids, suggestion_ids, summary, countdown, files,
 ):
-    """Announce in-game, wait, overlay this commit's files only.
+    """Stage this commit's files (overlay + boot probe), then announce.
 
     `files` is precomputed by the caller so empty commits never reach
     queue_deploy (announce-before-overlay was the false-positive path for
     merge tips with no file payload). ``bug_ids`` / ``suggestion_ids`` may
     list several tickets for a batch subject so on_resume marks every one
     resolved.
+
+    Order matters: the overlay's throwaway ``Game()`` boot probe blocks the
+    watcher loop, so it runs before the countdown. Players hear a number only
+    once the new files are on disk and proven bootable, and the copyover fires
+    on the next file poll instead of after another full boot.
     """
-    from tools.apply_pr_fix import overlay_files_from_ref_with_boot_probe
+    import tools.apply_pr_fix as apply_pr_fix
 
     deploy_notify = _fresh_deploy_notify()
     from engine import gateway_watch
 
     gateway_restart = gateway_watch.paths_touch_gateway_restart(files)
+
+    # Stage before announcing. Older apply_pr_fix on disk (module skew during
+    # a partial sync) falls back to the un-rollbackable overlay helper.
+    stage = getattr(apply_pr_fix, "stage_overlay_with_boot_probe", None)
+    if stage is not None:
+        ok, probe_detail, overlay_backups = stage(commit_sha, files, cwd=root)
+    else:
+        ok, probe_detail = apply_pr_fix.overlay_files_from_ref_with_boot_probe(
+            commit_sha, files, cwd=root,
+        )
+        overlay_backups = []
+    if not ok:
+        print(
+            f"[auto_deploy] overlay rolled back (boot probe): {probe_detail}",
+            flush=True,
+        )
+        return False
+    print(
+        f"[auto_deploy] staged {len(files)} file(s) from {commit_sha[:12]} "
+        f"(boot probe: {probe_detail})",
+        flush=True,
+    )
 
     primary_bug = bug_ids[0] if bug_ids else None
     primary_suggest = suggestion_ids[0] if suggestion_ids else None
@@ -2875,6 +3116,10 @@ def _run_deploy_pipeline(
             "(countdown already completed for this commit)",
             flush=True,
         )
+        # Players already heard the countdown for this commit on an earlier
+        # run; the files are staged now, so let the watcher reload without
+        # waiting out another settle window.
+        begin_announced_tree_sync(root)
         return True
 
     label = deploy_notify.describe_ticket_ref(bug_ids, suggestion_ids)
@@ -2896,25 +3141,17 @@ def _run_deploy_pipeline(
                 "is deploy_notify wired in server.py?",
                 flush=True,
             )
-        return False
-
-    begin_announced_tree_sync(root)
-    ok, probe_detail = overlay_files_from_ref_with_boot_probe(
-        commit_sha, files, cwd=root,
-    )
-    if not ok:
+        # Countdown never reached zero: un-stage so the running process and
+        # the files on disk stay in agreement, same as a pre-inversion abort.
+        rollback = getattr(apply_pr_fix, "rollback_staged_overlay", None)
+        if rollback is not None:
+            rollback(overlay_backups, cwd=root)
         abort_announced_tree_sync(root)
-        print(
-            f"[auto_deploy] overlay rolled back (boot probe): {probe_detail}",
-            flush=True,
-        )
         return False
 
-    print(
-        f"[auto_deploy] overlaid {len(files)} file(s) from {commit_sha[:12]} "
-        f"(boot probe: {probe_detail})",
-        flush=True,
-    )
+    # Countdown hit zero and the overlay is already on disk + probed: arm the
+    # copyover so the watcher fires on its next poll (no settle, no second boot).
+    begin_announced_tree_sync(root)
     from engine.deploy_guard import run_post_overlay_checks
     run_post_overlay_checks(root)
     _emit_deploy_diag(
@@ -3544,36 +3781,38 @@ def _run_reenable_catchup(root, state, remote_sha, *, immediate=False):
             flush=True,
         )
     else:
-        # Warn in-game before rewriting files (mtime → copyover).
+        # Stage the tree + boot probe FIRST, silently, then warn in-game.
         # ``autodeploy now`` keeps a 5s Veil instead of the 30s rewrite wait
         # and the 2–10 min merge-quiet debounce.
         countdown = DEFAULT_IMMEDIATE_COUNTDOWN if immediate else None
+        ok, gateway_restart, previous_head = _stage_tree_before_countdown(
+            root, remote_sha, triggered_by="auto_deploy_catchup",
+        )
+        if not ok:
+            print(
+                "[auto_deploy] catch-up sync aborted (boot probe failed)",
+                flush=True,
+            )
+            # Leave the flag so the next poll retries.
+            return False
         if not _run_catchup_countdown(
             root,
             commit_sha=remote_sha,
             countdown=countdown,
+            gateway_restart=gateway_restart,
             summary=(
                 "Catch-up rewrite — the Veil is about to stitch origin/main "
                 "into the live bones of this world."
             ),
         ):
+            _unstage_tree_after_abort(
+                root, previous_head, reason="catch-up countdown did not finish",
+            )
             # Leave the flag so the next poll retries.
             return False
-        try:
-            begin_announced_tree_sync(root)
-            _snapshot_db_before_tree_sync(root)
-            if not _reset_hard_to(root, remote_sha):
-                abort_announced_tree_sync(root)
-                print(
-                    "[auto_deploy] catch-up sync aborted (boot probe failed)",
-                    flush=True,
-                )
-                return False
-        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-            abort_announced_tree_sync(root)
-            print(f"[auto_deploy] catch-up sync failed: {exc}", flush=True)
-            # Leave the flag so the next poll retries.
-            return False
+        # Countdown hit zero with the new tree already on disk: the watcher
+        # copyovers on its next file poll instead of after a boot probe.
+        arm_announced_copyover(root)
 
     # Tree is at tip. Always clear the catch-up flag + advance tracked SHA
     # even if resolve queueing fails -- otherwise every poll re-runs
@@ -3763,30 +4002,33 @@ def try_auto_deploy():
                 ),
             )
             return False
+        # Stage the tree + boot probe FIRST (silent), then run the Veil
+        # countdown, then arm the copyover. Announcing before this work meant
+        # the "rewrite in N seconds" promise was followed by a full throwaway
+        # Game() boot on the watcher thread before anything visibly happened.
+        ok, gateway_restart, previous_head = _stage_tree_before_countdown(
+            root, remote_sha, triggered_by="auto_deploy_feature",
+        )
+        if not ok:
+            print(
+                "[auto_deploy] working-tree sync aborted (boot probe failed)",
+                flush=True,
+            )
+            return False
         if not _run_catchup_countdown(
             root,
             commit_sha=remote_sha,
+            gateway_restart=gateway_restart,
             summary=(
                 "A world rewrite is landing — stay put while the Veil "
                 "stitches the new bones into place."
             ),
         ):
+            _unstage_tree_after_abort(
+                root, previous_head, reason="feature countdown did not finish",
+            )
             return False
-        try:
-            begin_announced_tree_sync(root)
-            _snapshot_db_before_tree_sync(root)
-            if not _reset_hard_to(root, remote_sha):
-                abort_announced_tree_sync(root)
-                print(
-                    "[auto_deploy] working-tree sync aborted "
-                    "(boot probe failed)",
-                    flush=True,
-                )
-                return False
-        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-            abort_announced_tree_sync(root)
-            print(f"[auto_deploy] working-tree sync failed: {exc}", flush=True)
-            return False
+        arm_announced_copyover(root)
         # A feature tip can land in the same poll batch as Fix commits
         # underneath it -- resolve those tickets after the tree sync.
         if missed_fixes:

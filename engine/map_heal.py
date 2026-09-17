@@ -5,9 +5,17 @@ After auto-deploy ``git reset --hard``, ``content/zones/*.json`` and
 ``content/maps/*.json`` follow origin/main. Protected
 ``content/map_backups/<id>.json`` slots may still hold live populate /
 dig rooms and player **remodel** stamps. This module merges **missing
-room keys** (and missing exits whose destinations exist) back into the
-live file, and restores remodel prose / ``remodel_type`` / garage inbound
-exit labels on rooms that git already ships (bug report 765).
+room keys** (and missing exits whose destinations exist) into an
+**in-memory overlay**, and restores remodel prose / ``remodel_type`` /
+garage inbound exit labels on rooms that git already ships (bug report
+765). Git SoT files are never rewritten on a routine boot -- a full-file
+``json.dump`` of lebanon.json was indent-2 vs indent=4 plus backup extras
+copied into tracked files.
+
+``maps._load_map_files`` / ``resolve_map_file`` apply the overlay so the
+live room graph still sees backup extras after copyover. Staff
+``gm maps backup`` still snapshots the on-disk Git file plus this module's
+overlay via ``healed_live_doc`` when a caller needs the merged view.
 
 Used from ``engine.auto_deploy`` after protect-restore on silent main
 advances so live-built neighborhoods survive unrelated PR merges.
@@ -19,32 +27,190 @@ Engine-pure: no ``supers`` imports. Backup directory path is the standard
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
-import stat as stat_mod
 
 from engine import world_maps as maps_mod
 
+# abs(live_path) -> merged document for this process. Copyover starts a
+# fresh interpreter; ``_load_map_files`` re-merges from the backup file
+# when this dict is empty (fingerprint-skip on heal_all must not strand
+# backup rooms).
+_LIVE_OVERLAY: dict[str, dict] = {}
 
-def _restore_path_meta(path, info):
-    """Keep bind-mount owner/mode after a root-in-Docker rewrite.
+# Copyover / game-only restart is a fresh interpreter every boot, so
+# heal_all_from_hot_backups() reran its full open+json.load walk over every
+# live map/zone file and every hot backup slot on *every* boot, even when
+# nothing had changed since the last successful heal in this container.
+# A cheap path+mtime+size fingerprint (stat only, no file reads) lets a
+# reload boot skip that walk -- still correct for a hot map edit (dig,
+# populate, `gm maps backup`) right before copyover, because that changes
+# the fingerprint, and correct for a fresh auto-deploy `reset --hard`,
+# because checkout rewrites the live file's mtime. Persisted to a repo-root
+# dotfile (same convention as `.auto_deploy_state.json` / `.copyover_state.json`
+# -- see .gitignore) so it survives a game-only respawn, not just copyover's
+# in-process execv.
+_FINGERPRINT_STATE_NAME = ".map_heal_fingerprint.json"
 
-    Container map heal used to leave zone JSON ``root:root`` mode 600, so
-    the host user could not ``git hash`` the file and later checkouts
-    fought the bind-mount.
-    """
-    if info is None:
-        return
-    mode, uid, gid = info
+
+def _fingerprint_state_path(root):
+    return os.path.join(root, _FINGERPRINT_STATE_NAME)
+
+
+def _fingerprint_paths(root):
+    """Every path whose mtime/size affects a heal outcome."""
+    paths = list(maps_mod.iter_map_json_paths())
+    bak_dir = _backups_dir(root)
+    if os.path.isdir(bak_dir):
+        for name in sorted(os.listdir(bak_dir)):
+            if name.endswith(".json"):
+                paths.append(os.path.join(bak_dir, name))
+    return paths
+
+
+def _compute_heal_fingerprint(root):
+    """Sorted ``(relpath, mtime_ns, size)`` digest -- stat only, no reads."""
+    entries = []
+    for path in _fingerprint_paths(root):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        entries.append(
+            [os.path.relpath(path, root), int(st.st_mtime_ns), int(st.st_size)],
+        )
+    entries.sort()
+    payload = json.dumps(entries, sort_keys=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _load_saved_heal_fingerprint(root):
     try:
-        os.chmod(path, mode)
+        with open(_fingerprint_state_path(root), encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None
+    return data.get("fingerprint") if isinstance(data, dict) else None
+
+
+def _save_heal_fingerprint(root, fingerprint):
+    try:
+        with open(_fingerprint_state_path(root), "w", encoding="utf-8") as handle:
+            json.dump({"fingerprint": fingerprint}, handle)
     except OSError:
         pass
-    if hasattr(os, "chown") and uid is not None and gid is not None:
-        try:
-            os.chown(path, uid, gid)
-        except OSError:
-            pass
+
+
+def reset_live_overlay():
+    """Drop in-process merged docs (targeted smokes)."""
+    _LIVE_OVERLAY.clear()
+
+
+def forget_live_overlay(live_path):
+    """Drop the overlay for one Git path (after persist / restore)."""
+    if not live_path:
+        return
+    _LIVE_OVERLAY.pop(os.path.abspath(live_path), None)
+
+
+def remember_live_overlay(live_path, doc):
+    """Store a merged map/zone document for this process (never writes disk)."""
+    if not live_path or not isinstance(doc, dict):
+        return
+    _LIVE_OVERLAY[os.path.abspath(live_path)] = doc
+
+
+def overlay_doc(live_path):
+    """Merged in-memory doc for *live_path*, or None if none yet."""
+    if not live_path:
+        return None
+    return _LIVE_OVERLAY.get(os.path.abspath(live_path))
+
+
+def strip_overlay_rooms(live_path, doomed_keys):
+    """Remove *doomed_keys* from a cached overlay (persist=False boot heals).
+
+    Does not replace the overlay with a Git-only document -- backup extras
+    stay. Returns how many rooms were dropped from the overlay.
+    """
+    overlay = overlay_doc(live_path)
+    if overlay is None or not doomed_keys:
+        return 0
+    doomed = {k for k in doomed_keys if k}
+    rooms = overlay.get("rooms") or []
+    kept = [room for room in rooms if room.get("key") not in doomed]
+    dropped = len(rooms) - len(kept)
+    overlay["rooms"] = kept
+    for room in kept:
+        exits = room.get("exits") or {}
+        for direction, dest in list(exits.items()):
+            if dest in doomed:
+                del exits[direction]
+    for pocket in overlay.get("pockets") or []:
+        if pocket.get("hub_room") in doomed:
+            pocket["hub_room"] = ""
+    return dropped
+
+
+def backup_path_beside_live(live_path, live_doc):
+    """``content/map_backups/<map_id>.json`` next to this live maps/zones file."""
+    map_id = maps_mod._map_id_for(os.path.basename(live_path), live_doc)
+    content_root = os.path.dirname(os.path.dirname(os.path.abspath(live_path)))
+    return os.path.join(content_root, "map_backups", f"{map_id}.json")
+
+
+def apply_hot_backup_overlay(live_path, live_doc, *, backup_path=None):
+    """Return *live_doc* merged with hot-backup extras. Never writes Git SoT.
+
+    Idempotent: a second call for the same path returns the remembered
+    overlay. Missing / unreadable backups return *live_doc* unchanged.
+    """
+    if not live_path or not isinstance(live_doc, dict):
+        return live_doc
+    abs_path = os.path.abspath(live_path)
+    cached = _LIVE_OVERLAY.get(abs_path)
+    if cached is not None:
+        return cached
+    if backup_path is None:
+        backup_path = backup_path_beside_live(live_path, live_doc)
+    if not backup_path or not os.path.isfile(backup_path):
+        return live_doc
+    try:
+        with open(backup_path, encoding="utf-8") as handle:
+            backup_doc = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return live_doc
+    merged, added, exit_patches, skipped_vnum, remodel_patches = (
+        merge_missing_from_backup(live_doc, backup_doc)
+    )
+    if not added and not exit_patches and not skipped_vnum and not remodel_patches:
+        return live_doc
+    extra_keys = maps_mod.collect_map_room_keys(exclude_path=live_path)
+    exit_errors = maps_mod.document_hand_exit_graph_errors(
+        os.path.basename(live_path), merged, known_keys=extra_keys,
+    )
+    if exit_errors:
+        return live_doc
+    remember_live_overlay(abs_path, merged)
+    return merged
+
+
+def healed_live_doc(live_path, backup_path=None):
+    """Load the on-disk Git file, merge backup extras in memory, never write."""
+    if not live_path or not os.path.isfile(live_path):
+        return None
+    cached = overlay_doc(live_path)
+    if cached is not None:
+        return cached
+    try:
+        with open(live_path, encoding="utf-8") as handle:
+            live_doc = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return apply_hot_backup_overlay(
+        live_path, live_doc, backup_path=backup_path,
+    )
 
 
 def _backups_dir(root=None):
@@ -449,10 +615,10 @@ def merge_missing_from_backup(live_doc, backup_doc):
 
 
 def heal_file_from_backup(live_path, backup_path, *, dry_run=False):
-    """Merge backup into live_path when backup has extra rooms.
+    """Merge backup extras into an in-memory overlay for *live_path*.
 
-    Returns a short status string, or None when nothing to do.
-    Raises on I/O / JSON errors.
+    Does **not** rewrite the Git SoT file. Returns a short status string,
+    or None when nothing to do. Raises on I/O / JSON errors.
     """
     if not os.path.isfile(backup_path):
         return None
@@ -506,30 +672,36 @@ def heal_file_from_backup(live_path, backup_path, *, dry_run=False):
                 f"map heal {map_id}: skipped write — would break boot "
                 f"({exit_errors[0]})"
             )
-        prior = None
-        try:
-            st = os.stat(live_path)
-            prior = (stat_mod.S_IMODE(st.st_mode), st.st_uid, st.st_gid)
-        except OSError:
-            prior = None
-        with open(live_path, "w", encoding="utf-8") as handle:
-            json.dump(merged, handle, indent=4, ensure_ascii=False)
-            handle.write("\n")
-        _restore_path_meta(live_path, prior)
+        # In-memory only — Git SoT maps/zones stay as authored.
+        remember_live_overlay(live_path, merged)
 
     return _status_prefix()
 
 
-def heal_all_from_hot_backups(root=None, *, dry_run=False):
-    """Walk ``content/map_backups/*.json`` and heal matching live files.
+def heal_all_from_hot_backups(root=None, *, dry_run=False, force=False):
+    """Walk ``content/map_backups/*.json`` and overlay matching live files.
 
-    Returns a list of log lines (empty when nothing healed).
+    Merges into the in-memory overlay (never Git SoT). Returns a list of
+    log lines (empty when nothing healed). ``maps._load_map_files``
+    re-applies the same merge when this walk is fingerprint-skipped on a
+    fresh interpreter.
+
+    ``force=True`` (staff-triggered heals, e.g. a GM verb) always re-walks
+    and re-saves the fingerprint. Boot/auto-deploy callers leave it False
+    so an unchanged container skips the expensive parse pass; see the
+    fingerprint helpers above for why that is safe.
     """
     if root is None:
         root = os.getcwd()
     bak_dir = _backups_dir(root)
     if not os.path.isdir(bak_dir):
         return []
+
+    fingerprint = None
+    if not dry_run and not force:
+        fingerprint = _compute_heal_fingerprint(root)
+        if fingerprint == _load_saved_heal_fingerprint(root):
+            return []
 
     # map_id -> live absolute path
     live_by_id = {}
@@ -554,4 +726,10 @@ def heal_all_from_hot_backups(root=None, *, dry_run=False):
         msg = heal_file_from_backup(live_path, backup_path, dry_run=dry_run)
         if msg:
             lines.append(msg)
+
+    if not dry_run:
+        # Overlay no longer changes live-file mtimes. Still persist the
+        # fingerprint so a no-op copyover skips this walk; ``_load_map_files``
+        # re-merges from the backup on the fresh interpreter.
+        _save_heal_fingerprint(root, _compute_heal_fingerprint(root))
     return lines

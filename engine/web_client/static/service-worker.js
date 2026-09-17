@@ -2,7 +2,7 @@
  * Offline shell cache for the browser HUD — static assets only.
  * Does not intercept WebSockets or non-shell fetch targets.
  */
-const CACHE_BUILD = "2026-09-05c";
+const CACHE_BUILD = "2026-09-07-pathwalk";
 const CACHE_NAME = "riftforge-shell-" + CACHE_BUILD;
 
 const SHELL_FILES = new Set([

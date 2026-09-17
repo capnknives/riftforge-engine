@@ -7,7 +7,9 @@ staff clears the hold.
 
 Env (optional):
 
-- ``RIFTFORGE_CRASH_WINDOW`` -- seconds (default ``300``)
+- ``RIFTFORGE_CRASH_WINDOW`` -- seconds (default ``300``). Gateway-outage
+  revert also requires a stale ``.game_heartbeat`` (2026-09-11: 284s/325s
+  boots were scored as dead against this window while phases still advanced).
 - ``RIFTFORGE_CRASH_MAX_EXITS`` -- non-planned exits in window (default ``5``)
 - ``RIFTFORGE_CRASH_REVERT_BACKOFF`` -- base spawn backoff seconds (default ``30``)
 - ``RIFTFORGE_DB_CORRUPT_MAX_EXITS`` -- corrupt DB boot exits before hold (default ``3``)
@@ -34,6 +36,9 @@ HOLD_FILENAME = ".crash_revert_hold"
 # then" from "nothing has changed" without staff needing to remember a
 # manual `gm recover clearhold` every single time.
 HOLD_META_FILENAME = ".crash_revert_hold_meta.json"
+# Hold-written ``autodeploy off`` provenance (see ``hold_set_override_off``).
+# Staff ``set_override`` without ``_from_hold`` clears this so their intent wins.
+HOLD_AUTO_OVERRIDE_OFF_KEY = "auto_override_off"
 DB_HOLD_FILENAME = ".db_corruption_hold"
 BOOT_HOLD_FILENAME = ".boot_failure_hold"
 PLANNED_RESTART_FILENAME = ".planned_restart"
@@ -374,6 +379,37 @@ def write_gateway_ipc_down(
         pass
 
 
+def outage_predates_child(started, game_spawn_wall):
+    """True when IPC went down before this game child was even spawned.
+
+    ``GatewayBridge.connect_and_run`` runs *after* ``Game()`` returns
+    (``server.py`` main), so a booting child has never had IPC up in this
+    process -- the downtime on file belongs to the child that exited.
+    Split-brain is the opposite shape: the child connected (which clears
+    the stamp) and *then* lost the writer, so ``down_since_wall`` lands
+    after its spawn.
+
+    Live 2026-09-11: a 264s copyover boot was desync-killed at
+    ``ipc_down_300s>30s heartbeat_fresh_98s`` -- the killer had proof the
+    child was alive and still scored inherited downtime as split-brain.
+    The kill left no process stamping, so ``gateway_outage_tripped``
+    immediately saw a stale heartbeat and reverted the tree out from under
+    the boot, re-running the deploy (DB snapshot + 610-file protect
+    restore + boot probe) and making the next boot slower still.
+    """
+    if game_spawn_wall is None:
+        return False
+    try:
+        started = float(started)
+        spawn = float(game_spawn_wall)
+    except (TypeError, ValueError):
+        return False
+    if started <= 0:
+        return False
+    # 1s slack: the stamp and the spawn can land in the same second.
+    return started < (spawn - 1.0)
+
+
 def should_kill_for_ipc_desync(
     *, game_spawn_wall, now_wall=None, root=None
 ):
@@ -399,6 +435,10 @@ def should_kill_for_ipc_desync(
     started = float(data.get("down_since_wall") or 0)
     if started <= 0:
         return False, "invalid_down_since"
+    # A boot longer than boot grace is not split-brain: this child has
+    # never had IPC up, so there is no desync to kill.
+    if outage_predates_child(started, game_spawn_wall):
+        return False, "ipc_down_predates_this_child"
     age = now - started
     threshold = ipc_desync_kill_seconds()
     if age < threshold:
@@ -532,8 +572,46 @@ def read_gateway_outage(*, root=None):
         return None
 
 
-def gateway_outage_tripped(*, root=None, now=None):
-    """True when gateway reports game IPC down longer than crash window."""
+def heartbeat_stale_for_outage_revert(*, now=None):
+    """True when ``.game_heartbeat`` is missing or older than hang timeout.
+
+    Does **not** change hang-kill (``game_heartbeat.should_kill_for_hang``).
+    Used only so a gateway-outage revert ignores a child that is still
+    advancing boot phases.
+
+    Live 2026-09-11: ``[boot_profile] TOTAL: 284365.3`` and ``325242.8``
+    (284s / 325s) against a 300s crash window. Heartbeat notes kept
+    moving (``pre_load_world``, ``post_load_world``, ``item_inum_heal_done``,
+    ``pre_build_world``, ``post_tick``) while IPC was down. IPC-down-only
+    revert rolled the bind-mount, auto-resume re-shipped, copyover looped
+    ~every 5 minutes for hours (8 child exits in 3h). Container env cannot
+    raise ``RIFTFORGE_CRASH_WINDOW`` without compose recreate (hard rule 19).
+    """
+    from engine import game_heartbeat
+
+    now = time.time() if now is None else now
+    mtime = game_heartbeat.heartbeat_mtime()
+    if mtime is None:
+        # No stamp at all after the crash window: cannot prove progress.
+        # A live boot writes process_start / main_enter / game_init long
+        # before 300s, so a missing file here is a dead or unstarted child.
+        return True
+    return (now - float(mtime)) >= game_heartbeat.hang_timeout_seconds()
+
+
+def gateway_outage_tripped(*, root=None, now=None, game_spawn_wall=None):
+    """True when game IPC has been down past the crash window AND heartbeat is stale.
+
+    A slow-but-progressing ``Game()`` boot is alive -- do not revert the
+    tree out from under it (2026-09-11 284s/325s boots). A truly hung
+    child (heartbeat older than ``GAME_HANG_TIMEOUT``) still trips.
+
+    ``game_spawn_wall`` (when the watcher knows it) discards downtime the
+    *previous* child accrued. Without it, a kill/respawn hands the fresh
+    child an already-expired window plus a heartbeat that is stale only
+    because the stamp was just cleared on spawn -- which is how one slow
+    boot turned into an hours-long revert/re-ship loop on 2026-09-11.
+    """
     data = read_gateway_outage(root=root)
     if not data or not isinstance(data, dict):
         return False
@@ -542,8 +620,13 @@ def gateway_outage_tripped(*, root=None, now=None):
     started = float(data.get("down_since_wall") or 0)
     if started <= 0:
         return False
+    if outage_predates_child(started, game_spawn_wall):
+        return False
     now = time.time() if now is None else now
-    return (now - started) >= crash_window_seconds()
+    if (now - started) < crash_window_seconds():
+        return False
+    # Window elapsed is not enough -- require a real hang.
+    return heartbeat_stale_for_outage_revert(now=now)
 
 
 def write_gateway_outage(*, down_since_wall, planned_restart=False, root=None):
@@ -592,17 +675,63 @@ def _dominant_signature(recent):
     return Counter(sigs).most_common(1)[0][0]
 
 
-def read_hold_sha(*, root=None):
-    """HEAD SHA recorded when the current (or most recent) hold was set."""
+def _read_hold_meta(*, root=None):
+    """Return the hold-meta dict, or ``{}`` if missing / unreadable."""
     path = _hold_meta_path(root)
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return ""
-    if isinstance(data, dict):
-        return (data.get("sha") or "").strip()
-    return ""
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_hold_meta(data, *, root=None):
+    """Atomically rewrite ``.crash_revert_hold_meta.json`` (best-effort)."""
+    path = _hold_meta_path(root)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def read_hold_sha(*, root=None):
+    """HEAD SHA recorded when the current (or most recent) hold was set."""
+    return (_read_hold_meta(root=root).get("sha") or "").strip()
+
+
+def hold_set_override_off(*, root=None):
+    """True when the current hold itself wrote ``.auto_deploy_override`` off.
+
+    ``set_revert_hold`` pauses overlays so the crashing tip is not
+    immediately re-shipped. That off is **not** GM ``autodeploy off``.
+    Live 2026-09-11 follow-up: treating every override-off as staff-off
+    made ``maybe_auto_resume_hold`` unreachable (the hold always writes
+    off), which is the "auto recovery doesn't work" bug this helper
+    exists to prevent.
+    """
+    return bool(_read_hold_meta(root=root).get(HOLD_AUTO_OVERRIDE_OFF_KEY))
+
+
+def clear_hold_auto_override_off(*, root=None):
+    """Invalidate hold-written-off provenance (staff ``set_override``).
+
+    If staff type ``autodeploy off`` *after* a hold already auto-wrote
+    off, their intent must win -- auto-resume stays suppressed. No-op
+    when no meta file or the flag is already clear.
+    """
+    data = _read_hold_meta(root=root)
+    if not data.get(HOLD_AUTO_OVERRIDE_OFF_KEY):
+        return False
+    data[HOLD_AUTO_OVERRIDE_OFF_KEY] = False
+    return _write_hold_meta(data, root=root)
 
 
 def _reload_storm_reason(reason):
@@ -616,9 +745,15 @@ def set_revert_hold(*, reason="", root=None, hold_baseline_sha=None):
 
     Also stamps a SHA into ``.crash_revert_hold_meta.json`` so
     ``maybe_auto_resume_hold`` can later tell whether a real fix has
-    landed on ``origin/main`` since this hold began. Default baseline is
-    post-revert HEAD; reload-storm reverts pass the failed tip so auto-
-    resume does not immediately re-sync the same broken advance.
+    landed on ``origin/main`` since this hold began. Pass the *failed*
+    (pre-revert) tip as ``hold_baseline_sha`` so auto-resume does not
+    treat ``origin/main`` still sitting on that crashing commit as a
+    newer fix. Default without that argument is current HEAD.
+
+    Writes ``.auto_deploy_override`` off via ``set_override(...,
+    _from_hold=True)`` and records ``auto_override_off: true`` in hold
+    meta. That off is hold-authored, not GM ``autodeploy off`` --
+    auto-resume must still be allowed (2026-09-11 follow-up).
     """
     from engine import auto_deploy
 
@@ -631,27 +766,23 @@ def set_revert_hold(*, reason="", root=None, hold_baseline_sha=None):
             os.fsync(handle.fileno())
     except OSError:
         pass
-    auto_deploy.set_override("off", root=root, queue_catchup=False)
+    # ``_from_hold=True`` so set_override does not clear the provenance
+    # flag we are about to stamp. Staff ``autodeploy off`` uses the
+    # default (clears the flag) so their intent wins.
+    auto_deploy.set_override(
+        "off", root=root, queue_catchup=False, _from_hold=True
+    )
 
     sha = (hold_baseline_sha or "").strip() or boot_stability.current_head_sha(root)
-    if sha:
-        meta_path = _hold_meta_path(root)
-        tmp = meta_path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as handle:
-                json.dump(
-                    {
-                        "sha": sha,
-                        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    },
-                    handle,
-                )
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, meta_path)
-        except OSError:
-            pass
+    _write_hold_meta(
+        {
+            "sha": sha,
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            # Hold-written off -- auto-resume must still be allowed.
+            HOLD_AUTO_OVERRIDE_OFF_KEY: True,
+        },
+        root=root,
+    )
 
     if not was_active:
         try:
@@ -721,13 +852,18 @@ def maybe_auto_resume_hold(*, root=None):
     automatically re-validated it and resumed.
 
     While a hold is active, fetch ``origin/main`` and compare it to the SHA
-    that was checked out when the hold began (``read_hold_sha``). If a
-    *newer* commit exists, treat it as a candidate fix: clear the hold and
-    queue the normal catch-up sync (exactly what a manual clearhold does).
-    If the new code still crashes, the crash budget / thrash guard simply
-    re-arms the hold on the next failure -- no worse than a premature
-    manual clearhold, but a real fix now self-heals without anyone
-    remembering an extra step.
+    recorded in hold meta (``read_hold_sha``). That baseline is the
+    *crashing* tip when ``revert_to_last_stable`` stamped it -- not the
+    stable SHA we rolled back to. If ``origin/main`` is still that same
+    commit, stay held: that is the ship that just failed, not a fix
+    (live 2026-09-11: gateway-outage revert to a prior stable, then
+    auto-resume redeployed the hung copyover ship in a loop). If a
+    *newer* commit exists, treat it as a candidate fix: clear the hold
+    and queue the normal catch-up sync (exactly what a manual clearhold
+    does). If the new code still crashes, the crash budget / thrash
+    guard simply re-arms the hold on the next failure -- no worse than
+    a premature manual clearhold, but a real fix now self-heals without
+    anyone remembering an extra step.
 
     Never touches a DB-corruption hold (needs an explicit restore, not a
     code fix) and never guesses when no baseline SHA was recorded (a hold
@@ -955,8 +1091,13 @@ def evaluate_boot_failure(*, root=None):
     return "hold", detail
 
 
-def should_revert(*, root=None, now=None):
-    """Return ``(trip: bool, reason: str)`` for crash budget / gateway outage."""
+def should_revert(*, root=None, now=None, game_spawn_wall=None):
+    """Return ``(trip: bool, reason: str)`` for crash budget / gateway outage.
+
+    ``game_spawn_wall`` is forwarded to ``gateway_outage_tripped`` so
+    downtime inherited from an already-exited child cannot revert the tree
+    under a child that is still booting.
+    """
     root = root or _repo_root()
     now = time.time() if now is None else now
     # Hold means staff / a prior failed revert paused auto-deploy. Do not
@@ -972,8 +1113,12 @@ def should_revert(*, root=None, now=None):
     if not stable or not (stable.get("sha") or "").strip():
         return False, "no stable boot stamp yet"
 
-    if gateway_outage_tripped(root=root, now=now):
-        return True, "gateway game IPC down past crash window"
+    if gateway_outage_tripped(
+        root=root, now=now, game_spawn_wall=game_spawn_wall
+    ):
+        return True, (
+            "gateway game IPC down past crash window (heartbeat stale)"
+        )
 
     state = load_state(root)
     recent = _prune_exits(state.get("recent_exits") or [], now=now, window=crash_window_seconds())
@@ -1175,7 +1320,11 @@ def revert_to_last_stable(*, root=None, reason=""):
         clear_planned_restart(root=root)
         return False, f"reset failed: {detail}"
 
-    hold_baseline = failed_head if _reload_storm_reason(reason) else None
+    # Always pin hold meta to the SHA we left -- including gateway-outage
+    # reverts. Reload-storm already did this; other reasons used to stamp
+    # post-reset HEAD (the stable SHA), so origin/main still at the
+    # crashing tip looked like "a newer fix" and auto-resume redeployed it.
+    hold_baseline = (failed_head or "").strip() or None
     set_revert_hold(
         reason=reason or "crash budget exceeded",
         root=root,

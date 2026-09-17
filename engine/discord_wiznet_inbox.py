@@ -87,6 +87,8 @@ def _face_for_payload(game, payload: dict) -> str:
 
 def tick_discord_wiznet_inbox(game) -> None:
     """Process every pending inbound wiznet file (sync tick handler)."""
+    import time as _time
+
     from engine import discord_bridge
     from engine import gm_notify
 
@@ -98,6 +100,7 @@ def tick_discord_wiznet_inbox(game) -> None:
     paths = sorted(directory.glob("msg-*.json"))
     if not paths:
         return
+    t0 = _time.perf_counter()
     for path in paths:
         payload = _load_payload(path)
         try:
@@ -111,6 +114,17 @@ def tick_discord_wiznet_inbox(game) -> None:
             continue
         face = _face_for_payload(game, payload)
         gm_notify.wiznet_broadcast_from_discord(game, face, message)
+    try:
+        from engine import lag_watch
+
+        lag_watch.note_hitch_subphase(
+            game,
+            "discord_wiznet_inbox",
+            (_time.perf_counter() - t0) * 1000.0,
+            extra={"n_files": len(paths)},
+        )
+    except Exception:
+        pass
 
 
 def register_tick(game) -> None:

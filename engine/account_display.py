@@ -27,6 +27,7 @@ def format_account_status(game, account, viewer, *, screenreader=False, width=52
     bugs = int(getattr(account, "bugs_squashed", 0) or 0)
     ideas = int(getattr(account, "features_suggested", 0) or 0)
     gifted = int(getattr(account, "gifted", 0) or 0)
+    trivia_pts = int(getattr(account, "trivia_points", 0) or 0)
     gift_bank = int(getattr(account, "gift_bank", 0) or 0)
     points = accounts_mod.contribution_points(account)
 
@@ -69,6 +70,8 @@ def format_account_status(game, account, viewer, *, screenreader=False, width=52
     body.append(f"  Bugs squashed: {bugs}")
     body.append(f"  Ideas shipped: {ideas}")
     body.append(f"  Gifted: {gifted}")
+    if trivia_pts > 0:
+        body.append(f"  Trivia: {trivia_pts}")
     if gift_bank > 0:
         body.append(
             f"  Gift bank: {gift_bank} "
@@ -78,7 +81,7 @@ def format_account_status(game, account, viewer, *, screenreader=False, width=52
         body.append(
             style.paint(
                 "muted",
-                "  (resolved reports + gifted; leaderboard uses bugs/ideas)",
+                "  (bugs + ideas + gifted + trivia; leaderboard uses bugs/ideas)",
             )
         )
 
@@ -104,6 +107,9 @@ def format_account_status(game, account, viewer, *, screenreader=False, width=52
             f"  Cast roster: {cast_n} immersion cast "
             "(login menu + gm off <name>)"
         )
+        grants = accounts_mod.list_assigned_character_keys(account)
+        if grants:
+            body.append("  Assigned: " + ", ".join(grants))
         state = "on" if account.gm_see_accounts else "off"
         body.append(
             f"  See-accounts: {state} "

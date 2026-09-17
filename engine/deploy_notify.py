@@ -262,14 +262,16 @@ HEADS_UP_COPYOVER = (
     "to halt it."
 )
 HEADS_UP_RESTART = (
-    "Heads up — a full shutdown and restart is queued in the next few minutes, "
-    "not just a copyover. You will drop to the menu and need to log back in. "
-    "Ping me if something's going on and we need to halt it."
+    "Heads up — the queued rewrite looks like it may need a deeper restart "
+    "than a stay-connected copyover. If it does, you'll get a menu-drop "
+    "warning right before it happens, not a surprise. Ping me if something's "
+    "going on and we need to halt it."
 )
 HEADS_UP_FOLLOWUP_RESTART = (
-    "Update — that queued rewrite will now be a full shutdown and restart, "
-    "not a stay-connected copyover. You will drop to the menu and need to log "
-    "back in. Ping me if something's going on and we need to halt it."
+    "Update — that queued rewrite now looks like it may need a deeper "
+    "restart, not a stay-connected copyover. If it does, you'll get a "
+    "menu-drop warning right before it happens. Ping me if something's "
+    "going on and we need to halt it."
 )
 ABORT_OOC = (
     "The planned rewrite is halted. You're clear — no copyover or restart "
@@ -291,13 +293,12 @@ def _countdown_done_line(*, gateway_restart: bool) -> str:
     """After countdown: bridge line before tree sync + copyover MSG_BEFORE.
 
     Players can still type verbs until copyover freezes the game — do not
-    promise an immediate pause here (gateway hold music follows MSG_BEFORE).
+    promise an immediate pause or disconnect here. A real gateway drop is
+    announced only by ``_maybe_announce_disconnect_imminent`` at the instant
+    the watcher is about to kill the holder. ``gateway_restart`` is kept so
+    callers stay explicit; it must not change this bridge.
     """
-    if gateway_restart:
-        return (
-            "*** The countdown ends — you will disconnect. "
-            "Log in again when the rewrite is done. ***"
-        )
+    _ = gateway_restart
     return (
         "*** The Veil draws tight — the pause begins when the Veil shudders. ***"
     )
@@ -311,25 +312,38 @@ def _fix_countdown_open(
     total: int,
     gateway_restart: bool,
 ) -> str:
-    """Opening Fix-ship countdown (ticket chrome + Veil reseal timer)."""
-    lines = [
+    """Opening Fix-ship countdown (ticket chrome + Veil reseal timer).
+
+    ``gateway_restart`` is a *prediction* (git-diff against the sync that
+    has not run yet) -- it decides whether the watcher will later drop
+    clients for real, but it must not print the scary [ALERT] chrome this
+    far ahead. A predicted-true sync that ends up not touching gateway
+    files on disk (overlay drift, already-applied content, etc.) would
+    otherwise promise a disconnect that never happens. The one place that
+    ever tells players "you will fall back to the menu" is
+    ``_maybe_announce_disconnect_imminent`` -- fired by the watcher at the
+    instant it is actually about to kill the holder, off a real on-disk
+    file-change snapshot, not a guess.
+    """
+    _ = gateway_restart
+    return "\r\n".join([
         f"*** {ticket_ref} {verb}: {summary} ***",
         (
             f"*** The Veil will reseal in {total} seconds. "
             f"Stay put if you can. ***"
         ),
-    ]
-    if gateway_restart:
-        lines.append(GATEWAY_RESTART_WARNING.strip())
-    return "\r\n".join(lines)
+    ])
 
 
 def _catchup_countdown_open(*, total: int, gateway_restart: bool) -> str:
-    """Opening catch-up / feature-ship countdown."""
-    text = CATCHUP_COUNTDOWN_OPEN.format(total=total)
-    if gateway_restart:
-        text += GATEWAY_RESTART_WARNING
-    return text
+    """Opening catch-up / feature-ship countdown.
+
+    See ``_fix_countdown_open`` -- ``gateway_restart`` stays a same-shape
+    argument for callers, but no longer prints the disconnect [ALERT] this
+    far ahead of the actual sync.
+    """
+    _ = gateway_restart
+    return CATCHUP_COUNTDOWN_OPEN.format(total=total)
 
 
 def announce_world_stitching(game):
@@ -391,6 +405,67 @@ def queue_pending_ready_announce(game, message):
     if game is None or not (message or "").strip():
         return
     game._veil_pending_ready_announce = (message or "").strip()
+
+
+def _ticket_ids_from_veil_line(text: str) -> set:
+    """Bug / suggestion ids mentioned as ``#N`` in a Veil settle line."""
+    import re
+
+    return {int(n) for n in re.findall(r"#(\d+)", text or "")}
+
+
+def _unwrap_veil_settles(line: str) -> str:
+    """Inner clause of a ``*** The Veil settles. … ***`` broadcast."""
+    text = (line or "").strip()
+    if text.startswith("*** ") and text.endswith(" ***"):
+        text = text[4:-4].strip()
+    prefix = "the veil settles."
+    if text.lower().startswith(prefix):
+        text = text[len(prefix):].strip()
+    return text
+
+
+def coalesce_veil_ready_lines(ready_text, post_lines):
+    """Fold rewrite-complete + ticket chrome into one Veil-settles broadcast.
+
+    Live copyover was stacking a generic complete line, one catch-up line per
+    missed Fix batch, and the current Fix live line -- including a duplicate
+    of the same ticket as both catch-up and live (bug report 1246).
+    """
+    ready = (ready_text or "").strip()
+    posts = []
+    seen = set()
+    for raw in post_lines or []:
+        line = (raw or "").strip()
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        posts.append(line)
+
+    live_ids = set()
+    for line in posts:
+        if "(catch-up)" not in line.lower():
+            live_ids.update(_ticket_ids_from_veil_line(line))
+    kept = []
+    for line in posts:
+        if "(catch-up)" in line.lower():
+            ids = _ticket_ids_from_veil_line(line)
+            if ids and ids.issubset(live_ids):
+                continue
+        kept.append(line)
+
+    inners = []
+    if ready:
+        inners.append(_unwrap_veil_settles(ready))
+    for line in kept:
+        piece = _unwrap_veil_settles(line)
+        if piece and piece not in inners:
+            inners.append(piece)
+    if not inners:
+        return []
+    if len(inners) == 1 and ready and not kept:
+        return [ready]
+    return ["*** The Veil settles. " + " ".join(inners) + " ***"]
 
 
 def queue_pending_post_ready_announce(game, message):
@@ -475,9 +550,7 @@ def announce_rewrite_ready(game):
     post = getattr(game, "_veil_pending_post_ready", None) or []
     game._veil_pending_post_ready = None
     try:
-        if text:
-            game.broadcast_all(text)
-        for line in post:
+        for line in coalesce_veil_ready_lines(text, post):
             game.broadcast_all(line)
     except Exception as exc:
         print(
@@ -1090,11 +1163,23 @@ async def _run_countdown(game, signal):
     # Flush every live body before the host overlays files / copyover runs.
     # Post-deploy autosave defer can leave fence/sell mutations in RAM only;
     # without this checkpoint, inventory and wallet diverge after restart.
+    #
+    # This used to call the blocking save_world_before_process_exit(), which
+    # also shuts down the background persistence writer thread and then
+    # writes every live character synchronously on the event loop -- the
+    # whole game froze (observed 30s on live) for the duration since this
+    # coroutine runs on the same loop as ticks/commands, and the old process
+    # is still supposed to answer commands until copyover. save_world_async
+    # does the same forced full-roster write (wall_budget_ms=0 disables its
+    # normal defer-on-budget behavior, so nothing gets skipped) but chunked
+    # with cooperative yields, and leaves the writer thread running.
     try:
         from engine import persistence
 
-        persistence.save_world_before_process_exit(
-            game.db, game, reason="pre_deploy",
+        game._persist_force_full = True
+        game._persist_force_full_chars_only = False
+        await persistence.save_world_async(
+            game.db, game, wall_budget_ms=0,
         )
     except Exception as exc:
         print(
@@ -1172,6 +1257,13 @@ async def on_resume(game):
             reports.mark(
                 reports.SUGGEST, int(suggestion_id), "resolved",
                 directory=directory, game=game,
+            )
+            from engine import suggestion_ship_staff_notes as ship_notes_mod
+
+            ship_notes_mod.append_ship_staff_note(
+                int(suggestion_id),
+                summary=summary,
+                directory=directory,
             )
             print(
                 f"[deploy_notify] marked suggestion #{suggestion_id} resolved",

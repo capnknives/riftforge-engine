@@ -56,6 +56,32 @@ def clear_pending(character):
     character._party_merge_source_key = None
 
 
+def resolve_invite_target(inviter, name):
+    """Resolve ``name`` to someone in the inviter's room (party / group invite).
+
+    World-wide ``game.find_character`` needs a unique substring across every
+    logged-in body -- crowded shops and partial names like ``pi`` fail even
+    when Pierre stands beside you (bug report 1617). Match room occupants
+    the same way ``follow`` does: prefix / substring, first hit.
+    """
+    from engine.command_support import _find_character
+    from world import Character as CharType
+
+    if inviter is None:
+        return None
+    needle = (name or "").strip()
+    if not needle:
+        return None
+    here = getattr(inviter, "location", None)
+    if here is None:
+        return None
+    occupants = here.characters() if hasattr(here, "characters") else []
+    target = _find_character(needle, occupants, self_character=inviter)
+    if target is not None and isinstance(target, CharType):
+        return target
+    return None
+
+
 def _set_pending(target, inviter_key, intent, merge_source_key=None):
     target._party_invite_from = inviter_key
     target._party_invite_intent = intent
@@ -65,10 +91,21 @@ def _set_pending(target, inviter_key, intent, merge_source_key=None):
         target._party_merge_source_key = None
 
 
+def invite_pending_accept(target):
+    """True when ``invite`` left a live handshake the target must accept.
+
+    Echo / idlemode auto-join skips this -- do not tell them to type
+    ``party accept`` (they are already in the party).
+    """
+    return pending_inviter_key(target) is not None
+
+
 def invite(inviter, target, game):
     """Offer a party slot to ``target`` in the same room.
 
-    Returns (ok, message). On success the target may ``party accept``.
+    Returns (ok, message). Live targets get a pending handshake and may
+    ``party accept``. Same-room Echo / idlemode bodies auto-join because
+    they cannot type accept (bug report 1617).
     """
     from engine import group as group_mod
     from world import Character as CharType
@@ -77,10 +114,13 @@ def invite(inviter, target, game):
         return False, "Invite who?"
     if not isinstance(target, CharType):
         return False, "They are not here."
+    if getattr(target, "is_npc", False):
+        return False, (
+            f"{target.key} is not a player -- you cannot invite townsfolk "
+            "to a party."
+        )
     if _session(inviter) is None:
         return False, "You need to be online to form a party."
-    if _session(target) is None:
-        return False, f"{target.key} is not online."
     inv_room = getattr(inviter, "location", None)
     tgt_room = getattr(target, "location", None)
     if inv_room is None or tgt_room is None or inv_room is not tgt_room:
@@ -95,6 +135,15 @@ def invite(inviter, target, game):
     if group_mod.in_group(target):
         return False, (
             f"{target.key} is already grouped with someone else."
+        )
+    from engine.command_support import start_following
+
+    # Echo / idlemode bodies in the room cannot type party accept -- bond now.
+    if not group_mod.live_present(target):
+        if not start_following(target, inviter):
+            return False, "Could not add them to your party."
+        return True, (
+            f"{target.key} is an Echo here -- they fall in with your party."
         )
     _set_pending(target, getattr(inviter, "key", None), INTENT_PARTY)
     return True, (

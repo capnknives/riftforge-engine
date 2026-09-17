@@ -116,8 +116,10 @@ def format_affects(
         rid = str(row.get("id") or "")
         category = str(row.get("category") or "")
 
-        # Stealth runtime rows (set_affect) — States band; hidden from others.
-        if category == "stealth" or rid in ("hidden", "sneaking"):
+        # Stealth / lifestyle runtime rows — States band; hidden from others.
+        if category in ("stealth", "state") or rid in (
+            "hidden", "sneaking", "lifestyle:drunkenness",
+        ):
             if public_only:
                 continue
             label = str(row.get("label") or rid or "?")

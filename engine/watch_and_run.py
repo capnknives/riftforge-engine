@@ -18,7 +18,12 @@ What this does:
     on the gateway and get the settle line on reattach. SIGUSR1 waits for
     ``.copyover_ready`` (veil open) so a merge storm cannot terminate a
     child still inside ``Game()``. At most one copyover is queued. Crashes
-    still hard-respawn (no time to announce).
+    still hard-respawn (no time to announce). GM ``autodeploy off`` also
+    suppresses auto-resume / announced-deploy SIGUSR1 (live 2026-09-11
+    loop: override off did not stop origin-advance copyover). After N
+    consecutive exits with no ``.copyover_ready`` (default 3,
+    ``GAME_CRASH_LOOP_LIMIT``), copyover signaling stays off until a spawn
+    stamps ready -- the game child still respawns; the gateway stays up.
 
   - Hung game (PID alive, asyncio thread stuck): ``server.py`` touches
     ``.game_heartbeat`` each tick; if that stamp goes stale the watcher
@@ -129,7 +134,14 @@ _COPYOVER_SKIP_PREFIXES = (
 # (``content/changelog.db``) never lived here: it is a ``.db`` file, and
 # this watcher only globs ``*.py`` plus JSON under ``content/`` /
 # ``supers/content/`` in the first place.
-_COPYOVER_SKIP_FILES = ()
+#
+# Live-save JSON that game ticks mutate (Faith flock rows, …) must live
+# here or they SIGUSR1 the MUD with no Ash Heads-up (bug report 1471).
+_COPYOVER_SKIP_FILES = (
+    "supers/content/god_follower_sheets.json",
+)
+_CHANGED_PATH_LOG_LIMIT = 8
+_PENDING_CHANGE_PATHS_CAP = 40
 
 
 def _repo_root():
@@ -180,6 +192,116 @@ def copyover_child_ready(
     # AND with grace would still delay SIGUSR1 after players can type.
     _ = (boot_grace, now)
     return copyover_mod.copyover_ready_since(spawn_wall, root=root)
+
+
+# Consecutive game exits that never reached ``.copyover_ready`` before
+# the watcher stops piling SIGUSR1 on a child that cannot stay playable.
+# Live 2026-09-11: Game() took 4-5 minutes, crashed, watcher announced
+# another copyover (files=none) in a loop. Hard-respawn still runs.
+_CRASH_LOOP_LIMIT_DEFAULT = 3
+
+
+def crash_loop_limit():
+    """How many unready exits open the copyover circuit breaker.
+
+    Default 3. ``GAME_CRASH_LOOP_LIMIT`` overrides (minimum 1 so ``0``
+    cannot silently disable the guard). Junk values fall back to 3.
+    """
+    raw = (os.environ.get("GAME_CRASH_LOOP_LIMIT") or "").strip()
+    if not raw:
+        return _CRASH_LOOP_LIMIT_DEFAULT
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _CRASH_LOOP_LIMIT_DEFAULT
+
+
+def note_copyover_ready_reset(unready_exits, spawn_wall, *, root=None):
+    """Return 0 once this spawn stamps ``.copyover_ready``, else the count.
+
+    Uses ``copyover_ready_since`` -- do not reimplement the stamp check.
+    Reset happens as soon as the child is playable so file-mtime copyover
+    and announced deploys work again after a boot-crash streak.
+    """
+    from engine import copyover as copyover_mod
+
+    if copyover_mod.copyover_ready_since(spawn_wall, root=root):
+        return 0
+    return int(unready_exits or 0)
+
+
+def note_unready_exit(unready_exits, spawn_wall, *, root=None):
+    """Count this child exit if it never stamped ``.copyover_ready``.
+
+    Call **before** ``_spawn_game`` -- spawn clears the stamp, so a check
+    after spawn would always look unready. A spawn that *did* stamp
+    ready returns 0 (planned copyover / healthy crash-after-play).
+    """
+    from engine import copyover as copyover_mod
+
+    if copyover_mod.copyover_ready_since(spawn_wall, root=root):
+        return 0
+    return int(unready_exits or 0) + 1
+
+
+def copyover_signal_allowed(unready_exits):
+    """False when the crash-loop breaker is open (do not SIGUSR1)."""
+    return int(unready_exits or 0) < crash_loop_limit()
+
+
+def auto_resume_suppress_reason(root=None, *, unready_exits=0):
+    """Why auto-resume / origin-advance reload must not run, or None.
+
+    Reuses ``auto_deploy.override_is_off`` (same ``read_override`` parser
+    as the poll path). Cannot use ``poll_skip_reason`` here: that returns
+    ``revert hold active`` first, and auto-resume is meant to run *while*
+    held -- unless GM explicitly paused overlays.
+
+    Hold-written off is **not** staff off: ``set_revert_hold`` always
+    writes override off and stamps ``auto_override_off`` in hold meta.
+    Suppress only when override is off **and** that flag is clear
+    (staff ``autodeploy off``, including off typed *after* a hold).
+
+    Live 2026-09-11: ``.auto_deploy_override`` was ``off`` at 17:51 UTC;
+    at 17:52 the watcher still logged ``auto-resume: origin advanced``
+    then ``announced deploy sync`` (``files=none``).
+    ``resume_after_crash_hold`` writes override ``on``, so the gate must
+    sit *before* that call.
+    """
+    from engine import auto_deploy as auto_deploy_mod
+    from engine import crash_recovery as crash_recovery_mod
+
+    if auto_deploy_mod.override_is_off(root):
+        if not crash_recovery_mod.hold_set_override_off(root=root):
+            return "autodeploy override off"
+    if not copyover_signal_allowed(unready_exits):
+        return (
+            f"crash loop ({int(unready_exits)} exits without "
+            f".copyover_ready, limit {crash_loop_limit()})"
+        )
+    return None
+
+
+def copyover_suppress_reason(reason_label, *, unready_exits=0, root=None):
+    """Why this watcher must not SIGUSR1 / queue copyover, or None.
+
+    Crash-loop blocks every reason -- SIGUSR1 during ``Game()`` is the
+    default terminate signal, which is how merge storms killed a booting
+    child. GM autodeploy off blocks **only** announced-deploy (local
+    file-mtime copyover must still work while overlays are paused).
+    """
+    label = (reason_label or "").strip()
+    if not copyover_signal_allowed(unready_exits):
+        return (
+            f"crash loop ({int(unready_exits)} exits without "
+            f".copyover_ready, limit {crash_loop_limit()})"
+        )
+    if label == "announced deploy sync":
+        from engine import auto_deploy as auto_deploy_mod
+
+        if auto_deploy_mod.override_is_off(root):
+            return "autodeploy override off"
+    return None
 
 
 def _copyover_settle_seconds():
@@ -332,6 +454,8 @@ def _skip_copyover_path(path):
       ``/tmp`` instead -- dropping ``_remote_probe*.py`` in the bind-mount
       used to SIGUSR1 mid-chargen in a tight loop)
     - Agent debug NDJSON at repo root (``debug-*.log``)
+    - Live-save JSON under ``supers/content/`` that ticks rewrite
+      (``god_follower_sheets.json`` -- congregation mint, not a code ship)
 
     Paths are compared with ``os.path.normpath`` so Windows backslashes from
     ``glob`` still match the skip list.
@@ -354,6 +478,32 @@ def _skip_copyover_path(path):
 def _rel_posix(path):
     """Forward-slash relative path for skip/watch checks."""
     return os.path.normpath(path).replace("\\", "/")
+
+
+def _snapshot_changed_paths(before, after):
+    """Sorted relative paths whose mtime (or presence) changed between snaps."""
+    changed = []
+    keys = set(before) | set(after)
+    for path in keys:
+        if before.get(path) != after.get(path):
+            changed.append(_rel_posix(path))
+    changed.sort()
+    return changed
+
+
+def _format_changed_paths(paths, *, limit=None):
+    """One grep-friendly clause for Docker logs (capped list)."""
+    if limit is None:
+        limit = _CHANGED_PATH_LOG_LIMIT
+    paths = list(paths or ())
+    if not paths:
+        return "files=none"
+    shown = paths[:limit]
+    extra = len(paths) - len(shown)
+    text = ",".join(shown)
+    if extra > 0:
+        text = f"{text} +{extra} more"
+    return f"n={len(paths)} {text}"
 
 
 def _file_is_watched(rel):
@@ -642,6 +792,49 @@ def _gateway_paths_changed(before, after):
     return gateway_watch.snapshot_touches_gateway_restart(before, after)
 
 
+def _maybe_drop_clients_for_gateway_modules(
+    before,
+    after,
+    *,
+    proc,
+    gateway_proc,
+    use_gateway,
+    reason_label,
+):
+    """Restart holder modules when a snapshot delta hits gateway/watcher files.
+
+    Returns ``(proc, game_spawn_wall, gateway_proc)`` after a gateway+game
+    restart, or None when this delta is a stay-connected copyover.
+
+    Watcher self-change ``execv``s and does not return. Auto-deploy used to
+    snapshot *after* ``reset --hard`` and then fire announced game-only
+    copyover, so a Veil that warned "full shutdown" never dropped anyone.
+    """
+    if _watcher_self_changed(before, after):
+        _reexec_watcher(proc, gateway_proc)
+    if not (
+        use_gateway
+        and gateway_proc is not None
+        and _gateway_paths_changed(before, after)
+    ):
+        return None
+    from engine import auto_deploy as auto_deploy_mod
+
+    print(
+        f"[watch] {reason_label} -- "
+        "restarting gateway + game (clients drop)",
+        flush=True,
+    )
+    auto_deploy_mod.clear_announced_copyover(_repo_root())
+    _grace_disconnect_warning(_repo_root(), proc)
+    _stop_game(proc)
+    _stop_gateway(gateway_proc)
+    new_gateway = _spawn_gateway()
+    time.sleep(0.4)
+    new_proc, game_spawn_wall = _spawn_game(cold=True)
+    return new_proc, game_spawn_wall, new_gateway
+
+
 def _respawn_game(_proc, _game_spawn_wall, *, spawn_failures):
     """Apply crash budget / backoff, then spawn a fresh game child."""
     root = _repo_root()
@@ -660,14 +853,17 @@ def _respawn_game(_proc, _game_spawn_wall, *, spawn_failures):
     return _spawn_game()
 
 
-def _maybe_auto_revert(*, reason_prefix=""):
+def _maybe_auto_revert(*, reason_prefix="", game_spawn_wall=None):
     """Revert bind-mount when crash budget trips. Returns True if reverted.
 
     Never raises — git / FS failures must not kill this long-lived watcher
     (often Docker PID 1). Failed or skipped reverts set the crash hold and
     clear ``.gateway_outage.json`` so the next tick does not spin.
+
+    ``game_spawn_wall`` lets the gateway-outage check ignore downtime the
+    previous child accrued (a fresh child must not inherit a blown window).
     """
-    trip, reason = crash_recovery.should_revert()
+    trip, reason = crash_recovery.should_revert(game_spawn_wall=game_spawn_wall)
     if not trip:
         return False
     try:
@@ -715,11 +911,19 @@ def _maybe_reload_storm_revert(*, spawn_failures, game_spawn_wall):
         f"[watch] reload storm detected ({reason}) -- evaluating auto-revert",
         flush=True,
     )
+    # Deliberately does NOT pass game_spawn_wall: the storm breaker is the
+    # net for a genuinely broken tip (repeated respawns with no stable boot
+    # stamp), so it keeps the pre-2026-09-11 trip conditions.
     return _maybe_auto_revert(reason_prefix=f"reload storm: {reason}; ")
 
 
-def _after_game_exit(proc, *, hang_kill=False, root=None):
-    """Record exit, maybe trip DB/boot hold, maybe code-revert."""
+def _after_game_exit(proc, *, hang_kill=False, root=None, game_spawn_wall=None):
+    """Record exit, maybe trip DB/boot hold, maybe code-revert.
+
+    ``game_spawn_wall`` is the spawn time of the child that just exited, so
+    the gateway-outage check can tell its downtime apart from downtime a
+    still-booting successor inherited.
+    """
     root = root or _repo_root()
     crash_recovery.record_exit(
         returncode=proc.returncode,
@@ -734,7 +938,9 @@ def _after_game_exit(proc, *, hang_kill=False, root=None):
     crash_recovery.evaluate_boot_failure(root=root)
     if crash_recovery.boot_hold_active(root=root):
         return
-    _maybe_auto_revert(reason_prefix="exit: ")
+    _maybe_auto_revert(
+        reason_prefix="exit: ", game_spawn_wall=game_spawn_wall
+    )
 
 
 def _signal_planned_copyover(proc):
@@ -795,7 +1001,9 @@ def _maybe_watcher_request(
         crash_recovery.mark_planned_restart()
         if proc is not None and proc.poll() is None:
             _stop_game(proc)
-            _after_game_exit(proc, root=root)
+            _after_game_exit(
+                proc, root=root, game_spawn_wall=game_spawn_wall
+            )
         new_gateway = gateway_proc
         if use_gateway:
             if gateway_proc is not None:
@@ -901,14 +1109,40 @@ def main():
     before = _snapshot()
     pending_copyover = False
     copyover_wait_logged = False
+    # Unique-order paths that woke the current settle window (for Docker
+    # logs + .copyover_journal.jsonl). Cleared when SIGUSR1 actually fires.
+    pending_change_paths = []
     copyover_boot_grace = _copyover_boot_grace_seconds()
     copyover_settle_seconds = _copyover_settle_seconds()
     settle_deadline = None
     spawn_failures = 0
+    # Consecutive exits with no ``.copyover_ready`` (crash-loop breaker).
+    unready_exits = 0
     backup_running = False
     # Log boot/db hold once when respawn pauses — not every 1s poll tick.
     hold_pause_announced = False
     poll_tick = 0
+
+    def _count_unready_exit():
+        """Count a game-child death before ``_spawn_game`` clears the stamp.
+
+        Live 2026-09-11: SIGUSR1 during a never-ready boot was terminate,
+        then auto-resume announced another copyover. After the limit we
+        still respawn (availability) but stop piling copyover signals.
+        Gateway stays up.
+        """
+        nonlocal unready_exits
+        unready_exits = note_unready_exit(
+            unready_exits, game_spawn_wall, root=root
+        )
+        if not copyover_signal_allowed(unready_exits):
+            print(
+                f"[watch] crash loop: {unready_exits} exits without "
+                f".copyover_ready (limit {crash_loop_limit()}) -- "
+                "copyover signaling and auto-resume suppressed "
+                "(game still respawns; gateway stays up)",
+                flush=True,
+            )
 
     # First load (and later deploy polls reload) so auto_deploy patches that
     # arrive via reset --hard actually run inside this long-lived watcher.
@@ -941,6 +1175,12 @@ def main():
         )
     else:
         print("[watch] hang check off (GAME_HANG_CHECK=0)", flush=True)
+    print(
+        f"[watch] crash-loop breaker on "
+        f"(limit={crash_loop_limit()} unready exits; "
+        "GAME_CRASH_LOOP_LIMIT to override)",
+        flush=True,
+    )
     if copyover_settle_seconds > 0:
         print(
             f"[watch] copyover settle on "
@@ -982,7 +1222,24 @@ def main():
                 spawn_failures = 0
                 crash_recovery.clear_gateway_outage()
 
-        if crash_recovery.gateway_outage_tripped():
+        # Playable stamp is earlier than write_stable -- reset the
+        # crash-loop breaker as soon as look works (2026-09-11 loop).
+        was_crash_loop = not copyover_signal_allowed(unready_exits)
+        unready_exits = note_copyover_ready_reset(
+            unready_exits, game_spawn_wall, root=root
+        )
+        if was_crash_loop and copyover_signal_allowed(unready_exits):
+            print(
+                "[watch] crash loop cleared -- this spawn stamped "
+                ".copyover_ready; copyover signaling resumed",
+                flush=True,
+            )
+
+        # Also requires a stale heartbeat (2026-09-11: 284s/325s boots
+        # with advancing phases must not look like a dead game).
+        if crash_recovery.gateway_outage_tripped(
+            game_spawn_wall=game_spawn_wall
+        ):
             print(
                 "[watch] gateway outage past crash window -- "
                 "evaluating auto-revert",
@@ -1011,7 +1268,10 @@ def main():
                 # succeeds — otherwise a git failure used to leave the game
                 # dead (or kill PID 1) while ``.gateway_outage.json`` survived
                 # and re-tripped every restart.
-                reverted = _maybe_auto_revert(reason_prefix="gateway: ")
+                reverted = _maybe_auto_revert(
+                    reason_prefix="gateway: ",
+                    game_spawn_wall=game_spawn_wall,
+                )
                 if reverted:
                     if proc.poll() is None:
                         _stop_game(proc)
@@ -1054,7 +1314,9 @@ def main():
                 continue
 
         if proc.poll() is not None:   # None means "still running"
-            _after_game_exit(proc, root=root)
+            _after_game_exit(
+                proc, root=root, game_spawn_wall=game_spawn_wall
+            )
             if crash_recovery.respawn_paused(root=root):
                 if not hold_pause_announced:
                     hold_pause_announced = True
@@ -1069,6 +1331,9 @@ def main():
                         flush=True,
                     )
                 continue
+            # Count once per death, immediately before respawn -- not
+            # every poll tick while a hold pauses the dead child.
+            _count_unready_exit()
             hold_pause_announced = False
             if use_gateway:
                 print(
@@ -1121,7 +1386,10 @@ def main():
                         flush=True,
                     )
                     _stop_game(proc)
-                    _after_game_exit(proc, root=root)
+                    _after_game_exit(
+                        proc, root=root, game_spawn_wall=game_spawn_wall
+                    )
+                    _count_unready_exit()
                     crash_recovery.record_ipc_desync_gateway_restart(root=root)
                     _stop_gateway(gateway_proc)
                     gateway_proc = _spawn_gateway()
@@ -1137,9 +1405,12 @@ def main():
                     flush=True,
                 )
                 _stop_game(proc)
-                _after_game_exit(proc, root=root)
+                _after_game_exit(
+                    proc, root=root, game_spawn_wall=game_spawn_wall
+                )
                 if crash_recovery.respawn_paused(root=root):
                     continue
+                _count_unready_exit()
                 spawn_failures += 1
                 if _maybe_reload_storm_revert(
                     spawn_failures=spawn_failures,
@@ -1176,9 +1447,15 @@ def main():
                     flush=True,
                 )
             _stop_game(proc)
-            _after_game_exit(proc, hang_kill=True, root=root)
+            _after_game_exit(
+                proc,
+                hang_kill=True,
+                root=root,
+                game_spawn_wall=game_spawn_wall,
+            )
             if crash_recovery.respawn_paused(root=root):
                 continue
+            _count_unready_exit()
             spawn_failures += 1
             if _maybe_reload_storm_revert(
                 spawn_failures=spawn_failures,
@@ -1208,6 +1485,22 @@ def main():
                     flush=True,
                 )
                 pending_copyover = False
+                pending_change_paths = []
+                before = _snapshot()
+                continue
+            deferred_suppress = copyover_suppress_reason(
+                "deferred copyover",
+                unready_exits=unready_exits,
+                root=root,
+            )
+            if deferred_suppress:
+                print(
+                    f"[watch] deferred copyover suppressed: {deferred_suppress}",
+                    flush=True,
+                )
+                pending_copyover = False
+                pending_change_paths = []
+                copyover_wait_logged = False
                 before = _snapshot()
                 continue
             if copyover_child_ready(
@@ -1215,17 +1508,33 @@ def main():
                 boot_grace=copyover_boot_grace,
                 root=root,
             ):
+                files_note = _format_changed_paths(pending_change_paths)
                 print(
                     "[watch] deferred copyover -- signaling game "
-                    "(copyover ready; gateway holds clients)",
+                    f"(copyover ready; gateway holds clients) {files_note}",
                     flush=True,
                 )
+                try:
+                    from engine import copyover as copyover_mod
+
+                    copyover_mod.append_journal_event(
+                        "watch",
+                        reason="deferred copyover",
+                        files=pending_change_paths,
+                        root=root,
+                    )
+                except Exception as exc:
+                    print(
+                        f"[watch] copyover journal append failed: {exc!r}",
+                        flush=True,
+                    )
                 if not _signal_planned_copyover(proc):
                     _stop_game(proc)
                     proc, game_spawn_wall = _spawn_game()
                 pending_copyover = False
                 copyover_wait_logged = False
                 settle_deadline = None
+                pending_change_paths = []
                 before = _snapshot()
                 continue
             # One queued reload: absorb bind-mount churn until the stamp.
@@ -1241,6 +1550,22 @@ def main():
             """SIGUSR1 the game child, or queue until ``.copyover_ready``."""
             nonlocal proc, game_spawn_wall, before, pending_copyover
             nonlocal settle_deadline, copyover_wait_logged
+            nonlocal pending_change_paths
+            suppress = copyover_suppress_reason(
+                reason_label, unready_exits=unready_exits, root=root
+            )
+            if suppress:
+                print(
+                    f"[watch] {reason_label} suppressed: {suppress}",
+                    flush=True,
+                )
+                pending_copyover = False
+                pending_change_paths = []
+                settle_deadline = None
+                copyover_wait_logged = False
+                before = after
+                return
+            files_note = _format_changed_paths(pending_change_paths)
             if not copyover_child_ready(
                 game_spawn_wall,
                 boot_grace=copyover_boot_grace,
@@ -1252,7 +1577,7 @@ def main():
                 if not copyover_wait_logged:
                     print(
                         f"[watch] {reason_label} -- queued until "
-                        "copyover ready (Game() / veil stamp)",
+                        f"copyover ready (Game() / veil stamp) {files_note}",
                         flush=True,
                     )
                     copyover_wait_logged = True
@@ -1261,26 +1586,76 @@ def main():
             if use_gateway:
                 print(
                     f"[watch] {reason_label} -- "
-                    "signaling game (announce + exit; gateway holds clients)",
+                    "signaling game (announce + exit; gateway holds clients) "
+                    f"{files_note}",
                     flush=True,
                 )
             else:
                 print(
-                    f"[watch] {reason_label} -- hot-reloading (copyover)",
+                    f"[watch] {reason_label} -- hot-reloading (copyover) "
+                    f"{files_note}",
+                    flush=True,
+                )
+            try:
+                from engine import copyover as copyover_mod
+
+                copyover_mod.append_journal_event(
+                    "watch",
+                    reason=reason_label,
+                    files=pending_change_paths,
+                    root=root,
+                )
+            except Exception as exc:
+                print(
+                    f"[watch] copyover journal append failed: {exc!r}",
                     flush=True,
                 )
             if not _signal_planned_copyover(proc):
                 _stop_game(proc)
                 proc, game_spawn_wall = _spawn_game()
             pending_copyover = False
+            pending_change_paths = []
             settle_deadline = None
             before = after
 
         # Veil/sync announced exactly one deliberate reload (even during quiesce).
+        # If the sync also touched gateway-holder modules, drop clients --
+        # do not treat that as a stay-connected copyover.
         if auto_deploy_mod.announced_copyover_pending(root):
-            auto_deploy_mod.clear_announced_copyover(root)
-            _fire_copyover(reason_label="announced deploy sync")
-            continue
+            announced_suppress = copyover_suppress_reason(
+                "announced deploy sync",
+                unready_exits=unready_exits,
+                root=root,
+            )
+            if announced_suppress:
+                # Clear the stamp so a leftover announce cannot skip
+                # file-mtime forever. Off means off -- do not SIGUSR1,
+                # and do not bounce the gateway (2026-09-11: files=none
+                # copyover after autodeploy off).
+                print(
+                    f"[watch] announced deploy sync suppressed: "
+                    f"{announced_suppress}",
+                    flush=True,
+                )
+                auto_deploy_mod.clear_announced_copyover(root)
+            else:
+                dropped = _maybe_drop_clients_for_gateway_modules(
+                    before,
+                    after,
+                    proc=proc,
+                    gateway_proc=gateway_proc,
+                    use_gateway=use_gateway,
+                    reason_label="announced deploy touched gateway source",
+                )
+                if dropped:
+                    proc, game_spawn_wall, gateway_proc = dropped
+                    before = after
+                    pending_copyover = False
+                    settle_deadline = None
+                    continue
+                auto_deploy_mod.clear_announced_copyover(root)
+                _fire_copyover(reason_label="announced deploy sync")
+                continue
 
         # Post-sync protect-restore rewrites hundreds of mtimes. Absorb them
         # until stable boot at the new HEAD (quiesce cleared in write_stable).
@@ -1288,6 +1663,18 @@ def main():
             before = after
             pending_copyover = False
             settle_deadline = None
+            pending_change_paths = []
+            continue
+
+        # Boot disk heals (items.json canon patch, npc roster stamps, …)
+        # rewrite watched JSON after Game() starts. Absorb those mtimes
+        # until write_stable -- otherwise the heal's own write copyovers
+        # the child it just booted.
+        if boot_stability.boot_disk_quiesce_active(root):
+            before = after
+            pending_copyover = False
+            settle_deadline = None
+            pending_change_paths = []
             continue
 
         # Batched reload: quiet period elapsed since the last mtime churn.
@@ -1304,6 +1691,7 @@ def main():
                     flush=True,
                 )
                 settle_deadline = None
+                pending_change_paths = []
                 continue
             _fire_copyover(reason_label="settled code/content change")
             continue
@@ -1316,39 +1704,45 @@ def main():
                     flush=True,
                 )
                 pending_copyover = False
+                pending_change_paths = []
                 before = after
                 continue
-            if _watcher_self_changed(before, after):
-                _reexec_watcher(proc, gateway_proc)
             # Gateway process modules do not hot-reload -- restart holder
             # + game (clients drop). Everything else: game-only / copyover.
-            if use_gateway and gateway_proc is not None and _gateway_paths_changed(
-                before, after
-            ):
-                print(
-                    "[watch] gateway source changed -- "
-                    "restarting gateway + game (clients drop)",
-                    flush=True,
-                )
-                _grace_disconnect_warning(root, proc)
-                _stop_game(proc)
-                _stop_gateway(gateway_proc)
-                gateway_proc = _spawn_gateway()
-                time.sleep(0.4)
-                proc, game_spawn_wall = _spawn_game(cold=True)
+            dropped = _maybe_drop_clients_for_gateway_modules(
+                before,
+                after,
+                proc=proc,
+                gateway_proc=gateway_proc,
+                use_gateway=use_gateway,
+                reason_label="gateway source changed",
+            )
+            if dropped:
+                proc, game_spawn_wall, gateway_proc = dropped
                 before = after
                 pending_copyover = False
                 continue
             if copyover_settle_seconds > 0:
                 settle_deadline = time.time() + copyover_settle_seconds
+                delta = _snapshot_changed_paths(before, after)
+                for path in delta:
+                    if path not in pending_change_paths:
+                        pending_change_paths.append(path)
+                del pending_change_paths[_PENDING_CHANGE_PATHS_CAP:]
                 print(
                     "[watch] code/content change detected -- "
                     f"waiting {copyover_settle_seconds:.0f}s settle "
-                    "(batch rapid deploy edits)",
+                    "(batch rapid deploy edits) "
+                    f"{_format_changed_paths(delta)}",
                     flush=True,
                 )
                 before = after
                 continue
+            delta = _snapshot_changed_paths(before, after)
+            for path in delta:
+                if path not in pending_change_paths:
+                    pending_change_paths.append(path)
+            del pending_change_paths[_PENDING_CHANGE_PATHS_CAP:]
             _fire_copyover(reason_label="code/content change detected")
             continue
 
@@ -1374,20 +1768,48 @@ def main():
                 # someone remembers `gm recover clearhold`. Check on the same
                 # cadence as the deploy poll so a real fix self-heals.
                 if crash_recovery.hold_active(root=root):
-                    resumed, detail = crash_recovery.maybe_auto_resume_hold(
-                        root=root
+                    resume_suppress = auto_resume_suppress_reason(
+                        root, unready_exits=unready_exits
                     )
-                    if resumed:
-                        print(f"[watch] auto-resume: {detail}", flush=True)
+                    if resume_suppress:
+                        print(
+                            f"[watch] auto-resume suppressed: {resume_suppress}",
+                            flush=True,
+                        )
+                    else:
+                        resumed, detail = (
+                            crash_recovery.maybe_auto_resume_hold(root=root)
+                        )
+                        if resumed:
+                            print(
+                                f"[watch] auto-resume: {detail}",
+                                flush=True,
+                            )
                 skip = auto_deploy.poll_skip_reason(root)
                 if skip is None:
                     # Reload only when deploy would actually run -- re-parsing
                     # hooks.py every 30s with AUTO_DEPLOY=0 was wasted CPU.
                     auto_deploy = reload_auto_deploy()
                     deploy_every = auto_deploy.poll_interval_seconds()
+                    # Compare against the *pre-deploy* snapshot. Resetting
+                    # ``before`` here used to swallow gateway.py / watcher
+                    # mtimes, so a full-shutdown Veil ran as stay-connected
+                    # copyover and nobody disconnected.
+                    snap_before_deploy = before
                     deployed = auto_deploy.try_auto_deploy()
                     if deployed:
-                        before = _snapshot()
+                        after_deploy = _snapshot()
+                        dropped = _maybe_drop_clients_for_gateway_modules(
+                            snap_before_deploy,
+                            after_deploy,
+                            proc=proc,
+                            gateway_proc=gateway_proc,
+                            use_gateway=use_gateway,
+                            reason_label="deploy sync touched gateway source",
+                        )
+                        if dropped:
+                            proc, game_spawn_wall, gateway_proc = dropped
+                        before = after_deploy
                         pending_copyover = False
                         settle_deadline = None
             except Exception as exc:

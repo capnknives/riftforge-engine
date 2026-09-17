@@ -210,7 +210,9 @@ def _resolve_indexed_room(game, key):
     """Map index key back to a live room object, or ``None``."""
     rooms = getattr(game, "rooms", None) or {}
     if isinstance(key, str):
-        return rooms.get(key)
+        from engine.room_vnum import lookup_room
+
+        return lookup_room(game, key)
     for room in rooms.values():
         if _reset_room_key(room) == key:
             return room

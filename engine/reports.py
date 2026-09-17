@@ -30,6 +30,10 @@ HELP = "help"
 # Copy typos / grammar in rooms, help, and combat lines -- separate from
 # bugs so staff can prioritize them without mixing crash reports (idea 194).
 TYPO = "typo"
+# Player conduct flag with a target (bad appearance/name/setdesc, …).
+# Not an idea or a bug -- a moderation signal, so it stays out of the
+# bug/suggestion inbox entirely (suggestion 501).
+PREPORT = "preport"
 
 # Optional post-append hooks: list of callback(kind, payload). Kept for
 # future side effects; bug_webhook POSTs are GM-on-demand (squashbugs), not
@@ -44,6 +48,7 @@ _FILENAMES = {
     SUGGEST: "suggestions.log",
     HELP: "help_proposals.log",
     TYPO: "typos.log",
+    PREPORT: "player_reports.log",
 }
 
 # A report starts "open"; staff may mark an idea "approved" (yes, implement
@@ -70,6 +75,7 @@ DISPLAY_LABELS = {
     SUGGEST: "IDEA",
     HELP: "HELP",
     TYPO: "TYPO",
+    PREPORT: "CONDUCT",
 }
 
 # Parse words staff type after ``show`` / ``resolve`` (bug, idea, …).
@@ -84,6 +90,9 @@ KIND_ALIASES = {
     "help": HELP,
     "typo": TYPO,
     "typos": TYPO,
+    "preport": PREPORT,
+    "preports": PREPORT,
+    "conduct": PREPORT,
 }
 
 # Sections for the GM ``reports`` list (all-kinds view, oldest-first within
@@ -93,6 +102,7 @@ REPORT_LIST_SECTIONS = (
     (SUGGEST, "Ideas:", "IDEA"),
     (TYPO, "Typos:", "TYPO"),
     (HELP, "Help ideas:", "HELP"),
+    (PREPORT, "Player conduct:", "CONDUCT"),
 )
 
 
@@ -146,7 +156,7 @@ def register_after_mark(callback):
 
 
 def record(kind, reporter, description, history, directory=".", context=None,
-           subject=None):
+           subject=None, reporter_cnum=None):
     """Append one timestamped report as a single JSON line.
 
     history is a list of [line, traceback_or_None] pairs from the session
@@ -158,6 +168,9 @@ def record(kind, reporter, description, history, directory=".", context=None,
     context is an optional dict of diagnostic facts (room, vitals, mission,
     …) from engine.report_context.build(). Suggestions / typos / help ideas
     attach a slim identity/location snapshot instead of the full dump.
+
+    ``reporter_cnum`` is the filing body's identity tag (dual-write). Old
+    JSONL lines without it still match on ``reporter`` (storage name).
 
     Returns the payload dict that was written, including a 1-based ``id``
     (the physical line number in the JSONL file -- same numbering
@@ -190,6 +203,13 @@ def record(kind, reporter, description, history, directory=".", context=None,
         payload["context"] = context
     if subject:
         payload["subject"] = subject
+    if reporter_cnum:
+        try:
+            from engine.char_cnum import validate_cnum
+
+            payload["reporter_cnum"] = validate_cnum(reporter_cnum)
+        except ValueError:
+            pass
     path = _path(kind, directory)
     try:
         payload = thread_log.append_line(path, payload)
@@ -248,6 +268,118 @@ def get_by_id(kind, entry_id, directory="."):
     return None
 
 
+def reporter_cnums_for_character(game, character):
+    """CNUM tags whose tickets this player may list (account rollup).
+
+    Includes ``account.retired_reporter_cnums`` -- deleted characters drop
+    out of ``account.character_keys`` (their name may be recycled by a new
+    body), but tickets they filed still dual-write ``reporter_cnum``, so
+    the account keeps that CNUM around forever to stay matchable
+    (bug report 1605).
+    """
+    from engine.char_identity import find_character_exact_key, persist_cnum_text
+
+    cnums = set()
+    tagged = persist_cnum_text(character)
+    if tagged:
+        cnums.add(tagged)
+    if game is None or character is None:
+        return cnums
+    for key in reporter_keys_for_character(game, character):
+        if (getattr(character, "key", None) or "").strip() == key:
+            continue
+        body = find_character_exact_key(game, key)
+        tagged = persist_cnum_text(body)
+        if tagged:
+            cnums.add(tagged)
+    from engine.accounts import account_for_character
+
+    account = account_for_character(game, character)
+    for raw in getattr(account, "retired_reporter_cnums", None) or ():
+        cnum = (raw or "").strip()
+        if cnum:
+            cnums.add(cnum)
+    return cnums
+
+
+def backfill_retired_reporter_cnums(game) -> int:
+    """One-time boot migration: recover CNUMs of bodies deleted before the
+    ``retired_reporter_cnums`` fix shipped (bug report 1605).
+
+    Deleting a character purges its row entirely on the next full snapshot
+    (``DELETE FROM characters``) and drops it from
+    ``account.character_keys``, so nothing live is left to walk for
+    characters erased before this fix existed. But every filed ticket
+    already dual-writes ``reporter_cnum`` alongside the filing account's
+    name (``context.account`` -- ``engine/report_context.py``), and that
+    snapshot survives the character's deletion. Cross-reference it once so
+    a deleted body's old tickets rejoin the account's ``bugs``/``ideas``.
+
+    Returns the number of accounts updated.
+    """
+    if game is None:
+        return 0
+    from engine import accounts as accounts_mod
+    from engine.char_cnum import validate_cnum
+
+    directory = getattr(game, "report_dir", None) or "."
+    pending: dict[str, set[str]] = {}
+    for kind in _FILENAMES:
+        for entry in recent(kind, None, directory=directory):
+            account_name = (
+                (entry.get("context") or {}).get("account") or ""
+            ).strip()
+            raw_cnum = (entry.get("reporter_cnum") or "").strip()
+            if not account_name or not raw_cnum:
+                continue
+            try:
+                cnum = validate_cnum(raw_cnum)
+            except ValueError:
+                continue
+            key = accounts_mod.account_lookup_key(account_name)
+            pending.setdefault(key, set()).add(cnum)
+
+    if not pending:
+        return 0
+    accounts_dict = accounts_mod.ensure_accounts_dict(game)
+    updated = 0
+    for key, cnums in pending.items():
+        account = accounts_dict.get(key)
+        if account is None:
+            continue
+        retired = getattr(account, "retired_reporter_cnums", None)
+        if retired is None:
+            retired = []
+            account.retired_reporter_cnums = retired
+        added = False
+        for cnum in cnums:
+            if cnum not in retired:
+                retired.append(cnum)
+                added = True
+        if added:
+            updated += 1
+            from engine.persistence import mark_account_dirty
+
+            mark_account_dirty(game, account)
+    return updated
+
+
+def _entry_filed_by(entry, keys, cnums=None):
+    """True when this JSONL line belongs to the reporter keys/CNUMs."""
+    cnums = cnums or set()
+    raw_cnum = (entry.get("reporter_cnum") or "").strip()
+    if raw_cnum and cnums:
+        try:
+            from engine.char_cnum import validate_cnum
+
+            if validate_cnum(raw_cnum) in cnums:
+                return True
+        except ValueError:
+            pass
+    reporter = (entry.get("reporter") or "").strip()
+    return reporter in keys
+
+
 def reporter_keys_for_character(game, character):
     """Storage keys whose tickets this player may list (account rollup).
 
@@ -291,14 +423,16 @@ def by_reporter(
     """
     if character is not None and game is not None:
         keys = reporter_keys_for_character(game, character)
+        cnums = reporter_cnums_for_character(game, character)
     else:
         needle = (reporter_key or "").strip()
         keys = {needle} if needle else set()
-    if not keys:
+        cnums = set()
+    if not keys and not cnums:
         return []
     out = []
     for entry in recent(kind, None, directory=directory):
-        if entry.get("reporter") not in keys:
+        if not _entry_filed_by(entry, keys, cnums):
             continue
         if open_only and not is_active_status(entry.get("status", "open")):
             continue
@@ -313,16 +447,17 @@ def recently_resolved_for_keys(
     *,
     limit=5,
     within_hours=168,
+    cnums=None,
 ):
     """Recently resolved tickets for ``keys`` (newest first, capped)."""
-    if not keys or limit <= 0:
+    if (not keys and not cnums) or limit <= 0:
         return []
     from datetime import datetime, timedelta
 
     cutoff = datetime.now() - timedelta(hours=within_hours)
     picked = []
     for entry in reversed(recent(kind, None, directory=directory)):
-        if entry.get("reporter") not in keys:
+        if not _entry_filed_by(entry, keys or set(), cnums):
             continue
         if entry.get("status") != "resolved":
             continue
@@ -339,6 +474,134 @@ def recently_resolved_for_keys(
             break
     picked.reverse()
     return picked
+
+
+def _traceback_exception_name(traceback_text):
+    """Best-effort exception class from a stored traceback string.
+
+    Session history stores ``traceback.format_exc()``. The last non-blank
+    line is usually ``TypeError: …`` -- enough for a staff headline without
+    dumping the stack onto the ops channel.
+    """
+    last = ""
+    for line in (traceback_text or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            last = stripped
+    if not last:
+        return ""
+    name = last.split(":", 1)[0].strip()
+    token = name.split()[0] if name else ""
+    if not token:
+        return ""
+    if not token[0].isalpha() and token[0] != "_":
+        return ""
+    return token[:40]
+
+
+def _ticket_diag_flags(entry):
+    """Compact diagnostic flags from a JSONL report row.
+
+    Returns ``(error_count, last_exc, last_verb, overlay_dirty, look_mismatch,
+    room_label)``.
+    """
+    errors = entry.get("errors") or []
+    if not isinstance(errors, list):
+        errors = []
+    error_count = len(errors)
+    last_exc = ""
+    last_verb = ""
+    if errors:
+        last = errors[-1] if isinstance(errors[-1], dict) else {}
+        last_exc = _traceback_exception_name(last.get("traceback") or "")
+        raw_line = str(last.get("line") or "").strip()
+        if raw_line:
+            last_verb = raw_line.split()[0][:24]
+    ctx = entry.get("context") if isinstance(entry.get("context"), dict) else {}
+    room = ctx.get("room") if isinstance(ctx.get("room"), dict) else {}
+    room_label = str(room.get("title") or "").strip()
+    if not room_label:
+        room_label = str(room.get("zone") or "").strip()
+    if len(room_label) > 40:
+        room_label = room_label[:37] + "..."
+    game_ctx = ctx.get("game") if isinstance(ctx.get("game"), dict) else {}
+    runtime = (
+        game_ctx.get("runtime") if isinstance(game_ctx.get("runtime"), dict) else {}
+    )
+    overlay_dirty = bool(
+        runtime.get("overlay_dirty") or game_ctx.get("overlay_dirty")
+    )
+    sess = ctx.get("session") if isinstance(ctx.get("session"), dict) else {}
+    look_mismatch = bool(sess.get("look_location_mismatch"))
+    return (
+        error_count, last_exc, last_verb, overlay_dirty, look_mismatch,
+        room_label,
+    )
+
+
+def staff_ticket_headline(entry, *, kind=None):
+    """One-line staff triage bits for a filed ticket (ops ping, not Discord).
+
+    Bugs always include room when known. Suggestions / typos / help only
+    get a second line when there is a real diagnostic flag (tracebacks,
+    overlay split, look/location mismatch).
+    """
+    if not isinstance(entry, dict):
+        return ""
+    (
+        error_count, last_exc, last_verb, overlay_dirty, look_mismatch,
+        room_label,
+    ) = _ticket_diag_flags(entry)
+    bits = []
+    if error_count:
+        noun = "error" if error_count == 1 else "errors"
+        bits.append(f"{error_count} {noun}")
+        if last_exc and last_verb:
+            bits.append(f"last: {last_exc} in {last_verb}")
+        elif last_exc:
+            bits.append(f"last: {last_exc}")
+        elif last_verb:
+            bits.append(f"last: {last_verb}")
+    if overlay_dirty:
+        bits.append("overlay dirty")
+    if look_mismatch:
+        bits.append("look/location mismatch")
+    include_room = (kind == BUG) or bool(bits)
+    if include_room and room_label:
+        bits.append(room_label)
+    if not bits:
+        return ""
+    entry_id = entry.get("id", "?")
+    if kind == BUG:
+        prefix = f"bug #{entry_id}: "
+    elif kind == SUGGEST:
+        prefix = f"suggestion #{entry_id}: "
+    elif kind == TYPO:
+        prefix = f"typo #{entry_id}: "
+    elif kind == HELP:
+        prefix = f"help idea #{entry_id}: "
+    else:
+        prefix = ""
+    return prefix + " | ".join(bits)
+
+
+def staff_ticket_badges(entry):
+    """Short list suffixes such as `` [+2 tb] [overlay dirty]``."""
+    if not isinstance(entry, dict):
+        return ""
+    error_count, _exc, _verb, overlay_dirty, look_mismatch, _room = (
+        _ticket_diag_flags(entry)
+    )
+    parts = []
+    if error_count:
+        parts.append(f"+{error_count} tb")
+    if overlay_dirty:
+        parts.append("overlay dirty")
+    if look_mismatch:
+        parts.append("look mismatch")
+    if not parts:
+        return ""
+    return " " + " ".join(f"[{p}]" for p in parts)
 
 
 def format_entry_lines(kind, entry, *, game=None):
@@ -453,11 +716,15 @@ def is_ticket_reporter(entry, character_key, *, game=None, character=None):
     """True when this ticket belongs to the player (body or linked account)."""
     if entry is None:
         return False
+    if character is not None and game is not None:
+        return _entry_filed_by(
+            entry,
+            reporter_keys_for_character(game, character),
+            reporter_cnums_for_character(game, character),
+        )
     reporter = (entry.get("reporter") or "").strip()
     if not reporter:
         return False
-    if character is not None and game is not None:
-        return reporter in reporter_keys_for_character(game, character)
     needle = (character_key or "").strip()
     return bool(needle) and reporter == needle
 

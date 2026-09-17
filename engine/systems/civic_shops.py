@@ -223,6 +223,8 @@ def ensure_demo_newsstand(game):
                 "qty": None,
             },
         ]
-        game.rooms[hub_key] = hub
+        fixture_mod.install_runtime_hub(game, hub)
+    if hub is not None:
+        record["hub_room_key"] = getattr(hub, "key", hub_key) or hub_key
     heal_fixture(game, record)
     return record

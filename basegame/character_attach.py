@@ -94,3 +94,6 @@ def attach_basegame(character):
     character.traits = []
     # Demo sidearm for active-combat firearm verbs (load / aim / fire).
     firearms_mod.ensure_firearm(character)
+    # Folklore celestial demo grace tank (Wave 5a) — live uses fuel instead.
+    if not hasattr(character, "grace"):
+        character.grace = None

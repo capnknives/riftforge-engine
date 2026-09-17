@@ -150,7 +150,9 @@ def cmd_fly(character, args, game):
         return
     if tier == "globe":
         set_flight_tier(character, "orbit")
-        room = game.rooms.get(ORBIT_ROOM_KEY)
+        from engine.room_vnum import lookup_room
+
+        room = lookup_room(game, ORBIT_ROOM_KEY)
         if room is None:
             character.session.send("Orbit platform is not loaded.")
             return

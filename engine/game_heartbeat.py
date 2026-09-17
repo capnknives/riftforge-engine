@@ -154,6 +154,10 @@ def should_kill_for_hang(*, spawn_wall, now_wall=None):
     """
     if not hang_check_enabled():
         return False, "disabled"
+    from engine import crash_recovery
+
+    if crash_recovery.planned_restart_pending():
+        return False, "planned_restart"
     now = time.time() if now_wall is None else now_wall
     timeout = hang_timeout_seconds()
     grace = boot_grace_seconds()

@@ -268,6 +268,45 @@ def search_fts(conn, query, *, is_gm=False):
     return _row_to_dict(row) if row is not None else None
 
 
+def search_fts_many(conn, query, *, is_gm=False, limit=8):
+    """FTS hits as a list (best first) so help can disambiguate.
+
+    Suggestion report 325: a smart single pick felt like the wrong page.
+    Callers list several keyword matches instead of choosing one.
+    """
+    query = (query or "").strip()
+    if not query:
+        return []
+    cap = max(1, min(int(limit or 8), 20))
+    columns_sql = ", ".join(f"helpfiles.{c}" for c in _COLUMNS)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT {columns_sql}
+            FROM help_fts
+            JOIN helpfiles ON help_fts.rowid = helpfiles.rowid
+            WHERE help_fts MATCH ? AND (helpfiles.gm_only = 0 OR ? = 1)
+            ORDER BY bm25(help_fts)
+            LIMIT ?
+            """,
+            (_fts_query(query), int(bool(is_gm)), cap),
+        ).fetchall()
+    except Exception:
+        return []
+    out = []
+    seen = set()
+    for row in rows:
+        entry = _row_to_dict(row)
+        if not entry:
+            continue
+        key = str(entry.get("primary_keyword") or "").strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(entry)
+    return out
+
+
 def _levenshtein(a, b):
     """Classic edit-distance DP, O(len(a) * len(b)). Pure stdlib -- no
     trigram extension, no third-party fuzzy-match library.

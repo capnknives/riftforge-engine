@@ -33,12 +33,30 @@ bare engine Character already has (``engine/world.py`` sets
 ``character.origin = "mundane"``), and basegame's four ``bg_path`` jobs
 are unchanged. The chargen menu always offers "Mundane" as option 1
 plus one line per ``known_origins()``.
+
+Folklore Mortals & Monsters origin ids live in ``FOLKLORE_ORIGIN_IDS``.
+They are a reserved list so a later basegame pass registers under these
+ids instead of inventing a second registry. The engine does **not**
+self-register them (Alien remains the only shipped engine origin, as a
+sideline demo). Games call ``register_origin`` from their own modules.
 """
 
 from __future__ import annotations
 
 # id -> {"name": str, "summary": str, "chargen_step": fn|None, "on_attach": fn|None}
 _ORIGINS: dict[str, dict] = {}
+
+# Reserved folklore origin ids (charter layer table). Empty until a game
+# imports a module that calls register_origin. Do not put Winchester
+# chargen copy or live Origin trees here.
+FOLKLORE_ORIGIN_IDS = frozenset({
+    "hunter",
+    "vampire",
+    "werewolf",
+    "ghost",
+    "witch",
+    "celestial_vessel",
+})
 
 
 def register_origin(origin_id, *, name, summary="", chargen_step=None, on_attach=None):

@@ -48,6 +48,9 @@ def character_to_blob(character):
         "umbral_charge": float(getattr(character, "umbral_charge", 1.0) or 1.0),
         "tier": int(getattr(character, "tier", 0) or 0),
     }
+    grace_val = getattr(character, "grace", None)
+    if grace_val is not None:
+        blob["grace"] = float(grace_val)
     blob.update(_wallet_fields(character))
     from basegame import body_parts as body_parts_module
 
@@ -119,6 +122,8 @@ def apply_character_blob(character, data):
             maxlen=DEFAULT_RING_MAX,
         )
     _restore_origin_fields(character, data)
+    if "grace" in data:
+        character.grace = float(data.get("grace") or 0)
     if "tier" in data:
         character.tier = int(data.get("tier") or 0)
     for field in ("dollars", "cents", "bank_dollars", "bank_cents"):

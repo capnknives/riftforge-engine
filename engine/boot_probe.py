@@ -1,8 +1,9 @@
 """boot_probe.py -- prove SUPERS can register hooks and construct Game().
 
-Used by CI (``tools/boot_probe.py``) and auto-deploy overlay rollback so
-import-time validation / facade regressions fail before live picks up bad
-files. Runs in a fresh process with a throwaway SQLite DB.
+Used by GitHub ``boot-probe``, auto-deploy overlay rollback, and
+``tools/local_ci.py --full``. Not a targeted smoke: constructing ``Game()``
+stitches the world (Cadence, lodging, maps) and is too slow for pre-push.
+Targeted smokes stub the few attributes they need instead of calling this.
 """
 
 from __future__ import annotations
@@ -13,6 +14,14 @@ import tempfile
 import traceback
 
 
+# Live Game() on the droplet often takes 3–5 minutes (copyover 264s was
+# measured 2026-09-11). The old 180s subprocess cap then abort-held good
+# merges and git-reset live back to the previous SHA. Ten minutes is the
+# floor that still leaves crash recovery as the backstop for a hung boot.
+DEFAULT_BOOT_PROBE_TIMEOUT_S = 600.0
+MIN_BOOT_PROBE_TIMEOUT_S = 60.0
+
+
 def boot_probe_enabled():
     """True unless AUTO_DEPLOY_BOOT_PROBE / RIFTFORGE_BOOT_PROBE is off."""
     for key in ("AUTO_DEPLOY_BOOT_PROBE", "RIFTFORGE_BOOT_PROBE"):
@@ -20,6 +29,34 @@ def boot_probe_enabled():
         if raw in ("0", "false", "no", "off"):
             return False
     return True
+
+
+def boot_probe_timeout_seconds(explicit=None):
+    """Seconds the watcher waits for a throwaway ``Game()`` subprocess.
+
+    ``explicit`` wins (tests). Else ``RIFTFORGE_BOOT_PROBE_TIMEOUT`` or
+    ``AUTO_DEPLOY_BOOT_PROBE_TIMEOUT`` from env (``.env`` via apply_repo_env).
+    """
+    if explicit is not None:
+        try:
+            return max(MIN_BOOT_PROBE_TIMEOUT_S, float(explicit))
+        except (TypeError, ValueError):
+            pass
+    for key in ("RIFTFORGE_BOOT_PROBE_TIMEOUT", "AUTO_DEPLOY_BOOT_PROBE_TIMEOUT"):
+        raw = (os.environ.get(key) or "").strip()
+        if not raw:
+            continue
+        try:
+            return max(MIN_BOOT_PROBE_TIMEOUT_S, float(raw))
+        except ValueError:
+            continue
+    return DEFAULT_BOOT_PROBE_TIMEOUT_S
+
+
+def boot_probe_timed_out(detail):
+    """True when the subprocess was killed for wall-clock, not a crash."""
+    text = (detail or "").lower()
+    return "timed out after" in text
 
 
 def run_boot_probe(*, db_path=None, game_name="supers"):
@@ -76,10 +113,12 @@ def run_boot_probe(*, db_path=None, game_name="supers"):
                     pass
 
 
-def run_boot_probe_subprocess(*, cwd=None, timeout=180.0, game_name="supers"):
+def run_boot_probe_subprocess(*, cwd=None, timeout=None, game_name="supers"):
     """Spawn ``tools/boot_probe.py`` in a clean process (overlay safety).
 
-    Returns ``(ok: bool, detail: str)``.
+    Returns ``(ok: bool, detail: str)``. ``timeout=None`` uses
+    :func:`boot_probe_timeout_seconds` (default 600s, env override).
+    A timeout is *not* a Game() crash -- callers should not abort-hold.
     """
     import subprocess
 
@@ -88,17 +127,18 @@ def run_boot_probe_subprocess(*, cwd=None, timeout=180.0, game_name="supers"):
     env = os.environ.copy()
     if game_name:
         env["RIFTFORGE_GAME"] = game_name
+    seconds = boot_probe_timeout_seconds(timeout)
     try:
         result = subprocess.run(
             [sys.executable, script],
             cwd=root,
             capture_output=True,
             text=True,
-            timeout=float(timeout),
+            timeout=float(seconds),
             env=env,
         )
     except subprocess.TimeoutExpired:
-        return False, f"boot probe timed out after {timeout:.0f}s"
+        return False, f"boot probe timed out after {seconds:.0f}s"
     except OSError as exc:
         return False, f"boot probe spawn failed: {exc}"
 

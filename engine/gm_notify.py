@@ -8,9 +8,13 @@ bug/suggest.
 Never the only signal -- every line keeps a plain ``[GM]`` prefix so
 ``color off`` still reads clearly (docs/SYSTEMS_DESIGN.md section 8).
 
-Opt-out: Character.gm_notify False (GM verb ``gmnotify off``). Immersion
-cast bodies are skipped -- same staff filter as ``who``'s GM strip
-(``_is_staff_gm``).
+Opt-out: Character.gm_notify False (GM verb ``gm staffnotify off``). Idle
+immersion fixtures never listen (they are not in ``game.sessions``).
+Staff occupying a powered cast (playcast / Cast menu / ``gm off Dean``)
+still receive pings -- ``_is_staff_gm`` stays False so who / threat
+scaling remain in-character.
+Command-error pings (live player ``Something went wrong``) honor a second
+flag, ``gm_notify_exceptions`` (``gm staffnotify exceptions off``).
 
 Client IPs: ``peer_host`` always returns the real address when known
 (banlist, head-GM tooling). Connect/disconnect ``from …`` clauses and
@@ -18,12 +22,15 @@ Client IPs: ``peer_host`` always returns the real address when known
 do not see player IPs on the ops channel.
 """
 
-from engine.command_support import _is_head_gm, _is_staff_gm
+from engine.command_support import _is_gm, _is_head_gm, _is_staff_gm
 from engine import channel_history
 from engine import style
 
 # Re-export for callers that still import from gm_notify.
 WIZNET_HISTORY_MAX = channel_history.WIZNET_HISTORY_MAX
+
+# Same spirit as diag auto-capture: a looping verb must not flood [GM].
+EXCEPTION_PING_RATE_LIMIT_S = 45.0
 
 
 def peer_host(session):
@@ -160,17 +167,45 @@ def send_gm_session(session, message):
     return True
 
 
-def ping_gms(game, message, *, exclude=None, peer_session=None):
+def _receives_staff_ops(session, character):
+    """True when this live session should get ``[GM]`` / ``[WIZ]`` lines.
+
+    ``_is_staff_gm`` skips immersion so who and city-threat stay IC.
+    Staff occupying a powered Origin cast keep GM verbs
+    (``playcast_gm_tools`` / ``staff_account``) and must still hear
+    ops alerts. Idle catalog fixtures are never in ``game.sessions``.
+    """
+    if character is None or session is None:
+        return False
+    if _is_staff_gm(character):
+        return True
+    if not _is_gm(character):
+        return False
+    if bool(getattr(session, "playcast_gm_tools", False)):
+        return True
+    if getattr(character, "immersion", False) and getattr(
+        session, "staff_account", None,
+    ):
+        return True
+    return False
+
+
+def ping_gms(game, message, *, exclude=None, peer_session=None, kind="ops"):
     """Send one dark-green staff line to every opted-in online staff GM.
 
     exclude -- optional Character who should not receive this ping (e.g.
     the player who just disconnected, or a GM who triggered their own
-    event). Immersion cast is never pinged.
+    event). Idle immersion fixtures are never in ``game.sessions``.
+    Staff occupying a powered cast still receive the ping.
 
     peer_session -- optional Session whose client IP is appended via
     ``{from}`` in *message* (replaced per recipient). Head GM gets
     `` from 1.2.3.4``; junior staff get an empty string. If *message*
     has no ``{from}`` placeholder, it is sent unchanged to everyone.
+
+    kind -- ``ops`` (default) or ``exception``. Exception pings also
+    require ``gm_notify_exceptions`` (default on). ``staffnotify off``
+    still silences both.
     """
     sessions = getattr(game, "sessions", None) or []
     for session in list(sessions):
@@ -179,11 +214,14 @@ def ping_gms(game, message, *, exclude=None, peer_session=None):
             continue
         if exclude is not None and other is exclude:
             continue
-        # Staff only -- immersion GMs stay in-character on who/notify.
-        if not _is_staff_gm(other):
+        if not _receives_staff_ops(session, other):
             continue
         # Default on; gmnotify off flips this False (persisted).
         if not getattr(other, "gm_notify", True):
+            continue
+        if kind == "exception" and not getattr(
+            other, "gm_notify_exceptions", True,
+        ):
             continue
         send = getattr(session, "send", None)
         if send is None:
@@ -194,6 +232,44 @@ def ping_gms(game, message, *, exclude=None, peer_session=None):
                 "{from}", format_from(peer_session, viewer=other)
             )
         send(paint_gm_line(text))
+
+
+def ping_command_exception(game, character, exc, *, command=""):
+    """Rate-limited [GM] line when a live player's command raises.
+
+    The player already saw ``Something went wrong``. This is the staff
+    bell so a crash is visible even when nobody files ``bug``. Tracebacks
+    stay on stderr and in session history -- not on this line.
+    """
+    if game is None or character is None:
+        return False
+    import time as _time
+
+    exc_name = type(exc).__name__ if exc is not None else "Exception"
+    verb = ""
+    text = (command or "").strip()
+    if text:
+        verb = text.split()[0][:24]
+    key = (
+        str(getattr(character, "key", "") or "?"),
+        exc_name,
+    )
+    now = _time.monotonic()
+    stamp_map = getattr(game, "_gm_cmd_exc_ping_at", None)
+    if not isinstance(stamp_map, dict):
+        stamp_map = {}
+        game._gm_cmd_exc_ping_at = stamp_map
+    last = float(stamp_map.get(key, 0.0) or 0.0)
+    if last and (now - last) < EXCEPTION_PING_RATE_LIMIT_S:
+        return False
+    stamp_map[key] = now
+    who = public_who(character, game)
+    if verb:
+        msg = f"{who} command error: {exc_name} in {verb}"
+    else:
+        msg = f"{who} command error: {exc_name}"
+    ping_gms(game, msg, exclude=character, kind="exception")
+    return True
 
 
 def paint_wiz_line(message):
@@ -273,12 +349,13 @@ def send_wiznet_history(character, game):
 
 
 def wiznet_broadcast(game, speaker, message, *, exclude=None, skip_discord_mirror=False):
-    """Send one ``[WIZ]`` line to every online staff GM (not immersion cast).
+    """Send one ``[WIZ]`` line to every online staff GM / Archangel RPC.
 
     Unlike ``ping_gms``, this ignores ``gm_notify`` opt-out -- wiznet is
-    deliberate staff chat, not an ops ping you mute. Immersion cast stays
-    out so in-character bodies never see the channel. In-game lines also
-    mirror to Discord #staff unless *skip_discord_mirror* (inbound Discord).
+    deliberate staff chat, not an ops ping you mute. Idle catalog
+    fixtures never listen. Staff occupying a powered cast still hear
+    the channel. In-game lines also mirror to Discord #staff unless
+    *skip_discord_mirror* (inbound Discord).
     """
     plain = format_wiznet_plain(speaker, message, game=game)
     if plain is None:
@@ -302,7 +379,10 @@ def _deliver_wiznet_line(game, line, *, exclude=None) -> int:
         if exclude is not None and other is exclude:
             continue
         from engine import hooks
-        if not _is_staff_gm(other) and not hooks.is_rpc_staff(other):
+        if (
+            not _receives_staff_ops(session, other)
+            and not hooks.is_rpc_staff(other)
+        ):
             continue
         send = getattr(session, "send", None)
         if send is None:

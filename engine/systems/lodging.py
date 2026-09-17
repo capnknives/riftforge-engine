@@ -67,8 +67,9 @@ def _resolve_exit_room(dest, game=None):
         return None
     if not isinstance(dest, str):
         return dest
-    rooms = getattr(game, "rooms", None) or {}
-    return rooms.get(dest)
+    from engine.room_vnum import lookup_room
+
+    return lookup_room(game, dest)
 
 
 def is_house_satellite_chamber(room):
@@ -254,7 +255,12 @@ def main_homeroom_key(room):
 
 
 def same_house_room(a, b):
-    """True when two rooms share a ``main_homeroom`` (or are the same room)."""
+    """True when two rooms share a ``main_homeroom`` (or are the same room).
+
+    Homestead plots also count: kitchen / hallway / bedroom share one
+    ``homestead_plot_id`` even when ``main_homeroom`` still holds a stale
+    slug after VNUM restamp (bug report 1275).
+    """
     if a is None or b is None:
         return False
     if a is b:
@@ -263,7 +269,11 @@ def same_house_room(a, b):
         return True
     ma = main_homeroom_key(a)
     mb = main_homeroom_key(b)
-    return bool(ma) and ma == mb
+    if ma and ma == mb:
+        return True
+    pa = getattr(a, "homestead_plot_id", None)
+    pb = getattr(b, "homestead_plot_id", None)
+    return bool(pa) and pa == pb
 
 
 def room_is_character_home(character, room, game=None):
@@ -273,12 +283,13 @@ def room_is_character_home(character, room, game=None):
     home_key = getattr(character, "home_room_key", None)
     if not home_key:
         return False
-    if home_key == getattr(room, "key", None):
+    from engine.room_vnum import lookup_room, room_keys_match
+
+    if room_keys_match(game, home_key, getattr(room, "key", None)):
         return True
     if not getattr(room, "is_house", False) and not getattr(room, "is_home", False):
         return False
-    rooms = getattr(game, "rooms", None) if game is not None else None
-    home_room = rooms.get(home_key) if rooms else None
+    home_room = lookup_room(game, home_key) if game is not None else None
     if home_room is None:
         return main_homeroom_key(room) == home_key
     return same_house_room(home_room, room)
@@ -509,18 +520,18 @@ def _claimants_index(game):
         ):
             return index
     from engine.char_index import iter_characters
+    from engine.room_vnum import lookup_room, internal_room_key
 
-    rooms = getattr(game, "rooms", None) or {}
     by_key = {}
     for obj in iter_characters(game):
         home_key = getattr(obj, "home_room_key", None)
         if not home_key:
             continue
-        dest = rooms.get(home_key) if hasattr(rooms, "get") else None
+        dest = lookup_room(game, home_key)
         if dest is None:
             by_key.setdefault(home_key, []).append(obj)
             continue
-        canon = getattr(dest, "key", None) or home_key
+        canon = internal_room_key(dest) or getattr(dest, "key", None) or home_key
         by_key.setdefault(canon, []).append(obj)
         if home_key != canon:
             by_key.setdefault(home_key, []).append(obj)
@@ -539,8 +550,9 @@ def claimants_of(game, room_key):
     cache = getattr(game, "_cadence_claimants_cache", None)
     if isinstance(cache, dict) and room_key in cache:
         return cache[room_key]
-    rooms = getattr(game, "rooms", None) or {}
-    dest = rooms.get(room_key) if hasattr(rooms, "get") else None
+    from engine.room_vnum import lookup_room
+
+    dest = lookup_room(game, room_key)
     main = main_homeroom_key(dest) if dest is not None else room_key
     index = _claimants_index(game)
     seen = set()
@@ -571,7 +583,9 @@ def is_player_character(character):
 
 def _clear_bed_owners_for(game, room_key, owner_key):
     """Clear ``owner_key`` on beds in ``room_key`` that match this renter."""
-    room = game.rooms.get(room_key)
+    from engine.room_vnum import lookup_room
+
+    room = lookup_room(game, room_key)
     if room is None:
         return 0
     cleared = 0
@@ -714,7 +728,9 @@ def tick_leases(game):
         if now < until:
             continue
         home = getattr(obj, "home_room_key", None)
-        guest_room = game.rooms.get(home) if home else None
+        from engine.room_vnum import lookup_room
+
+        guest_room = lookup_room(game, home) if home else None
         if guest_room is not None and is_hotel_guest_room(guest_room):
             _clear_bed_owners_for(game, home, obj.key)
             obj.home_room_key = None

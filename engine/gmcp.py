@@ -123,6 +123,7 @@ SERVER_SUPPORTS = (
     "Char.Vitals 1",
     "Room 1",
     "Room.Info 1",
+    "Room.Occupants 1",
     "Comm 1",
     "Comm.Channel 1",
     # Live combat-pit / Mudlet spectator channel (supers/combat_viz.py).
@@ -186,6 +187,10 @@ def client_supports(session, package: str) -> bool:
 
     After Core.Supports.Set, session.gmcp_supports maps name -> version int.
     Parent check: Char.Vitals is covered by an entry for Char alone.
+
+    Occupancy uses ``client_supports_exact`` instead: stock ``Room`` must
+    not inherit ``Room.Occupants`` (MudRammer prints unknown GMCP as a
+    story line -- bug report 1221).
     """
     if not getattr(session, "gmcp_enabled", False):
         return False
@@ -196,6 +201,19 @@ def client_supports(session, package: str) -> bool:
         return True
     parent = package.split(".", 1)[0]
     return parent in supports
+
+
+def client_supports_exact(session, package: str) -> bool:
+    """True only when the client listed this exact GMCP package name.
+
+    Unlike ``client_supports``, a parent module (``Room``) does not cover
+    children (``Room.Occupants``). Use this for payloads that would spam
+    transcript-printing phone apps.
+    """
+    if not getattr(session, "gmcp_enabled", False):
+        return False
+    supports = getattr(session, "gmcp_supports", None) or {}
+    return bool(supports) and package in supports
 
 
 def _wants_mapper_gmcp(character) -> bool:
@@ -288,20 +306,39 @@ def _parse_supports_list(payload) -> dict:
     return out
 
 
+def _supports_refresh_sig(session):
+    """Stable stamp so identical Core.Supports frames skip a second atlas build.
+
+    Browser handshakeHud re-sends Core.Supports.Set after a Veil even when
+    ``resume_gmcp_after_gateway_reattach`` already restored Supports and
+    pushed Map.Atlas. Same list + same body → skip. Mudlet Supports.Add that
+    *adds* RiftForge.Map changes the stamp, so the mapper still gets Atlas.
+    """
+    char = getattr(session, "character", None)
+    supports = getattr(session, "gmcp_supports", None) or {}
+    return (id(char) if char is not None else None, tuple(sorted(supports.items())))
+
+
 def _refresh_after_supports(session):
     """Re-push identity / room / America atlas after the client changes Supports.
 
     Stock Mudlet sends Core.Supports.Set without RiftForge.Map. The mapper
     package then sends Core.Supports.Add once its script loads -- often
     *after* login -- so Atlas would never go out if we only handled Set.
+
+    ``push_map(..., force_grid=True)`` already calls ``push_map_atlas``
+    when the atlas id is new or forced -- do not send Atlas a second time.
     """
     if session.character is None:
         return
+    sig = _supports_refresh_sig(session)
+    if getattr(session, "_gmcp_supports_refresh_sig", None) == sig:
+        return
+    session._gmcp_supports_refresh_sig = sig
     push_char_identity(session.character)
     push_vitals(session.character)
     push_room(session.character)
     push_map(session.character, force_grid=True)
-    push_map_atlas(session.character)
 
 
 def handle_inbound(session, package: str, payload):
@@ -435,6 +472,7 @@ def resume_gmcp_after_gateway_reattach(session):
     session._pending_lines.clear()
     session._web_map_grid_ids = set()
     session._web_map_atlas_id = None
+    session._gmcp_supports_refresh_sig = None
     session.gag_captured_comms = False
     if isinstance(saved, dict) and saved:
         session.gmcp_supports = dict(saved)
@@ -632,6 +670,7 @@ def push_room(character):
         if payload:
             session.send_gmcp("Room.Info", payload)
         push_map(character)
+    push_occupants(character)
     # Fog + interior graph only for HUD/Mudlet clients that asked for them.
     # Telnet does not grow visited_room_keys on every look.
     if _wants_mapper_gmcp(character) and (
@@ -642,6 +681,227 @@ def push_room(character):
 
         zone_hud.record_visit(character)
         push_zone(character)
+
+
+# Closed occupant kind enum for Room.Occupants / RiftForge.Zone who[] rows.
+OCCUPANT_KIND_PLAYER = "player"
+OCCUPANT_KIND_NPC = "npc"
+OCCUPANT_KIND_ECHO = "echo"
+OCCUPANT_KIND_HOSTILE = "hostile"
+OCCUPANT_KIND_OTHER = "other"
+OCCUPANT_KINDS = frozenset({
+    OCCUPANT_KIND_PLAYER,
+    OCCUPANT_KIND_NPC,
+    OCCUPANT_KIND_ECHO,
+    OCCUPANT_KIND_HOSTILE,
+    OCCUPANT_KIND_OTHER,
+})
+OCCUPANT_TOKEN_DEFAULT = "person"
+OCCUPANT_TOKEN_VESSEL = "vessel"
+OCCUPANT_TOKENS = frozenset({OCCUPANT_TOKEN_DEFAULT, OCCUPANT_TOKEN_VESSEL})
+OCCUPANTS_CAP = 24
+
+
+def _default_occupant_kind(obj, viewer):
+    """Engine fallback when hooks.occupant_kind returns None."""
+    if obj is viewer or getattr(obj, "session", None) is not None:
+        return OCCUPANT_KIND_PLAYER
+    if getattr(obj, "hostile", False) or getattr(obj, "is_hostile", False):
+        return OCCUPANT_KIND_HOSTILE
+    password_hash = getattr(obj, "password_hash", "") or ""
+    if getattr(obj, "session", None) is None and password_hash:
+        return OCCUPANT_KIND_ECHO
+    if getattr(obj, "is_npc", False) or getattr(obj, "session", None) is None:
+        return OCCUPANT_KIND_NPC
+    return OCCUPANT_KIND_OTHER
+
+
+def _occupant_kind_for(obj, viewer):
+    """Resolve kind via hook, then engine defaults (closed set)."""
+    from engine import hooks
+
+    hooked = hooks.occupant_kind(obj, viewer)
+    if hooked is not None:
+        kind = str(hooked).strip().lower()
+        if kind in OCCUPANT_KINDS:
+            return kind
+    return _default_occupant_kind(obj, viewer)
+
+
+def _occupant_token_for(obj, viewer):
+    """Resolve skin token via hook; unknown ids fall back to person."""
+    from engine import hooks
+
+    hooked = hooks.occupant_token(obj, viewer)
+    if hooked is not None:
+        token = str(hooked).strip().lower()
+        if token in OCCUPANT_TOKENS:
+            return token
+    return OCCUPANT_TOKEN_DEFAULT
+
+
+def _safe_occupant_name(obj, viewer) -> str:
+    """Player-facing occupant label; never a VNUM or storage id."""
+    from engine.command_support import _display_name
+    from engine.room_vnum import label_is_bare_vnum
+
+    name = _display_name(obj, viewer=viewer)
+    text = str(name or "").strip()
+    lowered = text.lower()
+    if (
+        not text
+        or label_is_bare_vnum(text)
+        or "hub_room" in lowered
+        or "plot:" in lowered
+        or "gmspirit:" in lowered
+        or "homestead:" in lowered
+    ):
+        return "someone"
+    return text
+
+
+def occupants_payload(viewer) -> dict | None:
+    """Build Room.Occupants JSON for the viewer's current room.
+
+    Characters only (``room.characters()``). Dark / unseen rooms mirror
+    Room.Info: visible False with an empty who list. Capped at
+    ``OCCUPANTS_CAP`` rows with truncated True when more bodies exist.
+
+    Never raises: a leaky name is rewritten to ``someone`` so the walk
+    path cannot abort after relocate.
+    """
+    room = getattr(viewer, "location", None)
+    if room is None:
+        return None
+    from engine import map_hud
+    from engine import vision as vision_mod
+
+    if not vision_mod.can_see_room(viewer, room):
+        payload = {
+            "visible": False,
+            "count": 0,
+            "truncated": False,
+            "who": [],
+        }
+        try:
+            map_hud._assert_player_safe(payload)
+        except ValueError:
+            pass
+        return payload
+
+    chars = room.characters()
+    count = len(chars)
+    truncated = count > OCCUPANTS_CAP
+    who = []
+    for obj in chars[:OCCUPANTS_CAP]:
+        who.append({
+            "name": _safe_occupant_name(obj, viewer),
+            "you": obj is viewer,
+            "kind": _occupant_kind_for(obj, viewer),
+            "token": _occupant_token_for(obj, viewer),
+        })
+    payload = {
+        "visible": True,
+        "count": count,
+        "truncated": truncated,
+        "who": who,
+    }
+    try:
+        map_hud._assert_player_safe(payload)
+    except ValueError:
+        for row in who:
+            row["name"] = "someone"
+        try:
+            map_hud._assert_player_safe(payload)
+        except ValueError:
+            payload = {
+                "visible": True,
+                "count": count,
+                "truncated": truncated,
+                "who": [],
+            }
+    return payload
+
+
+def _session_wants_occupants_gmcp(session) -> bool:
+    """True when this session subscribed to occupancy or interior-map HUD.
+
+    ``Room.Occupants`` is exact-match only so stock ``Room`` mapper
+    clients do not inherit Occupants dumps into the transcript.
+    Zone / Map keep the usual parent check (HUD listed those packages).
+    """
+    if session is None or not getattr(session, "gmcp_enabled", False):
+        return False
+    return (
+        client_supports_exact(session, "Room.Occupants")
+        or client_supports(session, "RiftForge.Zone")
+        or client_supports(session, "RiftForge.Map")
+    )
+
+
+def _room_wants_occupants_gmcp(room) -> bool:
+    """Skip fan-out when nobody in the room asked for Occupants/Zone."""
+    if room is None:
+        return False
+    for ch in room.characters():
+        sess = getattr(ch, "session", None)
+        if sess is None or not getattr(sess, "alive", True):
+            continue
+        if _session_wants_occupants_gmcp(sess):
+            return True
+    return False
+
+
+def push_occupants(character) -> None:
+    """Send Room.Occupants to one online character when their client asked."""
+    try:
+        session = getattr(character, "session", None)
+        if session is None or not getattr(session, "alive", True):
+            return
+        if not _session_wants_occupants_gmcp(session):
+            return
+        payload = occupants_payload(character)
+        if payload is None:
+            return
+        session.send_gmcp("Room.Occupants", payload)
+    except Exception as exc:
+        print(f"[gmcp] occupants push skipped: {exc!r}", flush=True)
+
+
+def push_occupants_for_room(room) -> None:
+    """Refresh occupancy for every live session in ``room`` (+ Zone sync).
+
+    Swallows DTO faults so a walk that already relocated cannot lose
+    arrive-broadcast / look / follower pull.
+    """
+    try:
+        _push_occupants_for_room_inner(room)
+    except Exception as exc:
+        print(f"[gmcp] occupants fan-out skipped: {exc!r}", flush=True)
+
+
+def _push_occupants_for_room_inner(room) -> None:
+    """Inner Occupants/Zone fan-out; callers must go through the wrapper."""
+    if room is None or not _room_wants_occupants_gmcp(room):
+        return
+    zone_done = set()
+    for ch in room.characters():
+        sess = getattr(ch, "session", None)
+        if sess is None or not getattr(sess, "alive", True):
+            continue
+        push_occupants(ch)
+        ch_id = id(ch)
+        if ch_id in zone_done:
+            continue
+        if not _wants_mapper_gmcp(ch):
+            continue
+        if not (
+            client_supports(sess, "RiftForge.Zone")
+            or client_supports(sess, "RiftForge.Map")
+        ):
+            continue
+        push_zone(ch)
+        zone_done.add(ch_id)
 
 
 def push_zone(character):
@@ -666,6 +926,14 @@ def push_zone(character):
     payload = zone_hud.build_zone_payload(character, game)
     if not payload:
         return
+    if payload.get("hidden"):
+        payload.pop("who", None)
+    else:
+        occ = occupants_payload(character)
+        if occ and occ.get("visible"):
+            payload["who"] = list(occ.get("who") or [])
+        else:
+            payload["who"] = []
     session.send_gmcp("RiftForge.Zone", payload)
 
 
@@ -685,8 +953,13 @@ def push_map(character, *, force_grid=False):
         return
     game = getattr(session, "game", None)
     from engine import map_hud
+    from engine.systems import overland as overland_mod
 
-    atlas = getattr(game, "overland_atlas", None) if game is not None else None
+    atlas = (
+        overland_mod.atlas_for_character(character, game)
+        if game is not None
+        else None
+    )
     map_id = str(getattr(atlas, "map_id", "") or "") if atlas is not None else ""
     last_atlas = getattr(session, "_web_map_atlas_id", None)
     if map_id and (force_grid or map_id != last_atlas):
@@ -811,10 +1084,14 @@ def push_map_view(character, payload):
 
 
 def push_map_atlas(character, game=None):
-    """Send RiftForge.Map.Atlas once so Mudlet can draw the full country.
+    """Send RiftForge.Map.Atlas once so Mudlet/web can draw the full country.
 
-    Compact north-first glyph rows, no ANSI. Safe to call often -- skipped
-    when the client does not advertise RiftForge.Map.
+    Compact north-first glyph rows, no ANSI. HUD Canada land is space so
+    the silhouette stays the lower forty-eight; local ``map`` still paints
+    that land near a border. Callers that already went
+    through ``push_map(..., force_grid=True)`` must not call this again --
+    there is no same-id skip here because copyover *must* re-send the
+    country after the client dropped the last Atlas frame.
     """
     session = getattr(character, "session", None)
     if session is None:
@@ -828,10 +1105,13 @@ def push_map_atlas(character, game=None):
         return
     if game is None:
         game = getattr(session, "game", None)
-    atlas = getattr(game, "overland_atlas", None) if game is not None else None
+    from engine.systems import overland as overland_mod
+
+    atlas = overland_mod.atlas_for_character(character, game) if game is not None else None
     if atlas is None:
         return
     from engine import atlas_geo
+    from engine.atlas_layers import country_atlas_glyph
 
     width = int(atlas.width)
     height = int(atlas.height)
@@ -840,29 +1120,11 @@ def push_map_atlas(character, game=None):
     for y in range(height - 1, -1, -1):
         cells = []
         for x in range(width):
-            cell = atlas.terrain.get((x, y)) or {}
-            authored = str(cell.get("map_glyph") or "").strip()
-            if authored:
-                cells.append(authored[0])
-                continue
-            area = atlas.terrain_at(x, y)
-            # Tiny alphabet so a mapper theme can color by letter.
-            glyph = {
-                "ocean": "~",
-                "lake": "o",
-                "plains": ".",
-                "forest": "T",
-                "mountains": "^",
-                "hills": "n",
-                "desert": ",",
-                "swamp": ",",
-                "wetland": "'",
-                "city": "*",
-                "highway": "=",
-                "road": "=",
-                "void": " ",
-            }.get(area or "", ".")
-            cells.append(glyph)
+            cell = dict(atlas.terrain.get((x, y)) or {})
+            if not cell.get("area_type"):
+                cell["area_type"] = atlas.terrain_at(x, y)
+            # HUD Canada land becomes space so web / Mudlet stay CONUS.
+            cells.append(country_atlas_glyph(cell))
         rows.append("".join(cells))
     session.send_gmcp(
         "RiftForge.Map.Atlas",
@@ -878,9 +1140,12 @@ def push_map_atlas(character, game=None):
 
 
 def on_session_attach(character, game=None):
-    """Push identity + vitals after login/reconnect (Room comes from look)."""
+    """Push identity + vitals after login/reconnect (Room comes from look).
+
+    Atlas goes out through ``push_map(..., force_grid=True)`` -- a second
+    ``push_map_atlas`` here rebuilt the full W×H glyph dump twice per login.
+    """
     push_char_identity(character)
     push_vitals(character)
     push_room(character)
     push_map(character, force_grid=True)
-    push_map_atlas(character, game=game)

@@ -52,6 +52,9 @@ from basegame.verbs.phone import cmd_answer, cmd_call, cmd_dial, cmd_hangup
 from basegame.verbs.appearance import cmd_appearance
 from basegame.verbs.relate import cmd_friend, cmd_relate
 from basegame.verbs.greet import cmd_greet
+from basegame.verbs.lifestyle import cmd_fish
+from basegame.verbs.lockpick import cmd_lockpick
+from basegame.verbs.traps import cmd_traps
 from engine.systems.active_combat_verbs import (
     cmd_aim,
     cmd_autodefense,
@@ -367,5 +370,25 @@ BASEGAME_COMMANDS = {
     "greet": (
         cmd_greet,
         "greet someone here for persona flavor (see 'help personas')",
+    ),
+    "fish": (
+        cmd_fish,
+        "cast at water; fish worms / fish status (see 'help fishing')",
+    ),
+    "lockpick": (
+        cmd_lockpick,
+        "pick a lock on a container or door (see 'help lockpick')",
+    ),
+    "picklock": (
+        cmd_lockpick,
+        "alias: lockpick (see 'help lockpick')",
+    ),
+    "traps": (
+        cmd_traps,
+        "chalk or clear a devil's trap here (see 'help traps')",
+    ),
+    "trap": (
+        cmd_traps,
+        "alias: traps paint (see 'help traps')",
     ),
 }

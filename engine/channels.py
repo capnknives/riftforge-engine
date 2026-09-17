@@ -42,6 +42,7 @@ AUDIENCE_HELPER = "helper"
 FORMAT_OOC = "ooc"
 FORMAT_QUESTIONS = "questions"
 FORMAT_ANSWERS = "answers"
+FORMAT_TRIVIA = "trivia"
 FORMAT_WIZNET = "wiznet"
 FORMAT_SAY = "say"
 FORMAT_TELL = "tell"
@@ -50,7 +51,7 @@ FORMAT_PLAIN = "plain"
 _VERB_RE = re.compile(r"^[a-z][a-z0-9_]{1,15}$")
 MAX_PLAYER_CHANNELS_PER_ACCOUNT = 3
 RESERVED_CHANNEL_VERBS = frozenset({
-    "say", "tell", "ooc", "questions", "question", "answers", "wiznet", "emote", "who",
+    "say", "tell", "ooc", "questions", "question", "answers", "trivia", "wiznet", "emote", "who",
     "help", "mute", "unmute", "mutes", "chans", "channel", "reply",
     "whisper", "block", "unblock", "blocks", "query", "queries",
     "querylist", "queryread", "querycomment", "queryclose",
@@ -868,6 +869,11 @@ def render_answers_entry(entry, viewer, game) -> str:
     return answers_channel.format_answers_history_entry(entry, viewer, game)
 
 
+def render_trivia_entry(entry, viewer, game) -> str:
+    from engine import trivia_channel
+    return trivia_channel.format_trivia_history_entry(entry, viewer, game)
+
+
 def replay_wiznet_entry(entry) -> str:
     from engine import style
     plain = entry if isinstance(entry, str) else str(entry)
@@ -1057,6 +1063,8 @@ def replay_global(character, game, channel_name: str, *, index: int | None = Non
             line = render_questions_entry(entry, character, game)
         elif spec.format == FORMAT_ANSWERS:
             line = render_answers_entry(entry, character, game)
+        elif spec.format == FORMAT_TRIVIA:
+            line = render_trivia_entry(entry, character, game)
         elif spec.format == FORMAT_WIZNET:
             line = replay_wiznet_entry(entry)
         else:
@@ -1472,6 +1480,28 @@ def gateway_plain_comm_payload(channel_name: str, plain: str) -> Optional[dict[s
     return None
 
 
+def record_gateway_stitch_plain(game, channel_name: str, plain: str) -> None:
+    """Append one gateway stitch relay line to ooc.log / questions.log immediately.
+
+    Used while the Veil reloads so copyover OOC is mined even before the
+    ``chat_stitch_import`` replace pass runs (bug report 1473). Trivia
+    #4224 accidentally dropped this helper while gateway_client still
+    called it, which crashed the new game child after a multi-minute boot.
+    """
+    text = (plain or "").strip()
+    if not text:
+        return
+    spec = get_channel(channel_name)
+    if spec is None or spec.scope != SCOPE_GLOBAL:
+        return
+    entry = parse_gateway_plain_entry(channel_name, text)
+    if entry is None and channel_name != "wiznet":
+        return
+    if entry is None:
+        entry = text
+    _record_gateway_transcript(channel_name, entry, text, game)
+
+
 def _record_gateway_transcript(
     channel_name: str, entry: Any, plain: str, game,
 ) -> None:
@@ -1742,6 +1772,32 @@ register_channel(
         prefix="((ANSWERS))",
         color_role="absinthe_green",
         title="Answers",
+    )
+)
+
+register_channel(
+    ChannelSpec(
+        name="trivia",
+        verb="trivia",
+        game_attr="trivia_history",
+        meta_key="trivia_history",
+        scope=SCOPE_GLOBAL,
+        audience="optin:trivia",
+        replay_header="Recent trivia (last 20):",
+        empty_message=(
+            "No recent trivia. Type 'trivia join' then 'trivia start' to play."
+        ),
+        usage_message=(
+            "Usage: trivia join | start | start spn | <answer>  "
+            "(bare trivia replays history)"
+        ),
+        ring_max=DEFAULT_RING_MAX,
+        builtin=True,
+        gateway_stitch=True,
+        format=FORMAT_TRIVIA,
+        prefix="((TRIVIA))",
+        color_role="gold",
+        title="Trivia",
     )
 )
 

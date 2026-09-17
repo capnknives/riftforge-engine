@@ -1506,16 +1506,16 @@
       },
       "35,10": {
         "area_type": "city",
-        "title": "Lebanon Approach",
-        "description": "Kansas-flat horizon, grain elevators, and a faded Lebanon mile-marker. Hunter country -- geographic center of the contiguous US. Type enter lebanon to step onto the southern highway into town. Coordinates (35, 10).",
+        "title": "Notbigville Approach",
+        "description": "Kansas-flat horizon, grain elevators, and a faded Notbigville mile-marker. Hunter country on the prairie crossroads. Type enter notbigville to step onto the southern highway into town. Coordinates (35, 10).",
         "wilderness": false,
         "map_glyph": "*",
         "map_layer": "city"
       },
       "35,11": {
         "area_type": "plains",
-        "title": "Bunker Access Road",
-        "description": "A gravel spur just north of Lebanon, Kansas. A Men of Letters seal is weathered into a concrete lintel half-sunk in the berm. Type enter bunker to go in; south is the Lebanon approach. From town, Main Street north reaches the same Gatehouse via the access spur. Coordinates (35, 11).",
+        "title": "Storm Shelter Access Road",
+        "description": "A gravel spur north of Notbigville. A weathered civil-defense seal is half-sunk in a concrete lintel beside the berm. South is the Notbigville approach; from town, Main Street north reaches the same gatehouse spur. Coordinates (35, 11).",
         "wilderness": false,
         "map_glyph": "B",
         "map_layer": "city"
@@ -1576,7 +1576,7 @@
       "36,10": {
         "area_type": "plains",
         "title": "Outskirts Approach",
-        "description": "Monument road just east of Lebanon -- leyline hum under the trees. Type enter outskirts for the charter strip; exit returns here. Coordinates (36, 10).",
+        "description": "Monument road east of Notbigville -- leyline hum under the trees. Type enter outskirts for the charter strip; exit returns here. Coordinates (36, 10).",
         "map_glyph": "=",
         "map_layer": "highway"
       },

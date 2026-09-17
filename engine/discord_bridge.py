@@ -475,6 +475,26 @@ def _log_task_exception(task: asyncio.Task) -> None:
         print(f"[discord_bridge] background task crashed: {exc}", flush=True)
 
 
+def can_deliver(tag: str, *, kind: str | None = None) -> bool:
+    """True when `tag` has somewhere to post, without building the body.
+
+    Same destination test ``schedule_discord`` applies (per-tag webhook, or
+    bot token + channel id, and not GM-muted) but cheap: env reads plus the
+    toggles file, no message formatting. Callers that must do expensive work
+    just to assemble a post (patch notes scanning every CHANGELOG.d
+    fragment) check this first so a box with no Discord configured skips
+    that work entirely instead of paying for it and throwing it away.
+    """
+    tag_s = str(tag or "").strip().lower()
+    if not tag_s:
+        return False
+    if not _mirror_allowed(tag_s, kind):
+        return False
+    if webhook_url_for_tag(tag_s):
+        return True
+    return bool(bot_token() and channel_id_for_tag(tag_s))
+
+
 def schedule_discord(tag: str, body: str, *, kind: str | None = None) -> bool:
     """Queue one tagged Discord post; return True if a task was scheduled.
 

@@ -18,12 +18,13 @@ beyond Session.send, zero ``supers`` imports.
 
 from __future__ import annotations
 
+from engine.systems.player_text import PLAYER_TEXT_WALL_MAX
+
 # Soft cap so an inbox cannot grow forever; oldest letters drop first.
 MAIL_CAP = 30
-# Hard cap on letter body length (characters).
-MAIL_TEXT_MAX = 2000
-# Optional longer letters via ``mail long`` (same queue, higher cap).
-MAIL_LONG_MAX = 4000
+MAIL_TEXT_MAX = PLAYER_TEXT_WALL_MAX
+# ``mail long`` kept for players who learned the longer alias.
+MAIL_LONG_MAX = PLAYER_TEXT_WALL_MAX
 
 
 def is_mail_room(room):

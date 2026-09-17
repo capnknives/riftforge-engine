@@ -35,7 +35,7 @@ CLOTHING_SLOTS = frozenset({
 
 # Stable look order (top-down, matching worn gear display).
 CLOTHING_LOOK_ORDER = (
-    "head", "over", "about", "neck", "body", "arms", "hands",
+    "head", "neck", "over", "about", "body", "arms", "hands",
     "finger", "waist", "legs", "feet",
 )
 

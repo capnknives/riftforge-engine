@@ -25,6 +25,52 @@ ACCOUNT_NEW_KEYWORD = "new"
 # Menu sentinel objects (identity compared with ``is``).
 CREATE_NEW_MARKER = object()
 LINK_EXISTING_MARKER = object()
+# Surname prompt asked to redo the given-name step.
+NAME_PROMPT_BACK = object()
+
+# Handbook preview during name prompts (static HELP_TOPICS via hooks).
+_NAME_HELP_PREVIEW_LINES = 16
+
+
+def _is_name_help_query(stripped):
+    """True when the player asked for handbook help instead of a name."""
+    low = (stripped or "").strip().lower()
+    return low in ("?", "help") or low.startswith("help ") or low.startswith("?")
+
+
+def _name_help_topic_from_query(stripped):
+    """Topic token after ? or help, or empty for step-level help."""
+    low = (stripped or "").strip().lower()
+    if low in ("?", "help"):
+        return ""
+    if low.startswith("help "):
+        return stripped.strip()[5:].strip()
+    if low.startswith("?"):
+        return stripped.strip()[1:].strip()
+    return stripped.strip()
+
+
+def _lookup_name_prompt_help(topic):
+    """Short handbook preview for create-name prompts (engine-safe).
+
+    Uses the injected HELP_TOPICS map from hooks -- no live hedit overlay.
+    Returns a preview string, or None when the topic does not exist.
+    """
+    tid = (topic or "").strip().lower()
+    if not tid:
+        return None
+    topics = hooks.get_help_topics()
+    body = topics.get(tid) or topics.get(tid.replace(" ", "_"))
+    if not body:
+        return None
+    lines = body.strip("\n").split("\n")
+    preview = lines[:_NAME_HELP_PREVIEW_LINES]
+    if len(lines) > _NAME_HELP_PREVIEW_LINES:
+        preview.append(
+            f"... (type 'help {tid}' after you're in the game for the "
+            "full page)"
+        )
+    return "\n".join(preview)
 
 
 async def _read_player_line(session, *, password=False):
@@ -76,6 +122,8 @@ def _parse_menu_choice(pick, tagged):
 
 def _send_character_menu(session, game, account, tagged):
     """Paint the roster menu once (caller handles re-prompts)."""
+    from engine.npc_act import is_live_session
+
     if len(tagged) == 2:
         session.send("This account has no characters yet.")
     if len(tagged) == 1:
@@ -99,12 +147,21 @@ def _send_character_menu(session, game, account, tagged):
                 session.send("  -- Actions --")
             last_section = section
         face = _menu_face(game, entry)
+        if (
+            section == "character"
+            and entry not in (CREATE_NEW_MARKER, LINK_EXISTING_MARKER)
+            and not getattr(entry, "is_vaulted_menu_entry", False)
+            and accounts_mod.account_has_assigned_character(
+                account, getattr(entry, "key", ""),
+            )
+        ):
+            face = f"{face} (assigned)"
         online = ""
         if (
             section in ("character", "cast", "assigned_character")
             and entry not in (CREATE_NEW_MARKER, LINK_EXISTING_MARKER)
             and not getattr(entry, "is_vaulted_menu_entry", False)
-            and getattr(entry, "session", None)
+            and is_live_session(getattr(entry, "session", None))
         ):
             online = " (online)"
         session.send(f"  {i}. {face}{online}")
@@ -385,16 +442,34 @@ async def _prompt_given_name(session, game, *, prompt):
     """Letters-only given name for create/link."""
     from engine.connection import normalize_login_name
 
+    step_help = (
+        "Type ? or help for a handbook preview (? origins, ? vampire, …). "
+        "Type cancel to return to the character menu."
+    )
     while True:
         session.send(prompt)
-        session.send(
-            "Type cancel to return to the character menu without quitting."
-        )
+        session.send(step_help)
         raw = await session.read_line()
         if raw is None:
             return None
-        if is_menu_cancel(raw):
+        stripped = (raw or "").strip()
+        if is_menu_cancel(stripped):
             return CHARGEN_MENU
+        if _is_name_help_query(stripped):
+            topic = _name_help_topic_from_query(stripped)
+            if not topic:
+                session.send(step_help)
+            else:
+                lore = _lookup_name_prompt_help(topic)
+                if lore:
+                    session.send(lore)
+                else:
+                    session.send(
+                        f"Unknown help topic '{topic}' -- try ? alone, or "
+                        "? <keyword> (e.g. ? origins, ? chargen)."
+                    )
+            session.send("")
+            continue
         name, err, stripped = normalize_login_name(raw)
         if err:
             session.send(err + " Try again:")
@@ -411,6 +486,10 @@ async def _prompt_surname_for_create(session, game, given_name):
     """Surname for a new body -- optional when the given name is unique."""
     from engine import char_identity as identity_mod
 
+    step_help = (
+        "Type back to redo your first name. Type ? or help for a handbook "
+        "preview. Type cancel to return to the character menu."
+    )
     if identity_mod.surname_required_for_create(game, given_name):
         session.send(
             f"Another character already uses the name {given_name}. "
@@ -421,13 +500,31 @@ async def _prompt_surname_for_create(session, game, given_name):
             "What is your surname? "
             "(2-16 letters, or press Enter to skip)"
         )
+    session.send(step_help)
     while True:
         raw = await session.read_line()
         if raw is None:
             return None
         raw = (raw or "").strip()
+        if raw.lower() in ("back", "previous", "prev"):
+            return NAME_PROMPT_BACK
         if is_menu_cancel(raw):
             return CHARGEN_MENU
+        if _is_name_help_query(raw):
+            topic = _name_help_topic_from_query(raw)
+            if not topic:
+                session.send(step_help)
+            else:
+                lore = _lookup_name_prompt_help(topic)
+                if lore:
+                    session.send(lore)
+                else:
+                    session.send(
+                        f"Unknown help topic '{topic}' -- try ? alone, or "
+                        "? <keyword> (e.g. ? origins, ? chargen)."
+                    )
+            session.send("")
+            continue
         if identity_mod.surname_required_for_create(game, given_name):
             cleaned, err = identity_mod.normalize_surname(raw)
         else:
@@ -639,18 +736,22 @@ async def _flow_create_character(session, game, account):
     from engine import char_identity as identity_mod
     from engine.world import Character
 
-    given = await _prompt_given_name(
-        session, game, prompt="What is your character's first name?",
-    )
-    if given is None:
-        return None
-    if given is CHARGEN_MENU:
-        return CHARGEN_MENU
-    surname = await _prompt_surname_for_create(session, game, given)
-    if surname is None:
-        return None
-    if surname is CHARGEN_MENU:
-        return CHARGEN_MENU
+    while True:
+        given = await _prompt_given_name(
+            session, game, prompt="What is your character's first name?",
+        )
+        if given is None:
+            return None
+        if given is CHARGEN_MENU:
+            return CHARGEN_MENU
+        surname = await _prompt_surname_for_create(session, game, given)
+        if surname is None:
+            return None
+        if surname is NAME_PROMPT_BACK:
+            continue
+        if surname is CHARGEN_MENU:
+            return CHARGEN_MENU
+        break
     password = await _prompt_character_password(session, create=True)
     if password is None:
         return None

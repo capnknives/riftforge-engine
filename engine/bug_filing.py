@@ -130,13 +130,18 @@ def _bug_subject_prefix_allowed(token_slice):
 
 
 def resolve_bug_subject_character(reporter, query, game, history=None):
-    """Resolve a ``bug <name>`` subject with local context before world scan."""
+    """Resolve a ``bug <name>`` subject with local context before world scan.
+
+    ``@Andri`` may be an account login -- attach that account's character
+    (bug report 1363). Tells keep their own targeting rules.
+    """
     if reporter is None or game is None:
         return None
 
     from engine.command_support import (
         _collect_character_matches,
         _find_character,
+        resolve_gm_target_character,
         sort_character_target_matches,
     )
 
@@ -150,25 +155,23 @@ def resolve_bug_subject_character(reporter, query, game, history=None):
             return hit
 
     finder = getattr(game, "find_character", None)
-    if not callable(finder):
-        return None
-    world_hit = finder(query)
-    if world_hit is None:
-        return None
+    world_hit = finder(query) if callable(finder) else None
+    if world_hit is not None:
+        if not pool:
+            return world_hit
+        pool_matches = _collect_character_matches(
+            query, pool, self_character=reporter,
+        )
+        if not pool_matches:
+            return world_hit
+        if world_hit in pool_matches:
+            return world_hit
+        if len(pool_matches) == 1:
+            return pool_matches[0]
+        return sort_character_target_matches(pool_matches)[0]
 
-    if not pool:
-        return world_hit
-
-    pool_matches = _collect_character_matches(
-        query, pool, self_character=reporter,
-    )
-    if not pool_matches:
-        return world_hit
-    if world_hit in pool_matches:
-        return world_hit
-    if len(pool_matches) == 1:
-        return pool_matches[0]
-    return sort_character_target_matches(pool_matches)[0]
+    # Account login names (Andri → Ayla) when no character key matched.
+    return resolve_gm_target_character(game, query)
 
 
 def parse_bug_subject(reporter, args, game):
@@ -236,6 +239,195 @@ def _subject_display_name(subject):
     return legal_public_name(subject, force_surname=True)
 
 
+def _actor_presence(actor):
+    """Short presence label for sidecar actor rows (matches report_context)."""
+    try:
+        from engine.report_context import _presence_mode
+
+        return _presence_mode(actor)
+    except Exception:
+        pass
+    if getattr(actor, "is_npc", False):
+        return "npc"
+    if getattr(actor, "session", None) is None:
+        return "echo"
+    if getattr(actor, "idle_mode", False):
+        return "idlemode"
+    return "live"
+
+
+def _actor_in_group(actor):
+    """True when the body is following someone or in a follow-bond party."""
+    if getattr(actor, "following", None):
+        return True
+    try:
+        from engine import group as group_mod
+
+        return group_mod.in_group(actor)
+    except Exception:
+        return False
+
+
+def _filed_by_snapshot(reporter):
+    """Reporter identity for bug sidecar -- always the filing character.
+
+    ``context["character"]`` may describe a tagged subject instead; this
+    block keeps *who filed* separate for staff triage (bug report 203).
+    """
+    if reporter is None:
+        return {}
+    room = getattr(reporter, "location", None)
+    row = {
+        "key": getattr(reporter, "key", None),
+        "room_key": getattr(room, "key", None) if room is not None else None,
+        "plane": getattr(room, "plane", None) if room is not None else None,
+    }
+    occupy = getattr(reporter, "staff_occupy_account", None)
+    if occupy:
+        row["staff_occupy_account"] = str(occupy)
+    from engine.char_identity import persist_cnum_text
+
+    cnum = persist_cnum_text(reporter)
+    if cnum:
+        row["cnum"] = cnum
+    sess = getattr(reporter, "session", None)
+    if sess is not None and bool(getattr(sess, "playcast_gm_tools", False)):
+        row["playcast_gm_tools"] = True
+    return {k: v for k, v in row.items() if v is not None}
+
+
+def _mentioned_actor_row(actor):
+    """One capped sidecar row for a body named in the bug text or history."""
+    if actor is None:
+        return {}
+    room = getattr(actor, "location", None)
+    row = {
+        "key": getattr(actor, "key", None),
+        "room": getattr(room, "key", None) if room is not None else None,
+        "presence": _actor_presence(actor),
+        "in_vehicle": bool(getattr(actor, "in_vehicle", None)),
+        "in_group": _actor_in_group(actor),
+    }
+    cadence_last = getattr(actor, "_cadence_last_decision", None)
+    if cadence_last is not None:
+        row["cadence_last"] = str(cadence_last)
+    return {k: v for k, v in row.items() if v is not None}
+
+
+def _description_name_queries(description):
+    """Capitalized tokens/phrases in bug prose worth resolving as names.
+
+    ``bug Ash was stuck`` does not tag Ash as subject, but staff still
+    want Ash in ``mentioned_actors`` when the reporter names them in prose.
+    """
+    import re
+
+    text = (description or "").strip()
+    if not text:
+        return []
+    # Up to three Title-case words in a row (``Earl Jacobs``, ``Max Booth``).
+    pattern = re.compile(
+        r"\b(?:[A-Z][a-z']+)(?:\s+(?:[A-Z][a-z']+)){0,2}\b",
+    )
+    queries = []
+    seen = set()
+    for match in pattern.finditer(text):
+        phrase = match.group(0).strip()
+        parts = phrase.split()
+        if not _bug_subject_prefix_allowed(parts):
+            continue
+        key = phrase.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        queries.append(phrase)
+    return queries
+
+
+def _history_name_queries(history):
+    """Target strings from recent session commands (skip filing verbs)."""
+    from engine.command_support import split_shell_args
+
+    queries = []
+    seen = set()
+    for line, _tb in history or []:
+        text = (line or "").strip()
+        if not text:
+            continue
+        tokens = split_shell_args(text)
+        if len(tokens) < 2:
+            continue
+        verb = tokens[0].lower()
+        if verb in ("bug", "suggest", "typo", "ooc", "say", "tell", "emote"):
+            continue
+        target_text = " ".join(tokens[1:]).strip()
+        if target_text:
+            key = target_text.lower()
+            if key not in seen:
+                seen.add(key)
+                queries.append(target_text)
+        for frag in tokens[1:]:
+            frag = (frag or "").strip()
+            if not frag or not _bug_subject_prefix_allowed([frag]):
+                continue
+            key = frag.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            queries.append(frag)
+    return queries
+
+
+def _mentioned_actors_snapshot(
+    reporter, game, history, description, *, subject_character=None,
+):
+    """Capped list of bodies named in the report (not the reporter).
+
+    Resolution reuses ``_bug_subject_candidates`` + ``resolve_bug_subject_character``
+    so we do not add a second full-world scan beyond what subject resolution
+    already allows. Order: explicit subject, prose names, history targets.
+    """
+    from engine.report_debug import MENTIONED_ACTORS_CAP
+
+    if reporter is None or game is None:
+        return []
+
+    if history is None:
+        history = _history_for_bug_subject(reporter)
+
+    seen = set()
+    ordered = []
+
+    def add(actor):
+        if actor is None or actor is reporter:
+            return False
+        oid = id(actor)
+        if oid in seen:
+            return False
+        seen.add(oid)
+        ordered.append(actor)
+        return len(ordered) >= MENTIONED_ACTORS_CAP
+
+    if subject_character is not None and add(subject_character):
+        return [_mentioned_actor_row(a) for a in ordered]
+
+    for query in _description_name_queries(description):
+        hit = resolve_bug_subject_character(
+            reporter, query, game, history=history,
+        )
+        if add(hit):
+            return [_mentioned_actor_row(a) for a in ordered]
+
+    for query in _history_name_queries(history):
+        hit = resolve_bug_subject_character(
+            reporter, query, game, history=history,
+        )
+        if add(hit):
+            return [_mentioned_actor_row(a) for a in ordered]
+
+    return [_mentioned_actor_row(a) for a in ordered]
+
+
 def record_and_confirm(
     character, kind, description, history, report_dir, noun, *,
     subject_character=None,
@@ -253,6 +445,7 @@ def record_and_confirm(
     from engine import gm_notify
     from engine import report_context
     from engine import accounts as accounts_mod
+    from engine.char_identity import persist_cnum_text
 
     game = getattr(character.session, "game", None)
     # Snapshot the subject's room/vitals when filing about someone else;
@@ -272,12 +465,23 @@ def record_and_confirm(
     if account_name and isinstance(ctx, dict):
         ctx = dict(ctx)
         ctx["account"] = account_name
+    # Sidecar: reporter vs subject vs other named bodies (Wave 0).
+    if isinstance(ctx, dict):
+        ctx = dict(ctx)
+        ctx["filed_by"] = _filed_by_snapshot(character)
+        mentioned = _mentioned_actors_snapshot(
+            character, game, history, description,
+            subject_character=subject_character,
+        )
+        if mentioned:
+            ctx["mentioned_actors"] = mentioned
     subject_key = None
     if subject_character is not None and subject_character is not character:
         subject_key = subject_character.key
     payload = reports.record(
         kind, character.key, description, history, directory=report_dir,
         context=ctx, subject=subject_key,
+        reporter_cnum=persist_cnum_text(character),
     )
     # Also stamp a top-level account field for triage tools.
     if account_name:
@@ -305,6 +509,14 @@ def record_and_confirm(
             f"Add notes with typos comment {entry_id} <text>. "
             "Staff will triage it separately from crash reports."
         )
+    elif kind == reports.PREPORT:
+        about_clause = ""
+        if subject_key and subject_character is not None:
+            about_clause = f" about {_subject_display_name(subject_character)}"
+        character.session.send(
+            f"Logged -- player report #{entry_id}{about_clause} is filed "
+            "for staff review."
+        )
     else:
         character.session.send(
             f"Thanks — suggestion #{entry_id} is logged. "
@@ -321,6 +533,8 @@ def record_and_confirm(
         label = f"help idea #{entry_id}"
     elif kind == reports.TYPO:
         label = f"typo #{entry_id}"
+    elif kind == reports.PREPORT:
+        label = f"player report #{entry_id}"
     else:
         label = f"suggestion #{entry_id}"
     if game is not None:
@@ -339,6 +553,9 @@ def record_and_confirm(
             f"{who} filed {label}{about}: {desc}",
             exclude=character,
         )
+        headline = reports.staff_ticket_headline(payload, kind=kind)
+        if headline:
+            gm_notify.ping_gms(game, headline, exclude=character)
         try:
             from engine import discord_staff_reports
 

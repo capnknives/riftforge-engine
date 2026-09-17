@@ -127,6 +127,12 @@
       "required": false,
       "doc": "Secret exit directions (discover to reveal)."
     },
+    "extra_descs": {
+      "type": "object",
+      "required": false,
+      "doc": "Authored look keywords (keyword -> prose). Distinct from player setdesc and runtime room_look_extras.",
+      "default": null
+    },
     "map_glyph": {
       "type": "string",
       "required": false,

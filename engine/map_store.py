@@ -79,6 +79,8 @@ RSET_TEXT_FIELDS = frozenset({
 RSET_LIST_FIELDS = frozenset({
     "jobs",
     "resources",
+    "hidden_directions",
+    "no_door",
 })
 
 
@@ -278,6 +280,12 @@ def save_doc_validated(path, doc, *, full_world_reload=True):
             pass
 
     save_json(path, payload)
+    # Persist rewrote Git SoT; drop overlay so the next load matches disk.
+    try:
+        from engine import map_heal as map_heal_mod
+        map_heal_mod.forget_live_overlay(path)
+    except Exception:
+        pass
     rooms = payload.get("rooms") or []
     start_room = None
     if full_world_reload:
@@ -430,6 +438,12 @@ def _resolve_live_room_slot(game, identity):
         leg = getattr(room, "legacy_key", None)
         if leg and str(leg).strip() == text:
             return room, getattr(room, "key", None) or key
+    # Virtual overland foot cells live in game.overland_rooms, never
+    # game.rooms -- materialize on demand (bug report 1601).
+    from engine.systems.overland import resolve_virtual_overland_room_key
+    wild = resolve_virtual_overland_room_key(game, text)
+    if wild is not None:
+        return wild, getattr(wild, "key", None) or text
     return None, text
 
 
@@ -467,30 +481,15 @@ def _taken_vnums(game, *, extra=None):
 def _allocate_and_stamp_vnum(game, entry, live=None, *, taken=None):
     """Assign a globally unique vnum onto a rooms[] dict and optional Room.
 
-    Mutates ``entry`` (sets ``vnum``). When ``live`` is provided, stamps
+    Mutates ``entry``: JSON ``key`` becomes the VNUM; leftover leftover-name
+    keys move to ``legacy_key``. When ``live`` is provided, stamps
     ``live.vnum`` too. ``taken`` may be a shared set updated in place for
     batch allocates (append_hand_rooms).
     """
     if taken is None:
         taken = _taken_vnums(game)
-    raw = entry.get("vnum")
-    if raw is not None and str(raw).strip():
-        vnum = room_vnum_mod.validate_vnum(raw)
-        if vnum in taken:
-            vnum = room_vnum_mod.allocate_vnum_for_name(
-                entry.get("key") or getattr(live, "key", ""),
-                entry.get("title"),
-                taken=taken,
-            )
-    else:
-        vnum = room_vnum_mod.allocate_vnum_for_name(
-            entry.get("key") or getattr(live, "key", ""),
-            entry.get("title"),
-            taken=taken,
-        )
-    entry["vnum"] = vnum
-    taken.add(vnum)
-    if live is not None:
+    vnum = room_vnum_mod.stamp_json_room_identity(entry, taken=taken)
+    if live is not None and vnum:
         live.vnum = vnum
     return vnum
 
@@ -568,7 +567,9 @@ def _room_owner_hint(game, room_or_key):
     """Short 'map_id=… (filename)' hint for dig/link refusal messages."""
     room = room_or_key
     if isinstance(room_or_key, str):
-        room = (getattr(game, "rooms", None) or {}).get(room_or_key)
+        from engine.room_vnum import lookup_room
+
+        room = lookup_room(game, room_or_key)
     if room is None:
         return "unknown map"
     map_id = getattr(room, "map_id", None) or "?"
@@ -789,18 +790,16 @@ def dig_room(game, from_room, direction, new_key, *,
         except (TypeError, ValueError):
             pass
     game.rooms[vnum] = live
-    aliases = getattr(game, "room_aliases", None)
-    if aliases is None:
-        game.room_aliases = {}
-        aliases = game.room_aliases
-    aliases[legacy_dig_key] = vnum
+    from engine.room_vnum import note_room_alias, drop_room_alias
+
+    note_room_alias(game, legacy_dig_key, vnum)
     try:
         _live_set_exit(game, from_id, direction, vnum)
         if back:
             _live_set_exit(game, vnum, back, from_id)
     except ValueError:
         game.rooms.pop(vnum, None)
-        aliases.pop(legacy_dig_key, None)
+        drop_room_alias(game, legacy_dig_key)
         # Roll back the in-memory doc append so a failed live wire does not
         # leave orphan garage JSON that lags every later remodel save.
         rooms_list = doc.get("rooms") or []
@@ -870,14 +869,18 @@ def create_room(game, here, new_key, *, description=None, title=None):
     doc.setdefault("rooms", []).append(entry)
     save_doc_validated(path, doc)
 
-    live = Room(new_key, desc)
-    if title and title != new_key:
-        live.title = title
+    identity = entry.get("key") or vnum
+    live = Room(identity, desc)
+    live.title = entry.get("title") or title
     live.vnum = vnum
+    leftover = entry.get("legacy_key")
+    if leftover:
+        live.legacy_key = leftover
     _stamp_live_room_from_source(live, here, map_id)
     if zone and not is_grid_room(here):
         live.zone = zone
-    game.rooms[new_key] = live
+    game.rooms[identity] = live
+    room_vnum_mod.stamp_hand_room(game, live)
     return (
         f"Created disconnected room "
         f"{room_vnum_mod.staff_room_label(live) or new_key} (saved). "
@@ -891,15 +894,19 @@ def create_room(game, here, new_key, *, description=None, title=None):
 
 
 def link_rooms(game, from_room, direction, to_query, *, bidirectional=True,
-               persist=True):
+               persist=True, allow_internal_key=False):
     """Link from_room toward an existing room; persist both sides as needed.
 
-    ``to_query`` is a staff address: **VNUM** or unique **ROOM NAME**
-    (internal key still accepted silently until Phase 3). Exit JSON still
-    stores the destination's internal key.
+    ``to_query`` is a staff address: **VNUM** or unique **ROOM NAME**.
+    Leftover dig names are not a staff address; persist dual-read still
+    uses leftover names via ``lookup_room``. Exit JSON stores the
+    destination VNUM (``internal_room_key``).
 
     ``persist=False`` updates the live graph only so remodel can batch one
-    JSON write.
+    JSON write. ``allow_internal_key=True`` lets a caller pass a
+    machine-computed internal/leftover key (e.g. a virtual overland
+    ``Wilderness (mx,my)/ux,uy`` cell key from garage OUT wiring) instead
+    of a staff-typed VNUM/ROOM NAME.
     """
     direction = (direction or "").strip().lower()
     to_query = (to_query or "").strip()
@@ -907,7 +914,17 @@ def link_rooms(game, from_room, direction, to_query, *, bidirectional=True,
         raise ValueError(
             "Usage: room link <direction> <VNUM|ROOM NAME>"
         )
-    dest, err = room_vnum_mod.resolve_room_or_error(game, to_query)
+    dest, err = room_vnum_mod.resolve_room_or_error(
+        game, to_query, allow_internal_key=allow_internal_key,
+    )
+    if dest is None and allow_internal_key:
+        # Virtual overland foot cells (``Wilderness (mx,my)/ux,uy``,
+        # ``Gates of ...``) live in game.overland_rooms, not game.rooms --
+        # resolve_room never finds them. Materialize on demand so a
+        # homestead garage OUT can wire straight to an atlas wilderness
+        # tile (bug report 1601).
+        from engine.systems.overland import resolve_virtual_overland_room_key
+        dest = resolve_virtual_overland_room_key(game, to_query)
     if dest is None:
         raise ValueError(err)
     to_key = room_vnum_mod.internal_room_key(dest)
@@ -1043,40 +1060,476 @@ def unlink_exit(game, from_room, direction, *, bidirectional=True, persist=True)
 
         save_doc_validated(path, doc)
 
-        if back and dest_key and dest_key in game.rooms:
-            other = game.rooms[dest_key]
+        if back and dest_key:
+            other = room_vnum_mod.lookup_room(game, dest_key)
+            if other is not None:
+                rev = (getattr(other, "exits", None) or {}).get(back)
+                if rev is from_room or getattr(rev, "key", None) == from_room.key:
+                    other_path, _, _, _ = resolve_map_path(game, other)
+                    other_doc = load_doc(other_path)
+                    if is_grid_room(other):
+                        grid = other_doc.get("grid")
+                        if isinstance(grid, dict):
+                            portals = grid.setdefault("portals", [])
+                            portals[:] = [
+                                p for p in portals
+                                if not (
+                                    int(p.get("x", -1)) == int(other.grid_x)
+                                    and int(p.get("y", -1)) == int(other.grid_y)
+                                    and str(p.get("direction", "")).lower() == back
+                                )
+                            ]
+                    else:
+                        oentry = find_room_entry(other_doc, dest_key)
+                        if oentry is not None:
+                            oentry.setdefault("exits", {}).pop(back, None)
+                    save_doc_validated(other_path, other_doc)
+                    _live_clear_exit(game, dest_key, back)
+    elif back and dest_key:
+        other = room_vnum_mod.lookup_room(game, dest_key)
+        if other is not None:
             rev = (getattr(other, "exits", None) or {}).get(back)
             if rev is from_room or getattr(rev, "key", None) == from_room.key:
-                other_path, _, _, _ = resolve_map_path(game, other)
-                other_doc = load_doc(other_path)
-                if is_grid_room(other):
-                    grid = other_doc.get("grid")
-                    if isinstance(grid, dict):
-                        portals = grid.setdefault("portals", [])
-                        portals[:] = [
-                            p for p in portals
-                            if not (
-                                int(p.get("x", -1)) == int(other.grid_x)
-                                and int(p.get("y", -1)) == int(other.grid_y)
-                                and str(p.get("direction", "")).lower() == back
-                            )
-                        ]
-                else:
-                    oentry = find_room_entry(other_doc, dest_key)
-                    if oentry is not None:
-                        oentry.setdefault("exits", {}).pop(back, None)
-                save_doc_validated(other_path, other_doc)
                 _live_clear_exit(game, dest_key, back)
-    elif back and dest_key and dest_key in game.rooms:
-        other = game.rooms[dest_key]
-        rev = (getattr(other, "exits", None) or {}).get(back)
-        if rev is from_room or getattr(rev, "key", None) == from_room.key:
-            _live_clear_exit(game, dest_key, back)
 
     _live_clear_exit(game, from_room.key, direction)
     from_label = room_vnum_mod.staff_room_label(from_room) or from_room.key
     saved = "saved" if persist else "live"
     return f"Unlinked {direction} from {from_label} ({saved})."
+
+
+def _exit_dest_room(game, room, direction):
+    """Resolve the live Room (or key string) for one exit direction."""
+    dest = (getattr(room, "exits", None) or {}).get(direction)
+    if dest is None:
+        return None
+    if hasattr(dest, "key"):
+        return dest
+    if isinstance(dest, str):
+        return room_vnum_mod.lookup_room(game, dest)
+    return dest
+
+
+def _doors_dict_on_room(room):
+    """Normalize ``room.doors`` to a mutable dir->bool dict (may be empty)."""
+    raw = getattr(room, "doors", None)
+    out = {}
+    if isinstance(raw, dict):
+        for key, val in raw.items():
+            d = str(key).strip().lower()
+            if d:
+                out[d] = bool(val)
+    elif isinstance(raw, (list, tuple, set)):
+        for item in raw:
+            d = str(item).strip().lower()
+            if d:
+                out[d] = True
+    return out
+
+
+def _list_field_on_room(room, field):
+    """Return a normalized lowercase list for ``hidden_directions`` / ``no_door``."""
+    raw = getattr(room, field, None) or ()
+    if isinstance(raw, str):
+        raw = [raw]
+    return [
+        str(d).strip().lower()
+        for d in raw
+        if str(d).strip()
+    ]
+
+
+def _write_exit_list_field(entry, field, values):
+    """Persist a string list on a hand-room JSON entry (or pop when empty)."""
+    if values:
+        entry[field] = list(values)
+    else:
+        entry.pop(field, None)
+
+
+def _persist_exit_fields(game, room, entry, *, persist=True):
+    """Dual-write exit stamp fields from ``entry`` onto the live Room."""
+    doors = entry.get("doors")
+    if doors is None:
+        room.doors = None
+    elif isinstance(doors, dict):
+        room.doors = {
+            str(k).strip().lower(): bool(v)
+            for k, v in doors.items()
+            if str(k).strip()
+        }
+    elif isinstance(doors, list):
+        room.doors = [
+            str(d).strip().lower()
+            for d in doors
+            if str(d).strip()
+        ]
+    else:
+        room.doors = None
+
+    keys = entry.get("door_keys")
+    room.door_keys = dict(keys) if isinstance(keys, dict) and keys else None
+
+    hidden = entry.get("hidden_directions")
+    room.hidden_directions = tuple(
+        str(d).strip().lower()
+        for d in (hidden or [])
+        if str(d).strip()
+    )
+
+    no_door = entry.get("no_door")
+    room.no_door = [
+        str(d).strip().lower()
+        for d in (no_door or [])
+        if str(d).strip()
+    ] or None
+
+    descs = entry.get("exit_descs")
+    room.exit_descs = dict(descs) if isinstance(descs, dict) and descs else None
+
+    if persist:
+        path, _, _, _ = resolve_map_path(game, room)
+        doc = load_doc(path)
+        if is_grid_room(room):
+            grid = doc.setdefault("grid", {})
+            overrides = grid.setdefault("cell_overrides", {})
+            cell_key = _cell_override_key(room)
+            cell = overrides.setdefault(cell_key, {})
+            for field in (
+                "doors", "door_keys", "hidden_directions", "no_door", "exit_descs",
+            ):
+                if field in entry:
+                    cell[field] = entry[field]
+                else:
+                    cell.pop(field, None)
+            if not cell:
+                overrides.pop(cell_key, None)
+        else:
+            live_entry = _ensure_hand_room_entry(doc, room)
+            for field in (
+                "doors", "door_keys", "hidden_directions", "no_door", "exit_descs",
+            ):
+                if field in entry:
+                    live_entry[field] = entry[field]
+                else:
+                    live_entry.pop(field, None)
+        save_doc_validated(path, doc)
+
+
+def exit_menu_lines(game, room):
+    """Bare ``olc exit`` / ``room exit`` — this room's exits plus typed options.
+
+    Staff type the command with no direction to see what they can do, same
+    pattern as bare ``olc rset``. One direction then inspects that exit.
+    """
+    room_label = room_vnum_mod.staff_room_label(room) or room.key
+    lines = [f"Exits — {room_label}"]
+    exits = getattr(room, "exits", None) or {}
+    if not exits:
+        lines.append("  (no exits from this room)")
+    else:
+        for direction in exits:
+            dest = _exit_dest_room(game, room, direction)
+            if dest is None:
+                dest_label = str(exits.get(direction) or "?")
+            elif hasattr(dest, "key"):
+                dest_label = (
+                    room_vnum_mod.staff_room_label(dest) or dest.key
+                )
+            else:
+                dest_label = str(dest)
+            lines.append(f"  {direction} -> {dest_label}")
+    lines.extend([
+        "",
+        "Type:",
+        "  olc exit <dir>                 inspect door / key / hidden / desc",
+        "  olc exit <dir> door on|off",
+        "  olc exit <dir> key <item id>|clear",
+        "  olc exit <dir> hidden on|off",
+        "  olc exit <dir> desc <prose>|clear",
+        "See gmhelp olc-exits",
+    ])
+    return lines
+
+
+def exit_inspect_lines(game, room, direction):
+    """Staff submenu lines for ``room exit <dir>`` / ``olc exit <dir>``."""
+    direction = (direction or "").strip().lower()
+    dest = _exit_dest_room(game, room, direction)
+    if dest is None:
+        raise ValueError(
+            f"No exit {direction!r} from "
+            f"{room_vnum_mod.staff_room_label(room) or room.key}."
+        )
+    from engine.systems import doors as doors_engine
+
+    if hasattr(dest, "key"):
+        dest_key = room_vnum_mod.internal_room_key(dest) or dest.key
+        dest_label = room_vnum_mod.staff_room_label(dest) or dest_key
+    else:
+        dest_key = str(dest).strip()
+        dest_label = dest_key
+    room_label = room_vnum_mod.staff_room_label(room) or room.key
+    vnum = getattr(room, "vnum", None) or room.key
+    header = f"Exit {direction} — {room_label} [{vnum}]"
+    door_yes = doors_engine.exit_is_door(room, direction, dest)
+    keys = getattr(room, "door_keys", None) or {}
+    key_id = None
+    if isinstance(keys, dict):
+        key_id = keys.get(direction) or keys.get(direction.lower())
+    hidden = direction in _list_field_on_room(room, "hidden_directions")
+    descs = getattr(room, "exit_descs", None) or {}
+    look_desc = None
+    if isinstance(descs, dict):
+        look_desc = descs.get(direction) or descs.get(direction.lower())
+    lines = [
+        header,
+        f"  Destination : {dest_label} ({dest_key})",
+        f"  Door        : {'yes' if door_yes else 'no'}",
+        f"  Key         : {key_id or '(none)'}",
+        f"  Hidden      : {'yes' if hidden else 'no'}",
+        f"  Look desc   : {look_desc or '<none>'}",
+        (
+            "Type: olc exit "
+            f"{direction} door on|off | olc exit {direction} key <item id> | "
+            f"olc exit {direction} hidden on|off | "
+            f"olc exit {direction} desc <prose>"
+        ),
+    ]
+    return lines
+
+
+def set_exit_attr(game, room, direction, attr, value):
+    """Set one authored exit attribute (door / key / hidden / desc).
+
+    Owns the list-vs-dict shape of ``doors`` / ``door_keys`` / ``no_door`` /
+    ``hidden_directions`` / ``exit_descs`` so callers never hand-roll it.
+    Writes the map doc and the live Room, same dual-write contract as
+    ``rset_field``.
+    """
+    direction = (direction or "").strip().lower()
+    attr = (attr or "").strip().lower()
+    if not direction:
+        raise ValueError("Usage: room exit <direction> <door|key|hidden|desc> …")
+    dest = _exit_dest_room(game, room, direction)
+    if dest is None:
+        raise ValueError(
+            f"No exit {direction!r} from "
+            f"{room_vnum_mod.staff_room_label(room) or room.key}."
+        )
+
+    path, _, _, _ = resolve_map_path(game, room)
+    doc = load_doc(path)
+    if is_grid_room(room):
+        grid = doc.setdefault("grid", {})
+        overrides = grid.setdefault("cell_overrides", {})
+        cell_key = _cell_override_key(room)
+        entry = dict(overrides.get(cell_key) or {})
+    else:
+        entry = dict(_ensure_hand_room_entry(doc, room))
+
+    doors = _doors_dict_on_room(room)
+    door_keys = dict(getattr(room, "door_keys", None) or {})
+    hidden_dirs = _list_field_on_room(room, "hidden_directions")
+    no_door = _list_field_on_room(room, "no_door")
+    exit_descs = dict(getattr(room, "exit_descs", None) or {})
+
+    if attr == "door":
+        on = str(value).lower() in ("1", "true", "on", "yes", "y")
+        off = str(value).lower() in ("0", "false", "off", "no", "n")
+        if not on and not off:
+            raise ValueError(
+                f"door: use on|off (got {value!r})."
+            )
+        if on:
+            doors[direction] = True
+            no_door = [d for d in no_door if d != direction]
+        else:
+            doors.pop(direction, None)
+            if direction not in no_door:
+                no_door.append(direction)
+    elif attr == "key":
+        text = (value or "").strip()
+        cleared = text.lower() in ("clear", "none", "-", "")
+        if cleared:
+            door_keys.pop(direction, None)
+        else:
+            hooks.rset_item_id_validate(
+                text,
+                where=f"door_keys[{direction}]",
+            )
+            door_keys[direction] = text
+    elif attr == "hidden":
+        on = str(value).lower() in ("1", "true", "on", "yes", "y")
+        off = str(value).lower() in ("0", "false", "off", "no", "n")
+        if not on and not off:
+            raise ValueError(
+                f"hidden: use on|off (got {value!r})."
+            )
+        if on:
+            if direction not in hidden_dirs:
+                hidden_dirs.append(direction)
+        else:
+            hidden_dirs = [d for d in hidden_dirs if d != direction]
+    elif attr == "desc":
+        text = (value or "").strip()
+        cleared = text.lower() in ("clear", "none", "-", "")
+        if cleared:
+            exit_descs.pop(direction, None)
+        elif not text:
+            raise ValueError("desc needs prose (or 'clear' to remove).")
+        else:
+            exit_descs[direction] = text
+    else:
+        raise ValueError(
+            f"Unknown exit attribute {attr!r}. "
+            "Use door, key, hidden, or desc."
+        )
+
+    if doors:
+        entry["doors"] = doors
+    else:
+        entry.pop("doors", None)
+    if door_keys:
+        entry["door_keys"] = door_keys
+    else:
+        entry.pop("door_keys", None)
+    _write_exit_list_field(entry, "hidden_directions", hidden_dirs)
+    _write_exit_list_field(entry, "no_door", no_door)
+    if exit_descs:
+        entry["exit_descs"] = exit_descs
+    else:
+        entry.pop("exit_descs", None)
+
+    _persist_exit_fields(game, room, entry)
+    return f"Set {room.key} exit {direction} {attr} (saved)."
+
+
+def _normalize_extra_descs_dict(raw):
+    """Lowercase keyword -> prose map (empty when missing or malformed)."""
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(k).strip().lower(): str(v).strip()
+        for k, v in raw.items()
+        if str(k).strip() and str(v).strip()
+    }
+
+
+def match_extra_desc_keyword(query, extra_descs):
+    """Resolve one authored extra-desc keyword (prefix/substring like items).
+
+    Returns (matched_key, prose) or (None, None) when nothing matches.
+    """
+    descs = _normalize_extra_descs_dict(extra_descs)
+    if not query or not descs:
+        return None, None
+    needle = str(query).strip().lower()
+    if not needle:
+        return None, None
+    if needle in descs:
+        return needle, descs[needle]
+    prefix_hits = [k for k in descs if k.startswith(needle)]
+    if len(prefix_hits) == 1:
+        return prefix_hits[0], descs[prefix_hits[0]]
+    sub_hits = [k for k in descs if needle in k]
+    if len(sub_hits) == 1:
+        return sub_hits[0], descs[sub_hits[0]]
+    return None, None
+
+
+def _extra_descs_on_room(room):
+    """Normalized extra_descs dict from a live Room (may be unset)."""
+    return _normalize_extra_descs_dict(getattr(room, "extra_descs", None))
+
+
+def _persist_extra_descs(game, room, extra_descs, *, persist=True):
+    """Dual-write authored extra_descs to JSON + live Room."""
+    cleaned = {
+        str(k).strip().lower(): str(v).strip()
+        for k, v in (extra_descs or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+    room.extra_descs = dict(cleaned) if cleaned else None
+    if not persist:
+        return
+    path, _, _, _ = resolve_map_path(game, room)
+    doc = load_doc(path)
+    if is_grid_room(room):
+        grid = doc.setdefault("grid", {})
+        overrides = grid.setdefault("cell_overrides", {})
+        cell_key = _cell_override_key(room)
+        cell = dict(overrides.get(cell_key) or {})
+        if cleaned:
+            cell["extra_descs"] = cleaned
+        else:
+            cell.pop("extra_descs", None)
+        if cell:
+            overrides[cell_key] = cell
+        else:
+            overrides.pop(cell_key, None)
+    else:
+        entry = _ensure_hand_room_entry(doc, room)
+        if cleaned:
+            entry["extra_descs"] = cleaned
+        else:
+            entry.pop("extra_descs", None)
+    save_doc_validated(path, doc)
+
+
+def extra_desc_inspect_lines(game, room):
+    """Staff listing for ``olc extra`` with no keyword."""
+    room_label = room_vnum_mod.staff_room_label(room) or room.key
+    lines = [f"Extra descriptions — {room_label}"]
+    descs = _extra_descs_on_room(room)
+    if not descs:
+        lines.append("  (none)")
+    else:
+        for key in sorted(descs):
+            prose = descs[key]
+            preview = prose if len(prose) <= 60 else prose[:57] + "..."
+            lines.append(f"  {key} — {preview}")
+    lines.extend([
+        "",
+        "Type:",
+        "  olc extra                      list keywords in this room",
+        "  olc extra <keyword>            show that keyword's prose",
+        "  olc extra <keyword> <prose…>   set (saved to the map JSON)",
+        "  olc extra <keyword> clear      remove",
+        "Walk directions belong on olc exit <dir> desc, not extra.",
+        "See gmhelp olc-extra",
+    ])
+    return lines
+
+
+def set_extra_desc(game, room, keyword, value):
+    """Set, show, or clear one authored extra-desc keyword on this room."""
+    key = (keyword or "").strip().lower()
+    if not key:
+        return "\n".join(extra_desc_inspect_lines(game, room))
+    from engine.command_support import DIRECTIONS
+
+    if key in DIRECTIONS or key in DIRECTIONS.values():
+        raise ValueError(
+            f"Keyword {key!r} is a walk direction — use olc exit {key} desc "
+            "for exit look-text, not extra_descs."
+        )
+    descs = _extra_descs_on_room(room)
+    text = (value or "").strip()
+    if not text:
+        prose = descs.get(key)
+        if prose:
+            return f"{key}: {prose}"
+        return f"No extra description {key!r} in this room."
+    if text.lower() in ("clear", "none", "-"):
+        if key not in descs:
+            return f"No extra description {key!r} to clear."
+        descs.pop(key, None)
+        _persist_extra_descs(game, room, descs)
+        return f"Cleared extra description {key!r} (saved)."
+    descs[key] = text
+    _persist_extra_descs(game, room, descs)
+    return f"Set extra description {key!r} (saved)."
 
 
 def rset_field(game, room, field, value):
@@ -1232,12 +1685,12 @@ _APPEND_BOOL_FLAGS = frozenset({
 
 
 def _room_storage_key(room):
-    """JSON ``key`` / exit target for a live hand room (legacy before VNUM)."""
+    """JSON ``key`` / exit target for a live hand room (VNUM after stamp)."""
     if room is None:
         return None
-    leg = getattr(room, "legacy_key", None)
-    if leg:
-        return str(leg)
+    ident = room_vnum_mod.internal_room_key(room)
+    if ident:
+        return str(ident)
     return getattr(room, "key", None)
 
 
@@ -1259,15 +1712,17 @@ def room_to_json(room, *, game=None):
         "area_type": getattr(room, "area_type", None) or "city",
         "exits": {},
     }
-    live_key = getattr(room, "key", None)
     vnum = getattr(room, "vnum", None)
     if vnum:
         try:
             entry["vnum"] = room_vnum_mod.validate_vnum(vnum)
         except ValueError:
             entry["vnum"] = str(vnum).strip()
-    if live_key and str(live_key) != str(storage_key):
-        entry["legacy_key"] = str(live_key)
+    leftover = getattr(room, "legacy_key", None)
+    if leftover and str(leftover).strip() and str(leftover).strip() != str(
+        storage_key
+    ):
+        entry["legacy_key"] = str(leftover).strip()
     if getattr(room, "title", None):
         entry["title"] = room.title
     if getattr(room, "zone", None):
@@ -1309,6 +1764,69 @@ def room_to_json(room, *, game=None):
             dest_key = str(dest).strip() if dest else None
         if dest_key:
             entry["exits"][direction] = dest_key
+    doors = getattr(room, "doors", None)
+    if doors:
+        if isinstance(doors, dict):
+            cleaned = {
+                str(k).strip().lower(): bool(v)
+                for k, v in doors.items()
+                if str(k).strip() and bool(v)
+            }
+            if cleaned:
+                entry["doors"] = cleaned
+        elif isinstance(doors, (list, tuple, set)):
+            cleaned = [
+                str(d).strip().lower()
+                for d in doors
+                if str(d).strip()
+            ]
+            if cleaned:
+                entry["doors"] = cleaned
+    door_keys = getattr(room, "door_keys", None)
+    if isinstance(door_keys, dict) and door_keys:
+        cleaned_keys = {
+            str(k).strip().lower(): str(v).strip()
+            for k, v in door_keys.items()
+            if str(k).strip() and str(v).strip()
+        }
+        if cleaned_keys:
+            entry["door_keys"] = cleaned_keys
+    no_door = getattr(room, "no_door", None)
+    if no_door:
+        cleaned_no = [
+            str(d).strip().lower()
+            for d in no_door
+            if str(d).strip()
+        ]
+        if cleaned_no:
+            entry["no_door"] = cleaned_no
+    hidden = getattr(room, "hidden_directions", None)
+    if hidden:
+        cleaned_hidden = [
+            str(d).strip().lower()
+            for d in hidden
+            if str(d).strip()
+        ]
+        if cleaned_hidden:
+            entry["hidden_directions"] = cleaned_hidden
+    exit_descs = getattr(room, "exit_descs", None)
+    if isinstance(exit_descs, dict) and exit_descs:
+        cleaned_descs = {
+            str(k).strip().lower(): str(v).strip()
+            for k, v in exit_descs.items()
+            if str(k).strip() and str(v).strip()
+        }
+        if cleaned_descs:
+            entry["exit_descs"] = cleaned_descs
+    extra_descs = getattr(room, "extra_descs", None)
+    if isinstance(extra_descs, dict) and extra_descs:
+        cleaned_extra = {
+            str(k).strip().lower(): str(v).strip()
+            for k, v in extra_descs.items()
+            if str(k).strip() and str(v).strip()
+        }
+        if cleaned_extra:
+            entry["extra_descs"] = cleaned_extra
     return entry
 
 
@@ -1364,7 +1882,7 @@ def _apply_entry_fields_to_live(live, entry):
 
 
 
-def delete_hand_rooms(game, anchor_room, keys, *, relocate_to=None):
+def delete_hand_rooms(game, anchor_room, keys, *, relocate_to=None, persist=True):
     """Remove hand-authored rooms from JSON + live ``game.rooms``.
 
     Scrubs exits in the same map/zone file that pointed at deleted keys.
@@ -1372,6 +1890,9 @@ def delete_hand_rooms(game, anchor_room, keys, *, relocate_to=None):
     ``relocate_to`` when given (else the anchor). Grid cells and rooms
     outside this map file are left alone (exits to them are only unlinked
     from surviving rooms on this file).
+
+    ``persist=False`` (boot heals) updates the live graph only — Git SoT
+    zone JSON is not rewritten.
 
     Returns (removed_count, short_message).
     """
@@ -1412,11 +1933,18 @@ def delete_hand_rooms(game, anchor_room, keys, *, relocate_to=None):
         if pocket.get("hub_room") in doomed:
             pocket["hub_room"] = ""
 
-    save_doc_validated(path, doc)
+    if persist:
+        save_doc_validated(path, doc)
+    else:
+        try:
+            from engine import map_heal as map_heal_mod
+            map_heal_mod.strip_overlay_rooms(path, doomed)
+        except Exception:
+            pass
 
     # Live: move occupants, scrub exits, drop rooms.
     for key in list(doomed):
-        room = game.rooms.get(key)
+        room = room_vnum_mod.lookup_room(game, key)
         if room is None:
             continue
         for obj in list(getattr(room, "contents", None) or []):
@@ -1450,6 +1978,7 @@ def delete_hand_rooms(game, anchor_room, keys, *, relocate_to=None):
 
     msg = (
         f"Deleted {removed_json} room(s) from "
-        f"{os.path.basename(path)} (saved)."
+        f"{os.path.basename(path)}"
+        + (" (saved)." if persist else " (live only).")
     )
     return removed_json, msg

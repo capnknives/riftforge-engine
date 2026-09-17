@@ -14,6 +14,17 @@ META_KEY = "door_lock_state"
 META_KEY_OPEN = "door_open_state"
 LOOK_DOOR_CLOSED_SUFFIX = " (door closed)"
 
+
+def closed_exit_look_label(direction):
+    """Player-facing exit title when a door is shut -- no room name beyond."""
+    d = str(direction or "").strip().lower()
+    if d in _CARDINAL_DIRS:
+        return f"the {d} door (closed)"
+    if d:
+        return f"a closed door ({d})"
+    return "a closed door"
+
+
 _CARDINAL_DIRS = frozenset({
     "north", "south", "east", "west",
     "northeast", "northwest", "southeast", "southwest",
@@ -79,6 +90,29 @@ def ensure_open_state(game):
     return game.door_open_state
 
 
+def clear_exit_door_state(game, room, direction):
+    """Drop persisted lock/open bits for one directed exit.
+
+    Used when a homestead interior door is taken off its hinges so walking
+    that way no longer unlocks / opens / closes / locks a ghost door.
+    """
+    if game is None or room is None:
+        return
+    room_key = getattr(room, "key", None)
+    d = str(direction or "").strip().lower()
+    if not room_key or not d:
+        return
+    pair = _pair_key(room_key, d)
+    lock = ensure_game_state(game)
+    if pair in lock:
+        lock.pop(pair, None)
+        game._door_lock_dirty = True
+    opened = ensure_open_state(game)
+    if pair in opened:
+        opened.pop(pair, None)
+        game._door_open_dirty = True
+
+
 def direction_between(from_room, dest):
     """Return the exit label from ``from_room`` to ``dest``, or None."""
     if from_room is None or dest is None:
@@ -126,6 +160,13 @@ def _authored_door_override(room, direction):
     if room is None:
         return None
     d = str(direction or "").strip().lower()
+    # ``homestead door remove`` stamps ``no_door`` -- that must win over a
+    # leftover ``doors`` list/dict so lock/open verbs stop treating the
+    # opening as a door (bug report 1274).
+    no_door = getattr(room, "no_door", None)
+    if isinstance(no_door, (list, tuple, set)):
+        if d in {str(x).strip().lower() for x in no_door}:
+            return False
     doors = getattr(room, "doors", None)
     if isinstance(doors, dict):
         for key, val in doors.items():
@@ -135,10 +176,6 @@ def _authored_door_override(room, direction):
         lowered = {str(x).strip().lower() for x in doors}
         if d in lowered:
             return True
-    no_door = getattr(room, "no_door", None)
-    if isinstance(no_door, (list, tuple, set)):
-        if d in {str(x).strip().lower() for x in no_door}:
-            return False
     return None
 
 
@@ -391,7 +428,9 @@ def heal_orphan_open_state(game):
             removed += 1
             continue
         room_key, direction = key.rsplit("|", 1)
-        room = rooms.get(room_key)
+        from engine.room_vnum import lookup_room
+
+        room = lookup_room(game, room_key)
         if room is None:
             state.pop(key, None)
             removed += 1
@@ -425,7 +464,9 @@ def heal_orphan_lock_state(game):
             removed += 1
             continue
         room_key, direction = key.rsplit("|", 1)
-        room = rooms.get(room_key)
+        from engine.room_vnum import lookup_room
+
+        room = lookup_room(game, room_key)
         if room is None:
             state.pop(key, None)
             removed += 1

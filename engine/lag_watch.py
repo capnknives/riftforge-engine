@@ -18,6 +18,24 @@ from __future__ import annotations
 _LAST_POST_TICK_ATTR = "_lag_watch_last_post_tick_mono"
 
 
+def _maybe_auto_capture(game, reason, data):
+    """Always-on NDJSON burst (Slice C 45s gate). Never raises."""
+    try:
+        from engine import diag_export
+
+        diag_export.append_auto_capture_event(game, data, reason=reason)
+    except Exception as exc:
+        from engine import log_util
+
+        log_util.ops_once_per_tick(
+            game,
+            f"diag:{reason}",
+            "diag_export",
+            f"auto-capture {reason} failed",
+            exc=exc,
+        )
+
+
 def _env_float(name, default):
     import os
 
@@ -138,6 +156,14 @@ def check_inter_tick_gap(game):
         f"ticks={getattr(game, 'game_time_ticks', '?')} "
         f"autosave_running={autosave} save_task={in_flight}",
     )
+    payload = {
+        "gap_ms": round(gap_ms, 2),
+        "threshold_ms": threshold,
+        "autosave_running": autosave,
+        "save_task_in_flight": in_flight,
+        "game_time_ticks": getattr(game, "game_time_ticks", None),
+    }
+    _maybe_auto_capture(game, "inter_tick_gap", payload)
     try:
         from engine import diag_export
         if diag_export.diag_enabled():
@@ -145,16 +171,15 @@ def check_inter_tick_gap(game):
                 "AUTO",
                 "lag_watch.py:check_inter_tick_gap",
                 "inter_tick_gap",
-                {
-                    "gap_ms": round(gap_ms, 2),
-                    "threshold_ms": threshold,
-                    "autosave_running": autosave,
-                    "save_task_in_flight": in_flight,
-                    "game_time_ticks": getattr(game, "game_time_ticks", None),
-                },
+                payload,
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        from engine import log_util
+
+        log_util.ops_once_per_tick(
+            game, "diag:inter_tick", "diag_export",
+            "inter_tick_gap ndjson failed", exc=exc,
+        )
 
 
 def note_handler_stall(game, name, ms):
@@ -236,6 +261,131 @@ def note_command_stall(game, character, verb, ms, *, raw_preview="", extra=""):
         f"line={preview!r} ticks={getattr(game, 'game_time_ticks', '?')}"
         f"{suffix}",
     )
+    _maybe_auto_capture(
+        game,
+        "command_slow",
+        {
+            "verb": verb,
+            "ms": round(ms, 2),
+            "who": who,
+            "line": preview,
+            "game_time_ticks": getattr(game, "game_time_ticks", None),
+        },
+    )
+
+
+def note_hitch_subphase(game, name, ms, extra=None):
+    """Record one inner tick/handler slice for the next lag gist.
+
+    Always stores on ``game._lag_hitch_subphases`` (last value wins per
+    name). Emits NDJSON when ``ms >= 50`` so the next capture names the
+    slice without waiting for ``gm diaglog on``.
+    """
+    if game is None or not name:
+        return
+    ms = float(ms)
+    bucket = getattr(game, "_lag_hitch_subphases", None)
+    if not isinstance(bucket, dict):
+        bucket = {}
+        game._lag_hitch_subphases = bucket
+    row = {"ms": round(ms, 2)}
+    if extra:
+        row["extra"] = extra
+    bucket[str(name)] = row
+    if ms < 50.0:
+        return
+    payload = {
+        "name": str(name),
+        "ms": round(ms, 2),
+        "game_time_ticks": getattr(game, "game_time_ticks", None),
+    }
+    if extra:
+        payload["extra"] = extra
+    _maybe_auto_capture(game, f"hitch_{name}", payload)
+    try:
+        from engine import diag_export
+
+        if diag_export.diag_enabled():
+            diag_export.append_event(
+                "P23",
+                "lag_watch.py:note_hitch_subphase",
+                "hitch_subphase",
+                payload,
+            )
+    except Exception:
+        pass
+
+
+def note_parking_write(game, *, write_ms, n_vehicles, n_bytes):
+    """Log slow ``vehicle_parking.json`` rewrites (America cruise flush)."""
+    from engine import log_util
+
+    write_ms = float(write_ms)
+    if write_ms < 50.0:
+        return
+    log_util.ops(
+        "lag_watch",
+        "parking_write "
+        f"write_ms={write_ms:.1f} vehicles={int(n_vehicles)} "
+        f"bytes={int(n_bytes)} "
+        f"ticks={getattr(game, 'game_time_ticks', '?')}",
+    )
+    _maybe_auto_capture(
+        game,
+        "parking_write",
+        {
+            "write_ms": round(write_ms, 2),
+            "vehicles": int(n_vehicles),
+            "bytes": int(n_bytes),
+            "game_time_ticks": getattr(game, "game_time_ticks", None),
+        },
+    )
+    try:
+        from engine import diag_export
+
+        if diag_export.diag_enabled():
+            diag_export.append_event(
+                "P23",
+                "vehicles.py:save_parking_state",
+                "parking_write_ms",
+                {
+                    "write_ms": round(write_ms, 2),
+                    "vehicles": int(n_vehicles),
+                    "bytes": int(n_bytes),
+                    "game_time_ticks": getattr(game, "game_time_ticks", None),
+                },
+            )
+    except Exception:
+        pass
+
+
+def note_persist_collect_megachar(game, detail):
+    """Immediate ops line when one character collect build exceeds 200ms."""
+    from engine import log_util
+
+    if not detail:
+        return
+    name = detail.get("name") or "?"
+    parts = [
+        f"name={name}",
+        f"total_ms={detail.get('total_ms')}",
+        f"blob_ms={detail.get('blob_ms')}",
+        f"dumps_ms={detail.get('dumps_ms')}",
+        f"items_ms={detail.get('items_ms')}",
+        f"blob_bytes={detail.get('blob_bytes')}",
+    ]
+    top_keys = detail.get("blob_top_keys") or []
+    if top_keys:
+        frag = ", ".join(
+            f"{row.get('key')}~{row.get('approx_bytes')}b"
+            for row in top_keys[:5]
+        )
+        parts.append(f"blob_top=[{frag}]")
+    log_util.ops(
+        "lag_watch",
+        "persist_collect_megachar " + " ".join(str(p) for p in parts) + " "
+        f"ticks={getattr(game, 'game_time_ticks', '?')}",
+    )
 
 
 def note_autosave_stall(game, stats, *, reason):
@@ -269,6 +419,17 @@ def note_autosave_stall(game, stats, *, reason):
             parts.append(f"{key}={stats.get(key)}")
     if stats.get("n_changed_chars") is not None:
         parts.append(f"chars={stats.get('n_changed_chars')}")
+    for key in (
+        "char_build_total_ms",
+        "char_build_count",
+        "floor_rooms_scanned",
+        "floor_collect_fast_skip",
+        "floor_build_total_ms",
+        "n_dirty_chars_this_pass",
+        "n_dirty_rooms_this_pass",
+    ):
+        if stats.get(key) is not None:
+            parts.append(f"{key}={stats.get(key)}")
     if stats.get("wal_file_bytes_before") is not None:
         parts.append(f"wal_b={stats.get('wal_file_bytes_before')}")
     if stats.get("wal_checkpoint_mode"):
@@ -281,8 +442,23 @@ def note_autosave_stall(game, stats, *, reason):
         parts.append(f"disk_free_mb={stats.get('disk_free_mb')}")
     if stats.get("lock_wait_ms") is not None:
         parts.append(f"lock_wait_ms={stats.get('lock_wait_ms')}")
+    if stats.get("wall_budget_hit"):
+        parts.append("wall_budget_hit=1")
+    slow_detail = stats.get("slow_char_detail") or []
+    if slow_detail:
+        parts.append(f"slow_char_detail={slow_detail[:3]}")
     log_util.ops(
         "lag_watch",
         "autosave_slow " + " ".join(parts) + " "
         f"ticks={getattr(game, 'game_time_ticks', '?')}",
+    )
+    _maybe_auto_capture(
+        game,
+        "autosave_slow",
+        {
+            "reason": reason,
+            "save_ms": round(save_ms, 2),
+            "apply_ms": round(apply_ms_f, 2),
+            "game_time_ticks": getattr(game, "game_time_ticks", None),
+        },
     )

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from command_support import broadcast_here
 
+import hashlib
 import random
 
 from engine import hooks
@@ -163,15 +164,58 @@ def _mine_down(character, game, room):
     _roll_discoverable(game, mouth_key, shaft_id, character)
 
 
+def _elements_at_depth(table, depth):
+    """Return (element_id, yield_weight) pairs eligible at chamber depth."""
+    depth = int(depth)
+    candidates = []
+    if not isinstance(table, dict):
+        return candidates
+    for element_id, row in table.items():
+        if not isinstance(row, dict):
+            continue
+        for band in row.get("depth_bands") or []:
+            if not isinstance(band, dict):
+                continue
+            lo = int(band.get("min_depth", 0))
+            hi = int(band.get("max_depth", lo))
+            if lo <= depth <= hi:
+                weight = int(band.get("yield_weight", 1) or 1)
+                candidates.append((str(element_id), max(1, weight)))
+                break
+    return candidates
+
+
+def _roll_vein_element(table, depth, seed_key, *, fallback="iron"):
+    """Weighted stratum pick for one shared vein (stable per mouth room)."""
+    candidates = _elements_at_depth(table, depth)
+    if not candidates:
+        return fallback
+    total = sum(weight for _element, weight in candidates)
+    digest = hashlib.sha256(str(seed_key or "").encode()).hexdigest()
+    pick = int(digest[:8], 16) % total
+    acc = 0
+    for element_id, weight in candidates:
+        acc += weight
+        if pick < acc:
+            return element_id
+    return candidates[-1][0]
+
+
 def _harvest_vein(character, game, room, mouth, room_id):
     node = graph_mod.room_by_id(mouth, room_id)
     if node and node.get("vein_depleted"):
         _send(character, "This vein is picked clean for now.")
         return
     geo = mouth.get("geology") or {}
-    element = geo.get("primary_element", "iron")
     depth = int(node.get("depth") or 1) if node else 1
     table = hooks.mine_stratum_table("earth")
+    mouth_key = getattr(room, "mouth_key", None) or mouth.get("mouth_key")
+    element = _roll_vein_element(
+        table,
+        depth,
+        f"{mouth_key}:{room_id}:{depth}",
+        fallback=geo.get("primary_element") or "iron",
+    )
     row = table.get(element) if isinstance(table, dict) else {}
     ore_key = (row.get("catalog_ore_id") if isinstance(row, dict) else None) or f"ore_{element}"
     try:
@@ -610,7 +654,11 @@ def try_mine_directional_move(character, direction, game):
             _send(character, "No surface mouth to return to.")
             return True
         character.move_to(surface)
-        _send(character, "You climb back to the surface.")
+        _send(
+            character,
+            "You climb back to the surface. The shaft stays open -- "
+            "type mine down to go back in.",
+        )
         surface.broadcast(f"{character.key} emerges from the mine.", exclude=character)
         return True
     face = graph_mod.get_face(node, direction)

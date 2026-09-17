@@ -8,9 +8,9 @@ from __future__ import annotations
 
 
 def _require_account(character, game):
-    from engine.accounts import account_for_character
+    from engine.accounts import account_for_session_character
 
-    account = account_for_character(game, character)
+    account = account_for_session_character(game, character)
     if account is None:
         character.session.send(
             "Link an account first (help account). Mutes and public "
@@ -74,14 +74,14 @@ def _chans_usage(character):
 def cmd_chans(character, args, game):
     """Create or manage player-owned public chat channels."""
     from engine import channels
-    from engine.accounts import account_for_character
+    from engine.accounts import account_for_session_character
 
     parts = (args or "").strip().split()
     if not parts:
         _chans_usage(character)
         return
     sub = parts[0].lower()
-    account = account_for_character(game, character)
+    account = account_for_session_character(game, character)
     if sub == "list":
         lines = ["Public global channels:"]
         for spec in channels.all_channels():
