@@ -154,3 +154,20 @@ Exit graphs CLEAN. Corroborates E080-02 packaging.
 Ash · Patch · Grok · Mason on https://github.com/capnknives/riftforge-engine/pull/4
 
 **P0 call:** E080-01 / E-1 heal supers import · **E-2** wheel drops static → GET / 500 · E080-03 stamp desync · E080-13 TV help on Notbigville · E080-19 empty Millbrook NPCs.
+
+## Webclient platform matrix (CLOSED) — deepen
+
+Brief: `briefs/2026-09-17-webclient-platform-matrix.md` · tip engine `62aa66a` (static = v0.8.0)
+
+**Top cohort:** Chrome desktop returning visits — stamp triad desync (**E080-03**). Runner-up: Safari iOS OPEN-zombie (**E080-04** + **WC-8**).
+
+| ID | Note |
+|----|------|
+| WC-1 | SW update race |
+| WC-2 | close-code blindness |
+| WC-3 | IDB gate before connect |
+| WC-4 | in-app WebViews (Discord/FB) |
+| WC-5 | private RiftForge tip lag (no Map.View/drain vs engine v0.8.0) |
+| WC-6 | hard-refresh myth |
+| WC-7 | localStorage silent-fail |
+| WC-8 | visibilitychange no WS heal |
