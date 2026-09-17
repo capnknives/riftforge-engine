@@ -135,3 +135,22 @@ CI: only `engine-smoke` green. Local: packaging_smoke FAIL without supers; wheel
 https://github.com/capnknives/riftforge-engine/pull/4#issuecomment-5718033417
 
 Corroborates **E080-03…07**. Top some-users split: stamp desync. Addenda: Safari OPEN-zombie not healed on pageshow; **E080-08** unversioned `discord-invite.js`.
+
+
+### Mason content — CLOSED (+ E080-13…19)
+https://github.com/capnknives/riftforge-engine/pull/4#issuecomment-5718069870 · addendum #5718076555 · brief `briefs/2026-09-17-engine-v080-mason-content.md`
+
+| ID | Note |
+|----|------|
+| **E080-13** | basegame help still teaches Lebanon/Winchester/Purgatory/Chuck (Notbigville proof) |
+| **E080-14** | help origins ≠ chargen (reconciled) |
+| **E080-15…18** | dead enter lawrence/stull, chalk TV nouns, kind null, HE* alcoves (see Mason brief) |
+| **E080-19** | Millbrook Inn/Smithy/Temple shells but **0** town NPCs |
+
+Exit graphs CLEAN. Corroborates E080-02 packaging.
+
+## Lanes — ALL CLOSED
+
+Ash · Patch · Grok · Mason on https://github.com/capnknives/riftforge-engine/pull/4
+
+**P0 call:** E080-01 / E-1 heal supers import · **E-2** wheel drops static → GET / 500 · E080-03 stamp desync · E080-13 TV help on Notbigville · E080-19 empty Millbrook NPCs.
