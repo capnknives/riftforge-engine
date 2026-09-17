@@ -111,3 +111,27 @@
 **Top:** **E080-01** (H — ungated `supers.boot_migrations` aborts lean account heal), **E080-03** / **E080-04** / **E080-05** (webclient some-users), **E080-02** (pip pin packaging).  
 **Purity:** Phase 2 `engine/` claim holds (no live supers imports).  
 **Brief path:** `/workspace/riftforge-ash/briefs/2026-09-17-engine-v080-hunt.md`
+
+
+## Teammate folds
+
+### Patch CI/smoke — CLOSED @ `282ac8fe`
+Brief: `briefs/2026-09-17-v080-patch-ci.md`
+
+| ID | Sev | Note |
+|----|-----|------|
+| **E-1** | high | heal path can abort; CI still green (pairs E080-01) |
+| **E-2** | high | clean pip wheel drops `static/` → `GET /` 500 Missing static file (**webclient break class**) |
+| **E-3** | med | basegame/classic not in package (pairs E080-02) |
+| **E-4** | med | no webclient CI |
+| **E-5** | med | no branch protection / release workflow |
+| **E-6** | low | stamp desync (pairs E080-03) |
+| **E-7** | low | extra smokes not gated in CI |
+| **E-8** | info | Release has empty assets |
+
+CI: only `engine-smoke` green. Local: packaging_smoke FAIL without supers; wheel install → static 500.
+
+### Grok door — CLOSED
+https://github.com/capnknives/riftforge-engine/pull/4#issuecomment-5718033417
+
+Corroborates **E080-03…07**. Top some-users split: stamp desync. Addenda: Safari OPEN-zombie not healed on pageshow; **E080-08** unversioned `discord-invite.js`.
