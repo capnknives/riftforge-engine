@@ -39,8 +39,13 @@ CLOTHING_LOOK_ORDER = (
     "finger", "waist", "legs", "feet",
 )
 
-# Soft cap so a slot cannot grow forever (innermost → outermost).
+# Soft cap so a layered slot cannot grow forever (innermost → outermost).
 MAX_LAYERS_PER_SLOT = 6
+
+# Clothing slots that may hold multiple layers (tee + flannel on body, etc.).
+# Every other CLOTHING_SLOTS key is one garment per wear_depth -- new wear
+# replaces the previous piece at that depth (bug report 1775).
+CLOTHING_MULTI_LAYER_SLOTS = frozenset({"body", "about", "over"})
 
 
 def ensure_clothing_map(character):
@@ -138,7 +143,7 @@ def wear_piece(
         return True, f"You are already wearing {shown}."
     detach_from_stacks(character, piece)
     stack = slot_stack(character, slot)
-    if len(stack) >= MAX_LAYERS_PER_SLOT:
+    if slot in CLOTHING_MULTI_LAYER_SLOTS and len(stack) >= MAX_LAYERS_PER_SLOT:
         return False, (
             f"Your {slot} clothing is already {MAX_LAYERS_PER_SLOT} layers "
             "deep -- remove something first."
@@ -263,7 +268,19 @@ def rebind_clothing_from_inventory(
         if not entries:
             continue
         entries.sort(key=lambda triple: (triple[0], triple[1]))
-        stack = [piece for _, _, piece in entries[:MAX_LAYERS_PER_SLOT]]
+        if slot in CLOTHING_MULTI_LAYER_SLOTS:
+            stack = [piece for _, _, piece in entries[:MAX_LAYERS_PER_SLOT]]
+        else:
+            # One clothing piece per wear_depth on exclusive slots (legs, feet, …).
+            by_depth = {}
+            for _, _, piece in entries:
+                depth = getattr(piece, "wear_depth", None)
+                if not isinstance(depth, str) or not depth.strip():
+                    depth = "base"
+                else:
+                    depth = depth.strip().lower()
+                by_depth[depth] = piece
+            stack = list(by_depth.values())
         renumber_stack(stack)
         clothing[slot] = stack
     character.clothing = clothing

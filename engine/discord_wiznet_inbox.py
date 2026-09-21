@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 INBOX_DIR_NAME = ".discord_wiznet_inbox"
+INBOX_FILES_PER_TICK = 8
 
 
 def _repo_root() -> Path:
@@ -97,11 +98,12 @@ def tick_discord_wiznet_inbox(game) -> None:
     directory = inbox_dir()
     if not directory.is_dir():
         return
-    paths = sorted(directory.glob("msg-*.json"))
-    if not paths:
-        return
     t0 = _time.perf_counter()
-    for path in paths:
+    n_files = 0
+    for path in directory.glob("msg-*.json"):
+        if n_files >= INBOX_FILES_PER_TICK:
+            break
+        n_files += 1
         payload = _load_payload(path)
         try:
             path.unlink(missing_ok=True)
@@ -114,6 +116,8 @@ def tick_discord_wiznet_inbox(game) -> None:
             continue
         face = _face_for_payload(game, payload)
         gm_notify.wiznet_broadcast_from_discord(game, face, message)
+    if n_files <= 0:
+        return
     try:
         from engine import lag_watch
 
@@ -121,7 +125,7 @@ def tick_discord_wiznet_inbox(game) -> None:
             game,
             "discord_wiznet_inbox",
             (_time.perf_counter() - t0) * 1000.0,
-            extra={"n_files": len(paths)},
+            extra={"n_files": n_files},
         )
     except Exception:
         pass

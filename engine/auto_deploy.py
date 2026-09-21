@@ -16,8 +16,12 @@ Announce policy (player-facing countdown):
     ticket Veil countdown, then a tip-file overlay.
   - Feature / merge / other tip advances and GM ``autodeploy on`` catch-up
     still sync the working tree, but first queue a catch-up Veil countdown
-    (default 60s) so players know a copyover is coming — gothic rewrite
+    (default 30s) so players know a copyover is coming — gothic rewrite
     language without fake Bug #N chrome.
+  - Tips whose files are **repo-only** (``docs/``, ``CHANGELOG.d/``, ``tools/``,
+    agent rules, … — nothing ``watch_and_run`` watches) overlay quietly:
+    no Veil, no ``reset --hard``, no copyover. Docs ships must not rewrite
+    the pit mid-fight.
   - Subjects that merely *mention* ``bug #N`` mid-sentence never use the
     Fix announce path.
 
@@ -2940,6 +2944,52 @@ def should_ship_bug_fix(
     )
 
 
+def _run_quiet_repo_advance(
+    root, state, remote_sha, files, subject, reason, *, from_sha="",
+):
+    """Overlay repo-only paths and advance state without Veil or copyover.
+
+    Used when ``should_ship_bug_fix`` is false and every changed path is
+    ignored by ``watch_and_run`` (docs, changelog fragments, smoke scripts,
+    …). A full ``reset --hard`` + catch-up Veil would copyover the running
+    game for no runtime benefit (bug report 1801: docs tip during pit combat).
+    """
+    from tools.apply_pr_fix import overlay_files_from_ref
+
+    prev_head = _head_sha(root) or (from_sha or "").strip()
+    print(
+        f"[auto_deploy] quiet repo advance for {remote_sha[:12]} "
+        f"({reason}; {len(files)} path(s), no copyover): {subject}",
+        flush=True,
+    )
+    if files:
+        try:
+            overlay_files_from_ref(remote_sha, files, cwd=root)
+        except subprocess.CalledProcessError as exc:
+            print(f"[auto_deploy] quiet overlay failed: {exc}", flush=True)
+            return False
+    _ensure_changelog_ledger_after_sync(root)
+    if _head_sha(root) != remote_sha:
+        try:
+            _run_git("update-ref", "HEAD", remote_sha, cwd=root)
+        except subprocess.CalledProcessError as exc:
+            print(
+                f"[auto_deploy] quiet HEAD update failed: {exc}",
+                flush=True,
+            )
+            return False
+    _emit_deploy_diag(
+        kind="overlay",
+        from_sha=prev_head or from_sha or remote_sha,
+        to_sha=remote_sha,
+        n_files_changed=len(files),
+        extra={"quiet_repo_advance": True},
+    )
+    return _advance_origin_only(
+        root, state, remote_sha, subject, reason, from_sha=from_sha,
+    )
+
+
 def _advance_origin_only(root, state, remote_sha, subject, reason, *, from_sha=""):
     """Record the new tip without announcing or overlaying."""
     print(
@@ -3033,7 +3083,11 @@ def _run_catchup_countdown(
         f"{commit_sha[:12]} (gateway_restart={gateway_restart}): {summary}",
         flush=True,
     )
-    timeout = DEFAULT_READY_TIMEOUT + seconds
+    timeout = (
+        DEFAULT_READY_TIMEOUT
+        + seconds
+        + deploy_notify.WARMUP_READY_SLACK_S
+    )
     if not _wait_for_ready(root, timeout):
         if abort_requested(root):
             print(
@@ -3128,7 +3182,11 @@ def _run_deploy_pipeline(
         f"(gateway_restart={gateway_restart}): {summary}",
         flush=True,
     )
-    timeout = DEFAULT_READY_TIMEOUT + countdown
+    timeout = (
+        DEFAULT_READY_TIMEOUT
+        + countdown
+        + deploy_notify.WARMUP_READY_SLACK_S
+    )
     if not _wait_for_ready(root, timeout):
         if abort_requested(root):
             print(
@@ -4002,6 +4060,26 @@ def try_auto_deploy():
                 ),
             )
             return False
+        from engine import watch_and_run as watch_mod
+
+        if files and not watch_mod.deploy_commit_needs_copyover(files):
+            if missed_fixes:
+                try:
+                    _apply_catchup_fix_resolves(root, state, missed_fixes)
+                except Exception as exc:
+                    print(
+                        f"[auto_deploy] missed-fix catch-up failed: {exc}",
+                        flush=True,
+                    )
+            return _run_quiet_repo_advance(
+                root,
+                state,
+                remote_sha,
+                files,
+                subject,
+                reason,
+                from_sha=prev_sha,
+            )
         # Stage the tree + boot probe FIRST (silent), then run the Veil
         # countdown, then arm the copyover. Announcing before this work meant
         # the "rewrite in N seconds" promise was followed by a full throwaway

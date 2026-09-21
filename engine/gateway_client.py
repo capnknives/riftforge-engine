@@ -19,6 +19,7 @@ import os
 import time
 from typing import Callable, Optional
 
+from engine.game_heartbeat import hang_check_hold_enabled
 from engine.gateway_protocol import (
     TYPE_CTRL,
     TYPE_DATA,
@@ -210,7 +211,7 @@ class GatewayBridge:
         self._welcome_boot_task = None
         # Gateway stitch-intercept off while gap-fill heals run (commands
         # still flow over IPC; this flag only blocks the "game looks stale"
-        # OOC intercept). Watchdog also skips stale-kill while True.
+        # OOC intercept). IPC watchdog also skips stale-exit while True.
         self._boot_warming = False
 
     def _ipc_ping_interval_seconds(self) -> float:
@@ -235,6 +236,11 @@ class GatewayBridge:
 
         Split-brain recovery: ticks may continue while the gateway lost the
         IPC writer — periodic ping + stale detection forces watcher respawn.
+
+        Skips stale-exit while ``_boot_warming`` or scoped
+        ``.hang_check_hold`` (copyover persist) is active so a long SQLite
+        pass on the asyncio thread does not cancel Veil / roll auto-deploy.
+        Pings still run when the loop can schedule them.
         """
         interval = self._ipc_ping_interval_seconds()
         stale_limit = self._ipc_stale_seconds()
@@ -247,6 +253,7 @@ class GatewayBridge:
             if (
                 self._tick_loop_started
                 and not self._boot_warming
+                and not hang_check_hold_enabled()
                 and self._last_gateway_frame_at > 0
                 and (now - self._last_gateway_frame_at) > stale_limit
             ):

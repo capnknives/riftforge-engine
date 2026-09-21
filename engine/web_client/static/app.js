@@ -42,6 +42,10 @@
   const displayBtn = document.getElementById("show-display-prefs");
   const displayDialog = document.getElementById("display-dialog");
   const displayClose = document.getElementById("display-close");
+  const errorBadge = document.getElementById("client-error-badge");
+  const diagText = document.getElementById("diag-text");
+  const diagCopy = document.getElementById("diag-copy");
+  const diagCopied = document.getElementById("diag-copied");
   const saveLogBtn = document.getElementById("save-log");
   const vitalsAlertEl = document.getElementById("vitals-alert");
   const playRoot = document.getElementById("play");
@@ -78,7 +82,7 @@
   // Bump this string with each shipped client change so bug reports about
   // "the web client" can be matched to a build (help/ops QoL, not a version
   // negotiation -- GMCP Core.Hello version above is the protocol number).
-  const CLIENT_BUILD = "2026-09-16-atlas-wsdrain";
+  const CLIENT_BUILD = "2026-09-19-bugdiag";
 
   const MAX_LINES = 8000;
   const MAX_COMM_LINES = 500;
@@ -167,6 +171,21 @@
   let mapZoom = { atlas: 100, zone: 100 };
   let prevHpPct = null;
   let vitalsAlertTimer = null;
+  // True after Char.Name — atlas travel stays quiet on the login splash.
+  let playInWorld = false;
+  // Paint-coalesce / walk / WS-drain state MUST live with the other lets.
+  // Function declarations hoist; these lets do not. An early zoom apply
+  // used to run while atlasPaintRaf was still in the TDZ, which threw and
+  // left the chrome up with a stuck Connecting line and an empty map.
+  let atlasPaintRaf = 0;
+  let atlasCountryLayer = null;
+  let atlasCountrySig = "";
+  let walkQueue = [];
+  let walkExpect = null;
+  let walkPending = false;
+  let wsPending = [];
+  let wsRead = 0;
+  let wsDrainTimer = 0;
 
   const ATLAS_GLYPH_BG = {
     "~": "#1a2848",
@@ -608,8 +627,7 @@
   }
 
   mapZoom = readStoredJson(ZOOM_KEY, { atlas: 100, zone: 100 });
-  applyZoom("atlas");
-  applyZoom("zone");
+  // Zoom is applied at boot after error listeners are armed — not here.
 
   const atlasZoomOut = document.getElementById("atlas-zoom-out");
   const atlasZoomIn = document.getElementById("atlas-zoom-in");
@@ -693,12 +711,24 @@
   // --- Display preferences dialog ---------------------------------------
   // Text size / theme moved out of a permanent header row (it forced a
   // whole extra line on every load) and into this on-demand popover.
-  function openDisplayPrefs() {
+  function openDisplayPrefs(opts) {
     if (!displayDialog) {
       return;
     }
     displayDialog.hidden = false;
-    if (prefFontSize) {
+    // Refresh the local report each time the panel opens (declarations are
+    // hoisted, so renderDiagnostics is available even though it is defined
+    // further down).
+    renderDiagnostics();
+    if (diagCopied) {
+      diagCopied.textContent = "";
+    }
+    // The error badge opens this panel for the Connection report; the
+    // Display button still lands on type-size (the prefs the player came
+    // here to change).
+    if (opts && opts.focus === "diag" && diagText) {
+      diagText.focus();
+    } else if (prefFontSize) {
       prefFontSize.focus();
     }
   }
@@ -712,7 +742,9 @@
   }
 
   if (displayBtn) {
-    displayBtn.addEventListener("click", openDisplayPrefs);
+    displayBtn.addEventListener("click", function () {
+      openDisplayPrefs();
+    });
   }
   if (displayClose) {
     displayClose.addEventListener("click", closeDisplayPrefs);
@@ -821,6 +853,267 @@
     if (on) {
       cmd.focus();
     }
+  }
+
+  // ---------------------------------------------------------------------
+  // Tier 0 client diagnostics -- local only.
+  //
+  // Nothing in this section transmits. It exists because a thrown exception
+  // used to kill whatever handler it fired in with no trace: gauges freeze,
+  // the map goes stale, and the player sees a half-dead HUD with nothing to
+  // report. We now (a) notice, (b) say so visibly, and (c) let the player
+  // hand us the details *deliberately* by copying them into a bug report.
+  //
+  // Privacy shape: bounded in-memory rings, wiped on reload, never written
+  // to localStorage/IndexedDB, never sent over the socket, no identifiers.
+  // See docs/plans/web_client_drop_diagnostics.md.
+  // ---------------------------------------------------------------------
+
+  const FAULT_MAX = 20;      // ring cap: a crash loop must not eat memory
+  const CLOSE_MAX = 10;
+  const clientFaults = [];   // {t, kind, msg, where}
+  const closeHistory = [];   // {t, code, label, clean, reason, upMs}
+  let socketOpenedAt = 0;
+
+  // Mirrors engine/websocket.py _CLOSE_LABELS so player and server logs
+  // speak the same words about the same drop.
+  const WS_CLOSE_LABELS = {
+    1000: "normal",
+    1001: "going-away (tab closed / navigated)",
+    1002: "protocol-error",
+    1003: "unsupported-data",
+    1005: "no-status",
+    1006: "abnormal — no close frame (proxy/network reap?)",
+    1007: "invalid-payload (bad UTF-8 frame)",
+    1008: "policy-violation",
+    1009: "frame-too-big",
+    1011: "server-error",
+    1015: "tls-failure"
+  };
+
+  function closeLabel(code) {
+    if (code === undefined || code === null) {
+      return "none";
+    }
+    return WS_CLOSE_LABELS[code] || "unknown";
+  }
+
+  function stamp() {
+    try {
+      return new Date().toISOString().slice(11, 19);
+    } catch (err) {
+      return "??:??:??";
+    }
+  }
+
+  function showErrorBadge() {
+    if (!errorBadge) {
+      return;
+    }
+    errorBadge.hidden = false;
+    const n = clientFaults.length;
+    errorBadge.textContent =
+      n === 1 ? "client problem" : "client problems (" + n + ")";
+    // Not colour-only (hard rule 7): the word carries the meaning.
+    errorBadge.setAttribute(
+      "aria-label",
+      n + " client problem" + (n === 1 ? "" : "s") + " — open display for details"
+    );
+  }
+
+  function noteClientFault(kind, msg, where) {
+    // Never capture while the password prompt is live: a stack or message
+    // thrown mid-login could otherwise carry typed secrets into the report.
+    // Same guard as persistStoryNow / echoOwnInput. Also skip while the
+    // field is still typed as password (G13 clears passwordMode first on
+    // some paths).
+    if (passwordMode || (cmd && cmd.type === "password")) {
+      return;
+    }
+    clientFaults.push({
+      t: stamp(),
+      kind: String(kind || "error"),
+      msg: String(msg || "").slice(0, 300),
+      where: String(where || "").slice(0, 200)
+    });
+    while (clientFaults.length > FAULT_MAX) {
+      clientFaults.shift();
+    }
+    showErrorBadge();
+    renderDiagnostics();
+  }
+
+  window.addEventListener("error", function (ev) {
+    // Resource errors (a failed <img>) have no .error and bubble here too;
+    // keep them apart from real exceptions so the report stays readable.
+    if (ev && ev.target && ev.target !== window && ev.target.tagName) {
+      noteClientFault(
+        "resource",
+        "failed to load " + ev.target.tagName.toLowerCase(),
+        String(ev.target.src || ev.target.href || "")
+      );
+      return;
+    }
+    const where =
+      (ev && ev.filename ? ev.filename : "") +
+      (ev && ev.lineno ? ":" + ev.lineno : "") +
+      (ev && ev.colno ? ":" + ev.colno : "");
+    noteClientFault("error", ev && ev.message ? ev.message : "script error", where);
+  }, true);
+
+  window.addEventListener("unhandledrejection", function (ev) {
+    let msg = "unhandled promise rejection";
+    try {
+      const r = ev ? ev.reason : null;
+      if (r && r.message) {
+        msg = r.message;
+      } else if (r) {
+        msg = String(r);
+      }
+    } catch (err) {
+      /* reason may throw on access */
+    }
+    noteClientFault("promise", msg, "");
+  });
+
+  function noteSocketClose(ev) {
+    const code = ev && typeof ev.code === "number" ? ev.code : null;
+    const upMs = socketOpenedAt ? Date.now() - socketOpenedAt : 0;
+    closeHistory.push({
+      t: stamp(),
+      code: code,
+      label: closeLabel(code),
+      clean: !!(ev && ev.wasClean),
+      reason: ev && ev.reason ? String(ev.reason).slice(0, 120) : "",
+      upMs: upMs
+    });
+    while (closeHistory.length > CLOSE_MAX) {
+      closeHistory.shift();
+    }
+    renderDiagnostics();
+    return { code: code, upMs: upMs };
+  }
+
+  function buildDiagnosticsText() {
+    const lines = [];
+    lines.push("Mortals and Monsters — browser client report");
+    lines.push("build " + CLIENT_BUILD);
+    lines.push("page  " + String(window.location.origin || "?"));
+    // UA is the single most useful field for "breaks on some browsers" and
+    // the player can read it before deciding to share it.
+    lines.push("agent " + String(navigator.userAgent || "?").slice(0, 200));
+    lines.push(
+      "screen " +
+        (window.innerWidth || 0) + "x" + (window.innerHeight || 0) +
+        " dpr" + (window.devicePixelRatio || 1)
+    );
+    lines.push("");
+    lines.push("Disconnects (newest last):");
+    if (!closeHistory.length) {
+      lines.push("  none this session");
+    } else {
+      for (let i = 0; i < closeHistory.length; i++) {
+        const c = closeHistory[i];
+        lines.push(
+          "  " + c.t + "  code=" + (c.code === null ? "?" : c.code) +
+          " (" + c.label + ")" +
+          " clean=" + (c.clean ? "yes" : "no") +
+          " up=" + Math.round(c.upMs / 1000) + "s" +
+          (c.reason ? " reason=" + c.reason : "")
+        );
+      }
+    }
+    lines.push("");
+    lines.push("Client problems (newest last):");
+    if (!clientFaults.length) {
+      lines.push("  none this session");
+    } else {
+      for (let i = 0; i < clientFaults.length; i++) {
+        const f = clientFaults[i];
+        lines.push(
+          "  " + f.t + "  [" + f.kind + "] " + f.msg +
+          (f.where ? "  @ " + f.where : "")
+        );
+      }
+    }
+    return lines.join("\n");
+  }
+
+  function buildDiagnosticsPayload() {
+    // Structured twin of buildDiagnosticsText -- no story transcript.
+    return {
+      build: CLIENT_BUILD,
+      page: String(window.location.origin || "").slice(0, 120),
+      agent: String(navigator.userAgent || "").slice(0, 200),
+      screen:
+        String(window.innerWidth || 0) +
+        "x" +
+        String(window.innerHeight || 0) +
+        " dpr" +
+        String(window.devicePixelRatio || 1),
+      closes: closeHistory.slice(),
+      faults: clientFaults.slice()
+    };
+  }
+
+  function maybeSendBugDiag(line) {
+    // Player-initiated: only when they type bug, and never mid-password.
+    if (passwordMode || (cmd && cmd.type === "password")) {
+      return;
+    }
+    const first = String(line || "").trim().split(/\s+/)[0].toLowerCase();
+    if (first !== "bug") {
+      return;
+    }
+    sendGmcp("RiftForge.Client", { diag: buildDiagnosticsPayload() });
+  }
+
+  function renderDiagnostics() {
+    if (!diagText) {
+      return;
+    }
+    diagText.textContent = buildDiagnosticsText();
+  }
+
+  if (diagCopy) {
+    diagCopy.addEventListener("click", function () {
+      const text = buildDiagnosticsText();
+      if (!passwordMode && !(cmd && cmd.type === "password")) {
+        sendGmcp("RiftForge.Client", { diag: buildDiagnosticsPayload() });
+      }
+      function done(ok) {
+        if (diagCopied) {
+          diagCopied.textContent = ok
+            ? "Copied — it also rides the next bug you file from this tab."
+            : "Copy failed — select the text above instead.";
+        }
+      }
+      // navigator.clipboard is absent on http:// origins and older browsers;
+      // fall back to selecting the text so the player can copy by hand.
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(
+          function () { done(true); },
+          function () { done(false); }
+        );
+        return;
+      }
+      try {
+        const range = document.createRange();
+        range.selectNodeContents(diagText);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        done(false);
+      } catch (err) {
+        done(false);
+      }
+    });
+  }
+
+  if (errorBadge) {
+    errorBadge.addEventListener("click", function () {
+      openDisplayPrefs({ focus: "diag" });
+    });
   }
 
   function xterm256ToCss(n) {
@@ -1288,6 +1581,7 @@
   function sendCmd(line) {
     // Typing or tapping compass cancels an in-progress map walk.
     cancelWalk();
+    maybeSendBugDiag(line);
     sendEnvelope({ op: "cmd", data: line });
   }
 
@@ -1366,6 +1660,48 @@
     return true;
   }
 
+  function upsertWallet(id, label, text) {
+    // Cash / Bank are spoken amounts, not 0-100 meters. Same label row
+    // as the other gauges so screen readers get a name plus a value.
+    if (text == null || text === "" || !gaugesEl) {
+      return false;
+    }
+    let el = document.getElementById("g-" + id);
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "gauge-label";
+      el.id = "g-" + id;
+      el.setAttribute("role", "status");
+      const span = document.createElement("span");
+      const strong = document.createElement("strong");
+      el.appendChild(span);
+      el.appendChild(strong);
+      gaugesEl.appendChild(el);
+    }
+    const span = el.querySelector("span");
+    const strong = el.querySelector("strong");
+    if (span) {
+      span.textContent = label;
+    }
+    if (strong) {
+      strong.textContent = String(text);
+    }
+    el.setAttribute("aria-label", label + " " + text);
+    return true;
+  }
+
+  function applyCharName(payload) {
+    if (!payload || typeof payload !== "object") {
+      return;
+    }
+    const name = String(payload.name || "").trim();
+    if (!name) {
+      return;
+    }
+    playInWorld = true;
+    document.title = name + " — Mortals and Monsters";
+  }
+
   function applyVitals(v) {
     if (!v || typeof v !== "object" || !gaugesEl) {
       return;
@@ -1420,24 +1756,11 @@
         painted.push("mo");
       }
     }
-    if (v.cash) {
-      let cashEl = document.getElementById("g-cash");
-      if (!cashEl) {
-        cashEl = document.createElement("div");
-        cashEl.className = "gauge-label";
-        cashEl.id = "g-cash";
-        const span = document.createElement("span");
-        span.textContent = "Cash";
-        const strong = document.createElement("strong");
-        cashEl.appendChild(span);
-        cashEl.appendChild(strong);
-        gaugesEl.appendChild(cashEl);
-      }
-      const strong = cashEl.querySelector("strong");
-      if (strong) {
-        strong.textContent = String(v.cash);
-      }
+    if (upsertWallet("cash", "Cash", v.cash)) {
       painted.push("cash");
+    }
+    if (upsertWallet("bank", "Bank", v.bank)) {
+      painted.push("bank");
     }
     if (!painted.length) {
       return;
@@ -1732,10 +2055,9 @@
   }
 
   // Map + Atlas + Here often arrive in the same tick (copyover / Supports).
-  // Coalesce O(W×H) fillRect paints to one frame.
-  let atlasPaintRaf = 0;
-  let atlasCountryLayer = null;
-  let atlasCountrySig = "";
+  // Coalesce O(W×H) fillRect paints to one frame. atlasPaintRaf and the
+  // country-layer cache are declared with the other lets at the top of
+  // this IIFE so init-time applyZoom cannot hit a TDZ.
   function drawAtlas() {
     if (atlasPaintRaf) {
       return;
@@ -1888,9 +2210,6 @@
     ["west", -1, 0, "w"],
   ];
   const WALK_PATH_CAP = 48;
-  let walkQueue = [];
-  let walkExpect = null;
-  let walkPending = false;
 
   function walkRoomKey(x, y) {
     return String(x) + "," + String(y);
@@ -2359,6 +2678,10 @@
       applyComm(payload);
     } else if (name === "Char.Status") {
       applyStatus(payload);
+    } else if (name === "Char.Name") {
+      applyCharName(payload);
+    } else if (name === "RiftForge.Combat") {
+      // Advertised in Core.Supports; no combat pane yet (parked follow-on).
     }
   }
 
@@ -2408,9 +2731,7 @@
   // Post-hitch WS bursts used to apply every GMCP/text frame synchronously
   // on the message event (Pass 25 G38). Keep order, keep every line --
   // just spend at most ~8ms per animation frame so the tab stays live.
-  let wsPending = [];
-  let wsRead = 0;
-  let wsDrainTimer = 0;
+  // wsPending / wsRead / wsDrainTimer live with the other lets at the top.
 
   function scheduleWsDrain() {
     if (wsDrainTimer) {
@@ -2485,6 +2806,7 @@
       setStatus("Connected", "connected");
       setInputEnabled(true);
       reconnectDelay = 1000;
+      socketOpenedAt = Date.now();
       handshakeHud();
     });
     opened.addEventListener("message", function (ev) {
@@ -2496,11 +2818,27 @@
       }
       queueWsFrame(ev.data);
     });
-    opened.addEventListener("close", function () {
+    opened.addEventListener("close", function (ev) {
       if (socket !== opened) {
         return;
       }
-      setStatus("Disconnected. Reconnecting…", "error");
+      // Record the RFC 6455 code before anything else: this is the number
+      // that says whether the player closed the tab, the server hung up, or
+      // something in between reaped a quiet socket. Local only.
+      const info = noteSocketClose(ev);
+      // G13: a drop mid-login used to leave the bar masked as a password
+      // field on the way back to the Name prompt. Clear the typed secret
+      // *before* flipping to text so a leftover password never flashes
+      // (same invariant as the prompt-exit path).
+      cmd.value = "";
+      passwordMode = false;
+      passwordSent = false;
+      cmd.type = "text";
+      cancelWalk();
+      playInWorld = false;
+      document.title = "Mortals and Monsters — play in browser";
+      const codeText = info.code === null ? "" : " (code " + info.code + ")";
+      setStatus("Disconnected" + codeText + ". Reconnecting…", "error");
       setInputEnabled(false);
       socket = null;
       if (!userClosed) {
@@ -2635,6 +2973,13 @@
 
   atlasCanvas.addEventListener("contextmenu", function (ev) {
     ev.preventDefault();
+    if (!playInWorld) {
+      hideMenu();
+      if (atlasCaption) {
+        atlasCaption.textContent = "Log in before you travel from the map.";
+      }
+      return;
+    }
     const cell = cellAtEvent(ev);
     if (!cell) {
       hideMenu();
@@ -2688,6 +3033,13 @@
   }
 
   function openAtlasTravel(clientX, clientY, cell) {
+    if (!playInWorld) {
+      hideMenu();
+      if (atlasCaption) {
+        atlasCaption.textContent = "Log in before you travel from the map.";
+      }
+      return false;
+    }
     if (!cell) {
       hideMenu();
       return false;
@@ -3271,6 +3623,8 @@
     gagCheckbox.checked = storedGag === true;
   }
 
+  applyZoom("atlas");
+  applyZoom("zone");
   restoreStoryLog().then(function () {
     connect();
   });

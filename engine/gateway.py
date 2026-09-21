@@ -217,6 +217,90 @@ class ClientSlot:
         # Last client Core.Supports map (survives game-only reload).
         self.gmcp_supports: dict[str, int] = {}
         self._ws_handshake_done = protocol != "websocket"
+        # --- browser drop diagnostics (web_client_drop_diagnostics.md) ---
+        # Connection-shape counters only: no player text, no per-player
+        # identity beyond the session id we already log on open. These answer
+        # "did the socket die idle?" (proxy reap) and "did we overrun a
+        # frame?" (outbound truncation) without asking the browser anything.
+        self.opened_at = time.monotonic()
+        self.last_out_at = self.opened_at  # last byte we pushed at the client
+        self.ws_frames_out = 0
+        self.ws_bytes_out = 0
+        self.ws_frames_oversize = 0  # frames that hit MAX_FRAME_PAYLOAD
+        # Server-initiated hangup verdict (kick / gateway stop). Stamp this
+        # *before* closing the writer: the read loop often sees only EOF
+        # after that, and without a stamp that EOF is logged as a proxy
+        # idle-reap — the lie this instrument exists to avoid.
+        self.ws_drop = None
+
+
+def _ws_write_frame(slot: ClientSlot, frame: str) -> None:
+    """Encode + write one browser frame, stamping drop-diagnostic counters.
+
+    Single choke point for browser-bound frames so ``last_out_at`` is honest:
+    the gateway's idle clock is what tells a proxy reap (silent socket, then
+    1006) apart from a player closing the tab (1001 while chatty).
+
+    Also counts frames that hit ``MAX_FRAME_PAYLOAD``. ``encode_text_frame``
+    truncates at that cap, which can split a multi-byte UTF-8 character and
+    make the browser fail the connection outright -- so an oversize frame is
+    a *suspected cause* of the very drop we are trying to attribute, and it
+    gets its own loud log line rather than dying silently.
+    """
+    from engine import websocket as ws_mod
+
+    # Encode once: the byte length is both the counter and the frame body.
+    payload = frame.encode("utf-8")
+    payload_len = len(payload)
+    if payload_len > ws_mod.MAX_FRAME_PAYLOAD:
+        slot.ws_frames_oversize += 1
+        print(
+            f"[gateway] ws OVERSIZE frame sid={slot.session_id[:8]}… "
+            f"{payload_len}B > {ws_mod.MAX_FRAME_PAYLOAD}B cap — truncating "
+            f"(browser may drop with 1002/1007)",
+            flush=True,
+        )
+    slot.writer.write(ws_mod.encode_text_frame_from_bytes(payload))
+    slot.ws_frames_out += 1
+    slot.ws_bytes_out += payload_len
+    slot.last_out_at = time.monotonic()
+
+
+def _stamp_ws_drop(slot: ClientSlot, ws_close) -> None:
+    """Record why we are about to hang up, if nothing has already.
+
+    First stamp wins so a kick is not overwritten by the EOF that follows.
+    """
+    if getattr(slot, "ws_drop", None) is None:
+        slot.ws_drop = ws_close
+
+
+def _resolve_ws_close(slot: ClientSlot, ws_close, *, running: bool, transport_exc=None):
+    """Pick one close verdict after the websocket read loop ends.
+
+    Order: a server stamp (kick / shutdown) beats a later client echo of
+    our own close frame; then a parsed client/protocol close; then a
+    leftover stamp; then gateway-stopping; then a transport exception;
+    otherwise None (logged as EOF / 1006).
+    """
+    from engine import websocket as ws_mod
+
+    stamped = getattr(slot, "ws_drop", None)
+    if stamped is not None and getattr(stamped, "source", None) == "server":
+        return stamped
+    if ws_close is not None:
+        return ws_close
+    if stamped is not None:
+        return stamped
+    if not running:
+        return ws_mod.WsClose(
+            ws_mod.CLOSE_GOING_AWAY, "gateway stopping", "server"
+        )
+    if transport_exc is not None:
+        return ws_mod.WsClose(
+            ws_mod.CLOSE_ABNORMAL, type(transport_exc).__name__, "transport"
+        )
+    return None
 
 
 def _note_client_gmcp_supports(slot: ClientSlot, package: str, payload) -> None:
@@ -343,7 +427,6 @@ class Gateway:
         """
         from engine import gmcp as gmcp_mod
         from engine import telnet
-        from engine import websocket as ws_mod
         from engine import ws_json
 
         slot.ws_out_buf += data or b""
@@ -376,7 +459,7 @@ class Gateway:
             if decoded:
                 frames.append(ws_json.encode_text(decoded))
         for frame in frames:
-            slot.writer.write(ws_mod.encode_text_frame(frame))
+            _ws_write_frame(slot, frame)
 
     def _discord_bridge(self):
         """Import + reload ``discord_bridge`` so GM mutes apply in-process.
@@ -667,6 +750,34 @@ class Gateway:
         if notify_game:
             await self.send_to_game(encode_ctrl({"op": "close", "sid": session_id}))
 
+    async def _ws_server_close(self, slot: ClientSlot, code, reason: str) -> None:
+        """Stamp a server hangup and try to send a close frame first.
+
+        The stamp is what the drop log reads. The frame is so the *browser*
+        also sees a real code instead of 1006 after we yank TCP.
+        """
+        from engine import websocket as ws_mod
+
+        _stamp_ws_drop(slot, ws_mod.WsClose(code, reason, "server"))
+        if slot.protocol != "websocket":
+            return
+        try:
+            slot.writer.write(ws_mod.encode_close(code, reason))
+            await slot.writer.drain()
+        except Exception:
+            pass
+
+    async def _note_browser_shutdown(self) -> None:
+        """Mark every browser slot as gateway-stopping before we cancel tasks."""
+        from engine import websocket as ws_mod
+
+        for slot in list(self.clients.values()):
+            if slot.protocol != "websocket":
+                continue
+            await self._ws_server_close(
+                slot, ws_mod.CLOSE_GOING_AWAY, "gateway stopping"
+            )
+
     def _should_intercept_commands(self) -> bool:
         """True when the gateway should handle OOC / GM restart locally."""
         if self._game_writer is None:
@@ -696,12 +807,11 @@ class Gateway:
         slot = self.clients.get(session_id)
         if slot is None or not slot.alive or slot.protocol != "websocket":
             return
-        from engine import websocket as ws_mod
         from engine import ws_json
 
         try:
             frame = ws_json.encode_gmcp(package, payload)
-            slot.writer.write(ws_mod.encode_text_frame(frame))
+            _ws_write_frame(slot, frame)
             await slot.writer.drain()
         except (ConnectionError, OSError):
             await self._drop_client(session_id, notify_game=True)
@@ -1387,6 +1497,10 @@ class Gateway:
             open_msg["peer"] = peer
         await self.send_to_game(encode_ctrl(open_msg))
         await self._notify_client_game_down(session_id)
+        # Filled in by whichever path ends the read loop; None after
+        # resolve still means the socket vanished with no close frame
+        # (EOF) -- the proxy/NAT reap signature.
+        ws_close = None
         try:
             from engine import websocket as ws_mod
 
@@ -1395,13 +1509,24 @@ class Gateway:
                 if not chunk:
                     break
                 slot.ws_recv_buf += chunk
-                messages, remainder, close_req = ws_mod.decode_client_messages(
-                    slot.ws_recv_buf
+                messages, remainder, close_info = (
+                    ws_mod.decode_client_messages_ex(slot.ws_recv_buf)
                 )
                 slot.ws_recv_buf = remainder
-                if close_req:
+                if close_info is not None:
+                    ws_close = close_info
                     try:
-                        writer.write(ws_mod.encode_close())
+                        # Echo a code back so the browser can log why we hung
+                        # up. A protocol refusal replies with our own verdict;
+                        # a polite client close gets a plain 1000.
+                        if close_info.source == "protocol":
+                            writer.write(
+                                ws_mod.encode_close(
+                                    close_info.code, close_info.reason
+                                )
+                            )
+                        else:
+                            writer.write(ws_mod.encode_close(ws_mod.CLOSE_NORMAL))
                         await writer.drain()
                     except Exception:
                         pass
@@ -1409,15 +1534,95 @@ class Gateway:
                 for payload in messages:
                     text = payload.decode("utf-8", errors="replace")
                     await self._process_ws_message(slot, text)
-        except (ConnectionError, OSError, asyncio.CancelledError):
-            pass
+            ws_close = _resolve_ws_close(
+                slot, ws_close, running=self._running
+            )
+        except (ConnectionError, OSError, asyncio.CancelledError) as exc:
+            ws_close = _resolve_ws_close(
+                slot, ws_close, running=self._running, transport_exc=exc
+            )
         finally:
             await self._drop_client(session_id, notify_game=True)
-            print(
-                f"[gateway] websocket closed sid={session_id[:8]}… "
-                f"({len(self.clients)} held)",
-                flush=True,
+            self._log_ws_drop(slot, ws_close)
+
+    def _log_ws_drop(self, slot: ClientSlot, ws_close) -> None:
+        """One attributable line per browser disconnect.
+
+        Deliberately connection-shape only -- no transcript, no command text,
+        no new identifier. The session id prefix is already printed on open,
+        so this adds no linkage that the open line did not.
+
+        Must not raise: this runs in ``finally`` after the socket is already
+        gone, and a log failure must not mask CancelledError / ConnectionError.
+
+        Why each field earns its place:
+
+        - ``code``/``label`` -- 1001 (tab closed) vs 1006/EOF (something in
+          the middle reaped us) vs 1002/1007 (we sent a frame the browser
+          refused). This is the whole point of the change.
+        - ``up`` -- session lifetime. A cluster at a round number (60s, 300s)
+          is a proxy read timeout, not player behaviour.
+        - ``idle`` -- seconds since the last byte *we* sent. A drop with a
+          high idle is the keepalive gap; a drop with idle ~0 is not.
+        - ``frames``/``bytes``/``oversize`` -- whether we overran the 64 KiB
+          frame cap just before losing them.
+        """
+        try:
+            self._log_ws_drop_inner(slot, ws_close)
+        except Exception as exc:
+            try:
+                sid = getattr(slot, "session_id", "") or "?"
+                prefix = sid[:8] if isinstance(sid, str) else "?"
+                print(
+                    f"[gateway] websocket closed sid={prefix}… "
+                    f"(drop-log failed: {type(exc).__name__})",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+    def _log_ws_drop_inner(self, slot: ClientSlot, ws_close) -> None:
+        """Format the drop line. Callers use :meth:`_log_ws_drop` (raise-safe)."""
+        from engine import websocket as ws_mod
+
+        now = time.monotonic()
+        up = now - getattr(slot, "opened_at", now)
+        idle = now - getattr(slot, "last_out_at", now)
+        if ws_close is None:
+            ws_close = getattr(slot, "ws_drop", None)
+        if ws_close is None:
+            # EOF with no close frame: the socket vanished mid-stream. This is
+            # what an nginx/NAT idle reap looks like from in here.
+            code, label, source, reason = (
+                ws_mod.CLOSE_ABNORMAL,
+                ws_mod.close_code_label(ws_mod.CLOSE_ABNORMAL),
+                "eof",
+                "no close frame",
             )
+        else:
+            code, label = ws_close.code, ws_close.label
+            source, reason = ws_close.source, ws_close.reason
+        oversize = getattr(slot, "ws_frames_oversize", 0)
+        detail = f" reason={reason!r}" if reason else ""
+        suspect = ""
+        if oversize:
+            suspect = " SUSPECT=oversize-frame"
+        elif source == "eof" and idle >= 30.0:
+            # Silent socket then a vanish -- the signature we are hunting.
+            # Kick / shutdown stamp source=server and must never land here.
+            suspect = " SUSPECT=idle-reap"
+        sid = getattr(slot, "session_id", "") or "?"
+        sid8 = sid[:8] if isinstance(sid, str) else "?"
+        print(
+            f"[gateway] websocket closed sid={sid8}… "
+            f"code={code} ({label}) src={source}{detail} "
+            f"up={up:.1f}s idle={idle:.1f}s "
+            f"frames={getattr(slot, 'ws_frames_out', 0)} "
+            f"bytes={getattr(slot, 'ws_bytes_out', 0)} "
+            f"oversize={oversize} "
+            f"({len(self.clients)} held){suspect}",
+            flush=True,
+        )
 
     async def handle_game_ipc(self, reader, writer) -> None:
         """One game process connected to the IPC port.
@@ -1509,8 +1714,18 @@ class Gateway:
                             s.staff_gm = False
                     elif op == "kick":
                         # Intentional quit / takeover — drop the real TCP.
+                        # Stamp source=server and send a close frame first so
+                        # this is not logged (or seen in the browser) as the
+                        # 1006/eof idle-reap signature.
                         sid = (payload or {}).get("sid", "")
                         if sid:
+                            s = self.clients.get(sid)
+                            if s is not None:
+                                from engine import websocket as ws_mod
+
+                                await self._ws_server_close(
+                                    s, ws_mod.CLOSE_NORMAL, "kick"
+                                )
                             await self._drop_client(sid, notify_game=False)
                     elif op == "planned_restart":
                         # SIGUSR1 / auto-deploy game-only reload -- the Veil
@@ -1708,6 +1923,7 @@ def main() -> None:
             # Brief read window before sockets close on process exit.
             await asyncio.sleep(2.0)
             print("[gateway] shutting down…", flush=True)
+            await gw._note_browser_shutdown()
             gw._running = False
             for task in asyncio.all_tasks(loop):
                 if task is not asyncio.current_task():

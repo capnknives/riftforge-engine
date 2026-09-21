@@ -637,7 +637,12 @@ class Game:
         try:
             from engine import accounts as accounts_mod
             from engine.world_backup import prune_pre_deploy_snapshots
-            from supers import boot_migrations as boot_mig_mod
+            # Lean / public engine boots must not import supers. The
+            # run_once ledger lives in the game package; engine heals
+            # below still run when that import is skipped.
+            boot_mig_mod = None
+            if _HAS_SUPERS:
+                from supers import boot_migrations as boot_mig_mod
 
             def _accounts_heal(name, fn):
                 """Time one load_accounts heal and poke the watcher heartbeat.
@@ -667,14 +672,15 @@ class Game:
             # copyover boot plan 4b). A future wipe of one of those specific
             # accounts is rare enough to repair via a manual
             # ``boot_migrations`` ledger reset, not an every-boot scan.
-            _accounts_heal(
-                "heal_restored_player_accounts",
-                lambda: boot_mig_mod.run_once(
-                    self,
-                    boot_mig_mod.HEAL_RESTORED_PLAYER_ACCOUNTS_V1,
-                    accounts_mod.heal_restored_player_accounts,
-                ),
-            )
+            if boot_mig_mod is not None:
+                _accounts_heal(
+                    "heal_restored_player_accounts",
+                    lambda: boot_mig_mod.run_once(
+                        self,
+                        boot_mig_mod.HEAL_RESTORED_PLAYER_ACCOUNTS_V1,
+                        accounts_mod.heal_restored_player_accounts,
+                    ),
+                )
             _accounts_heal(
                 "heal_drifted_staff_ranks",
                 lambda: accounts_mod.heal_drifted_staff_ranks(self),
@@ -698,28 +704,30 @@ class Game:
             # heal_drifted_staff_ranks still calls migrate_legacy_gm_ranks
             # directly (ungated) whenever it heals real drift, so future
             # rank drift is still caught without this every-boot pass.
-            _accounts_heal(
-                "migrate_legacy_gm_ranks",
-                lambda: boot_mig_mod.run_once(
-                    self,
-                    boot_mig_mod.MIGRATE_LEGACY_GM_RANKS_V1,
-                    accounts_mod.migrate_legacy_gm_ranks,
-                ),
-            )
+            if boot_mig_mod is not None:
+                _accounts_heal(
+                    "migrate_legacy_gm_ranks",
+                    lambda: boot_mig_mod.run_once(
+                        self,
+                        boot_mig_mod.MIGRATE_LEGACY_GM_RANKS_V1,
+                        accounts_mod.migrate_legacy_gm_ranks,
+                    ),
+                )
             _accounts_heal(
                 "heal_empty_account_passwords",
                 lambda: accounts_mod.heal_empty_account_passwords(self),
             )
             # One-time created_at backfill for accounts minted before the
             # field shipped -- run_once (fast copyover boot plan 4b).
-            _accounts_heal(
-                "heal_account_created_at_stamps",
-                lambda: boot_mig_mod.run_once(
-                    self,
-                    boot_mig_mod.HEAL_ACCOUNT_CREATED_AT_STAMPS_V1,
-                    accounts_mod.heal_account_created_at_stamps,
-                ),
-            )
+            if boot_mig_mod is not None:
+                _accounts_heal(
+                    "heal_account_created_at_stamps",
+                    lambda: boot_mig_mod.run_once(
+                        self,
+                        boot_mig_mod.HEAL_ACCOUNT_CREATED_AT_STAMPS_V1,
+                        accounts_mod.heal_account_created_at_stamps,
+                    ),
+                )
             # Cap leftovers from deploys that skipped prune (24 x 330MB
             # on live the morning of the outage). Read-only restore still
             # never opens the live DB from a second process.
@@ -1084,47 +1092,11 @@ class Game:
             except Exception:
                 print("[server] copyover login checkpoints failed:", flush=True)
                 traceback.print_exc()
-            ep.save_game_time(self.db, self.game_time_ticks)
-            ep.save_calendar_epoch_day(
-                self.db, getattr(self, "calendar_epoch_day", 0)
-            )
-            ep.save_game_clock_tuning(self.db, self)
-            # Account changelog cursors only lived in memory when incremental
-            # autosave skipped the accounts slice (bug report 744).
-            ep.save_accounts(self.db, self, force_full=True)
-            hooks_mod.save_game_meta(self, self.db)
-            if _HAS_SUPERS:
-                try:
-                    from supers import homestead as homestead_mod
-                    from supers import gathering as gathering_mod
-                    homestead_mod.save_homesteads(self.db, self, force=True)
-                    gathering_mod.save_gather_nodes(self.db, self)
-                    from supers import player_shops as player_shops_mod
-                    player_shops_mod.save_player_shops(
-                        self.db, self, force=True
-                    )
-                    from supers import township as township_mod
-                    township_mod.save_townships(self.db, self)
-                    from supers import personal_realm as personal_realm_mod
-                    personal_realm_mod.save_personal_realms(self.db, self)
-                    self._personal_realms_dirty = False
-                    from supers.demesne.persist import save_demesnes
-                    save_demesnes(self.db, self)
-                    from supers import dream_pocket as dream_pocket_mod
-                    dream_pocket_mod.save_dream_pockets(self.db, self)
-                except Exception:
-                    print("[server] homestead/gather save failed:", flush=True)
-                    traceback.print_exc()
-                try:
-                    from supers import vehicles as vehicles_mod
+            # Last-delta aux: meta/sites/parking must force-write. save_world
+            # already cleared _persist_force_full, so implicit full is gone.
+            from engine import copyover_persist as copyover_persist_mod
 
-                    vehicles_mod.flush_vehicle_parking_from_aboard_macros(self)
-                except Exception:
-                    print(
-                        "[server] copyover vehicle parking flush failed:",
-                        flush=True,
-                    )
-                    traceback.print_exc()
+            copyover_persist_mod.flush_copyover_aux(self, force=True)
             return
 
         persistence.save_world(self.db, self)
@@ -1615,6 +1587,17 @@ class Game:
                     writer_handoff=writer_handoff,
                 )
                 self._save_collecting = False
+                # Any discarded snapshot (wall budget, empty/short
+                # force_full refuse) must not fall through to inline
+                # homestead/meta. Live 2026-09-18 gist 77009b2e: empty
+                # force_full skipped without wall_budget, then
+                # homesteads_ms ~2s + save_meta_deferred pending-retried
+                # every ~3s and pegged the core.
+                if persistence.park_save_async_after_world_skip(
+                    self, meta_stats,
+                ):
+                    self._note_save_success()
+                    return
                 if writer_handoff and writer_handoff.get("world"):
                     # P30: meta SQL runs on the writer thread with the
                     # pre-collected world packet -- not on the asyncio loop
@@ -1717,12 +1700,14 @@ class Game:
                         from supers.demesne.persist import save_demesnes
                         from supers import dream_pocket as dream_pocket_mod
 
-                        await _meta_slice(
-                            "homesteads",
-                            lambda: homestead_mod.save_homesteads(
-                                self.db, self,
+                        await homestead_mod.save_homesteads_async(
+                            self.db, self,
+                            force=_save_meta_force_full(reason),
+                            wall_start=save_wall_start,
+                            wall_budget_ms=save_wall_budget_ms,
+                            respect_wall_budget=_save_meta_respect_wall_budget(
+                                reason,
                             ),
-                            required=False,
                         )
                         await _meta_slice(
                             "gather",

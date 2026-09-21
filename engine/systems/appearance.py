@@ -266,6 +266,60 @@ def with_article(rest, *, capitalize=False):
     return f"{article} {cleaned}"
 
 
+def capitalize_sentence_lead(text):
+    """Capitalize a leading ``a`` / ``an`` / ``the`` when *text* opens a sentence.
+
+    Pit chimera and catalog creature faces often store a lowercase article
+    (``a pit warden``, ``an appealed crawler``). KO and body-drop templates
+    that start with ``{name}`` must read ``A pit warden…``, not ``a pit…``.
+    Proper names and lines that already start with a capital letter are
+    unchanged.
+    """
+    cleaned = " ".join(str(text or "").split())
+    if not cleaned:
+        return cleaned
+    low = cleaned.lower()
+    for prefix in ("a ", "an ", "the "):
+        if low.startswith(prefix):
+            return cleaned[0].upper() + cleaned[1:]
+    return cleaned
+
+
+def possessive_phrase(label):
+    """Append a possessive apostrophe to a display name (``Leftovers'`` not ``Leftovers's``).
+
+    Names that already end in ``s`` take a trailing apostrophe only; others
+    get ``'s``. Already-terminated forms (``…'``) are left alone.
+    """
+    cleaned = " ".join(str(label or "").split())
+    if not cleaned:
+        return "its"
+    if cleaned.endswith("'"):
+        return cleaned
+    if cleaned.lower().endswith("s"):
+        return f"{cleaned}'"
+    return f"{cleaned}'s"
+
+
+def combat_weapon_label(name, *, true_artifact=False):
+    """Spoken weapon name for combat templates (``with {weapon}`` / kit clauses).
+
+    True artifacts and owner-named blades (``Gabriel's archangel blade``)
+    skip the indefinite article so prose never reads ``a gabriel's …``.
+    Ordinary catalog weapons still get ``with_article``.
+    """
+    cleaned = " ".join(str(name or "").split())
+    if not cleaned:
+        return ""
+    if true_artifact:
+        return cleaned
+    if "'" in cleaned:
+        if cleaned[0].islower():
+            return cleaned[0].upper() + cleaned[1:]
+        return cleaned
+    return with_article(cleaned)
+
+
 def _skin_short_bit(skin, kit=None):
     """Skin (or elemental matter) fragment for anonymous short-descs."""
     if not skin:

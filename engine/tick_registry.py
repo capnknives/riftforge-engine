@@ -144,9 +144,28 @@ def _persist_save_busy(game):
         return False
 
 
+def _sessions_online(game):
+    """True when at least one live session is attached (telnet / viewport)."""
+    return len(getattr(game, "sessions", None) or ()) > 0
+
+
+def _keep_cadence_while_online(game, name):
+    """Never drop Cadence as ambient while someone is logged in.
+
+    Bug report 1810 / gist 927846e9: save_busy and auto-disable both put
+    ``cadence`` in ``skipped_ambient`` (or ``cadence:disabled``) with 3
+    sessions online. Town looked frozen, then catch-up storms. Combat and
+    montages already stay on the loop during collect; Cadence must too.
+    Slice with ``await sleep(0)`` rather than skipping the handler.
+    """
+    return name == "cadence" and _sessions_online(game)
+
+
 def _tick_save_busy_skip(game, name):
     """Defer non-critical handlers while persistence is busy."""
     if not _persist_save_busy(game):
+        return False
+    if _keep_cadence_while_online(game, name):
         return False
     return name not in _TICK_SAVE_BUSY_ALLOW
 
@@ -160,6 +179,31 @@ def _effective_tick_soft_budget(game):
     if budget <= 0:
         return cap
     return min(budget, cap)
+
+
+def _cadence_hitch_save_fields(game):
+    """Name this-tick save overlap on every hitch row (lag U3 / 16s hole).
+
+    Cadence wall of 24.7s with cpu ~268ms was wait, not AI. Stamp
+    ``save_busy`` / ``autosave_running`` / ``lifestyle_save_busy_ms`` even
+    when diaglog writers are off so a later gist can join the hole.
+    """
+    last_cad = getattr(game, "_cadence_last_pass", None) or {}
+    phases = last_cad.get("phases") or {}
+    busy_ms = last_cad.get("lifestyle_save_busy_ms")
+    if busy_ms is None:
+        busy_ms = phases.get("lifestyle_save_busy_ms", 0.0)
+    save_busy = last_cad.get("save_busy")
+    if save_busy is None:
+        save_busy = _persist_save_busy(game)
+    autosave_running = last_cad.get("autosave_running")
+    if autosave_running is None:
+        autosave_running = bool(getattr(game, "_autosave_running", False))
+    return {
+        "save_busy": bool(save_busy),
+        "autosave_running": bool(autosave_running),
+        "lifestyle_save_busy_ms": round(float(busy_ms or 0.0), 2),
+    }
 
 
 def _handler_timing_extras(ranked, total_ms):
@@ -232,6 +276,14 @@ def _tick_handlers_disabled(game):
 
 
 def is_tick_handler_disabled(game, name):
+    """True when this handler was auto-disabled for repeated failures.
+
+    Cadence stays enabled while anyone is logged in -- a dict-size
+    RuntimeError must not freeze the town (live 2026-09-19 skipped
+    ``cadence:disabled`` with 3 sessions).
+    """
+    if _keep_cadence_while_online(game, name):
+        return False
     return name in _tick_handlers_disabled(game)
 
 
@@ -264,6 +316,10 @@ def _maybe_disable_tick_handler(game, name):
         return
     disabled = _tick_handlers_disabled(game)
     if name in disabled:
+        return
+    # Do not auto-disable Cadence while players are in the world -- the
+    # next heartbeat still needs lifestyle, even if this one raised.
+    if _keep_cadence_while_online(game, name):
         return
     disabled.add(name)
     metrics_mod.bump(game, f"tick_disabled:{name}")
@@ -399,7 +455,12 @@ def _handler_due(name, every_n, heartbeat_n):
 
 
 def _cadence_pressure_skip_ambient(game, name, h_ms, spent, budget):
-    """After a heavy Cadence slice, drop remaining skippable ambient work."""
+    """After a heavy Cadence slice, drop *later* skippable ambient work.
+
+    Cadence itself is not skippable. This saturates the soft budget so
+    ``limbo_ambience``, ``mine_ambience``, ``citizen_nest_spawn``, and
+    tips can yield the rest of the heartbeat -- not so Cadence is dropped.
+    """
     if name != "cadence" or budget <= 0:
         return spent
     spent = max(spent, h_ms)
@@ -529,10 +590,12 @@ def _finalize_tick_run(
             **timing_extras,
         }
         payload["persist_save_busy"] = _persist_save_busy(game)
+        payload.update(_cadence_hitch_save_fields(game))
         if skipped:
             payload["skipped_ambient"] = list(skipped)[:20]
         payload["autosave_running"] = bool(
-            getattr(game, "_autosave_running", False)
+            payload.get("autosave_running")
+            or getattr(game, "_autosave_running", False)
         )
         last_as = getattr(game, "_last_autosave_stats", None) or {}
         if last_as.get("save_ms") is not None:
@@ -575,6 +638,7 @@ def _finalize_tick_run(
         }
         if skipped:
             payload["skipped_ambient"] = list(skipped)[:20]
+        payload.update(_cadence_hitch_save_fields(game))
         diag_export.append_event(
             "A_D",
             "tick_registry.py:run_ticks",
@@ -626,12 +690,18 @@ def _run_ticks_sync_body(
             continue
         if (
             skippable
+            and not _keep_cadence_while_online(game, name)
             and budget > 0
             and spent >= budget
         ):
             skipped.append(name)
             continue
-        if skippable and save_busy and budget <= 0:
+        if (
+            skippable
+            and not _keep_cadence_while_online(game, name)
+            and save_busy
+            and budget <= 0
+        ):
             skipped.append(name)
             continue
         h0 = time.perf_counter()
@@ -723,12 +793,18 @@ async def _run_ticks_async_body(
             continue
         if (
             skippable
+            and not _keep_cadence_while_online(game, name)
             and budget > 0
             and spent >= budget
         ):
             skipped.append(name)
             continue
-        if skippable and save_busy and budget <= 0:
+        if (
+            skippable
+            and not _keep_cadence_while_online(game, name)
+            and save_busy
+            and budget <= 0
+        ):
             skipped.append(name)
             continue
         h0 = time.perf_counter()

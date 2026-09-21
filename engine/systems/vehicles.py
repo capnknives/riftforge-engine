@@ -316,6 +316,31 @@ def canonical_park_key(game, key):
     return key
 
 
+def resolve_vehicle_park_room(game, park_key):
+    """Resolve a vehicle `parked_room` string to a live Room, or None.
+
+    Homestead yard mouths and other America micro cells are virtual rooms in
+    `overland_rooms` -- `lookup_room` alone misses them, which made
+    `leave` fall back to a default charter strip (bug reports 1297, 1760).
+    """
+    if not park_key or game is None:
+        return None
+    from engine.room_vnum import lookup_room
+
+    canon = canonical_park_key(game, park_key)
+    for candidate in (canon, park_key):
+        if not candidate:
+            continue
+        room = lookup_room(game, candidate)
+        if room is not None:
+            return room
+    from engine.systems import overland as overland_mod
+
+    return overland_mod.resolve_virtual_overland_room_key(
+        game, canon or park_key,
+    )
+
+
 def park_keys_match(game, left, right):
     """True when two park strings refer to the same room (VNUM or legacy)."""
     if not left or not right:
@@ -1406,12 +1431,10 @@ def _vehicle_parked_in_virtual_room(game, veh, room):
     if veh_plane != room_plane:
         return False
     macro = overland_mod._parse_pos_pair(veh.get("macro_pos"))
-    micro = overland_mod._parse_pos_pair(veh.get("micro_pos"))
     if macro is not None and tuple(macro) == tuple(room_macro):
-        if micro is not None:
-            return tuple(micro) == tuple(room_micro)
-        # Open-road stamp without micro: visible anywhere on the atlas tile
-        # (legacy saves and leave before micro was stamped -- bug report 1134).
+        # One America macro cell = one parked ride for look / enter (bug
+        # reports 1134, 1794). Micro can lag after park, leave, or a walk
+        # to the gate while the kit still stamps an older micro.
         return True
     if park_key:
         mouth_macro = _park_room_overland_gate_macro(game, park_key)
@@ -1459,9 +1482,36 @@ _GENERIC_BOARD_NEEDLES = frozenset({
 })
 
 
+def _resolve_vehicle_board_room(game, room, character):
+    """Dual-layer cell for board/look when ``location`` lags body coords."""
+    from engine.systems import overland as overland_mod
+
+    if room is not None and overland_mod.is_virtual_room(room):
+        return room
+    if character is None:
+        return room
+    macro = overland_mod._parse_pos_pair(getattr(character, "macro_pos", None))
+    if macro is None:
+        return room
+    micro = overland_mod._parse_pos_pair(getattr(character, "micro_pos", None))
+    if micro is None:
+        micro = overland_mod.LANDMARK_MICRO
+    loc = getattr(character, "location", None)
+    plane = (
+        overland_mod._overland_plane_for_room(loc) if loc is not None else None
+    )
+    plane = str(plane or getattr(character, "overland_plane", None) or "earth")
+    plane = plane.strip().lower() or "earth"
+    resolved = overland_mod.get_virtual_room(
+        game, macro, micro, plane=plane,
+    )
+    return resolved or room
+
+
 def find_vehicle_at(game, room, query, character=None):
     """Return vehicle dict parked in ``room`` matching ``query``, or None."""
     ensure_game_vehicles(game)
+    room = _resolve_vehicle_board_room(game, room, character)
     if room is None:
         return None
     needle = _normalize_board_needle(query)
@@ -1523,9 +1573,10 @@ def find_vehicle_at(game, room, query, character=None):
     return matches[0]
 
 
-def parked_vehicles_in(game, room):
+def parked_vehicles_in(game, room, character=None):
     """List vehicle dicts parked in ``room``."""
     ensure_game_vehicles(game)
+    room = _resolve_vehicle_board_room(game, room, character)
     if room is None:
         return []
     return [
@@ -1611,9 +1662,7 @@ def eject_motorcycle_from_cabin(character, game, veh):
     park_key = veh.get("parked_room")
     if not park_key:
         return False
-    from engine.room_vnum import lookup_room
-
-    park = lookup_room(game, park_key)
+    park = resolve_vehicle_park_room(game, park_key)
     if park is None or getattr(character, "location", None) is park:
         return False
     character.move_to(park)
@@ -2123,7 +2172,7 @@ def try_board(character, args, game):
         return False
     veh = find_vehicle_at(game, room, query, character=character)
     if veh is None:
-        parked = parked_vehicles_in(game, room)
+        parked = parked_vehicles_in(game, room, character=character)
         if parked:
             aliases = set()
             for v in parked:
@@ -2232,9 +2281,7 @@ def leave_vehicle(character, game, *, pull_followers=True):
             character, game, veh, pull_followers=pull_followers,
         )
     park_key = veh.get("parked_room")
-    from engine.room_vnum import lookup_room
-
-    park = lookup_room(game, park_key) if park_key else None
+    park = resolve_vehicle_park_room(game, park_key) if park_key else None
     interior = veh.get("interior")
     if (
         park is None
@@ -2573,13 +2620,13 @@ def _board_alias_for(veh):
     return key.split()[0] if key else "vehicle"
 
 
-def _parked_for_look(room, game):
+def _parked_for_look(room, game, character=None):
     """Unoccupied vehicles parked in ``room`` (hook may filter riders)."""
     ensure_game_vehicles(game)
     if room is None:
         return []
     return vehicle_parked_without_rider(
-        game, room, parked_vehicles_in(game, room),
+        game, room, parked_vehicles_in(game, room, character=character),
     )
 
 
@@ -2600,7 +2647,7 @@ def _wants_compact_vehicle_look(character, game):
 
 def look_vehicle_detail_lines(room, game, character=None):
     """Full parked-vehicle rows for ``look vehicles``."""
-    parked = _parked_for_look(room, game)
+    parked = _parked_for_look(room, game, character=character)
     if not parked:
         return []
     sr = _vehicle_look_screenreader(character)
@@ -2619,7 +2666,7 @@ def look_vehicle_detail_lines(room, game, character=None):
 
 def look_vehicle_hint(room, game, character=None):
     """Extra look line when vehicles are parked in this room."""
-    parked = _parked_for_look(room, game)
+    parked = _parked_for_look(room, game, character=character)
     if not parked:
         return None
     sr = _vehicle_look_screenreader(character)

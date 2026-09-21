@@ -34,6 +34,8 @@ _heavy_sidecar_load = None
 _heavy_sidecar_merge = None
 _heavy_sidecar_parse_payload = None
 _heavy_sidecar_property_stash_empty = None
+_heavy_sidecar_property_stash_merge = None
+_heavy_sidecar_life_log_empty = None
 _mark_property_stash_heavy_dirty = None
 
 # Game-owned Game meta (T3 persistence-api): moral/Tide, Cadence overrides,
@@ -41,6 +43,9 @@ _mark_property_stash_heavy_dirty = None
 # world snapshot. Default no-op so lean boots keep __init__ defaults.
 _game_meta_loader = None
 _game_meta_saver = None
+# Game-owned copyover aux tables (homestead, shops, parking, …).
+# The engine calls this after clock + accounts. Unset on a lean boot.
+_copyover_aux_flusher = None
 
 # Per-character built sites (homestead / demesne / shop / realm / town)
 # flushed on player ``save`` and archived in the checkpoint tank.
@@ -110,6 +115,8 @@ _origin_default_prompt = None
 _is_factory_prompt = None
 # Prompt supplemental bands: fn(character, game) -> dict[str, str].
 _prompt_supplemental_bands = None
+# Extra ``config combat`` status lines from SUPERS (own pulse gap, etc.).
+_config_combat_status_extra = None
 
 # System topic pages for bare `help` (game content; engine verbs read these).
 _help_topics = {}
@@ -302,6 +309,9 @@ _can_target_hidden_attacker = None
 _can_notice_stealth = None
 # Game-side extra presence hide (Signal dwell, …). fn(viewer, other) -> bool.
 _presence_hidden_extra = None
+# Room look Souls omit (own living husk co-located with Mantle). fn(viewer,
+# occupant, room, game) -> bool.
+_look_room_skip_occupant = None
 _extra_affect_rows = None
 # Staff gm-on look pierce for hidden presences (stealth, etc.) -- tagged
 # ``(hidden)`` instead of omitted. fn(viewer, other) -> bool.
@@ -419,9 +429,19 @@ _look_detail_for = None
 # fn(character) -> bool. Default False when no game is installed.
 _is_untargetable_helper = None
 
+# Game-owned fight-verb refusal (e.g. pit hole-mates: no friendly fire).
+# fn(actor, other) -> str | None. None = allowed / hook unset.
+_combat_target_refusal = None
+
 # Chargen placement when ``chargen_start_room_key`` did not resolve.
 # fn(character, game) -> Room | None. Default None when no game is installed.
 _chargen_fallback_start_room = None
+
+# Where a brand-new character actually wakes, given the room chargen
+# resolved (the Nature homezone). fn(character, game, dest_room) -> Room |
+# None. None keeps ``dest_room``. SUPERS lands everyone on the shared
+# Threshold street and graduates them to ``dest_room`` later.
+_chargen_arrival_room = None
 
 # Room-entry spawn/aggro rolls (wilderness hostiles, procedural dungeons,
 # idle-hostile aggro). fn(game, room) -> None (side-effecting only).
@@ -751,6 +771,28 @@ def should_skip_map_missing_stub_heal(character):
     return bool(_should_skip_map_missing_stub_heal(character))
 
 
+_safe_relocation_room = None  # fn(game, character) -> Room or None
+
+
+def set_safe_relocation_room(fn):
+    """Register fn(game, character) -> Room or None for stub/empty-key heal.
+
+    When a saved room is gone, engine falls back to ``home_room_key`` then
+    ``start_room``. Homestead workers leave home unset on purpose (they must
+    not claim the house), so SUPERS returns the plot hub/porch/duty room
+    instead of Lebanon plaza. Pass None to restore the default.
+    """
+    global _safe_relocation_room
+    _safe_relocation_room = fn
+
+
+def safe_relocation_room(game, character):
+    """Game-owned restore dest, or None to keep engine home/start fallback."""
+    if _safe_relocation_room is None:
+        return None
+    return _safe_relocation_room(game, character)
+
+
 _on_map_missing_stub_healed = None  # fn(character, stub_key) -> None
 
 
@@ -1066,12 +1108,15 @@ def set_heavy_sidecar_codec(collect_fn, load_fn, merge_fn):
     _heavy_sidecar_merge = merge_fn
 
 
-def collect_heavy_sidecar_rows(game, character, cnum, *, prev_shard_hashes):
+def collect_heavy_sidecar_rows(
+    game, character, cnum, *, prev_shard_hashes, wall_check=None,
+):
     """Build ``character_heavy_blobs`` INSERT rows, or empty when unregistered."""
     if _heavy_sidecar_collect is None:
         return [], prev_shard_hashes or {}
     return _heavy_sidecar_collect(
         game, character, cnum, prev_shard_hashes=prev_shard_hashes,
+        wall_check=wall_check,
     )
 
 
@@ -1089,11 +1134,16 @@ def merge_saved_with_sidecars(saved, sidecar_shards):
     return _heavy_sidecar_merge(saved, sidecar_shards)
 
 
-def set_heavy_sidecar_property_stash_helpers(parse_fn=None, empty_fn=None):
-    """Register property-stash shard parse/empty helpers for upsert skip logic."""
+def set_heavy_sidecar_property_stash_helpers(
+    parse_fn=None, empty_fn=None, merge_fn=None, life_empty_fn=None,
+):
+    """Register property-stash / journal sidecar helpers for upsert skip logic."""
     global _heavy_sidecar_parse_payload, _heavy_sidecar_property_stash_empty
+    global _heavy_sidecar_property_stash_merge, _heavy_sidecar_life_log_empty
     _heavy_sidecar_parse_payload = parse_fn
     _heavy_sidecar_property_stash_empty = empty_fn
+    _heavy_sidecar_property_stash_merge = merge_fn
+    _heavy_sidecar_life_log_empty = life_empty_fn
 
 
 def parse_heavy_shard_payload(payload):
@@ -1108,6 +1158,26 @@ def property_stash_payload_empty(parsed):
     if _heavy_sidecar_property_stash_empty is None:
         return False
     return bool(_heavy_sidecar_property_stash_empty(parsed))
+
+
+def merge_property_stash_payloads(old, new):
+    """Per-key union so empty crates cannot clobber a full on-disk pile."""
+    if _heavy_sidecar_property_stash_merge is None:
+        old = old if isinstance(old, dict) else {}
+        new = new if isinstance(new, dict) else {}
+        out = dict(old)
+        for key, val in new.items():
+            if val:
+                out[key] = val
+        return out
+    return _heavy_sidecar_property_stash_merge(old, new)
+
+
+def life_log_payload_empty(parsed):
+    """True when a parsed life_log shard is empty; False when unregistered."""
+    if _heavy_sidecar_life_log_empty is None:
+        return False
+    return bool(_heavy_sidecar_life_log_empty(parsed))
 
 
 def set_mark_property_stash_heavy_dirty(fn):
@@ -1175,10 +1245,78 @@ def load_game_meta(game, conn):
         _game_meta_loader(game, conn)
 
 
-def save_game_meta(game, conn):
-    """Run the registered meta saver, or no-op if none is set."""
-    if _game_meta_saver is not None:
+def save_game_meta(game, conn, *, force_full=False):
+    """Run the registered meta saver, or no-op if none is set.
+
+    ``force_full=True`` is the copyover / shutdown contract: every meta
+    slice must write even when its fingerprint looks unchanged. A saver
+    that predates the flag keeps the old two-argument signature, so probe
+    it with ``inspect`` rather than guessing from a ``TypeError`` (a real
+    ``TypeError`` raised *inside* the saver must not look like a bad call).
+    """
+    if _game_meta_saver is None:
+        return
+    if not force_full:
         _game_meta_saver(game, conn)
+        return
+    import inspect
+
+    try:
+        accepts = "force_full" in inspect.signature(_game_meta_saver).parameters
+    except (TypeError, ValueError):
+        accepts = False
+    if accepts:
+        _game_meta_saver(game, conn, force_full=True)
+        return
+    # Legacy saver: arm the game-level flag it does understand instead of
+    # silently downgrading copyover to a fingerprint-skipping save.
+    prev = getattr(game, "_persist_force_full", False)
+    game._persist_force_full = True
+    try:
+        _game_meta_saver(game, conn)
+    finally:
+        game._persist_force_full = prev
+
+
+def set_copyover_aux_flusher(fn):
+    """Register ``fn(game, conn)`` for game-specific copyover site tables.
+
+    Copyover writes the clock and accounts itself, then asks the game to
+    flush homestead, shops, realms, and parking. The engine must not
+    import the game package to do that. Lean boots leave this unset and
+    call ``save_game_meta`` instead.
+
+    ``fn`` may be a plain function or a coroutine function. Pass None
+    to clear (tests, and ``importlib.reload`` before re-register).
+    """
+    global _copyover_aux_flusher
+    _copyover_aux_flusher = fn
+
+
+def copyover_aux_flusher_registered():
+    """True when a game registered a copyover aux flusher."""
+    return _copyover_aux_flusher is not None
+
+
+async def flush_copyover_aux_game(game, conn):
+    """Run the registered copyover aux flusher.
+
+    Returns True when a flusher ran. Returns False when none is set so
+    the caller can abort a SUPERS seal instead of skipping site tables.
+    A swallowed miss used to look like a lean boot and drop those rows
+    (bug report 387).
+    """
+    fn = _copyover_aux_flusher
+    if fn is None:
+        return False
+    # Local import: hooks.py is reloaded mid-copyover; keep inspect off
+    # the module import path so a stale caller still awaits coroutines.
+    import inspect
+
+    result = fn(game, conn)
+    if inspect.isawaitable(result):
+        await result
+    return True
 
 
 def set_player_built_site_codec(save_fn, collect_fn, restore_fn):
@@ -1478,6 +1616,23 @@ def prompt_supplemental_bands(character, game=None):
         except Exception as exc:
             _log_hook_fail(game, "prompt_supplemental_bands", exc)
             return {}
+    return {}
+
+
+def set_config_combat_status_extra(fn):
+    """Register fn(character) -> list[str] appended on ``config combat`` pages."""
+    global _config_combat_status_extra
+    _config_combat_status_extra = fn
+
+
+def config_combat_status_extra(character):
+    """Optional combat config rows from the game hook."""
+    if _config_combat_status_extra is not None:
+        try:
+            return _config_combat_status_extra(character) or []
+        except Exception as exc:
+            _log_hook_fail(None, "config_combat_status_extra", exc)
+            return []
     return {}
 
 
@@ -3334,6 +3489,48 @@ def is_untargetable_helper(character):
     return False
 
 
+def set_combat_target_refusal(fn):
+    """Register fn(actor, other) -> str | None for fight-verb targeting.
+
+    The string is the player-facing refusal. Pass None to restore the
+    default: every visible body is a legal fight pick.
+    """
+    global _combat_target_refusal
+    _combat_target_refusal = fn
+
+
+def combat_target_refusal(actor, other):
+    """Refusal line when the installed game forbids this fight pick.
+
+    Default (no game installed): None (allowed).
+    """
+    if _combat_target_refusal is None:
+        return None
+    try:
+        msg = _combat_target_refusal(actor, other)
+    except Exception:
+        return None
+    if msg is None:
+        return None
+    text = str(msg).strip()
+    return text or None
+
+
+def set_chargen_arrival_room(fn):
+    """Register fn(character, game, dest_room) -> Room | None."""
+    global _chargen_arrival_room
+    _chargen_arrival_room = fn
+
+
+def chargen_arrival_room(character, game, dest_room):
+    """Room a new character materializes in; ``dest_room`` when unset."""
+    if _chargen_arrival_room is not None:
+        room = _chargen_arrival_room(character, game, dest_room)
+        if room is not None:
+            return room
+    return dest_room
+
+
 def set_chargen_fallback_start_room(fn):
     """Register fn(character, game) -> Room | None for post-chargen placement.
 
@@ -3494,6 +3691,24 @@ def presence_hidden_extra(viewer, other) -> bool:
         return False
     try:
         return bool(_presence_hidden_extra(viewer, other))
+    except Exception:
+        return False
+
+
+def set_look_room_skip_occupant(fn):
+    """Register fn(viewer, occupant, room, game) -> bool for look Souls omit."""
+    global _look_room_skip_occupant
+    _look_room_skip_occupant = fn
+
+
+def look_room_skip_occupant(viewer, occupant, room, game=None) -> bool:
+    """True when ``occupant`` must not appear in room look Souls lists."""
+    if occupant is None or viewer is None:
+        return False
+    if _look_room_skip_occupant is None:
+        return False
+    try:
+        return bool(_look_room_skip_occupant(viewer, occupant, room, game))
     except Exception:
         return False
 

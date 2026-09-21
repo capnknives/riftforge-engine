@@ -98,12 +98,22 @@ class Account:
         # ``Accountname(GM)`` -- a deliberate staff reveal. Parked spirits
         # (`gm off`) are always invisible regardless of this flag.
         self.wizinvis = True
+        # Hide Account(GM) on who while playing a body (default off --
+        # GMs stay listed). Separate from wizinvis, which defaults on
+        # for watcher form.
+        self.gm_incognito = False
         # Visible cast occupy: False = player look/who; True = staff chrome.
         self.gm_eyes_staff_view = False
+        # Body last used for ``gm on`` -- bare ``gm off`` returns here, not
+        # the first ``character_keys`` sibling (bug 1763: Matt/Daniel/Erik).
+        self.last_gm_play_key = ""
         # Playtester diagnostic tools (``playtest`` / ``playtester add``).
         self.playtester = False
         # One-time MUD basics orientation completed on any linked character.
         self.mud_basics_seen = False
+        # Any body on this account already left the shared starter street
+        # (alts are offered a skip at spawn).
+        self.threshold_graduated = False
         # Volunteer player helper (``gm set … helper on``).
         self.player_helper = False
         # Visit-ceiling for in-game ``changes`` (new since last acknowledgment).
@@ -167,9 +177,16 @@ class Account:
             ),
             "gm_see_accounts": bool(self.gm_see_accounts),
             "wizinvis": bool(self.wizinvis),
+            "gm_incognito": bool(getattr(self, "gm_incognito", False)),
             "gm_eyes_staff_view": bool(getattr(self, "gm_eyes_staff_view", False)),
+            "last_gm_play_key": str(
+                getattr(self, "last_gm_play_key", "") or ""
+            ),
             "playtester": bool(self.playtester),
             "mud_basics_seen": bool(getattr(self, "mud_basics_seen", False)),
+            "threshold_graduated": bool(
+                getattr(self, "threshold_graduated", False)
+            ),
             "player_helper": bool(self.player_helper),
             "last_seen_changelog_id": int(
                 getattr(self, "last_seen_changelog_id", 0) or 0
@@ -282,9 +299,13 @@ class Account:
         self.gm_see_accounts = bool(data.get("gm_see_accounts", False))
         # Missing key = default staff-invisible (old saves keep prior behavior).
         self.wizinvis = bool(data.get("wizinvis", True))
+        # Missing key = show GM who-band (new pref; old saves stay visible).
+        self.gm_incognito = bool(data.get("gm_incognito", False))
         self.gm_eyes_staff_view = bool(data.get("gm_eyes_staff_view", False))
+        self.last_gm_play_key = str(data.get("last_gm_play_key", "") or "").strip()
         self.playtester = bool(data.get("playtester", False))
         self.mud_basics_seen = bool(data.get("mud_basics_seen", False))
+        self.threshold_graduated = bool(data.get("threshold_graduated", False))
         self.player_helper = bool(data.get("player_helper", False))
         try:
             self.last_seen_changelog_id = int(
@@ -1162,6 +1183,11 @@ def reserved_character_keys_for_spawns(game):
 
     Includes live bodies, every account roster key (even vaulted/offline),
     and immersion catalog cast so a street djinn cannot steal ``Daniel``.
+
+    Live 2026-09-19 py-spy: Town Morals smoke spawn called this on the
+    heartbeat while ``roster_character_keys`` walked ``game.characters``
+    once per account. Live bodies stay fresh every call; the account /
+    vault / catalog half is memoized for this ``game_time_ticks``.
     """
     taken = set()
     if game is None:
@@ -1172,6 +1198,22 @@ def reserved_character_keys_for_spawns(game):
         key = (getattr(char, "key", None) or "").strip()
         if key:
             taken.add(key)
+    taken.update(_spawn_reserved_offline_keys(game))
+    return taken
+
+
+def _spawn_reserved_offline_keys(game):
+    """Account + vault + catalog reserved keys, once per heartbeat.
+
+    ``roster_character_keys`` walks the live character list per account.
+    Spawning several sulfur coils in one tick used to repeat that scan.
+    """
+    ticks = int(getattr(game, "game_time_ticks", 0) or 0)
+    cached = getattr(game, "_spawn_reserved_offline_keys", None)
+    stamp = getattr(game, "_spawn_reserved_offline_keys_tick", None)
+    if isinstance(cached, set) and stamp == ticks:
+        return cached
+    taken = set()
     for account in ensure_accounts_dict(game).values():
         for key in roster_character_keys(game, account):
             key = (key or "").strip()
@@ -1197,7 +1239,10 @@ def reserved_character_keys_for_spawns(game):
     from engine import hooks
 
     for key in hooks.iter_spawn_reserved_character_keys_extra(game):
-        taken.add(key)
+        if key:
+            taken.add(key)
+    game._spawn_reserved_offline_keys = taken
+    game._spawn_reserved_offline_keys_tick = ticks
     return taken
 
 
@@ -1409,7 +1454,12 @@ def heal_unrostered_player_orphans(game) -> int:
 def reconcile_accounts(game):
     """Boot heal: keep account.character_keys ↔ character.account honest.
 
-    Idempotent. Returns a small stats dict for logs / smoke.
+    Assigned Characters (``gm rpc assign`` / playcast loans) stay until
+    staff revoke. Do **not** drop them just because the body is vaulted,
+    sitting idle as an NPC fixture, or briefly missing the ``immersion``
+    stamp (a pit pocket / husk mix-up used to wipe Gabriel off CapnKnives
+    on the next copyover). Idempotent. Returns a small stats dict for
+    logs / smoke.
     """
     accounts = ensure_accounts_dict(game)
     linked = 0
@@ -1434,6 +1484,8 @@ def reconcile_accounts(game):
             if not k:
                 continue
             low = k.lower()
+            if low.startswith("gmspirit:") or low.startswith("husk:"):
+                continue
             if low in seen:
                 continue
             seen.add(low)
@@ -1465,22 +1517,24 @@ def reconcile_accounts(game):
         # Ensure gm_spirit_key is stamped when ranked.
         if account.gm_rank in ("gm", "head_gm"):
             account.gm_spirit_key = gm_spirit_key_for_account(account)
-        # Drop stale RPC cast grants (folded cast, typos, renamed keys).
+        # Assigned Characters are staff loans, not roster rows. Login
+        # restore / playcast will unvault or restamp the body later.
+        # Only husk: / gmspirit: leftovers and empty/duplicate keys go.
         grant_kept = []
         grant_seen = set()
         for raw_key in list_assigned_character_keys(account):
-            low = raw_key.lower()
-            char = by_key.get(low)
-            if char is None or getattr(char, "is_npc", False):
-                dropped_stale += 1
+            k = (raw_key or "").strip()
+            if not k:
                 continue
-            if not getattr(char, "immersion", False):
+            low = k.lower()
+            if low.startswith("gmspirit:") or low.startswith("husk:"):
                 dropped_stale += 1
                 continue
             if low in grant_seen:
                 continue
             grant_seen.add(low)
-            grant_kept.append(getattr(char, "key", raw_key) or raw_key)
+            char = by_key.get(low)
+            grant_kept.append(getattr(char, "key", k) or k)
         if grant_kept != list_assigned_character_keys(account):
             account.assigned_characters = grant_kept
             roster_repaired += 1
@@ -1887,11 +1941,12 @@ def is_staff_login_cast(char):
 
 
 def list_immersion_cast(game):
-    """Live immersion-cast bodies for staff account secondary roster.
+    """Live occupy-able immersion bodies (gm off <name> / playcast).
 
-    Playable cast: ``immersion=True`` and not ``is_npc``. Staff-login
-    fixtures (Ash) stay in the list even while idle NPCs so typing the
-    name occupies them. Sorted by key for stable menus.
+    Login menus do **not** dump this list -- staff login paints Assigned
+    Characters (Gabriel) plus ``staff_login`` fixtures (Ash). Linking
+    catalog Cast onto ``account.character_keys`` made OOC say Matt
+    (bug reports 1694 / 1695). Sorted by key for stable menus.
     """
     found = []
     if game is None:
@@ -1912,10 +1967,11 @@ def list_immersion_cast(game):
 
 
 def list_essential_fixture_cast(game):
-    """Idle ``npc_until_assigned`` essential cast (Ash, desk fixtures, …).
+    """Idle ``npc_until_assigned`` essential cast (desk fixtures, …).
 
-    ``list_immersion_cast`` skips ordinary ``is_npc`` bodies; staff login
-    menus still need them pickable by name for crash-gate telnet.
+    Staff login no longer paints this onto the Cast band (Dean / Sergei
+    clutter). ``staff_login`` fixtures (Ash) still come from
+    ``list_immersion_cast``. Crash-gate can type Ash via the name backdoor.
     """
     found = []
     if game is None:
@@ -2028,7 +2084,10 @@ def list_assigned_characters(game, account):
         if char is None or not getattr(char, "immersion", False):
             from engine import hooks as hooks_mod
 
-            restored = hooks_mod.try_restore_assigned_character(game, key)
+            try:
+                restored = hooks_mod.try_restore_assigned_character(game, key)
+            except Exception:
+                restored = None
             if restored is not None:
                 char = restored
         if char is None:
@@ -2042,6 +2101,42 @@ def list_assigned_characters(game, account):
         # assigned Dean/Gabriel rows appear on the login play list.
         found.append(char)
     return found
+
+
+def resolve_assigned_login_character(game, account, raw):
+    """Restore/match one Assigned Character by typed login name.
+
+    Used when the painted row is missing (vault restore failed earlier)
+    but ``account.assigned_characters`` still names Gabriel.
+    """
+    needle = (raw or "").strip()
+    if not needle or account is None or game is None:
+        return None
+    low = needle.lower()
+    for key in list_assigned_character_keys(account):
+        if key.lower() != low:
+            continue
+        body = game.find_character(key)
+        if body is None:
+            from engine import hooks as hooks_mod
+
+            try:
+                body = hooks_mod.try_restore_assigned_character(game, key)
+            except Exception:
+                body = None
+        if body is not None and getattr(body, "immersion", False):
+            return body
+        return None
+    # Given-name match against live assigned bodies.
+    matches = []
+    for body in list_assigned_characters(game, account):
+        key = (getattr(body, "key", None) or "").lower()
+        given = (getattr(body, "given_name", None) or "").lower()
+        if low == key or (given and low == given):
+            matches.append(body)
+    if len(matches) == 1:
+        return matches[0]
+    return None
 
 
 def account_has_assigned_character(account, character_key):
@@ -2181,19 +2276,22 @@ def roster_character_keys(game, account):
         low = (key or "").strip().lower()
         if not low or low in seen:
             continue
+        if low.startswith("gmspirit:") or low.startswith("husk:"):
+            continue
         seen.add(low)
         keys.append(key)
     acct_name = (getattr(account, "name", None) or "").strip().lower()
     if acct_name and game is not None:
         for char in getattr(game, "characters", None) or []:
-            if getattr(char, "is_npc", False):
+            play_key = _playable_account_link_key(char)
+            if not play_key:
                 continue
             if (getattr(char, "account", None) or "").strip().lower() != acct_name:
                 continue
-            low = (getattr(char, "key", None) or "").strip().lower()
+            low = play_key.strip().lower()
             if low and low not in seen:
                 seen.add(low)
-                keys.append(char.key)
+                keys.append(play_key)
     return keys
 
 
@@ -2201,9 +2299,9 @@ def account_login_choices(game, account):
     """Build account-login pick list: assigned + owned PCs, then cast if staff.
 
     Assigned catalog bodies sit at the top of the Characters band (not a
-    separate section, not buried in Cast). Returns ``(section, character)``
-    where ``section`` is ``"character"`` or ``"cast"``. Vaulted-only roster
-    keys are omitted here -- ``account_login.build_account_menu`` adds them.
+    dump of Dean / Chuck). Staff Cast band is ``staff_login`` fixtures
+    only (Ash). Vaulted assigned keys are omitted here --
+    ``account_login.build_account_menu`` adds them.
     """
     choices = []
     if account is None or game is None:
@@ -2236,19 +2334,16 @@ def account_login_choices(game, account):
         if char is None or getattr(char, "is_npc", False):
             continue
         low = (getattr(char, "key", None) or "").lower()
+        if not low or low.startswith("gmspirit:") or low.startswith("husk:"):
+            continue
         if low in seen:
             continue
         seen.add(low)
         choices.append(("character", char))
     if account_is_staff(account):
         for cast in list_immersion_cast(game):
-            low = (getattr(cast, "key", None) or "").lower()
-            if low in seen:
+            if not is_staff_login_cast(cast):
                 continue
-            # Cast linked as a PC stays in Characters only.
-            seen.add(low)
-            choices.append(("cast", cast))
-        for cast in list_essential_fixture_cast(game):
             low = (getattr(cast, "key", None) or "").lower()
             if low in seen:
                 continue

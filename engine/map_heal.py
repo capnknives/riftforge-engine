@@ -102,6 +102,22 @@ def _save_heal_fingerprint(root, fingerprint):
         pass
 
 
+def stamp_heal_fingerprint(root=None):
+    """Persist the heal-input digest after backup snapshots (copyover persist).
+
+    ``heal_all_from_hot_backups`` fingerprints live map/zone files **and**
+    every ``content/map_backups/*.json`` slot. Copyover warmup rewrites all
+    backup slots from the in-memory overlay without touching Git SoT, which
+    bumps backup mtimes and would otherwise force an ~87s re-heal on the
+    game-only reload child. Stamping after ``MAP BACKUP ALL`` records the
+    post-snapshot inputs so the reload boot can skip the walk. A real hot
+    map edit still changes live or backup bytes and forces a heal.
+    """
+    if root is None:
+        root = os.getcwd()
+    _save_heal_fingerprint(root, _compute_heal_fingerprint(root))
+
+
 def reset_live_overlay():
     """Drop in-process merged docs (targeted smokes)."""
     _LIVE_OVERLAY.clear()

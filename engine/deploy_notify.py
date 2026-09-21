@@ -6,10 +6,11 @@ the GM `deployfix` command writes `.deploy_signal.json` beside the save file.
 The game tick loop calls tick() each heartbeat; that starts a background
 asyncio task which:
 
-  1. Broadcasts that a bug was fixed and a world reset is coming.
-  2. Counts down (players stay connected -- copyover preserves sockets).
-  3. Writes `.deploy_ready` so the host script can `gh pr checkout` the fix.
-  4. After copyover resumes, on_resume() announces the fix is live and marks
+  1. Silently force-saves the world (warmup) while players keep playing.
+  2. Only after that apply acks, broadcasts that a rewrite is coming.
+  3. Counts down (players stay connected -- copyover preserves sockets).
+  4. Writes `.deploy_ready` so the host script can `gh pr checkout` the fix.
+  5. After copyover resumes, on_resume() announces the fix is live and marks
      each bug in bug_ids (or the legacy single bug_id) resolved in
      bug_reports.log — which credits reporters via the after-mark hook.
 
@@ -38,6 +39,11 @@ CATCHUP_RESOLVE_PATH = ".catchup_bug_resolve.json"
 # Seconds at which to repeat the countdown warning (plus the initial announce).
 # Keep sparse — milestone spam mid-play felt overbearing on live deploys.
 _COUNTDOWN_WARN_AT = (10, 5)
+
+# Host waiters (auto_deploy / deploy_bug_fix) poll for ``.deploy_ready``
+# after queueing a signal. Ready is written *after* silent warmup *and*
+# the announced countdown, so their timeout must cover both.
+WARMUP_READY_SLACK_S = 90
 
 # Background task handle -- None when idle.
 _deploy_task = None
@@ -249,7 +255,8 @@ KIND_CATCHUP = "catchup"
 # family as copyover MSG_BEFORE / Fix reseal countdowns).
 CATCHUP_COUNTDOWN_OPEN = (
     "*** The Veil thins — the world will rewrite in {total} seconds. "
-    "Stay put if you can. ***"
+    "You can keep playing until the Veil shudders; then leave your pack, "
+    "your house, and the shops alone. ***"
 )
 GATEWAY_RESTART_WARNING = (
     "\r\n*** [ALERT] The weave that binds you must be torn down and rewoven — "
@@ -278,7 +285,8 @@ ABORT_OOC = (
     "from that queue."
 )
 CATCHUP_READY_LINE = (
-    "*** The Veil settles. The rewrite is complete — you are still here. ***"
+    "*** The Veil settles. The rewrite is complete — you are still here. "
+    "You can move, trade, and build again. ***"
 )
 # Legacy alias for smokes / older callers.
 CATCHUP_COUNTDOWN_LIVE = CATCHUP_READY_LINE
@@ -286,7 +294,9 @@ CATCHUP_COUNTDOWN_LIVE = CATCHUP_READY_LINE
 
 def _countdown_tick_line(remaining: int) -> str:
     """Gothic milestone during the Veil reseal countdown."""
-    return f"*** The Veil reseals in {remaining}... ***"
+    return (
+        f"*** The Veil reseals in {remaining}... you can still play. ***"
+    )
 
 
 def _countdown_done_line(*, gateway_restart: bool) -> str:
@@ -300,7 +310,8 @@ def _countdown_done_line(*, gateway_restart: bool) -> str:
     """
     _ = gateway_restart
     return (
-        "*** The Veil draws tight — the pause begins when the Veil shudders. ***"
+        "*** The Veil draws tight — keep playing until it shudders. "
+        "Commands freeze only after the pause line. ***"
     )
 
 
@@ -330,7 +341,8 @@ def _fix_countdown_open(
         f"*** {ticket_ref} {verb}: {summary} ***",
         (
             f"*** The Veil will reseal in {total} seconds. "
-            f"Stay put if you can. ***"
+            f"You can keep playing until the Veil shudders; then leave "
+            f"your pack, your house, and the shops alone. ***"
         ),
     ])
 
@@ -1090,7 +1102,7 @@ def _log_task_exception(task):
 
 
 async def _run_countdown(game, signal):
-    """Broadcast the fix announcement, count down, then release the host."""
+    """Announce playable T-minus, then release the host (no persist here)."""
     directory = game.report_dir
     bug_ids = _normalize_bug_ids(
         bug_id=signal.get("bug_id"), bug_ids=signal.get("bug_ids"),
@@ -1103,6 +1115,16 @@ async def _run_countdown(game, signal):
     total = int(signal.get("countdown_seconds", 30))
     kind = signal.get("kind") or KIND_FIX
     gateway_restart = bool(signal.get("gateway_restart"))
+
+    from engine import auto_deploy
+
+    # T-minus is playable -- SQLite waits until copyover MSG_BEFORE.
+    signal["phase"] = "countdown"
+    _write_signal(directory, signal)
+    if auto_deploy.abort_requested(directory):
+        _cleanup(directory)
+        print("[deploy_notify] countdown aborted by GM before announce", flush=True)
+        return
 
     if kind == KIND_CATCHUP:
         game.broadcast_all(
@@ -1136,8 +1158,6 @@ async def _run_countdown(game, signal):
         )
 
     # Walk second-by-second so we can hit WARN_AT milestones cleanly.
-    from engine import auto_deploy
-
     try:
         for remaining in range(total, 0, -1):
             if auto_deploy.abort_requested(directory):
@@ -1159,34 +1179,6 @@ async def _run_countdown(game, signal):
 
     signal["phase"] = "awaiting_copyover"
     _write_signal(directory, signal)
-
-    # Flush every live body before the host overlays files / copyover runs.
-    # Post-deploy autosave defer can leave fence/sell mutations in RAM only;
-    # without this checkpoint, inventory and wallet diverge after restart.
-    #
-    # This used to call the blocking save_world_before_process_exit(), which
-    # also shuts down the background persistence writer thread and then
-    # writes every live character synchronously on the event loop -- the
-    # whole game froze (observed 30s on live) for the duration since this
-    # coroutine runs on the same loop as ticks/commands, and the old process
-    # is still supposed to answer commands until copyover. save_world_async
-    # does the same forced full-roster write (wall_budget_ms=0 disables its
-    # normal defer-on-budget behavior, so nothing gets skipped) but chunked
-    # with cooperative yields, and leaves the writer thread running.
-    try:
-        from engine import persistence
-
-        game._persist_force_full = True
-        game._persist_force_full_chars_only = False
-        await persistence.save_world_async(
-            game.db, game, wall_budget_ms=0,
-        )
-    except Exception as exc:
-        print(
-            f"[deploy_notify] pre-deploy save failed ({exc!r}) -- "
-            "host may still sync; players could lose recent sells",
-            flush=True,
-        )
 
     # Host tools/deploy_bug_fix.py polls for this file before git checkout.
     with open(ready_path(directory), "w", encoding="utf-8") as f:

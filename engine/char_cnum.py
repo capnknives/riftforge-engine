@@ -82,17 +82,29 @@ def validate_cnum(s) -> str:
 def next_cnum(prefix: str, taken: set[str]) -> str:
     """Allocate the next free ``PREFIX#####`` under ``prefix``.
 
-    ``taken`` holds already-used CNUM strings (any casing; compared upper).
-    Raises ``ValueError`` if the 5-digit space is exhausted.
+    ``taken`` holds already-used CNUM strings. Lasting reserved tags
+    (players / immersion / authored roster) are also skipped so a wiped
+    PC's number is not handed to a new clerk. Ephemeral civic workers
+    are *not* reserved -- those numbers recycle.
     """
     pref = str(prefix or "").strip().upper()
     if len(pref) != 2 or not all("A" <= ch <= "Z" for ch in pref):
         raise ValueError(f"cnum prefix must be two A–Z letters, got {prefix!r}")
     used = {str(v).strip().upper() for v in (taken or ()) if v}
+    reserved = None
+    try:
+        from engine.id_reserve import KIND_CNUM, reserved_pool
+
+        reserved = reserved_pool(KIND_CNUM)
+    except Exception:
+        reserved = None
     for n in range(1, _MAX_SEQ + 1):
         candidate = format_cnum(pref, n)
-        if candidate not in used:
-            return candidate
+        if candidate in used:
+            continue
+        if reserved and candidate in reserved:
+            continue
+        return candidate
     raise ValueError(
         f"no free CNUM left under prefix {pref!r} (1..{_MAX_SEQ} exhausted)"
     )

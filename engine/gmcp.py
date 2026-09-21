@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 
 from engine import telnet
 
@@ -74,6 +75,109 @@ def _mudlet_package_version():
         return None
     _mudlet_version_cache = (mtime, version)
     return version
+
+
+# Browser Tier 1: cap the inbound connection-report ring so a crash loop
+# cannot flood session RAM or the next bug JSONL row.
+_CLIENT_DIAG_CLOSES_MAX = 10
+_CLIENT_DIAG_FAULTS_MAX = 20
+_CLIENT_DIAG_RATE_MAX = 8
+_CLIENT_DIAG_RATE_WINDOW_S = 10.0
+
+
+def _clip_text(value, limit):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text[:limit]
+
+
+def sanitize_client_diag(payload):
+    """Keep only connection-shape fields. No transcript, no secrets."""
+    if not isinstance(payload, dict):
+        return None
+    out = {}
+    build = _clip_text(payload.get("build"), 40)
+    if build:
+        out["build"] = build
+    page = _clip_text(payload.get("page"), 120)
+    if page:
+        out["page"] = page
+    agent = _clip_text(payload.get("agent"), 200)
+    if agent:
+        out["agent"] = agent
+    screen = _clip_text(payload.get("screen"), 40)
+    if screen:
+        out["screen"] = screen
+    closes = payload.get("closes")
+    if isinstance(closes, list):
+        kept = []
+        for row in closes[-_CLIENT_DIAG_CLOSES_MAX:]:
+            if not isinstance(row, dict):
+                continue
+            entry = {}
+            if row.get("code") is not None:
+                try:
+                    entry["code"] = int(row["code"])
+                except (TypeError, ValueError):
+                    pass
+            label = _clip_text(row.get("label"), 40)
+            if label:
+                entry["label"] = label
+            if "clean" in row:
+                entry["clean"] = bool(row.get("clean"))
+            reason = _clip_text(row.get("reason"), 120)
+            if reason:
+                entry["reason"] = reason
+            if row.get("upMs") is not None:
+                try:
+                    entry["up_s"] = int(round(float(row["upMs"]) / 1000.0))
+                except (TypeError, ValueError):
+                    pass
+            if entry:
+                kept.append(entry)
+        if kept:
+            out["closes"] = kept
+    faults = payload.get("faults")
+    if isinstance(faults, list):
+        kept = []
+        for row in faults[-_CLIENT_DIAG_FAULTS_MAX:]:
+            if not isinstance(row, dict):
+                continue
+            entry = {}
+            kind = _clip_text(row.get("kind"), 24)
+            if kind:
+                entry["kind"] = kind
+            msg = _clip_text(row.get("msg"), 160)
+            if msg:
+                entry["msg"] = msg
+            where = _clip_text(row.get("where"), 80)
+            if where:
+                entry["where"] = where
+            if entry:
+                kept.append(entry)
+        if kept:
+            out["faults"] = kept
+    return out or None
+
+
+def _store_client_diag(session, payload):
+    """Overwrite session.client_diag; drop a crash-loop flood."""
+    if session is None:
+        return
+    now = time.time()
+    stamps = getattr(session, "_client_diag_stamps", None)
+    if not isinstance(stamps, list):
+        stamps = []
+    stamps = [t for t in stamps if now - float(t) <= _CLIENT_DIAG_RATE_WINDOW_S]
+    stamps.append(now)
+    session._client_diag_stamps = stamps
+    clean = sanitize_client_diag(payload)
+    if clean is None:
+        return
+    if len(stamps) > _CLIENT_DIAG_RATE_MAX:
+        clean["rate_limited"] = True
+    session.client_diag = clean
 
 
 def maybe_push_client_gui(session):
@@ -380,6 +484,9 @@ def handle_inbound(session, package: str, payload):
         # Telnet clients never send this package, so they keep full prose.
         if isinstance(payload, dict) and "gag_comms" in payload:
             session.gag_captured_comms = _gag_comms_flag(payload.get("gag_comms"))
+        # Tier 1: capped connection-report ring attached to the next bug.
+        if isinstance(payload, dict) and "diag" in payload:
+            _store_client_diag(session, payload.get("diag"))
         return
     # Everything else: ignore.
 
@@ -527,8 +634,10 @@ def push_vitals(character):
     session = getattr(character, "session", None)
     if session is None or not client_supports(session, "Char.Vitals"):
         return
-    from engine import hooks
-    payload = hooks.gmcp_char_vitals(character)
+    payload = getattr(character, "_combat_round_vitals_cache", None)
+    if not isinstance(payload, dict):
+        from engine import hooks
+        payload = hooks.gmcp_char_vitals(character)
     if not isinstance(payload, dict):
         # Bare-engine fallback: HP only if present.
         hp = getattr(character, "hp", None)

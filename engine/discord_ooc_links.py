@@ -231,27 +231,68 @@ def status_for_account(game, account_name: str, *, root=None) -> str:
     return "\r\n".join(lines)
 
 
+def _staff_discord_gm_face(account) -> str:
+    """``Accountname(GM)`` for Discord-originated staff lines."""
+    face = (
+        str(getattr(account, "display_name", None) or "")
+        or str(getattr(account, "name", None) or "")
+    ).strip()
+    if not face:
+        return ""
+    if face.endswith("(GM)"):
+        return face
+    return f"{face}(GM)"
+
+
+def _is_playable_roster_key(key: str) -> bool:
+    """True when ``key`` is a login body, not a spirit / husk leftover."""
+    low = (key or "").strip().lower()
+    if not low:
+        return False
+    return not low.startswith(("gmspirit:", "husk:", "twin:"))
+
+
 def resolve_ooc_face_for_discord(game, account_name: str) -> str:
-    """OOC speaker label for a Discord-originated line."""
+    """OOC speaker label for a Discord-originated line.
+
+    Discord links bind a Discord user to a MUD **account**, not a body.
+    Staff (GM / head GM) therefore always read as ``Accountname(GM)`` --
+    never the first roster PC (Wits, Erik, ...) and never an occupied Cast.
+    In-game ``ooc`` typed on a Cast still uses the character name; a
+    Discord post is the staffer's own voice.
+
+    Players honor ``config oocname``: account identity uses the account
+    display name; character identity prefers a live session, then the
+    first playable roster body.
+    """
     from engine import accounts as accounts_mod
     from engine import ooc_channel
 
     account = accounts_mod.find_account(game, account_name)
     if account is None:
         return str(account_name or "Discord")
+    if accounts_mod.account_is_staff(account):
+        staff_face = _staff_discord_gm_face(account)
+        if staff_face:
+            return staff_face
+    if getattr(account, "ooc_identity", "") == accounts_mod.OOC_IDENTITY_ACCOUNT:
+        face = (account.display_name or account.name or "").strip()
+        if face:
+            return face
     # Prefer an online character on this account.
+    want = accounts_mod.account_lookup_key(account.name)
     for session in list(getattr(game, "sessions", None) or []):
         character = getattr(session, "character", None)
         if character is None:
             continue
         char_acct = (getattr(character, "account", None) or "").strip()
-        if accounts_mod.account_lookup_key(char_acct) == accounts_mod.account_lookup_key(
-            account.name
-        ):
+        if accounts_mod.account_lookup_key(char_acct) == want:
             return ooc_channel.speaker_face_for_character(character, game)
-    # Offline: honor account ooc_identity against first roster body.
+    # Offline: first playable roster body (skip gmspirit / husk leftovers).
+    finder = getattr(game, "find_login_character", None)
     for key in list(account.character_keys):
-        finder = getattr(game, "find_login_character", None)
+        if not _is_playable_roster_key(key):
+            continue
         body = finder(key) if callable(finder) else None
         if body is None:
             body = game.find_character(key)

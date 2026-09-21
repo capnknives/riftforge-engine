@@ -17,7 +17,7 @@ from urllib.parse import quote, unquote
 
 from engine.world_backup import backups_root
 
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
 CHECKPOINT_SUBDIR = "player-checkpoints"
 DEFAULT_RETENTION = 10
 
@@ -97,7 +97,7 @@ def _item_row_dict(row):
     return out
 
 
-def build_checkpoint_payload(char_row, item_rows, built_sites=None):
+def build_checkpoint_payload(char_row, item_rows, built_sites=None, heavy_sidecars=None):
     """Serialize one character save row set for the checkpoint tank."""
     name, description, room_key, blob_text = char_row[:4]
     payload = {
@@ -111,6 +111,8 @@ def build_checkpoint_payload(char_row, item_rows, built_sites=None):
     }
     if isinstance(built_sites, dict) and built_sites:
         payload["built_sites"] = built_sites
+    if isinstance(heavy_sidecars, dict) and heavy_sidecars:
+        payload["heavy_sidecars"] = heavy_sidecars
     return payload
 
 
@@ -134,7 +136,9 @@ def _prune_old_checkpoints(char_dir, keep):
             pass
 
 
-def archive_player_checkpoint(char_row, item_rows, *, root=None, built_sites=None):
+def archive_player_checkpoint(
+    char_row, item_rows, *, root=None, built_sites=None, heavy_sidecars=None,
+):
     """Write a player-initiated save to the checkpoint tank.
 
     Returns ``(path_or_none, detail)`` where *detail* is human-readable for
@@ -161,6 +165,7 @@ def archive_player_checkpoint(char_row, item_rows, *, root=None, built_sites=Non
     path = os.path.join(char_dir, filename)
     payload = build_checkpoint_payload(
         char_row, item_rows, built_sites=built_sites,
+        heavy_sidecars=heavy_sidecars,
     )
 
     try:

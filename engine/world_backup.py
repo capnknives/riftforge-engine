@@ -282,6 +282,51 @@ def _sqlite_backup(src_db, dest_db):
         src.close()
 
 
+def _db_sidecar_exts():
+    """SQLite write-ahead files that live next to the main ``.db`` path."""
+    return ("-wal", "-shm")
+
+
+def _move_db_bundle(src_main, dest_main):
+    """Rename a SQLite main file *and* its WAL/SHM so they stay a pair.
+
+    SQLite looks for ``<main>-wal`` beside whatever the main file is
+    currently named. Moving only ``riftforge.db`` and leaving
+    ``riftforge.db-wal`` behind is what mixed a restored main file with
+    the previous live WAL on 2026-09-17 (integrity_check: 2nd reference
+    to page, then a boot crash-loop). Quarantine names the WAL after the
+    *quarantine* main file (``riftforge.db.corrupt.<stamp>-wal``) so the
+    old snapshot still opens as one database.
+    """
+    os.replace(src_main, dest_main)
+    moved = [dest_main]
+    for ext in _db_sidecar_exts():
+        src_side = src_main + ext
+        if os.path.isfile(src_side):
+            dest_side = dest_main + ext
+            os.replace(src_side, dest_side)
+            moved.append(dest_side)
+    return moved
+
+
+def _remove_db_sidecars(main_path):
+    """Drop leftover WAL/SHM next to ``main_path`` (not the main file)."""
+    for ext in _db_sidecar_exts():
+        side = main_path + ext
+        if os.path.isfile(side):
+            os.remove(side)
+
+
+def _rollback_db_bundle(live_db, quarantine):
+    """Put a quarantined main+WAL bundle back as the live database."""
+    if not quarantine or not os.path.isfile(quarantine):
+        return
+    if os.path.isfile(live_db):
+        os.remove(live_db)
+    _remove_db_sidecars(live_db)
+    _move_db_bundle(quarantine, live_db)
+
+
 def prune_pre_deploy_snapshots(*, root=None):
     """Drop oldest ``backups/pre-deploy/<timestamp>/`` dirs beyond the keep cap.
 
@@ -579,7 +624,9 @@ def find_latest_restorable_backup(*, root=None):
 def restore_live_db(date=None, *, root=None, triggered_by="staff"):
     """Replace live ``riftforge.db`` from ``backups/<date>/``.
 
-    Quarantines the current DB beside the live file. The game child must
+    Quarantines the current DB *bundle* (main file + WAL/SHM) beside the
+    live path, then copies the backup with the SQLite backup API so a
+    WAL-mode source is merged into one main file. The game child must
     be stopped (watcher handles that for ``gm recover restoredb``).
 
     Returns ``(ok: bool, detail: str)``.
@@ -606,22 +653,24 @@ def restore_live_db(date=None, *, root=None, triggered_by="staff"):
         stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
         quarantine = f"{live_db}.corrupt.{stamp}"
         try:
-            os.replace(live_db, quarantine)
+            _move_db_bundle(live_db, quarantine)
         except OSError as exc:
             return False, f"could not quarantine live db: {exc!r}"
 
+    # A leftover live WAL after the main file was replaced is how the
+    # 2026-09-17 catch-up restore_db mixed two databases. Strip sidecars
+    # again in case quarantine missed a name, then copy via backup API
+    # (not shutil.copy2) so the source WAL is folded into dest.
+    _remove_db_sidecars(live_db)
     try:
-        shutil.copy2(src, live_db)
-    except OSError as exc:
-        if quarantine and os.path.isfile(quarantine) and not os.path.isfile(live_db):
-            try:
-                os.replace(quarantine, live_db)
-            except OSError:
-                pass
+        _sqlite_backup(src, live_db)
+    except (OSError, sqlite3.Error) as exc:
+        _rollback_db_bundle(live_db, quarantine)
         return False, f"copy failed: {exc!r}"
 
     ok, live_detail = verify_db_file(live_db)
     if not ok:
+        _rollback_db_bundle(live_db, quarantine)
         return False, f"restored db failed integrity_check: {live_detail}"
 
     manifest = _read_manifest(date, root=root) or {}

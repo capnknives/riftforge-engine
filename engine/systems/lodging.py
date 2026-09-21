@@ -100,6 +100,56 @@ def is_house_satellite_chamber(room):
     return False
 
 
+# Homestead remodel types that are walk-throughs, never a living-room hub.
+# Foyers often carry ``out`` to the porch (private_home), which used to
+# beat the real living room in ``pick_main_homeroom`` and then grow
+# default couches/TVs on every rewrite (bug report 1819).
+_HOUSE_CONNECTOR_REMODEL_TYPES = frozenset({"foyer", "hallway"})
+
+
+def is_house_connector_chamber(room):
+    """True for foyer / hallway interiors that must not elect as the hub.
+
+    These rooms stay in the house cluster and keep player-installed
+    furniture. They must not win ``pick_main_homeroom`` or receive the
+    living-room media kit on boot.
+    """
+    if room is None:
+        return False
+    rtype = (getattr(room, "remodel_type", None) or "").strip().lower()
+    if rtype in _HOUSE_CONNECTOR_REMODEL_TYPES:
+        return True
+    title = str(
+        getattr(room, "title", None) or getattr(room, "name", None) or ""
+    ).strip()
+    # Homestead foyer styles: "Wide Entry Foyer". Avoid bare "Hall"
+    # (City Hall, dance hall).
+    if title.endswith(" Foyer") or title.endswith(" Hallway"):
+        return True
+    return False
+
+
+def _looks_like_living_hub(room):
+    """True when ``room`` is the living / parlor claim hub, not a connector."""
+    if room is None:
+        return False
+    if is_house_connector_chamber(room):
+        return False
+    rtype = (getattr(room, "remodel_type", None) or "").strip().lower()
+    if rtype == "living_room":
+        return True
+    key = str(getattr(room, "key", None) or "")
+    legacy = str(getattr(room, "legacy_key", None) or "")
+    title = str(
+        getattr(room, "title", None) or getattr(room, "name", None) or ""
+    )
+    if key.endswith(" Living") or legacy.endswith(" Living"):
+        return True
+    if title.endswith(" Living") or title.endswith(" Living Room"):
+        return True
+    return False
+
+
 def _claim_hub_key(room):
     """Best-effort deed hub for cluster bounding (``main_homeroom`` or hub room)."""
     if room is None:
@@ -182,11 +232,20 @@ def pick_main_homeroom(rooms, game=None):
     for key, room in by_key.items():
         if key.endswith(" Living"):
             return room
+    # Homestead VNUM hubs do not end in " Living". Prefer the living
+    # room over a foyer whose ``out`` faces the porch (bug report 1819).
     for room in hubs:
+        if _looks_like_living_hub(room):
+            return room
+    for room in hubs:
+        if is_house_connector_chamber(room):
+            continue
         outbound = _resolve_exit_room((room.exits or {}).get("out"), game)
         if outbound is not None and getattr(outbound, "private_home", False):
             return room
     for room in hubs:
+        if is_house_connector_chamber(room):
+            continue
         main = getattr(room, "main_homeroom", None)
         if main and main == getattr(room, "key", None):
             return room

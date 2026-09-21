@@ -1076,6 +1076,11 @@ def _add_room(rooms, filename, key, description, gravity=1.0,
     # Engine forge/smelter stations (smithing, mining help).
     if game_fields is not None and game_fields.get("foundry_amenity"):
         room.foundry_amenity = True
+    # Folklore occult stamps are room.engine fields -- apply here so
+    # lean / basegame / SUPERS JSON all land, not only a game stamper.
+    if game_fields:
+        from engine.systems import occult_marks as occult_marks_mod
+        occult_marks_mod.apply_json_occult_flags(room, game_fields)
     # SUPERS (or any game) authored flavor flags -- Stage G hook.
     from engine import hooks as _hooks
     _hooks.stamp_map_room(room, game_fields or {}, filename=filename)

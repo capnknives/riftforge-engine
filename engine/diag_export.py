@@ -861,7 +861,15 @@ def tick_save_overlap_hint(game, slow_handlers=None):
     # Lag U3: only flag overlap when a save is in-flight on *this* tick,
     # not merely because the last autosave was slow (mislabels Cadence).
     running = bool(getattr(game, "_autosave_running", False))
-    if running:
+    collecting = bool(getattr(game, "_save_collecting", False))
+    last_cad = getattr(game, "_cadence_last_pass", None) or {}
+    this_tick_busy = bool(
+        last_cad.get("save_busy")
+        or last_cad.get("autosave_running")
+        or running
+        or collecting
+    )
+    if this_tick_busy:
         return "cadence_wall_includes_save_overlap=1"
     return None
 

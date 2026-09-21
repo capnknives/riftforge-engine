@@ -81,6 +81,7 @@ IDLE_SPECTATOR = frozenset({
     # Room / who / sheet basics
     "look", "l",
     "who", "whofull", "whohide",
+    "staff", "gmlist", "wizlist",
     "score", "sc",
     "help", "commands", "changes",
     "more", "stop",  # pager continuation for long help / staff dumps
@@ -117,7 +118,6 @@ IDLE_SPECTATOR = frozenset({
     "missions", "board",
     # GM inspect / session meta (mutate verbs like goto/set/spawn still wake)
     "stat", "stats",
-    "gmlist",
     "whoallnpc", "npclist", "mobs",
     "reports",
     "gmmode", "gm on", "gm off",
@@ -334,6 +334,15 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
         verb = "burntree"
         args = ""
 
+    # Afterlife / hotel desk: players type "check out" / "check-out"
+    # from Heaven prose. Keep hyphen out of COMMANDS so help check-out
+    # is not a hub stub (help_content_quality / help_pointer).
+    if verb == "check-out" or (
+        verb == "check" and (args or "").strip().lower() in ("out", "-out")
+    ):
+        verb = "checkout"
+        args = ""
+
     # Stamp player activity for auto-idle (skip Cadence SilentSession).
     from engine.npc_act import SilentSession
     from engine import hooks
@@ -420,6 +429,18 @@ def _dispatch_body(character, raw, game, verb, args, *, force_actor=None):
     if blocked:
         send_if_online(character, gate_msg)
         return
+
+    # SUPERS Action-mode combat FIFO (Q49): meta verbs bypass; ``--`` clears.
+    if _active_game == "supers" and force_actor is None:
+        try:
+            from supers import combat_command_buffer as combat_cmd_buf_mod
+
+            if combat_cmd_buf_mod.maybe_buffer_dispatch(
+                character, raw, verb, args, game,
+            ):
+                return
+        except ImportError:
+            pass
 
     # GM mute: block global / room speech channels only (not movement).
     _MUTED_VERBS = frozenset({

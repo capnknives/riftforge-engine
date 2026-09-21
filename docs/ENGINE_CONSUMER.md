@@ -165,8 +165,11 @@ must refresh modules in this order:
 2. ``importlib.reload(engine.char_identity)`` — persistence save-path imports
    (``is_account_linked_body``) bind to the in-memory identity module; skip
    this and copyover aborts after the Veil announce (live 2026-09-10).
-3. ``importlib.reload(engine.persistence)``
-4. ``game_select.reregister_blob_codec()`` (or ``hooks.reload_blob_codec()``)
+3. ``importlib.reload(engine.item_inum)`` — persistence save-path imports
+   ``ensure_item_inum(..., holder=)``; skip this and copyover save TypeError's
+   after the Veil announce (live 2026-09-17).
+4. ``importlib.reload(engine.persistence)``
+5. ``game_select.reregister_blob_codec()`` (or ``hooks.reload_blob_codec()``)
    — ``reload(hooks)`` clears bootstrap callbacks; re-register before
    ``game.save(copyover=True)``.
 

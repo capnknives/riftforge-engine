@@ -30,15 +30,22 @@ def add_grace_amount(current, amount, *, cap=GRACE_MAX) -> tuple[float, float]:
     return after, round(after - before, 2)
 
 
-def grace_drip_amount(*, on_home_plane: bool, on_consecrated: bool) -> float:
+def grace_drip_amount(
+    *,
+    on_home_plane: bool,
+    on_earth: bool = False,
+    on_consecrated: bool = False,
+) -> float:
     """Passive tick drip rate copied from live ``tick_grace_drip`` priority.
 
-    Home plane (Heaven on live) beats consecrated ground; secular rooms
-    drip nothing. Rates match ``GRACE_DRIP_HOME_PER_TICK`` and
-    ``GRACE_DRIP_PER_TICK`` — engine name avoids plane-specific prose.
+    Home plane (Heaven on live) is the strong boost. Earth (and leftover
+    consecrated rooms on other planes) uses the slower native top-up.
+    Other planes drip nothing unless consecrated. Rates match
+    ``GRACE_DRIP_HOME_PER_TICK`` and ``GRACE_DRIP_PER_TICK`` — engine
+    names stay plane-generic.
     """
     if on_home_plane:
         return GRACE_DRIP_HOME_PER_TICK
-    if on_consecrated:
+    if on_earth or on_consecrated:
         return GRACE_DRIP_PER_TICK
     return 0.0

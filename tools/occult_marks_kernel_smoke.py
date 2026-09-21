@@ -140,6 +140,28 @@ def test_session_send_str():
     assert sess.sent == ["ok"]
 
 
+def test_json_holy_water_lands():
+    """Authored holy_water_ward must stamp and persist (v0.8.0 hunt)."""
+    from world import Room
+    from engine import map_store
+    from engine.systems import occult_marks as occult_marks_mod
+
+    assert "holy_water_ward" in occult_marks_mod.OCCULT_BOOL_FIELDS
+    assert "holy_water_ward" in map_store.RSET_BOOL_FLAGS
+    assert "holy_water_ward" in map_store._APPEND_BOOL_FLAGS
+    room = Room("chapel", "Chapel")
+    occult_marks_mod.apply_json_occult_flags(room, {"holy_water_ward": True})
+    assert occult_marks_mod.room_has_holy_water_ward(room) is True
+    live = Room("hand", "Hand room")
+    map_store._apply_entry_fields_to_live(
+        live, {"holy_water_ward": True, "title": "Hand"},
+    )
+    assert occult_marks_mod.room_has_holy_water_ward(live) is True
+    dumped = map_store.room_to_json(live)
+    assert dumped is not None
+    assert dumped.get("holy_water_ward") is True
+
+
 def main() -> int:
     test_bare_room_stamp_clear()
     test_salt_iron_holy_stamps()
@@ -148,6 +170,7 @@ def main() -> int:
     test_zone_dto_marks()
     test_zone_payload_player_safe()
     test_session_send_str()
+    test_json_holy_water_lands()
     print("occult_marks_kernel_smoke: ok")
     return 0
 

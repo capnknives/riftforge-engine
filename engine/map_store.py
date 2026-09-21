@@ -64,7 +64,7 @@ RSET_BOOL_FLAGS = frozenset({
     "consecrated", "evil_zone", "dungeon",
     "no_random_spawn", "zone_exit",
     "devils_gate", "unholy", "crossroads", "demon_deal",
-    "devils_trap", "salt_line", "iron_ward",
+    "devils_trap", "salt_line", "iron_ward", "holy_water_ward",
     "croatoan_contaminated", "croatoan_quarantine", "croatoan_seal",
 })
 
@@ -1679,7 +1679,7 @@ _APPEND_BOOL_FLAGS = frozenset({
     "consecrated", "evil_zone", "dungeon", "no_random_spawn",
     "zone_exit",
     "devils_gate", "unholy", "crossroads", "demon_deal",
-    "devils_trap", "salt_line", "iron_ward",
+    "devils_trap", "salt_line", "iron_ward", "holy_water_ward",
     "croatoan_contaminated", "croatoan_quarantine", "croatoan_seal",
 })
 
@@ -1850,6 +1850,8 @@ def _apply_entry_fields_to_live(live, entry):
     for flag in _APPEND_BOOL_FLAGS:
         if flag in entry:
             setattr(live, flag, bool(entry[flag]))
+    from engine.systems import occult_marks as occult_marks_mod
+    occult_marks_mod.apply_json_occult_flags(live, entry)
     if "main_homeroom" in entry:
         text = str(entry.get("main_homeroom") or "").strip()
         live.main_homeroom = text or None

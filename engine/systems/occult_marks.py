@@ -15,15 +15,35 @@ _MARK_DEVILS_TRAP = "devils_trap"
 _MARK_SALT_LINE = "salt_line"
 _MARK_IRON_WARD = "iron_ward"
 _MARK_HOLY_WATER = "holy_water_ward"
+OCCULT_BOOL_FIELDS = (
+    _MARK_DEVILS_TRAP,
+    _MARK_SALT_LINE,
+    _MARK_IRON_WARD,
+    _MARK_HOLY_WATER,
+)
 
 
 def ensure_occult_defaults(room) -> None:
     """Fill occult stamp attrs when never stamped. Idempotent."""
     if room is None:
         return
-    for attr in (_MARK_DEVILS_TRAP, _MARK_SALT_LINE, _MARK_IRON_WARD, _MARK_HOLY_WATER):
+    for attr in OCCULT_BOOL_FIELDS:
         if not hasattr(room, attr):
             setattr(room, attr, False)
+
+
+def apply_json_occult_flags(room, data) -> None:
+    """Stamp authored occult bools from a map/zone rooms[] dict.
+
+    Engine kind ``room.engine`` owns these keys. Call this from map load
+    and persist apply so a game stamper cannot drop ``holy_water_ward``.
+    """
+    if room is None or not isinstance(data, dict):
+        return
+    ensure_occult_defaults(room)
+    for attr in OCCULT_BOOL_FIELDS:
+        if attr in data:
+            setattr(room, attr, bool(data[attr]))
 
 
 def room_is_devils_trap(room, game_time_ticks=0) -> bool:

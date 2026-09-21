@@ -425,19 +425,21 @@ _SHORT_DESC_SKIP = frozenset({
     "with", "from",
 })
 
+# Same tokenizer as item names (engine.command_support._ITEM_NAME_TOKEN_SPLIT).
+# Kept here so identity matching does not import command_support at module
+# load (that module lazy-imports this one for needles).
+_IDENTITY_TOKEN_SPLIT = re.compile(r"[^a-z0-9]+")
 
-def _short_desc_match_needles(char) -> list[str]:
-    """Words from ``short_desc_override`` (setshort / hunt faces).
 
-    Room listing shows this string to strangers. ``look`` / ``attack``
-    must accept the same words -- ``look sunburn`` and ``look man`` for
-    ``a sunburned man`` -- not only the storage key. Staff pierce still
-    displays the legal name; the override still has to target.
+def _phrase_match_needles(raw) -> list[str]:
+    """Full phrase plus each ≥3-letter word, skipping articles.
+
+    ``look injunction`` must hit ``The Overturned Injunction`` the same
+    way ``look appeal`` hits ``a Remanded Appeal`` and ``look sunburn``
+    hits ``a sunburned man``. Catalog keys, legal names, and setshort
+    faces all go through this splitter -- not only short_desc_override.
     """
-    raw = getattr(char, "short_desc_override", None)
-    if not raw:
-        return []
-    face = " ".join(str(raw).split()).strip().lower()
+    face = " ".join(str(raw or "").split()).strip().lower()
     if not face:
         return []
     out = [face]
@@ -452,31 +454,81 @@ def _short_desc_match_needles(char) -> list[str]:
     return out
 
 
+def _short_desc_match_needles(char) -> list[str]:
+    """Words from ``short_desc_override`` (setshort / hunt faces).
+
+    Room listing shows this string to strangers. ``look`` / ``attack``
+    must accept the same words -- ``look sunburn`` and ``look man`` for
+    ``a sunburned man`` -- not only the storage key. Staff pierce still
+    displays the legal name; the override still has to target.
+    """
+    raw = getattr(char, "short_desc_override", None)
+    if not raw:
+        return []
+    return _phrase_match_needles(raw)
+
+
+def identity_query_matches(query, labels) -> bool:
+    """True when ``query`` hits any identity needle at word boundaries.
+
+    Shared by look / consider / kill / fight (``_collect_character_matches``).
+    Multi-word queries are a contiguous phrase (``overturned injunction``).
+    Single tokens prefix-match whole words only (``injunction`` in
+    ``The Overturned Injunction``; ``er`` in ``Erin``). One-letter queries
+    must equal a whole token. Substring-in-the-middle (``unc`` in
+    ``injunction``) does not count -- same rule as item names.
+    """
+    needle = (query or "").strip().lower()
+    if not needle:
+        return False
+    for raw in labels or ():
+        text = str(raw or "").strip().lower()
+        if not text:
+            continue
+        if " " in needle:
+            pat = rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])"
+            if re.search(pat, text):
+                return True
+            continue
+        tokens = [tok for tok in _IDENTITY_TOKEN_SPLIT.split(text) if tok]
+        if not tokens:
+            continue
+        if len(needle) == 1:
+            if needle in tokens:
+                return True
+            continue
+        if any(tok.startswith(needle) for tok in tokens):
+            return True
+    return False
+
+
 def identity_match_needles(char) -> list[str]:
     """Lowercase strings that should match this character in targeting."""
     needles = []
+
+    def _add_phrase(raw):
+        for extra in _phrase_match_needles(raw):
+            if extra not in needles:
+                needles.append(extra)
+
     key = (getattr(char, "key", None) or "").lower()
     raw_key = getattr(char, "key", None) or ""
     if key:
-        needles.append(key)
+        _add_phrase(key)
         # Peel ephemeral prefix for bare-name match.
         peeled = _strip_prefix(key).lower()
-        if peeled and peeled != "?" and peeled not in needles:
-            needles.append(peeled)
+        if peeled and peeled != "?":
+            _add_phrase(peeled)
         spaced = humanize_storage_key(raw_key).lower()
-        if spaced and spaced not in needles and spaced != peeled:
-            needles.append(spaced)
+        if spaced and spaced != peeled:
+            _add_phrase(spaced)
     given = character_given_name(char).lower()
-    if given and given not in needles:
-        needles.append(given)
+    if given:
+        _add_phrase(given)
     sur = character_surname(char).lower()
     if given and sur and surname_is_targetable(char):
-        full = f"{given} {sur}"
-        if full not in needles:
-            needles.append(full)
-        rev = f"{sur}, {given}"
-        if rev.lower() not in needles:
-            needles.append(rev.lower())
+        _add_phrase(f"{given} {sur}")
+        _add_phrase(f"{sur}, {given}")
         mash = f"{given}{sur}"
         if mash not in needles:
             needles.append(mash)
@@ -486,9 +538,7 @@ def identity_match_needles(char) -> list[str]:
         or ""
     )
     if face:
-        face_l = str(face).strip().lower()
-        if face_l and face_l not in needles:
-            needles.append(face_l)
+        _add_phrase(str(face).strip())
     for extra in _short_desc_match_needles(char):
         if extra not in needles:
             needles.append(extra)
@@ -730,6 +780,11 @@ def remint_cnum_clash_for_restore(
                     taken.add(validate_cnum(raw))
                 except ValueError:
                     continue
+        # Leftover sidecar shards (bug report 1776 keeps homestead
+        # crates after a character row is gone) still occupy a CNUM.
+        # Skipping those numbers is what lets remint avoid a UNIQUE
+        # abort on character_heavy_blobs.
+        taken.update(_taken_cnums_from_heavy_blobs(conn))
     if game is not None:
         taken.update(collect_taken_cnums(getattr(game, "characters", None)))
     taken.add(wanted)
@@ -758,7 +813,12 @@ def remint_cnum_clash_for_restore(
             "WHERE name = ? COLLATE NOCASE",
             (new, new_blob, occ_name),
         )
-        _retarget_cnum_sidecars(conn, wanted, new, occ_name)
+        # Keep homestead crates / journals on the lasting tag the PC
+        # still holds. Occupant items move by holder_key; heavy blobs
+        # on ``wanted`` belong to the player, not the NPC.
+        _retarget_cnum_sidecars(
+            conn, wanted, new, occ_name, move_heavy=False,
+        )
     if ram_occupant is not None:
         ram_occupant.cnum = new
         if game is not None:
@@ -771,8 +831,15 @@ def remint_cnum_clash_for_restore(
     return wanted, notes
 
 
-def _retarget_cnum_sidecars(conn, old_cnum, new_cnum, owner_name):
-    """Move item / homestead / heavy-blob CNUM pointers with a remint."""
+def _retarget_cnum_sidecars(
+    conn, old_cnum, new_cnum, owner_name, *, move_heavy=True,
+):
+    """Move item / homestead / heavy-blob CNUM pointers with a remint.
+
+    ``move_heavy=False`` when an NPC yields a tag a login PC still
+    wears -- crates and journals on that CNUM belong to the player
+    (bug report 1846). Occupant inventory still remaps by holder_key.
+    """
     if conn is None or not old_cnum or not new_cnum:
         return
     item_cols = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
@@ -787,20 +854,749 @@ def _retarget_cnum_sidecars(conn, old_cnum, new_cnum, owner_name):
             "SELECT name FROM sqlite_master WHERE type='table'"
         )
     }
-    if "character_heavy_blobs" in tables:
-        conn.execute(
-            "UPDATE character_heavy_blobs SET cnum = ? WHERE cnum = ?",
-            (new_cnum, old_cnum),
-        )
+    if move_heavy and "character_heavy_blobs" in tables:
+        _move_heavy_blob_cnum(conn, old_cnum, new_cnum)
     if "homestead_plots" in tables:
         plot_cols = {
             row[1] for row in conn.execute("PRAGMA table_info(homestead_plots)")
         }
-        if "owner_cnum" in plot_cols:
+        # Plot owner_key stays on the login PC; only retarget plots
+        # when we are moving the owner themselves (heavy move).
+        if move_heavy and "owner_cnum" in plot_cols:
             conn.execute(
                 "UPDATE homestead_plots SET owner_cnum = ? WHERE owner_cnum = ?",
                 (new_cnum, old_cnum),
             )
+
+
+def _taken_cnums_from_heavy_blobs(conn):
+    """CNUM strings that still have sidecar rows, including orphan crates."""
+    taken = set()
+    if conn is None:
+        return taken
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT cnum FROM character_heavy_blobs "
+            "WHERE cnum IS NOT NULL AND cnum != ''",
+        )
+    except Exception:
+        return taken
+    for row in rows:
+        raw = row[0] if row else None
+        if isinstance(raw, str) and raw.strip():
+            try:
+                taken.add(validate_cnum(raw))
+            except ValueError:
+                continue
+    return taken
+
+
+def _sidecar_payload_json(payload):
+    """Normalize a sidecar cell to the JSON text SQLite stores."""
+    if isinstance(payload, dict):
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    if payload is None:
+        return "{}"
+    return payload
+
+
+def _parse_heavy_blob_payload(payload):
+    """Dict from a sidecar cell. Hooks codec first; JSON fallback for tests."""
+    parsed = None
+    try:
+        from engine import hooks
+
+        parsed = hooks.parse_heavy_shard_payload(payload)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, str) and payload.strip():
+        try:
+            loaded = json.loads(payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+    return {}
+
+
+def _merge_heavy_blob_payloads(shard, dest_payload, src_payload):
+    """Combine two shards for the same (cnum, shard) instead of aborting.
+
+    Homestead crates and Echo journals must not vanish when a remint lands
+    on a leftover sidecar. Other shards prefer the live source payload.
+    """
+    from engine import hooks
+
+    shard_name = str(shard or "")
+    dest = _parse_heavy_blob_payload(dest_payload)
+    src = _parse_heavy_blob_payload(src_payload)
+    if shard_name == "property_stash":
+        # Reattach / remint must UNION piles. Key-wise replace would
+        # drop 134 loose items when a later remint hop only saved four
+        # fish (bug report 1846).
+        return _sidecar_payload_json(_union_property_stash_payloads(dest, src))
+    if shard_name == "helper_roster":
+        return _sidecar_payload_json(_union_helper_roster_payloads(dest, src))
+    if shard_name == "life_log":
+        dest_empty = hooks.life_log_payload_empty(dest)
+        src_empty = hooks.life_log_payload_empty(src)
+        if src_empty and not dest_empty:
+            return _sidecar_payload_json(dest)
+        if dest_empty and not src_empty:
+            return _sidecar_payload_json(src)
+        # Both nonempty: keep old days, fill missing diary pages, append
+        # events that are not already on dest (bug report 1846 reattach).
+        return _sidecar_payload_json(_union_life_log_payloads(dest, src))
+    if src:
+        return _sidecar_payload_json(src)
+    return _sidecar_payload_json(dest)
+
+
+def _move_heavy_blob_cnum(conn, old_cnum, new_cnum):
+    """Retarget sidecar shards one row at a time.
+
+    A bulk ``UPDATE ... SET cnum = new WHERE cnum = old`` IntegrityError's
+    when ``new`` already has that shard -- leftover property_stash from a
+    retired body (kept on purpose so crates survive force-full wipe).
+    Copyover used to cancel the whole Veil rewrite on that UNIQUE clash.
+    """
+    old_cnum = str(old_cnum or "").strip()
+    new_cnum = str(new_cnum or "").strip()
+    if not old_cnum or not new_cnum or old_cnum == new_cnum:
+        return
+    try:
+        rows = conn.execute(
+            "SELECT shard, payload FROM character_heavy_blobs WHERE cnum=?",
+            (old_cnum,),
+        ).fetchall()
+    except Exception:
+        return
+    for shard, payload in rows:
+        dest = conn.execute(
+            "SELECT payload FROM character_heavy_blobs "
+            "WHERE cnum=? AND shard=?",
+            (new_cnum, shard),
+        ).fetchone()
+        if dest is None:
+            conn.execute(
+                "UPDATE character_heavy_blobs SET cnum=? "
+                "WHERE cnum=? AND shard=?",
+                (new_cnum, old_cnum, shard),
+            )
+            continue
+        merged = _merge_heavy_blob_payloads(shard, dest[0], payload)
+        conn.execute(
+            "UPDATE character_heavy_blobs SET payload=? "
+            "WHERE cnum=? AND shard=?",
+            (merged, new_cnum, shard),
+        )
+        conn.execute(
+            "DELETE FROM character_heavy_blobs WHERE cnum=? AND shard=?",
+            (old_cnum, shard),
+        )
+
+
+def _stash_row_inum(row):
+    """Instance id for a persisted item dict, or empty if none."""
+    if not isinstance(row, dict):
+        return ""
+    container = row.get("container")
+    if not isinstance(container, dict):
+        container = {}
+    inum = str(container.get("inum") or row.get("inum") or "").strip()
+    return inum
+
+
+def _union_item_rows(left, right):
+    """Concatenate stash rows; skip duplicate INUMs we already kept."""
+    out = []
+    seen = set()
+    for row in list(left or []) + list(right or []):
+        if not isinstance(row, dict):
+            continue
+        inum = _stash_row_inum(row)
+        if inum:
+            if inum in seen:
+                continue
+            seen.add(inum)
+        out.append(row)
+    return out
+
+
+def _union_home_boxes(left, right):
+    """Merge labeled crates by label; union contents inside each crate."""
+    by_label = {}
+    order = []
+    for box in list(left or []) + list(right or []):
+        if not isinstance(box, dict):
+            continue
+        label = str(box.get("label") or "crate").strip() or "crate"
+        key = label.lower()
+        if key not in by_label:
+            by_label[key] = {
+                "key": str(box.get("key") or f"box_{len(order) + 1}"),
+                "label": label,
+                "contents": list(box.get("contents") or []),
+            }
+            order.append(key)
+            continue
+        by_label[key]["contents"] = _union_item_rows(
+            by_label[key].get("contents"),
+            box.get("contents"),
+        )
+    return [by_label[k] for k in order]
+
+
+def _union_property_stash_payloads(dest, src):
+    """Keep every crate and loose item from both remint hops."""
+    dest = dest if isinstance(dest, dict) else {}
+    src = src if isinstance(src, dict) else {}
+    out = dict(dest)
+    out["home_stash_items"] = _union_item_rows(
+        dest.get("home_stash_items"), src.get("home_stash_items"),
+    )
+    out["home_boxes"] = _union_home_boxes(
+        dest.get("home_boxes"), src.get("home_boxes"),
+    )
+    out["pit_stash_items"] = _union_item_rows(
+        dest.get("pit_stash_items"), src.get("pit_stash_items"),
+    )
+    out["prison_property_items"] = _union_item_rows(
+        dest.get("prison_property_items"), src.get("prison_property_items"),
+    )
+    out["bugworld_property_items"] = _union_item_rows(
+        dest.get("bugworld_property_items"), src.get("bugworld_property_items"),
+    )
+    look = {}
+    for source in (dest.get("bugworld_look_stash"), src.get("bugworld_look_stash")):
+        if isinstance(source, dict):
+            look.update(source)
+    out["bugworld_look_stash"] = look or None
+    return out
+
+
+def _union_helper_roster_payloads(dest, src):
+    """Keep crew rows from both remint hops (unique npc_key / given_name)."""
+    dest = dest if isinstance(dest, dict) else {}
+    src = src if isinstance(src, dict) else {}
+    rows = []
+    seen = set()
+    for row in list(dest.get("helper_roster") or []) + list(
+        src.get("helper_roster") or []
+    ):
+        if not isinstance(row, dict):
+            continue
+        ident = (
+            str(row.get("npc_key") or "").strip().lower()
+            or str(row.get("given_name") or "").strip().lower()
+        )
+        if ident:
+            if ident in seen:
+                continue
+            seen.add(ident)
+        rows.append(row)
+    return {"helper_roster": rows}
+
+
+def _union_life_log_payloads(dest, src):
+    """Keep dest journal pages; add src days and events dest does not have."""
+    out = dict(dest or {})
+    side = src if isinstance(src, dict) else {}
+    dest_events = list(out.get("life_log_events") or [])
+    src_events = list(side.get("life_log_events") or [])
+    seen = set()
+    merged_events = []
+    for event in dest_events + src_events:
+        if not isinstance(event, dict):
+            continue
+        key = json.dumps(event, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged_events.append(event)
+    if merged_events:
+        out["life_log_events"] = merged_events
+    for key in ("life_log_diary", "life_log_daily"):
+        merged = {}
+        for source in (out.get(key), side.get(key)):
+            if not isinstance(source, dict):
+                continue
+            for day, page in source.items():
+                day_key = str(day)
+                if day_key in merged or not isinstance(page, dict):
+                    continue
+                merged[day_key] = dict(page)
+        if merged:
+            out[key] = merged
+    meta = dict(side.get("life_log_meta") or {})
+    meta.update(out.get("life_log_meta") or {})
+    if merged_events:
+        meta["raw_event_count"] = len(merged_events)
+    diary = out.get("life_log_diary")
+    if isinstance(diary, dict):
+        meta["diary_day_count"] = len(diary)
+    if meta:
+        out["life_log_meta"] = meta
+    return out
+
+
+def _property_stash_rank(parsed, payload):
+    """Order leftover stashes: labeled crates first, then item count, then bytes.
+
+    Payload length alone would pick a later remint hop of four fish over
+    the homestead crate sidecar (bug report 1846).
+    """
+    parsed = parsed if isinstance(parsed, dict) else {}
+    boxes = parsed.get("home_boxes")
+    if not isinstance(boxes, list):
+        boxes = []
+    n_contents = 0
+    for box in boxes:
+        if not isinstance(box, dict):
+            continue
+        contents = box.get("contents")
+        if isinstance(contents, list):
+            n_contents += len(contents)
+    n_loose = 0
+    for key in (
+        "home_stash_items",
+        "pit_stash_items",
+        "prison_property_items",
+        "bugworld_property_items",
+    ):
+        rows = parsed.get(key)
+        if isinstance(rows, list):
+            n_loose += len(rows)
+    size = len(payload) if isinstance(payload, (str, bytes)) else 0
+    return (len(boxes), n_contents + n_loose, size)
+
+
+def reattach_orphaned_login_sidecars(game, conn=None):
+    """Walk login PCs back onto unheld prefix tags and fold leftover shards.
+
+    Persist snapshot-clash reminted passworded PCs and left homestead
+    sidecars on every old CNUM (bug report 1846). Player tags are lasting:
+    if exactly one login PC uses a prefix, restore that body onto the
+    largest crate tag and UNION every other unheld same-prefix shard
+    (loose piles, later remint hops, journals, helper rosters).
+    """
+    from engine.char_cnum import (
+        cnum_prefix,
+        parse_cnum,
+        validate_cnum,
+    )
+    from engine.char_index import iter_characters
+    from engine import hooks as hooks_mod
+
+    notes = []
+    conn = conn or (getattr(game, "db", None) if game is not None else None)
+    if game is None or conn is None:
+        return notes
+
+    held = set()
+    try:
+        for row in conn.execute(
+            "SELECT cnum FROM characters "
+            "WHERE cnum IS NOT NULL AND cnum != ''"
+        ):
+            try:
+                held.add(validate_cnum(row[0]))
+            except (TypeError, ValueError):
+                continue
+    except Exception:
+        return notes
+    held.update(collect_taken_cnums(iter_characters(game)))
+
+    # Persist remint hops leave shards on every old tag -- crates on one
+    # CNUM, a later pile of fish on another, journals on a third. Fold
+    # every unheld same-prefix shard; do not keep only the largest crate.
+    stash_by_prefix = {}
+    shards_by_prefix = {}
+    try:
+        rows = conn.execute(
+            "SELECT cnum, shard, payload FROM character_heavy_blobs "
+            "WHERE cnum IS NOT NULL AND cnum != ''",
+        ).fetchall()
+    except Exception:
+        return notes
+    for raw_cnum, shard, payload in rows:
+        try:
+            tag = validate_cnum(raw_cnum)
+        except (TypeError, ValueError):
+            continue
+        if tag in held:
+            continue
+        parsed_tag = parse_cnum(tag)
+        if not parsed_tag:
+            continue
+        prefix = parsed_tag[0]
+        shards_by_prefix.setdefault(prefix, set()).add(tag)
+        if str(shard) != "property_stash":
+            continue
+        parsed = hooks_mod.parse_heavy_shard_payload(payload)
+        if hooks_mod.property_stash_payload_empty(parsed):
+            continue
+        rank = _property_stash_rank(parsed, payload)
+        stash_by_prefix.setdefault(prefix, []).append((tag, rank))
+
+    login_by_prefix = {}
+    for char in list(iter_characters(game)):
+        if not is_passworded_roster_body(char):
+            continue
+        prefix = None
+        raw = getattr(char, "cnum", None)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                prefix = parse_cnum(validate_cnum(raw))[0]
+            except (TypeError, ValueError):
+                prefix = None
+        if not prefix:
+            prefix = cnum_prefix(character_given_name(char))
+        login_by_prefix.setdefault(prefix, []).append(char)
+
+    for prefix, pcs in login_by_prefix.items():
+        candidates = stash_by_prefix.get(prefix) or []
+        extras = shards_by_prefix.get(prefix) or set()
+        if not candidates and not extras:
+            continue
+        if len(pcs) != 1:
+            print(
+                f"[cnum] skip reattach prefix {prefix}: "
+                f"{len(pcs)} login PCs, will not guess",
+                flush=True,
+            )
+            continue
+        pc = pcs[0]
+        current = None
+        raw = getattr(pc, "cnum", None)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                current = validate_cnum(raw)
+            except (TypeError, ValueError):
+                current = None
+        current_rank = (0, 0, 0)
+        if current:
+            row = conn.execute(
+                "SELECT payload FROM character_heavy_blobs "
+                "WHERE cnum=? AND shard=?",
+                (current, "property_stash"),
+            ).fetchone()
+            if row:
+                parsed = hooks_mod.parse_heavy_shard_payload(row[0])
+                current_rank = _property_stash_rank(parsed, row[0])
+        if candidates:
+            winner, win_rank = max(candidates, key=lambda item: item[1])
+        else:
+            winner, win_rank = current, current_rank
+        if not winner:
+            continue
+        lasting = winner
+        if current and current_rank >= win_rank and current_rank > (0, 0, 0):
+            lasting = current
+        extra = sorted(
+            tag for tag in extras
+            if tag and tag != lasting and tag != current
+        )
+        if lasting == current and not extra:
+            continue
+        _restore_login_pc_cnum(
+            game, conn, pc, lasting=lasting, old=current, extra_cnums=extra,
+        )
+        notes.append(
+            f"{getattr(pc, 'key', '?')} {current} -> {lasting} "
+            f"(reattach leftover house-tag shards)"
+        )
+    return notes
+
+
+
+def retarget_orphan_stash_sidecars(game, conn=None, *, backup_db_path=None):
+    """Move homestead/pit sidecars onto the live PC CNUM for that name.
+
+    Force-full keep preserves ``property_stash`` on the *old* tag while
+    the character row is inserted under a reminted CNUM (live 2026-09-20:
+    Ayla AL00002 crates vs AL00038 body). ``stash`` then looks empty.
+    The one-shot ``STASH_SIDECAR_CNUM_REATTACH_V1`` already stamped, and
+    it skipped tags still held by an NPC (Donna Robbins on DN00001).
+
+    This walk is idempotent: passworded bodies that already hold their
+    sidecar are a no-op. Does not remint the PC back onto the old tag.
+    """
+    conn = conn or (getattr(game, "db", None) if game is not None else None)
+    if conn is None:
+        return []
+    from engine.char_index import iter_characters
+
+    notes = []
+    name_by_cnum = _stash_owner_names_from_backup(backup_db_path)
+    passworded = {}
+    if game is not None:
+        for char in list(iter_characters(game)):
+            if not is_passworded_roster_body(char):
+                continue
+            key = (getattr(char, "key", None) or "").strip()
+            if key:
+                passworded[key.lower()] = char
+    # SQLite fallback when called from surgical restore (no Game()).
+    if not passworded:
+        try:
+            for name, cnum, blob in conn.execute(
+                "SELECT name, cnum, stats FROM characters"
+            ):
+                stats = {}
+                if blob:
+                    try:
+                        parsed = json.loads(blob)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        parsed = {}
+                    if isinstance(parsed, dict):
+                        stats = parsed
+                fake = type("Row", (), {
+                    "key": name,
+                    "cnum": cnum,
+                    "account": stats.get("account") or "",
+                    "password_hash": stats.get("password_hash") or "",
+                    "is_npc": bool(stats.get("is_npc")),
+                    "is_guest": bool(stats.get("is_guest")),
+                })()
+                if is_passworded_roster_body(fake):
+                    passworded[(name or "").strip().lower()] = fake
+        except Exception:
+            return notes
+
+    live_cnum_by_name = {}
+    for key, char in passworded.items():
+        raw = getattr(char, "cnum", None)
+        if isinstance(raw, str) and raw.strip():
+            try:
+                live_cnum_by_name[key] = validate_cnum(raw)
+            except (TypeError, ValueError):
+                continue
+
+    prefix_uniques = {}
+    for key, tag in live_cnum_by_name.items():
+        parsed = parse_cnum(tag)
+        if not parsed:
+            continue
+        prefix_uniques.setdefault(parsed[0], []).append(key)
+
+    try:
+        rows = conn.execute(
+            "SELECT cnum FROM character_heavy_blobs "
+            "WHERE shard='property_stash' AND cnum IS NOT NULL AND cnum != ''"
+        ).fetchall()
+    except Exception:
+        return notes
+
+    for (raw_cnum,) in rows:
+        try:
+            old = validate_cnum(raw_cnum)
+        except (TypeError, ValueError):
+            continue
+        try:
+            payload_row = conn.execute(
+                "SELECT payload FROM character_heavy_blobs "
+                "WHERE cnum=? AND shard=?",
+                (old, "property_stash"),
+            ).fetchone()
+        except Exception:
+            payload_row = None
+        parsed_stash = _parse_heavy_blob_payload(
+            payload_row[0] if payload_row else None,
+        )
+        stash_rank = _property_stash_rank(
+            parsed_stash, payload_row[0] if payload_row else "",
+        )
+        if stash_rank[0] == 0 and stash_rank[1] == 0:
+            # Empty celestial NPC leftovers (143B of []) must not fold
+            # onto a unique-prefix login PC.
+            continue
+        holder_name = None
+        try:
+            row = conn.execute(
+                "SELECT name, stats FROM characters WHERE cnum=?",
+                (old,),
+            ).fetchone()
+        except Exception:
+            row = None
+        if row:
+            holder_name = (row[0] or "").strip()
+            holder_stats = {}
+            if row[1]:
+                try:
+                    parsed = json.loads(row[1])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    parsed = {}
+                if isinstance(parsed, dict):
+                    holder_stats = parsed
+            holder = type("Row", (), {
+                "key": holder_name,
+                "cnum": old,
+                "account": holder_stats.get("account") or "",
+                "password_hash": holder_stats.get("password_hash") or "",
+                "is_npc": bool(holder_stats.get("is_npc")),
+                "is_guest": False,
+            })()
+            if is_passworded_roster_body(holder):
+                continue
+        owner_key = (name_by_cnum.get(old) or "").strip().lower()
+        if not owner_key:
+            parsed = parse_cnum(old)
+            prefix = parsed[0] if parsed else None
+            names = prefix_uniques.get(prefix) or []
+            if len(names) == 1:
+                owner_key = names[0]
+        if not owner_key:
+            continue
+        new = live_cnum_by_name.get(owner_key)
+        if not new or new == old:
+            continue
+        _move_heavy_blob_cnum(conn, old, new)
+        pc = passworded.get(owner_key)
+        if game is not None and pc is not None:
+            _apply_property_sidecar_to_character(pc, conn, new)
+        notes.append(f"{owner_key} {old} -> {new}")
+        print(
+            f"[cnum] retarget stash sidecar {owner_key!r} {old} -> {new}",
+            flush=True,
+        )
+    return notes
+
+
+def _stash_owner_names_from_backup(backup_db_path=None):
+    """Map CNUM -> storage name from a backup DB (newest nightly default)."""
+    paths = []
+    if backup_db_path:
+        paths.append(backup_db_path)
+    else:
+        try:
+            from engine.world_backup import backups_root
+            import os
+            root = backups_root()
+            if root and os.path.isdir(root):
+                dates = sorted(
+                    (
+                        name for name in os.listdir(root)
+                        if len(name) == 10 and name[4] == "-" and name[7] == "-"
+                    ),
+                    reverse=True,
+                )
+                for date in dates:
+                    candidate = os.path.join(root, date, "riftforge.db")
+                    if os.path.isfile(candidate):
+                        paths.append(candidate)
+                        break
+                pre = os.path.join(root, "pre-deploy")
+                if os.path.isdir(pre):
+                    stems = sorted(os.listdir(pre), reverse=True)
+                    for stem in stems:
+                        candidate = os.path.join(pre, stem, "riftforge.db")
+                        if os.path.isfile(candidate):
+                            paths.append(candidate)
+                            break
+        except Exception:
+            pass
+    out = {}
+    import sqlite3
+    for path in paths:
+        try:
+            bak = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        except sqlite3.Error:
+            continue
+        try:
+            for name, cnum in bak.execute(
+                "SELECT name, cnum FROM characters "
+                "WHERE cnum IS NOT NULL AND cnum != ''"
+            ):
+                tag = str(cnum or "").strip()
+                key = (name or "").strip()
+                if tag and key and tag not in out:
+                    out[tag] = key
+        except sqlite3.Error:
+            pass
+        finally:
+            bak.close()
+        if out:
+            break
+    return out
+
+
+def _restore_login_pc_cnum(
+    game, conn, pc, *, lasting, old, extra_cnums=(),
+):
+    """Move a login PC onto ``lasting`` and merge every remint-hop sidecar."""
+    name = getattr(pc, "key", None) or ""
+    pc.cnum = lasting
+    for extra in extra_cnums or ():
+        if extra and extra != lasting:
+            _move_heavy_blob_cnum(conn, extra, lasting)
+    if old and old != lasting:
+        _move_heavy_blob_cnum(conn, old, lasting)
+        _retarget_cnum_sidecars(
+            conn, old, lasting, name, move_heavy=False,
+        )
+    stats = None
+    try:
+        row = conn.execute(
+            "SELECT stats FROM characters WHERE name=? COLLATE NOCASE",
+            (name,),
+        ).fetchone()
+        stats = row[0] if row else None
+    except Exception:
+        stats = None
+    conn.execute(
+        "UPDATE characters SET cnum = ?, stats = ? "
+        "WHERE name = ? COLLATE NOCASE",
+        (lasting, rewrite_stats_blob_cnum(stats or "{}", lasting), name),
+    )
+    try:
+        from engine.persistence import mark_character_dirty
+
+        mark_character_dirty(game, pc, force=True)
+    except Exception:
+        pass
+    try:
+        from engine.id_reserve import note_character_cnum
+
+        note_character_cnum(pc)
+    except Exception:
+        pass
+    _apply_property_sidecar_to_character(pc, conn, lasting)
+    print(
+        f"[cnum] reattach login {name!r} {old} -> {lasting}",
+        flush=True,
+    )
+
+
+def _apply_property_sidecar_to_character(pc, conn, cnum):
+    """Load persisted property_stash / life_log shards onto the live body."""
+    from engine import hooks as hooks_mod
+
+    try:
+        rows = conn.execute(
+            "SELECT shard, payload FROM character_heavy_blobs WHERE cnum=?",
+            (cnum,),
+        ).fetchall()
+    except Exception:
+        return
+    saved = {}
+    for shard, payload in rows:
+        parsed = hooks_mod.parse_heavy_shard_payload(payload)
+        if isinstance(parsed, dict):
+            saved.update(parsed)
+    if not saved:
+        return
+    try:
+        hooks_mod.apply_character_blob(pc, saved)
+    except Exception as exc:
+        print(
+            f"[cnum] reattach apply blob skipped {getattr(pc, 'key', '?')}: "
+            f"{exc!r}",
+            flush=True,
+        )
 
 
 def find_character_exact_key(game, key):

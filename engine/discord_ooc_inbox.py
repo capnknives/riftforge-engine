@@ -15,6 +15,9 @@ import time
 from pathlib import Path
 
 INBOX_DIR_NAME = ".discord_ooc_inbox"
+# Live 2026-09-18: draining/sorting the whole inbox billed ~90ms on the
+# heartbeat. Cap so a burst cannot stall look/who.
+INBOX_FILES_PER_TICK = 8
 
 
 def _repo_root() -> Path:
@@ -77,10 +80,11 @@ def tick_discord_ooc_inbox(game) -> None:
     directory = inbox_dir()
     if not directory.is_dir():
         return
-    paths = sorted(directory.glob("msg-*.json"))
-    if not paths:
-        return
-    for path in paths:
+    n = 0
+    for path in directory.glob("msg-*.json"):
+        if n >= INBOX_FILES_PER_TICK:
+            break
+        n += 1
         payload = _load_payload(path)
         try:
             path.unlink(missing_ok=True)

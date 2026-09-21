@@ -38,6 +38,7 @@ from engine.systems.civic_fixture import floor_items_excluding_fixtures
 from command_support import (
     _can_see_spirit,
     _is_presence_hidden,
+    _look_skip_room_occupant,
     _display_name,
     floor_item_look_lines,
     format_floor_items_for_look,
@@ -269,9 +270,7 @@ def _look_room_section(character, game, section):
             continue
         if not isinstance(o, Character):
             continue
-        if getattr(o, "vessel_host_key", None):
-            continue
-        if getattr(o, "husk_ridden", False):
+        if _look_skip_room_occupant(character, o, room, game):
             continue
         if hooks.in_veil(o) and hooks.veil_visible_to(character, o):
             base = _display_name(o, viewer=character)
@@ -654,11 +653,7 @@ def cmd_look(character, args, game, *, after_move=False):
                 continue
             if not isinstance(o, Character):
                 continue
-            # Riding Mantle: inside host -- hide the Mantle body.
-            if getattr(o, "vessel_host_key", None):
-                continue
-            # Living husk while Mantle rides -- hide the shell.
-            if getattr(o, "husk_ridden", False):
+            if _look_skip_room_occupant(character, o, room, game):
                 continue
             if hooks.in_veil(o) and hooks.veil_visible_to(character, o):
                 base = _display_name(o, viewer=character)
@@ -4190,6 +4185,45 @@ def cmd_config(character, args, game):
         else:
             character.session.send("Usage: config combathints on|off")
         return
+    if key in ("combatpulse", "combat_pulse", "pulsegap", "pulseclock"):
+        if not rest:
+            state = "on" if getattr(character, "show_combat_pulse_n", False) else "off"
+            character.session.send(
+                f"Combat pulse display is {state}. "
+                "Usage: config combatpulse on|off "
+                "(YOUR gap only while fighting; never opponents)."
+            )
+            if getattr(character, "show_combat_pulse_n", False):
+                from engine import hooks
+
+                for row in hooks.config_combat_status_extra(character):
+                    if row.strip().startswith("your pulse"):
+                        character.session.send(row.strip())
+            return
+        choice = rest.split(None, 1)[0].lower()
+        if choice in ("on", "yes", "true", "1"):
+            character.show_combat_pulse_n = True
+            display_prefs.mark_pref_manual(character, "show_combat_pulse_n")
+            msg = (
+                "Combat pulse display on -- add %Pn to your prompt if you "
+                "want the gap visible in fights. Shows YOUR pulse gap only."
+            )
+            from engine import hooks
+
+            for row in hooks.config_combat_status_extra(character):
+                if row.strip().startswith("your pulse"):
+                    msg = f"{msg}\r\n{row.strip()}"
+                    break
+            character.session.send(msg)
+        elif choice in ("off", "no", "false", "0"):
+            character.show_combat_pulse_n = False
+            display_prefs.mark_pref_manual(character, "show_combat_pulse_n")
+            character.session.send(
+                "Combat pulse display off -- pulse gap stays felt, not shown."
+            )
+        else:
+            character.session.send("Usage: config combatpulse on|off")
+        return
     if key == "items":
         sub = (rest or "").split(None, 1)
         subkey = sub[0].lower() if sub else ""
@@ -4512,6 +4546,7 @@ def cmd_config(character, args, game):
         "scoremeters": "scoremeters",
         "combatdiag": "combatdiag",
         "combatterse": "combatterse",
+        "combatlong": "combatlong",
         "combatairy": "combatairy",
         "combatprose": "combatprose",
         "fightlog": "fightlog",
@@ -4613,7 +4648,7 @@ def _config_category_index():
         "  display   -- color, width, map, screenreader, spacing, traffic, radio",
         "  brief     -- brief look + items/vehicles/houses compact "
         "(alias: compact)",
-        "  combat    -- gag, tags, hints, numbers, diag, fightlog, autokill",
+        "  combat    -- gag, tags, terse/prose, hints, numbers, diag, fightlog, combatpulse, autokill",
         "  autoloot  -- kill scoop, dungeon/relics, autosplit, autotap",
         "  chat      -- config channel ooc|say|emote|tell|questions, "
         "plaincomms, tips, surname reminder",
@@ -4693,9 +4728,13 @@ def _config_reset_dispatch(character, rest_l, game):
         character.combat_diag = False
         character.combat_prose = False
         character.combat_terse = False
+        character.combat_long = False
+        character.combat_view_rev = 1
         character.combat_terse_airy = False
         character.fightlog_enabled = False
+        character.show_combat_pulse_n = False
         display_prefs.mark_pref_manual(character, "fightlog_enabled")
+        display_prefs.mark_pref_manual(character, "show_combat_pulse_n")
     elif category == "autoloot":
         dispatch = hooks.get_dispatch()
         if dispatch is not None:
@@ -4809,7 +4848,7 @@ def _config_section_combat(character, display_prefs):
     tags_state = "on" if character.show_combat_tags else "off"
     if getattr(character, "screenreader", False) and not character.show_combat_tags:
         tags_state += "  (hit/miss still named in plain words)"
-    return [
+    lines = [
         "Combat:",
         f"  combatgag: "
         f"{'on' if character.combat_gag_other else 'off'}  "
@@ -4832,7 +4871,15 @@ def _config_section_combat(character, display_prefs):
         "-- config combatdiag on|off",
         f"  combatterse: "
         f"{'on' if getattr(character, 'combat_terse', False) else 'off'}  "
-        "-- config combatterse on|off (sighted short colored lines)",
+        "-- config combatterse on|off (short attempt / reaction pairs)",
+        f"  combatlong: "
+        f"{'on' if getattr(character, 'combat_long', False) else 'off'}  "
+        "-- config combatlong on|off (the long one-paragraph swing)",
+        "  fight voice: "
+        + ("combatlong (long paragraph)" if getattr(character, "combat_long", False)
+           else "combatterse (short pairs)" if getattr(character, "combat_terse", False)
+           else "cinematic pairs (default)")
+        + "  -- three voices: cinematic pairs, combatterse, combatlong",
         f"  spacing: "
         f"{display_prefs.normalize_output_spacing(getattr(character, 'output_spacing', display_prefs.OUTPUT_SPACING_AIRY))}  "
         "-- config spacing airy|packed (fight rounds too; combatairy is the same switch)",
@@ -4850,6 +4897,12 @@ def _config_section_combat(character, display_prefs):
         f"{'on' if getattr(character, 'fightlog_enabled', False) else 'off'}  "
         "-- config fightlog on|off (cinematic replay after fights)",
     ]
+    from engine import hooks
+
+    extra = hooks.config_combat_status_extra(character)
+    if extra:
+        lines.extend(extra)
+    return lines
 
 
 def _config_section_autoloot(character):
@@ -8503,6 +8556,13 @@ def cmd_get(character, args, game):
     from world import Item
     if not args:
         character.session.send("Get what?")
+        return
+
+    from engine.verbs.wallet_cash import try_send_wallet_cash
+
+    # Cash uses the same get shape as a bag: get 20 from wallet.
+    # Does not need a room -- the wallet is on the body.
+    if try_send_wallet_cash(character, args, game, direction="get"):
         return
 
     room = character.location

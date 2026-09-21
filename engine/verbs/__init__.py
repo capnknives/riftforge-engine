@@ -102,6 +102,7 @@ from engine.verbs.player_queries import (
     cmd_queryread,
 )
 from engine.pager import cmd_more, cmd_stop
+from engine.channels import cmd_newbie
 
 # Verb -> (handler, help_text). See commands.py's COMMANDS docstring for why
 # the help_text lives right next to the handler instead of somewhere else.
@@ -126,8 +127,8 @@ ENGINE_COMMANDS = {
     "in":        (cmd_go_in,     "go in through a nested indoor exit"),
     "out":       (cmd_go_out,    "go out through a nested indoor exit"),
     "leave":     (cmd_go_out,    "go out through a nested indoor exit"),
-    "get":       (cmd_get,       "pick up an item (get <name>|all|10 from backpack; get all.<name> from 2.backpack)"),
-    "take":      (cmd_get,       "pick up an item (get <name>|all|all.<name>; get all.<name> from 2.backpack)"),
+    "get":       (cmd_get,       "pick up an item (get <name>|all|10 from backpack; get 20 from wallet)"),
+    "take":      (cmd_get,       "pick up an item (get <name>|all|all.<name>; get 20 from wallet)"),
     "drop":      (cmd_drop,      "drop a carried item (drop <name>|all|all.<name>); fades after a few hours outside a homestead (help grounddecay)"),
     "give":      (cmd_give,      "hand items or pocket cash to someone here (give <item>|$N to <name>)"),
     "hand":      (cmd_give,      "hand items or pocket cash to someone here (give <item>|$N to <name>)"),
@@ -150,6 +151,8 @@ ENGINE_COMMANDS = {
     "osay":      (cmd_osay,      "room OOC chat to everyone here (see 'help osay')"),
     "questions": (cmd_questions, "global player-help questions; question is the same verb; bare questions numbers recent lines"),
     "question":  (cmd_questions, "alias: questions (see 'help questions')"),
+    "newbie":    (cmd_newbie,    "global OOC newbie net; newb is the same verb; bare newbie numbers recent lines (see 'help newbie-channel')"),
+    "newb":      (cmd_newbie,    "alias: newbie (see 'help newbie-channel')"),
     "answers":   (cmd_answers,   "helper answers net; bare answers numbers recent lines (helpers only)"),
     "replay":    (cmd_replay,    "replay ooc 12 or replay questions 12 for one numbered line"),
     "query":     (cmd_query,     "open a helper ticket when nobody is online (see help query)"),

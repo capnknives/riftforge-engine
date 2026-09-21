@@ -81,6 +81,7 @@ _VERB_DOMAINS = {
     "pack": ("needs_lifestyle",),
     "seek": ("needs_lifestyle", "craft_contracts"),
     "cook": ("needs_lifestyle", "gathering"),
+    "bake": ("needs_lifestyle", "gathering"),
     "grocery": ("needs_lifestyle",),
     # Craft contracts
     "investigate": ("craft_contracts",),
@@ -140,6 +141,7 @@ _VERB_DOMAINS = {
     "mechanic": ("vehicle_travel",),
     "tow": ("vehicle_travel",),
     "leave": ("vehicle_travel",),
+    "hail": ("vehicle_travel",),
     "makecar": ("vehicle_travel",),
     "vehicle": ("vehicle_travel",),
     "vehicles": ("vehicle_travel",),
@@ -194,8 +196,14 @@ _VERB_DOMAINS = {
     "fillet": ("gathering",),
     "forage": ("gathering",),
     "craft": ("gathering",),
-    "chop": ("gathering",),
+    "chop": ("gathering", "helpers_chapter"),
     "skin": ("gathering",),
+    "log": ("gathering", "helpers_chapter"),
+    "timber": ("gathering", "helpers_chapter"),
+    "helpers": ("helpers_chapter", "gathering"),
+    "chapter": ("helpers_chapter",),
+    "worksites": ("helpers_chapter", "homestead"),
+    "worksite": ("helpers_chapter", "homestead"),
     # Autoloot / corpse scoop
     "autoloot": ("autoloot",),
     "loot": ("autoloot",),
@@ -239,6 +247,14 @@ _VERB_DOMAINS = {
     "releasehound": ("origin_kit",),
     "warp": ("origin_kit",),
     "laylow": ("origin_kit", "stealth"),
+    # Wear / draw / stash -- kit is always-on, but history still tags modules.
+    "wear": ("origin_kit",),
+    "remove": ("origin_kit",),
+    "draw": ("combat",),
+    "stow": ("combat",),
+    "stash": ("containers", "homestead"),
+    "retrieve": ("containers", "homestead"),
+    "occupy": ("account",),
 }
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
@@ -492,6 +508,16 @@ def select_modules(signals, *, modules=None):
         for mid in ("combat", "needs_lifestyle"):
             if mid in _modules_by_id:
                 chosen.add(mid)
+        # Walking / enter / park crashes often omit these unless the
+        # last 20 lines still hold the verb (bug reports 1795-1798).
+        hist_domains = set(signals.get("history_domains") or ())
+        if hist_domains & {"vehicle_travel", "homestead", "helpers_chapter"}:
+            for mid in ("vehicle_travel", "homestead", "helpers_chapter"):
+                if mid in _modules_by_id and (
+                    mid in hist_domains
+                    or mid in (signals.get("history_modules") or ())
+                ):
+                    chosen.add(mid)
 
     # Cross-fire: if A is chosen, also pull B.
     changed = True

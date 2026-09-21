@@ -81,6 +81,5 @@ def stamp_basegame_map_room(room, data, *, filename=None):
             )
         room.reset_item_specs = [dict(entry) for entry in reset_specs]
 
-    devils_trap = data.get("devils_trap")
-    if devils_trap is not None:
-        room.devils_trap = bool(devils_trap)
+    from engine.systems import occult_marks as occult_marks_mod
+    occult_marks_mod.apply_json_occult_flags(room, data)

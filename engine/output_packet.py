@@ -61,6 +61,18 @@ _depth = 0
 #   {"viewer": Character, "lines": [str, ...], "blank_after": bool}
 _staged: dict[int, dict] = {}
 
+# Callables run once when the outermost ``flush()`` is about to deliver --
+# after the beat's lines are staged but before ``snoop.tell`` writes them.
+# Fightlog uses this so a bout-end [ALERT] stages after [EXECUTE] lines that
+# autokill / post-KO finish still add mid-packet (bug report 1866).
+_pre_flush_hooks: list = []
+
+
+def register_pre_flush_hook(callback):
+    """Register ``callback()`` for the next outermost flush (idempotent add)."""
+    if callback is not None and callback not in _pre_flush_hooks:
+        _pre_flush_hooks.append(callback)
+
 
 def is_open():
     """True while a combat beat is being buffered (used by smokes/asserts)."""
@@ -172,6 +184,27 @@ def tell(viewer, text):
     snoop.tell(viewer, text)
 
 
+def mark_airy_beat_gap_after_flush():
+    """Request a trailing blank after this beat for sighted ``spacing airy``.
+
+    Personal combat pulses may land several seconds apart; each delivered
+    packet still deserves the same paragraph gap room say uses, without a
+    second combat-only spacing switch (Q32 / display_prefs).
+    """
+    if _depth <= 0 or not _staged:
+        return
+    try:
+        from engine import display_prefs
+
+        for entry in _staged.values():
+            viewer = entry.get("viewer")
+            if viewer is not None and display_prefs.wants_airy_spacing(viewer):
+                entry["blank_after"] = True
+    except Exception:
+        # Sessionless smokes / stubs without display prefs stay packed.
+        pass
+
+
 def flush():
     """Close one nesting level; deliver the beat when the outermost closes.
 
@@ -187,6 +220,17 @@ def flush():
         # swallowing later beats.
         _depth = 0
         return
+    # Stage deferred beat tails (fightlog bout-end tips) while the packet is
+    # still open so ``tell`` buffers instead of jumping the wire.
+    if _depth == 1:
+        hooks = list(_pre_flush_hooks)
+        _pre_flush_hooks.clear()
+        for hook in hooks:
+            try:
+                hook()
+            except Exception:
+                # Hooks are UX ordering only -- never block delivery.
+                pass
     _depth -= 1
     if _depth > 0:
         # Still inside an outer beat -- keep buffering.
@@ -222,3 +266,4 @@ def reset_for_tests():
     global _depth
     _depth = 0
     _staged.clear()
+    _pre_flush_hooks.clear()

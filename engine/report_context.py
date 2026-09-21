@@ -708,6 +708,23 @@ def build(character, game, *, history=None, description=None, kind=None):
         occupy_acct = getattr(character, "staff_occupy_account", None)
         if occupy_acct:
             ctx["session"]["staff_occupy_account"] = str(occupy_acct)
+        sess_body = getattr(sess, "character", None)
+        if sess_body is not None:
+            sess_key = _safe_str(getattr(sess_body, "key", None))
+            if sess_key:
+                ctx["session"]["session_body"] = sess_key
+        play_home = getattr(sess, "gm_play_body_key", None)
+        if play_home:
+            ctx["session"]["gm_play_body_key"] = str(play_home)
+        return_home = getattr(character, "gm_return_body_key", None)
+        if return_home:
+            ctx["session"]["gm_return_body_key"] = str(return_home)
+        char_key = _safe_str(getattr(character, "key", None), "")
+        if char_key.lower().startswith("gmspirit:"):
+            ctx["session"]["filing_as_gmspirit"] = True
+        client_diag = getattr(sess, "client_diag", None)
+        if isinstance(client_diag, dict) and client_diag:
+            ctx["client"] = dict(client_diag)
         try:
             from engine.command_support import _is_gm
 

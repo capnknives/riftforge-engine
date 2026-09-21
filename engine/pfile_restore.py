@@ -312,6 +312,17 @@ def apply_restore_payload_to_character(target, payload, game, *, persist=True):
     )
     if new_cnum:
         target.cnum = new_cnum
+    try:
+        from engine.id_reserve import note_character_cnum, note_item_inum
+        from engine.item_inum import walk_item_tree
+
+        note_character_cnum(target)
+        for attr in ("inventory", "gear_bag", "home_stash"):
+            for obj in getattr(target, attr, None) or ():
+                for node in walk_item_tree(obj):
+                    note_item_inum(node, holder=target)
+    except Exception:
+        pass
 
     persist_ok = True
     persist_msg = ""
@@ -525,6 +536,88 @@ def heal_all_roster_pfile_overwrites(game, *, root=None, check_collapse=True):
     return healed
 
 
+_HEAVY_BLOBS_DDL = """
+CREATE TABLE IF NOT EXISTS character_heavy_blobs (
+    cnum TEXT NOT NULL,
+    shard TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY (cnum, shard)
+)
+"""
+
+
+def _ensure_heavy_blobs_table(conn):
+    """Surgical restore DBs may predate Lag S2 sidecars."""
+    conn.execute(_HEAVY_BLOBS_DDL)
+
+
+def _copy_backup_heavy_blobs(live, backup_db_path, character_name, *, dest_cnum):
+    """UNION backup homestead/journal shards onto the restored CNUM.
+
+    Restoring the character row used to skip ``character_heavy_blobs``,
+    so a wiped PC came back with an empty stash even when the nightly
+    still had the crates.
+    """
+    dest = str(dest_cnum or "").strip()
+    if not dest or not backup_db_path:
+        return
+    try:
+        bak = sqlite3.connect(f"file:{backup_db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return
+    try:
+        tags = set()
+        try:
+            for row in bak.execute(
+                "SELECT cnum FROM characters WHERE name = ? COLLATE NOCASE",
+                (character_name,),
+            ):
+                tag = str(row[0] or "").strip()
+                if tag:
+                    tags.add(tag)
+        except sqlite3.Error:
+            return
+        shards = []
+        for tag in tags:
+            try:
+                shards.extend(
+                    bak.execute(
+                        "SELECT shard, payload FROM character_heavy_blobs "
+                        "WHERE cnum=?",
+                        (tag,),
+                    ).fetchall()
+                )
+            except sqlite3.Error:
+                continue
+        if not shards:
+            return
+        from engine.char_identity import _merge_heavy_blob_payloads
+
+        for shard, payload in shards:
+            if not shard:
+                continue
+            existing = live.execute(
+                "SELECT payload FROM character_heavy_blobs "
+                "WHERE cnum=? AND shard=?",
+                (dest, shard),
+            ).fetchone()
+            if existing is None:
+                live.execute(
+                    "INSERT INTO character_heavy_blobs "
+                    "(cnum, shard, payload) VALUES (?, ?, ?)",
+                    (dest, shard, payload),
+                )
+                continue
+            merged = _merge_heavy_blob_payloads(shard, existing[0], payload)
+            live.execute(
+                "UPDATE character_heavy_blobs SET payload=? "
+                "WHERE cnum=? AND shard=?",
+                (merged, dest, shard),
+            )
+    finally:
+        bak.close()
+
+
 def sqlite_restore_character_from_backup(
     live_db_path,
     backup_db_path,
@@ -655,7 +748,36 @@ def sqlite_restore_character_from_backup(
                     "holder_key, container) VALUES (?, ?, ?, ?, ?)",
                     tuple(row[:5]),
                 )
+        _ensure_heavy_blobs_table(live)
+        _copy_backup_heavy_blobs(
+            live, backup_db_path, name, dest_cnum=cnum_val,
+        )
+        from engine.char_identity import retarget_orphan_stash_sidecars
+
+        # Afternoon remints left crates on the morning tag while this
+        # INSERT used the backup's newer CNUM. Fold those sidecars onto
+        # the restored body before we commit.
+        retarget_orphan_stash_sidecars(
+            None, live, backup_db_path=backup_db_path,
+        )
         live.execute("COMMIT")
+        try:
+            from engine.id_reserve import (
+                KIND_CNUM,
+                note_reserved,
+                stats_blob_should_reserve_cnum,
+            )
+
+            if stats_blob_should_reserve_cnum(stats) and cnum_val:
+                note_reserved(KIND_CNUM, cnum_val, persist=False)
+                live.execute(
+                    "INSERT OR IGNORE INTO id_reserved (kind, tag) "
+                    "VALUES (?, ?)",
+                    (KIND_CNUM, cnum_val),
+                )
+                live.commit()
+        except sqlite3.Error:
+            pass
     except sqlite3.Error as exc:
         try:
             live.execute("ROLLBACK")

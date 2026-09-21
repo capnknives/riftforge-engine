@@ -1023,3 +1023,66 @@ body[data-fontsize="xlarge"] { --ui-font-size: 22px; }
     min-height: 44px;
   }
 }
+
+/* ---------------------------------------------------------------------
+   Tier 0 client diagnostics (docs/plans/web_client_drop_diagnostics.md).
+   The badge only appears after a real fault, so it costs nothing in the
+   normal case. Crimson carries no meaning on its own -- the button text
+   says "client problem", and an aria-label repeats the count (hard rule 7).
+   --------------------------------------------------------------------- */
+#client-error-badge {
+  color: var(--silver);
+  background: var(--crimson);
+  border: 1px solid var(--gold);
+  border-radius: 2px;
+  padding: 0 0.4rem;
+  margin-left: 0.4rem;
+  font-size: 0.72rem;
+  cursor: pointer;
+}
+
+#client-error-badge:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 1px;
+}
+
+#diag-block {
+  margin: 0.9rem 0 0.6rem;
+  border-top: 1px solid var(--rule);
+  padding-top: 0.7rem;
+}
+
+#diag-block h3 {
+  margin: 0 0 0.3rem;
+  font-size: 0.85rem;
+  color: var(--silver);
+}
+
+#diag-note {
+  margin: 0 0 0.5rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+#diag-text {
+  /* Scrolls rather than stretching the popover; wraps so long user-agent
+     strings do not force a horizontal scrollbar on phones. */
+  max-height: 14rem;
+  overflow: auto;
+  margin: 0 0 0.5rem;
+  padding: 0.5rem;
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  font-size: 0.72rem;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--silver);
+}
+
+#diag-copied {
+  display: block;
+  margin-top: 0.35rem;
+  font-size: 0.72rem;
+  color: var(--teal);
+}

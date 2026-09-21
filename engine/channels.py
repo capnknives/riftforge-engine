@@ -51,7 +51,7 @@ FORMAT_PLAIN = "plain"
 _VERB_RE = re.compile(r"^[a-z][a-z0-9_]{1,15}$")
 MAX_PLAYER_CHANNELS_PER_ACCOUNT = 3
 RESERVED_CHANNEL_VERBS = frozenset({
-    "say", "tell", "ooc", "questions", "question", "answers", "trivia", "wiznet", "emote", "who",
+    "say", "tell", "ooc", "newbie", "newb", "questions", "question", "answers", "trivia", "wiznet", "emote", "who",
     "help", "mute", "unmute", "mutes", "chans", "channel", "reply",
     "whisper", "block", "unblock", "blocks", "query", "queries",
     "querylist", "queryread", "querycomment", "queryclose",
@@ -545,7 +545,7 @@ def save_channel(conn, game, channel_name: str) -> None:
     if spec is None:
         return
     if spec.format == FORMAT_OOC:
-        items = _serialize_ooc_ring(game)
+        items = _serialize_ooc_ring(game, channel_name=channel_name)
     elif spec.format in (FORMAT_QUESTIONS, FORMAT_ANSWERS):
         items = _serialize_ooc_ring(game, channel_name=channel_name)
     elif spec.format == FORMAT_WIZNET:
@@ -823,7 +823,7 @@ def set_channel_audience(game, name: str, audience: str) -> tuple[bool, str]:
     spec = get_channel(key)
     if spec is None:
         return False, f"No channel named '{key}'."
-    if spec.builtin and key in ("ooc", "wiznet", "questions", "answers"):
+    if spec.builtin and key in ("ooc", "wiznet", "questions", "answers", "newbie"):
         return False, f"Built-in '{key}' audience is fixed."
     aud = (audience or AUDIENCE_ALL).strip().lower()
     new = ChannelSpec(
@@ -1255,6 +1255,11 @@ def speak_custom_global(
         gmcp.deliver_comm(sess, spec.verb, message, speaker_face, line, "")
         delivered = True
     return delivered
+
+
+def cmd_newbie(character, args: str, game) -> None:
+    """Voluntary global OOC newbie net (``newbie`` / ``newb``)."""
+    cmd_dynamic_channel(character, args, game, verb="newbie")
 
 
 def cmd_dynamic_channel(character, args: str, game, *, verb: str) -> None:
@@ -1753,6 +1758,33 @@ register_channel(
     )
 )
 register_channel_verb_alias("questions", "question")
+
+register_channel(
+    ChannelSpec(
+        name="newbie",
+        verb="newbie",
+        game_attr="newbie_history",
+        meta_key="newbie_history",
+        scope=SCOPE_GLOBAL,
+        audience=AUDIENCE_ALL,
+        replay_header="Recent newbie channel (last 20):",
+        empty_message=(
+            "No recent newbie channel traffic. "
+            "Type 'newbie <message>' (or newb) to speak."
+        ),
+        usage_message=(
+            "Usage: newbie <message>  (short alias: newb; bare newbie replays history)"
+        ),
+        ring_max=DEFAULT_RING_MAX,
+        builtin=True,
+        gateway_stitch=False,
+        format=FORMAT_PLAIN,
+        prefix="((NEWBIE))",
+        color_role="ooc",
+        title="Newbie",
+    )
+)
+register_channel_verb_alias("newbie", "newb")
 
 register_channel(
     ChannelSpec(

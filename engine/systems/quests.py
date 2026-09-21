@@ -1878,7 +1878,7 @@ def _giver_direct_offers(character, npc):
     prog = _progress(character)
     out = []
     for qid, data in loader_mod.load_quests().items():
-        if data.get("auto_start"):
+        if data.get("auto_start") or _quest_is_parked(data):
             continue
         giver = data.get("giver_npc") or ""
         if not giver or not _npc_matches_giver(

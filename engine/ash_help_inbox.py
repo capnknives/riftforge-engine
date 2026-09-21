@@ -17,6 +17,7 @@ from pathlib import Path
 
 JOBS_DIR_NAME = ".ash_help_jobs"
 OUTBOX_DIR_NAME = ".ash_help_outbox"
+OUTBOX_FILES_PER_TICK = 8
 ASH_FACE = "Ash [Helper AI]"
 ASH_SPEAKER_KEY = "ash-help"
 RATE_SECONDS = 20
@@ -168,7 +169,11 @@ def tick_ash_help_outbox(game) -> None:
     directory = outbox_dir()
     if not directory.is_dir():
         return
-    for path in sorted(directory.glob("msg-*.json")):
+    n = 0
+    for path in directory.glob("msg-*.json"):
+        if n >= OUTBOX_FILES_PER_TICK:
+            break
+        n += 1
         payload = _load_payload(path)
         try:
             path.unlink(missing_ok=True)

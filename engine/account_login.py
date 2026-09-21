@@ -214,10 +214,16 @@ def build_account_menu(game, account):
         for _sec, ch in tagged
         if ch is not None
     }
-    tagged.extend(hooks.account_menu_vault_rows(game, account, live_low))
-    tagged.append(("action", CREATE_NEW_MARKER))
-    tagged.append(("action", LINK_EXISTING_MARKER))
-    return tagged
+    vault_rows = list(hooks.account_menu_vault_rows(game, account, live_low))
+    chars = [row for row in tagged if row[0] == "character"]
+    casts = [row for row in tagged if row[0] == "cast"]
+    other = [row for row in tagged if row[0] not in ("character", "cast")]
+    char_vault = [row for row in vault_rows if row[0] == "character"]
+    cast_vault = [row for row in vault_rows if row[0] == "cast"]
+    grouped = chars + char_vault + casts + cast_vault + other
+    grouped.append(("action", CREATE_NEW_MARKER))
+    grouped.append(("action", LINK_EXISTING_MARKER))
+    return grouped
 
 
 def _menu_face(game, entry):
@@ -428,6 +434,11 @@ async def _prompt_character_menu(session, game, account):
                 backdoor = accounts_mod.resolve_staff_login_cast(game, pick)
                 if backdoor is not None:
                     return backdoor
+            assigned = accounts_mod.resolve_assigned_login_character(
+                game, account, pick,
+            )
+            if assigned is not None:
+                return assigned
             session.send(
                 "Pick the menu number, a character name, or type create or link."
             )
@@ -631,6 +642,9 @@ async def _finish_new_character_after_chargen(session, game, account, char):
         start_room = hooks.chargen_fallback_start_room(char, game)
     if start_room is None:
         start_room = game.start_room
+    # The game may land new bodies somewhere else first (SUPERS: the shared
+    # Threshold street); chargen's room stays their eventual homezone.
+    start_room = hooks.chargen_arrival_room(char, game, start_room)
     char.chargen_start_room_key = None
     char.chargen_step = 0
     draft_mod.finish_chargen_draft(account, game, character=char)

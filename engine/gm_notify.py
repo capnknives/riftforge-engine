@@ -190,13 +190,17 @@ def _receives_staff_ops(session, character):
     return False
 
 
-def ping_gms(game, message, *, exclude=None, peer_session=None, kind="ops"):
+def ping_gms(
+    game, message, *, exclude=None, peer_session=None, kind="ops",
+    gm_form_only=False,
+):
     """Send one dark-green staff line to every opted-in online staff GM.
 
     exclude -- optional Character who should not receive this ping (e.g.
     the player who just disconnected, or a GM who triggered their own
     event). Idle immersion fixtures are never in ``game.sessions``.
-    Staff occupying a powered cast still receive the ping.
+    Staff occupying a powered cast still receive the ping unless
+    ``gm_form_only`` is True.
 
     peer_session -- optional Session whose client IP is appended via
     ``{from}`` in *message* (replaced per recipient). Head GM gets
@@ -206,6 +210,9 @@ def ping_gms(game, message, *, exclude=None, peer_session=None, kind="ops"):
     kind -- ``ops`` (default) or ``exception``. Exception pings also
     require ``gm_notify_exceptions`` (default on). ``staffnotify off``
     still silences both.
+
+    gm_form_only -- when True, skip occupied / gm-off bodies (auto-diag
+    capture; suggestion 488). Staff in GM form still hear it.
     """
     sessions = getattr(game, "sessions", None) or []
     for session in list(sessions):
@@ -215,6 +222,8 @@ def ping_gms(game, message, *, exclude=None, peer_session=None, kind="ops"):
         if exclude is not None and other is exclude:
             continue
         if not _receives_staff_ops(session, other):
+            continue
+        if gm_form_only and not bool(getattr(other, "gm_mode", False)):
             continue
         # Default on; gmnotify off flips this False (persisted).
         if not getattr(other, "gm_notify", True):

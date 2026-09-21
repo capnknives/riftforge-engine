@@ -27,6 +27,7 @@ Never imported by ``server.py``. Stdlib only.
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import re
 import sys
@@ -248,7 +249,17 @@ def main():
     import server as server_mod
     assert server_mod._HAS_SUPERS is False
     # Lean Game: maps + persistence, no Cadence seed; still one-room demo.
-    lean_game = server_mod.Game(db_path=":memory:")
+    # Capture stderr so a supers import in this block cannot hide behind
+    # engine_smoke_ok the way v0.8.0 did (account reconcile traceback).
+    _game_err = io.StringIO()
+    _old_err = sys.stderr
+    sys.stderr = _game_err
+    try:
+        lean_game = server_mod.Game(db_path=":memory:")
+    finally:
+        sys.stderr = _old_err
+    _err_text = _game_err.getvalue()
+    assert "account reconcile/migrate failed" not in _err_text, _err_text
     assert lean_game.start_room is not None
     assert lean_game.start_room.key == "Demo Start" or (
         isinstance(lean_game.start_room.key, str)

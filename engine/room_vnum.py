@@ -233,6 +233,13 @@ def scramble_vnum(
 
     pref = _validate_prefix(prefix)
     used = _normalize_taken(taken)
+    reserved = None
+    try:
+        from engine.id_reserve import KIND_VNUM, reserved_pool
+
+        reserved = reserved_pool(KIND_VNUM)
+    except Exception:
+        reserved = None
 
     parsed_anchor = parse_vnum(anchor) if anchor else None
     if parsed_anchor is not None:
@@ -243,8 +250,11 @@ def scramble_vnum(
             for high_first in (go_high, not go_high):
                 for n in _child_seq_candidates(anchor_n, go_high=high_first):
                     candidate = format_vnum(pref, n)
-                    if candidate not in used:
-                        return candidate
+                    if candidate in used:
+                        continue
+                    if reserved and candidate in reserved:
+                        continue
+                    return candidate
 
     seed_text = str(seed if seed is not None else pref)
     span = _SCRAMBLE_BAND_MAX - _SCRAMBLE_BAND_MIN + 1
@@ -252,8 +262,11 @@ def scramble_vnum(
     for offset in range(span):
         n = _SCRAMBLE_BAND_MIN + ((start - _SCRAMBLE_BAND_MIN + offset) % span)
         candidate = format_vnum(pref, n)
-        if candidate not in used:
-            return candidate
+        if candidate in used:
+            continue
+        if reserved and candidate in reserved:
+            continue
+        return candidate
 
     return next_vnum(pref, used)
 
@@ -267,10 +280,20 @@ def next_vnum(prefix: str, taken: set[str]) -> str:
     """
     pref = _validate_prefix(prefix)
     used = _normalize_taken(taken)
+    reserved = None
+    try:
+        from engine.id_reserve import KIND_VNUM, reserved_pool
+
+        reserved = reserved_pool(KIND_VNUM)
+    except Exception:
+        reserved = None
     for n in range(1, _MAX_SEQ + 1):
         candidate = format_vnum(pref, n)
-        if candidate not in used:
-            return candidate
+        if candidate in used:
+            continue
+        if reserved and candidate in reserved:
+            continue
+        return candidate
     raise ValueError(
         f"no free vnum left under prefix {pref!r} (1..{_MAX_SEQ} exhausted)"
     )
@@ -389,6 +412,12 @@ def stamp_hand_room(
         leg = old_key
 
     room.key = vnum
+    try:
+        from engine.id_reserve import note_room_vnum
+
+        note_room_vnum(room)
+    except Exception:
+        pass
     if isinstance(rooms, dict):
         existing = rooms.get(vnum)
         if existing is not None and existing is not room:
@@ -1805,6 +1834,16 @@ def canonical_persisted_room_key(game, token) -> str:
     text = str(token or "").strip()
     if not text:
         return token if token is None else text
+    # Fast path: token is already this room's live identity. Mira's
+    # known_exits blob billed 3.2s collect on live 2026-09-18 because
+    # every already-VNUM key rebuilt the owner index and remapped.
+    if game is not None:
+        rooms = getattr(game, "rooms", None)
+        hit = rooms.get(text) if rooms is not None else None
+        if hit is not None:
+            ident = internal_room_key(hit) or (getattr(hit, "key", "") or "")
+            if ident == text:
+                return text
     index = _build_room_owner_index(game) if game is not None else None
     src_owner = (
         _owner_for_leftover_token(game, text, index=index)

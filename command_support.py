@@ -52,6 +52,7 @@ from engine.command_support import (
     _is_head_gm,
     _is_staff_gm,
     _is_presence_hidden,
+    _look_skip_room_occupant,
     _move_one,
     _presence_face,
     _presence_hears,

@@ -6,8 +6,10 @@ are asyncio queues. Commands go through ``commands.dispatch``; every
 file:line that ran the turn.
 
 The JSON listener binds loopback only (default ``127.0.0.1:4002``). It is
-the agent/MCP path for playtest — never a public port, never live unless
-``RIFTFORGE_VIEWPORT=1`` is set on that host (crashgate yes, live default no).
+the agent/MCP path for playtest — never a public port. Enable with
+``RIFTFORGE_VIEWPORT=1``. Live droplet also sets
+``RIFTFORGE_VIEWPORT_SAFETIES=live`` (restore + playerfile freeze). Sidecar
+and crashgate set ``=off`` so the old wipebodies reset still works there.
 
 Stdlib only. No supers imports.
 """
@@ -25,6 +27,7 @@ from typing import Any
 
 from engine.connection import Session
 from engine.gateway_protocol import is_loopback_host
+from engine import viewport_live as viewport_live_mod
 
 # Protocol version the MCP / viewport_client.py speak.
 VIEWPORT_PROTOCOL = 1
@@ -33,6 +36,7 @@ DEFAULT_CHARACTER = "Ash"
 MAX_EVENTS = 2000
 MAX_LINE = 65536
 # Staff setup lines ``op=reset`` may dispatch. Player mode blocks other gm*.
+# Live profile uses ``LIVE_RESET_STAFF_LINES`` (gm on only) instead.
 RESET_STAFF_LINES = ("gm on", "gm wipebodies", "gm expelspirits")
 
 
@@ -286,6 +290,13 @@ class ViewportHub:
         self.mode = "staff"
         # Sidecar binds :4002 before Game() returns.
         self.booting = False
+        # Live restore snapshots keyed by character.key.
+        self._restore: dict[str, dict[str, Any]] = {}
+        self._idle_handle: asyncio.TimerHandle | None = None
+        self._live_gm_on = False
+        self._restoring = False
+        self._yellow_spawn_before = None
+        self._last_op_mono = time.monotonic()
 
     def record(self, session, kind: str, **fields) -> dict[str, Any]:
         self.seq += 1
@@ -357,8 +368,9 @@ class ViewportHub:
                 session.staff_account = found.name
                 return
         # Fresh sidecar sqlite has no login accounts. Mint the playtest
-        # Ash head_gm row so gm on is not "You aren't a GM."
-        if char_key == "ash":
+        # Ash head_gm row so gm on is not "You aren't a GM." Never mint
+        # on the live droplet (playerfile / account table).
+        if char_key == "ash" and not viewport_live_mod.viewport_safeties_live():
             minted = accounts_mod.ensure_playtest_staff_account(game)
             if accounts_mod.account_is_staff(minted):
                 session.staff_account = minted.name
@@ -382,6 +394,257 @@ class ViewportHub:
             char.is_npc = False
             if getattr(char, "idle_mode", False):
                 char.idle_mode = False
+
+    def note_op(self) -> None:
+        """Bump the live idle watchdog so a dead MCP session still restores."""
+        self._last_op_mono = time.monotonic()
+        if not viewport_live_mod.viewport_safeties_live():
+            return
+        handle = self._idle_handle
+        if handle is not None:
+            handle.cancel()
+            self._idle_handle = None
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        def _fire() -> None:
+            try:
+                loop.create_task(self.detach(park=True))
+            except Exception:
+                pass
+
+        self._idle_handle = loop.call_later(
+            viewport_live_mod.LIVE_IDLE_TIMEOUT_S, _fire,
+        )
+
+    def cancel_idle_watchdog(self) -> None:
+        """Drop the idle timer (detach / restore already running)."""
+        handle = self._idle_handle
+        if handle is not None:
+            handle.cancel()
+            self._idle_handle = None
+
+    def freeze_character(self, char, *, spawn: bool = False) -> None:
+        """Snapshot persist rows + RAM flags before the first live mutation."""
+        if char is None or not viewport_live_mod.viewport_safeties_live():
+            return
+        key = getattr(char, "key", None) or ""
+        if not key or key in self._restore:
+            return
+        loc = getattr(char, "location", None)
+        room_key = getattr(loc, "key", None) if loc is not None else None
+        blob = {}
+        try:
+            from engine import hooks as hooks_mod
+
+            blob = dict(hooks_mod.character_to_blob(char) or {})
+        except Exception as exc:
+            from engine import log_util
+
+            log_util.ops("viewport", f"live freeze blob failed key={key}", exc=exc)
+        char_row = None
+        item_rows: list = []
+        try:
+            from engine import persistence as persist_mod
+
+            payload = persist_mod._character_save_rows(
+                self.game, char, set(), persist_mod._begin_persist_cnum_set(self.game)[0],
+            )
+            if payload is not None:
+                char_row, item_rows, _stats = payload
+        except Exception as exc:
+            from engine import log_util
+
+            log_util.ops("viewport", f"live freeze persist failed key={key}", exc=exc)
+        self._restore[key] = {
+            "blob": blob,
+            "room_key": room_key,
+            "char_row": char_row,
+            "item_rows": list(item_rows or []),
+            "is_npc": bool(getattr(char, "is_npc", False)),
+            "idle_mode": bool(getattr(char, "idle_mode", False)),
+            "peaceful": bool(getattr(char, "peaceful", False)),
+            "spawn": bool(spawn or getattr(char, "viewport_live_spawn", False)),
+        }
+        if spawn:
+            char.viewport_live_spawn = True
+
+    def _room_character_keys(self, room) -> set[str]:
+        keys = set()
+        if room is None:
+            return keys
+        for obj in list(getattr(room, "contents", None) or []):
+            name = getattr(obj, "key", None)
+            if name:
+                keys.add(name)
+        return keys
+
+    def _tag_new_spawns(self, room, before_keys: set[str]) -> None:
+        """Mark hostiles that appeared in *room* after a live spawn command."""
+        if room is None:
+            return
+        from engine.world import Character
+
+        for obj in list(getattr(room, "contents", None) or []):
+            if not isinstance(obj, Character):
+                continue
+            key = getattr(obj, "key", None) or ""
+            if not key or key in before_keys:
+                continue
+            if viewport_live_mod.is_live_playerfile_body(obj):
+                continue
+            obj.viewport_live_spawn = True
+            self.freeze_character(obj, spawn=True)
+
+    def _resolve_line_bodies(self, line: str) -> list:
+        """Characters named in *line* (force/set/summon targets)."""
+        game = self.game
+        if game is None:
+            return []
+        found = []
+        seen = set()
+        text = (line or "").replace('"', " ")
+        for token in text.split():
+            raw = token.strip().strip(".,;:")
+            if not raw or raw.lower() in ("gm", "force", "set", "summon", "enemy", "spawn"):
+                continue
+            char = self.resolve_body(raw)
+            if char is None:
+                finder = getattr(game, "find_character", None)
+                char = finder(raw) if callable(finder) else None
+            key = getattr(char, "key", None) if char is not None else None
+            if char is None or not key or key in seen:
+                continue
+            seen.add(key)
+            found.append(char)
+        return found
+
+    def live_prepare_line(self, line: str) -> str | None:
+        """Refuse red verbs; snapshot yellow targets. Return error or None."""
+        if not viewport_live_mod.viewport_safeties_live():
+            return None
+        if viewport_live_mod.live_line_is_red(line):
+            return viewport_live_mod.live_red_refuse_message(line)
+        for char in self._resolve_line_bodies(line):
+            if viewport_live_mod.is_live_playerfile_body(char):
+                name = getattr(char, "key", "?")
+                return (
+                    f"live viewport refuses occupy/set/force on playerfile "
+                    f"{name!r}. Use immersion Cast (Dean, Buffy, …) or "
+                    "staff-login Ash."
+                )
+        if viewport_live_mod.live_line_is_yellow(line):
+            actor = getattr(self.session, "character", None) if self.session else None
+            room = getattr(actor, "location", None) if actor is not None else None
+            before = self._room_character_keys(room)
+            self._yellow_spawn_before = (room, before)
+            for char in self._resolve_line_bodies(line):
+                self.freeze_character(char)
+            play = _play_body_character(self.session)
+            if play is not None:
+                self.freeze_character(play)
+        else:
+            self._yellow_spawn_before = None
+        return None
+
+    def live_after_line(self, line: str) -> None:
+        """Tag newly spawned foes after a yellow spawn command."""
+        if not viewport_live_mod.viewport_safeties_live():
+            return
+        pending = getattr(self, "_yellow_spawn_before", None)
+        self._yellow_spawn_before = None
+        if pending is None or not viewport_live_mod.live_line_is_yellow(line):
+            return
+        room, before = pending
+        if "spawn" in (line or "").lower():
+            self._tag_new_spawns(room, before)
+
+    def _restore_one(self, key: str, row: dict[str, Any]) -> None:
+        """Put one frozen body back (or despawn a tagged foe)."""
+        game = self.game
+        if game is None:
+            return
+        finder = getattr(game, "find_character", None)
+        char = finder(key) if callable(finder) else None
+        if char is None:
+            return
+        if row.get("spawn") or getattr(char, "viewport_live_spawn", False):
+            loc = getattr(char, "location", None)
+            try:
+                if loc is not None and hasattr(loc, "remove"):
+                    loc.remove(char)
+                else:
+                    from engine.char_index import unregister_character
+
+                    unregister_character(game, char)
+            except Exception as exc:
+                from engine import log_util
+
+                log_util.ops("viewport", f"live despawn failed key={key}", exc=exc)
+            return
+        blob = row.get("blob")
+        if isinstance(blob, dict) and blob:
+            try:
+                from engine import hooks as hooks_mod
+
+                hooks_mod.apply_character_blob(char, blob)
+            except Exception as exc:
+                from engine import log_util
+
+                log_util.ops("viewport", f"live restore blob failed key={key}", exc=exc)
+        char.is_npc = bool(row.get("is_npc"))
+        char.idle_mode = bool(row.get("idle_mode"))
+        if "peaceful" in row:
+            char.peaceful = bool(row.get("peaceful"))
+        room_key = row.get("room_key")
+        if room_key:
+            try:
+                from engine.room_vnum import lookup_room
+
+                dest = lookup_room(game, room_key)
+                if dest is not None and getattr(char, "location", None) is not dest:
+                    char.move_to(dest)
+            except Exception as exc:
+                from engine import log_util
+
+                log_util.ops("viewport", f"live restore move failed key={key}", exc=exc)
+
+    async def restore_live_session(self, *, reason: str = "close") -> None:
+        """Always put live bodies back, then park Ash.
+
+        Best-effort: MCP hangup, idle timeout, and ``op=close`` all land here.
+        """
+        if not viewport_live_mod.viewport_safeties_live():
+            return
+        if self._restoring:
+            return
+        self._restoring = True
+        self.cancel_idle_watchdog()
+        from engine import log_util
+
+        try:
+            log_util.ops(
+                "viewport",
+                f"live restore reason={reason} keys={list(self._restore)}",
+            )
+            if self._live_gm_on and self.session is not None and self.session.alive:
+                try:
+                    await self.send_line("gm off", timeout=8.0)
+                except Exception:
+                    pass
+                self._live_gm_on = False
+            for key, row in list(self._restore.items()):
+                try:
+                    self._restore_one(key, row)
+                except Exception as exc:
+                    log_util.ops(
+                        "viewport", f"live restore one failed key={key}", exc=exc,
+                    )
+            self._restore.clear()
+        finally:
+            self._restoring = False
 
     def resolve_body(self, name: str):
         """Find the playable / immersion body (Ash by default).
@@ -429,8 +692,16 @@ class ViewportHub:
                 "the seeded Ash body; local sidecar boots a world that "
                 "ensure_all should spawn immersion Ash."
             )
+        if viewport_live_mod.viewport_safeties_live():
+            if not viewport_live_mod.is_staff_fixture_body(char):
+                raise LookupError(
+                    "live viewport occupies staff-login Ash only; "
+                    f"refusing {want!r}. Snoop/force immersion Cast instead."
+                )
+            self.freeze_character(char)
         if self.session is not None and self.session.alive:
             if getattr(self.session, "character", None) is char:
+                self.note_op()
                 return self.session, want
             await self.detach(park=True)
 
@@ -457,10 +728,18 @@ class ViewportHub:
         # Wait until the command loop, not the auto-look finish_turn —
         # deferred NEWS after look used to make the next send time out.
         await session.wait_ready(timeout=20.0)
+        self.note_op()
         return session, getattr(char, "key", want)
 
     async def detach(self, *, park: bool = True) -> None:
         """End the viewport session; park the body as an Echo when *park*."""
+        try:
+            await self.restore_live_session(reason="detach")
+        except Exception as exc:
+            from engine import log_util
+
+            log_util.ops("viewport", "live restore during detach failed", exc=exc)
+        self.cancel_idle_watchdog()
         session = self.session
         if session is None:
             return
@@ -491,6 +770,8 @@ class ViewportHub:
             raise RuntimeError("viewport is not open; call open first")
         if not session._viewport_play_ready.is_set():
             await session.wait_ready(timeout=timeout)
+        if not getattr(self, "_restoring", False):
+            self.note_op()
         if self.mode == "player" and player_mode_blocks(line):
             session.send(
                 "viewport mode=player refuses staff commands. "
@@ -501,8 +782,25 @@ class ViewportHub:
             turn["blocked"] = True
             turn["seq"] = self.seq
             return turn
+        if not getattr(self, "_restoring", False):
+            refused = self.live_prepare_line(line)
+            if refused:
+                session.send(refused)
+                turn = self.last_turn()
+                turn["ok"] = False
+                turn["blocked"] = True
+                turn["refused"] = True
+                turn["seq"] = self.seq
+                return turn
         session.inject_line(line)
         ok = await session.wait_turn(timeout=timeout)
+        if not getattr(self, "_restoring", False):
+            self.live_after_line(line)
+        verb = _first_verb(line)
+        if verb == "gm" and " gm on" in f" {line.strip().lower()}":
+            self._live_gm_on = True
+        elif line.strip().lower() == "gm on":
+            self._live_gm_on = True
         turn = self.last_turn()
         turn["ok"] = ok
         turn["timed_out"] = not ok
@@ -521,26 +819,33 @@ class ViewportHub:
         session, key = await self.attach(DEFAULT_CHARACTER)
         occupy = session.character
         self.occupy_like_cast(occupy)
-        try:
-            from engine.systems import quests as quests_mod
-            for qid in list(quests_mod.active_quest_ids(occupy) or []):
-                try:
-                    quests_mod.abandon(occupy, qid, game=self.game, confirm=True)
-                except Exception as exc:
-                    from engine import log_util
+        live = viewport_live_mod.viewport_safeties_live()
+        if not live:
+            try:
+                from engine.systems import quests as quests_mod
+                for qid in list(quests_mod.active_quest_ids(occupy) or []):
+                    try:
+                        quests_mod.abandon(occupy, qid, game=self.game, confirm=True)
+                    except Exception as exc:
+                        from engine import log_util
 
-                    log_util.ops(
-                        "viewport",
-                        f"reset abandon failed qid={qid}",
-                        exc=exc,
-                    )
-        except Exception as exc:
-            from engine import log_util
+                        log_util.ops(
+                            "viewport",
+                            f"reset abandon failed qid={qid}",
+                            exc=exc,
+                        )
+            except Exception as exc:
+                from engine import log_util
 
-            log_util.ops("viewport", "reset abandon loop failed", exc=exc)
+                log_util.ops("viewport", "reset abandon loop failed", exc=exc)
         last = {}
-        for line in RESET_STAFF_LINES:
+        staff_lines = (
+            viewport_live_mod.LIVE_RESET_STAFF_LINES if live else RESET_STAFF_LINES
+        )
+        for line in staff_lines:
             last = await self.send_line(line, timeout=20.0)
+            if str(line).strip().lower() == "gm on":
+                self._live_gm_on = True
         actor = session.character
         lobby = _find_room_name_parts(self.game, ("sheriff", "lobby"))
         if lobby is not None and getattr(actor, "location", None) is not lobby:
@@ -659,6 +964,7 @@ def _inspect_payload(hub: ViewportHub) -> dict[str, Any]:
         "sha": _git_sha(),
         "booting": bool(hub.booting),
         "viewport_enabled": viewport_enabled(),
+        "safeties": "live" if viewport_live_mod.viewport_safeties_live() else "off",
     }
 
 
@@ -680,6 +986,8 @@ async def _handle_request(hub: ViewportHub, req: dict[str, Any]) -> dict[str, An
     """One JSON request → JSON response (never raises to the caller)."""
     op = str(req.get("op") or "").strip().lower()
     try:
+        if op in ("hello", "ping", "poll", "inspect"):
+            hub.note_op()
         if op in ("hello", "ping"):
             session = hub.session
             char = getattr(session, "character", None) if session else None
@@ -693,6 +1001,9 @@ async def _handle_request(hub: ViewportHub, req: dict[str, Any]) -> dict[str, An
                 "sha": _git_sha(),
                 "viewport_enabled": viewport_enabled(),
                 "mode": hub.mode,
+                "safeties": (
+                    "live" if viewport_live_mod.viewport_safeties_live() else "off"
+                ),
             }
         if hub.booting and op not in ("hello", "ping"):
             return {

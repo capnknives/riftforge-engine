@@ -409,10 +409,11 @@ def _persist_chars_only_chunked_verify(game, force_full_chars, force_full_floor)
     Cold-boot full verify still needs one atomic wipe pass; only the warm
     ``persist_full_every()`` chars-only path may chunk on wall budget. Without
     this, a slow roster (~700+ live characters) hitting the 5s collect wall
-    budget discards the entire pass and re-arms ``force_full`` -- CPU
-    followon 2026-09: this looped forever, ~5s collect back-to-back,
-    pegging one core at ~100% because ``_save_pending_after_current``
-    bypasses the normal 180s autosave gate on a wall-budget skip.
+    budget discards the entire pass and re-arms ``force_full``. A wall skip
+    must not set ``_save_pending_after_current`` -- that bypasses the 180s
+    autosave gate and loops collect forever (live 2026-09-18: clients
+    dropped while force_full skipped every ~3s). The next heartbeat
+    autosave continues; chunked verify keeps partial progress.
     """
     if not force_full_chars or force_full_floor:
         return False
@@ -534,7 +535,6 @@ def meta_persist_note_loaded(game, tag, fingerprint):
 from engine.hooks import (
     apply_character_blob,
     character_to_blob,
-    ensure_game_defaults,
     recompute_hp,
     upgrade_legacy_container,
 )
@@ -898,6 +898,11 @@ def _resolve_saved_room(game, room_key, character_name, character=None):
     real room exists before this runs. See CONTENT_AUTHORING.md.
     """
     if not room_key:
+        from engine import hooks as hooks_mod
+
+        hooked = hooks_mod.safe_relocation_room(game, character)
+        if hooked is not None and not getattr(hooked, "map_missing_stub", False):
+            return hooked
         print(
             f"[persistence] {character_name!r} has empty room_key -- "
             f"using start room {getattr(game.start_room, 'key', None)!r}",
@@ -1009,6 +1014,11 @@ def _safe_relocation_room(game, character):
         room = _usable(key)
         if room is not None:
             return room
+    from engine import hooks as hooks_mod
+
+    hooked = hooks_mod.safe_relocation_room(game, character)
+    if hooked is not None and not getattr(hooked, "map_missing_stub", False):
+        return hooked
     return start
 
 
@@ -1313,6 +1323,13 @@ CREATE TABLE IF NOT EXISTS character_heavy_blobs (
     payload TEXT NOT NULL,
     PRIMARY KEY (cnum, shard)
 );
+-- Lasting CNUM / VNUM / INUM tags. Ephemeral civic workers and hostiles
+-- recycle; wiped PCs keep their number so restore cannot collide.
+CREATE TABLE IF NOT EXISTS id_reserved (
+    kind TEXT NOT NULL,
+    tag  TEXT NOT NULL,
+    PRIMARY KEY (kind, tag)
+);
 -- External-content FTS5 index (keyword + body only -- aliases already get
 -- exact-match coverage via help_aliases, see help_db.get_entry). Kept in
 -- sync by the three triggers below rather than the app re-indexing itself.
@@ -1400,6 +1417,12 @@ def connect(path):
         sqlite_wal_mod.maybe_checkpoint_on_boot(conn, path)
     conn.executescript(_SCHEMA)   # executescript runs several statements at once
     _migrate(conn)
+    try:
+        from engine.id_reserve import load_from_conn
+
+        load_from_conn(conn)
+    except Exception:
+        pass
     # Writer thread already sets this; the loop connection did not, so
     # login / help FTS / player ``save`` hit SQLITE_BUSY immediately
     # during WAL TRUNCATE or a long writer transaction.
@@ -1600,6 +1623,7 @@ _MIGRATIONS = [
     payload TEXT NOT NULL,
     PRIMARY KEY (cnum, shard)
 )"""),
+    (25, "_migrate_id_reserved"),
 ]
 
 
@@ -2018,6 +2042,29 @@ def _migrate_characters_cnum_pk(conn):
     )
 
 
+def _migrate_id_reserved(conn):
+    """Create ``id_reserved`` and seed lasting CNUMs / held INUMs.
+
+    Civic workers and hostiles in the live table are skipped so we do not
+    freeze every clerk who ever staffed a desk.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS id_reserved (
+            kind TEXT NOT NULL,
+            tag  TEXT NOT NULL,
+            PRIMARY KEY (kind, tag)
+        )
+        """
+    )
+    from engine.id_reserve import seed_from_character_rows
+
+    # Do not set_persist_conn(conn): overlay copyover migrates on the
+    # writer thread, and pointing _PERSIST_CONN at that connection made
+    # loop-thread note_* able to COMMIT a partial roster apply.
+    seed_from_character_rows(conn)
+
+
 # Name -> callable for migrations that cannot be a single SQL statement.
 _MIGRATION_CALLABLES = {
     "_migrate_items_holder_gear": _migrate_items_holder_gear,
@@ -2025,6 +2072,7 @@ _MIGRATION_CALLABLES = {
     "_migrate_characters_cnum_column": _migrate_characters_cnum_column,
     "_migrate_holder_cnum_columns": _migrate_holder_cnum_columns,
     "_migrate_characters_cnum_pk": _migrate_characters_cnum_pk,
+    "_migrate_id_reserved": _migrate_id_reserved,
 }
 
 
@@ -2238,23 +2286,31 @@ def load_moral_state(conn):
 
 
 def save_moral_state(conn, game):
-    """Persist moral_balance / eclipse / hold timers / scout cooldown."""
-    ensure_game_defaults(game)
+    """Persist moral_balance / eclipse / hold timers / scout cooldown.
+
+    Do **not** call ``engine.hooks.ensure_game_defaults`` here. On SUPERS
+    that hook is the full catalog boot (vehicles, overland, stables). Live
+    py-spy 2026-09-19 caught the persist-writer thread holding the GIL in
+    ``ensure_all_owned_vehicles`` -> ``stamp_hand_room`` for seconds while
+    this function ran. Meter defaults belong in the SUPERS caller
+    (``supers.balance.ensure_game_defaults``), which is cheap and does
+    not rematerialize the parking census.
+    """
     with conn:
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES "
             "('moral_balance', ?)",
-            (str(int(game.moral_balance)),),
+            (str(int(getattr(game, "moral_balance", 0) or 0)),),
         )
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES "
             "('eclipse_until_tick', ?)",
-            (str(int(game.eclipse_until_tick or 0)),),
+            (str(int(getattr(game, "eclipse_until_tick", 0) or 0)),),
         )
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES "
             "('moral_event_cooldown_until', ?)",
-            (str(int(game.moral_event_cooldown_until or 0)),),
+            (str(int(getattr(game, "moral_event_cooldown_until", 0) or 0)),),
         )
         # Maxed-hold arming -- must survive Docker restart or the ±100
         # wall timer resets every bounce.
@@ -3749,7 +3805,40 @@ def _restore_phone_media_fields(item, state):
             setattr(item, cosmetic, val.strip())
 
 
-def _item_container_blob(item):
+def _reload_item_inum_module():
+    """Refresh ``engine.item_inum`` from disk before a copyover snapshot.
+
+    Copyover already reloads this persistence module. Item INUM stamping
+    lives in a sibling that overlay can leave stale -- ``holder=`` then
+    TypeError's and the Veil rewrite cancels (live 2026-09-17).
+    """
+    import importlib
+
+    from engine import item_inum as item_inum_mod
+
+    importlib.reload(item_inum_mod)
+
+
+def _ensure_item_inum_for_persist(item, *, holder=None):
+    """Stamp an INUM even if this process still has a pre-holder helper.
+
+    Live 2026-09-17: overlay reloaded persistence (``holder=`` kwarg) while
+    ``engine.item_inum`` stayed stale. Copyover save TypeError'd; autosave
+    streak kept climbing. Unexpected-keyword is the mixed-module case;
+    any other TypeError still raises.
+    """
+    from engine.item_inum import ensure_item_inum
+
+    try:
+        return ensure_item_inum(item, holder=holder)
+    except TypeError as exc:
+        msg = str(exc).lower()
+        if "holder" not in msg and "unexpected keyword" not in msg:
+            raise
+        return ensure_item_inum(item)
+
+
+def _item_container_blob(item, holder=None):
     """JSON for the items.container column: an Item's locked/loot state (a
     dungeon lockbox's whole reward, world.make_lockbox), same reasoning as
     characters.stats -- one JSON blob means a plain flavor Item (locked=
@@ -3759,10 +3848,14 @@ def _item_container_blob(item):
     row, no schema change needed. Lodging adds furniture / owner_key / need
     so beds survive a restart with their sleep tag and claim stamp.
     Staff item instance INUM dual-writes here (no new items column).
+    Lasting holders persist-reserve the INUM; floor trash recycles.
     """
-    from engine.item_inum import ensure_item_inum, persist_inum_text
+    from engine.item_inum import persist_inum_text
 
-    ensure_item_inum(item)
+    # Overlay skew (bug report 1763 / live 2026-09-17): persist.py can land
+    # before item_inum accepts ``holder=``. Never abort copyover / gm on /
+    # vault restore on that TypeError.
+    _ensure_item_inum_for_persist(item, holder=holder)
     return json.dumps({
         "locked": item.locked,
         "loot": _loot_for_json(item.loot),
@@ -4260,7 +4353,15 @@ def _bonded_companion_must_save(obj):
         return False
     if int(getattr(obj, "hp", 0) or 0) <= 0:
         return False
-    return bool(getattr(obj, "is_pet", False) or getattr(obj, "is_horse", False))
+    if getattr(obj, "is_pet", False) or getattr(obj, "is_horse", False):
+        return True
+    # Copyover can drop is_pet while pet_species survives (bug report 1757).
+    if (
+        getattr(obj, "pet_kind", None) in (None, "beast")
+        and getattr(obj, "pet_species", None)
+    ):
+        return True
+    return False
 
 
 def _persistable_reseat_body(obj):
@@ -4350,6 +4451,10 @@ def _reseat_account_linked_if_unroomed(obj, game):
     if dest is None and not stay_in_century and not stay_in_mine:
         dest = lookup_room(game, getattr(obj, "home_room_key", None))
     if dest is None and not stay_in_century and not stay_in_mine:
+        from engine import hooks as hooks_mod
+
+        dest = hooks_mod.safe_relocation_room(game, obj)
+    if dest is None and not stay_in_century and not stay_in_mine:
         dest = getattr(game, "start_room", None)
     if dest is None or dest is loc:
         return loc
@@ -4369,26 +4474,53 @@ def _reseat_account_linked_if_unroomed(obj, game):
 def _keep_skipped_login_body_alive(
     obj, name, alive_names, new_char_hashes, prev_char_hashes,
 ):
-    """Keep a skip-saved login PC in ``alive_names`` so SQLite is not wiped.
+    """Keep a skip-saved persistable body in ``alive_names`` so SQLite is not wiped.
 
     Incremental ``removed_chars`` is ``prev - alive``. A body that is still
     in ``game.characters`` but skipped (no room, pit tag, …) used to look
-    despawned and lose its row (bug report 1437).
+    despawned and lose its row (bug report 1437). Login PCs, bonded pets,
+    and immersion / essential catalog bodies all need the same keep-alive
+    -- otherwise a force_full or incremental pass deletes Thor and the
+    rest of ``gmcast`` while they are still in RAM.
     """
     if not name:
         return
-    if not (
-        _login_body_must_save(obj) or _bonded_companion_must_save(obj)
-    ):
+    if not _persistable_reseat_body(obj):
         return
     alive_names.add(name)
     prev_hash = (prev_char_hashes or {}).get(name)
     if prev_hash is not None:
         new_char_hashes[name] = prev_hash
+    kind = "login" if _login_body_must_save(obj) else "catalog"
     print(
-        f"[persistence] keep sqlite row for skipped login body {name!r}",
+        f"[persistence] keep sqlite row for skipped {kind} body {name!r}",
         flush=True,
     )
+
+
+def _note_skipped_persistable_body(
+    obj,
+    name,
+    alive_names,
+    new_char_hashes,
+    prev_char_hashes,
+    skipped_login_names,
+    skipped_persistable_names,
+):
+    """Keep-alive plus the force_full keep-list for one skip-saved body.
+
+    Login skips still abort copyover (bug report 1509). Catalog / pet
+    skips keep their SQLite row without aborting the Veil rewrite.
+    """
+    _keep_skipped_login_body_alive(
+        obj, name, alive_names, new_char_hashes, prev_char_hashes,
+    )
+    if not name:
+        return
+    if _login_body_must_save(obj):
+        skipped_login_names.append(name)
+    elif _persistable_reseat_body(obj):
+        skipped_persistable_names.append(name)
 
 
 def _should_skip_character_save(obj, game, seen_names):
@@ -4440,10 +4572,36 @@ def _should_skip_character_save(obj, game, seen_names):
         return True
     if getattr(obj, "pit_run_tag", None):
         return True
+    if getattr(obj, "viewport_live_spawn", False):
+        # Tagged live-viewport foe — never a playerfile. Despawned on restore.
+        return True
     if getattr(obj, "is_guest", False):
         return True
     if getattr(obj, "transient_soul", False):
         return True
+    # Path Demon nest soldiers must never persist, even if something
+    # flipped them peaceful, dropped hub stamps, or cleared is_npc so
+    # they look like Echoes. Authored Hell desk staff keep a real job
+    # (brimstone_barkeep, …) so they still save. Classifier lives in
+    # supers.spawn_hubs; this belt is flag-only so engine persist
+    # collect does not import SUPERS. Account / immersion / civic
+    # bodies still save (checked above and again here).
+    if (
+        not (getattr(obj, "account", None) or "").strip()
+        and not getattr(obj, "immersion", False)
+        and not getattr(obj, "essential", False)
+        and not getattr(obj, "civic_worker", False)
+        and not getattr(obj, "helper_owner_key", None)
+        # Real occupation lockdown spirits already bail on spirit=True.
+        # Gate leftovers that only stole ``_town_moral_smoke`` still skip-save.
+        and not getattr(obj, "spirit", False)
+        and getattr(obj, "origin", None) == "celestial"
+        and getattr(obj, "path", None) == "demon"
+    ):
+        job = getattr(obj, "job", None) or ""
+        hub = getattr(obj, "_spawn_hub", None)
+        if hub == "demon_nest" or job in ("", "plane_demon"):
+            return True
     # Sleep-astral copies are ephemeral scenery (respawned from the
     # Earth's sleep_dream_tour stamp). Never a second pfile.
     if getattr(obj, "is_sleep_dream_clone", False):
@@ -4513,11 +4671,13 @@ def _should_skip_character_save(obj, game, seen_names):
     # reloads (bug report 152).
     if getattr(obj, "god_twin", False) or key_low.startswith("twin:"):
         pass
-    elif getattr(obj, "_town_moral_smoke", False) or getattr(
-        obj, "_town_moral_possessed", False,
-    ):
-        # Lockdown occupation is tagged hostile (peaceful=False) so the
-        # street-hostile skip below would drop it on copyover. Keep it.
+    elif (
+        getattr(obj, "_town_moral_smoke", False)
+        and getattr(obj, "spirit", False)
+    ) or getattr(obj, "_town_moral_possessed", False):
+        # Real husk-less coils (spirit) and possessed hosts must survive
+        # copyover. Gate leftovers that only stole the smoke flag must
+        # not.
         pass
     elif (
         obj.is_npc
@@ -4537,14 +4697,13 @@ def _should_skip_character_save(obj, game, seen_names):
 
 
 def _begin_persist_cnum_set(game):
-    """Return ``(taken, extra_dirty_keys)`` after at-most-once uniqueness heal.
+    """Return ``(snapshot_seen, extra_dirty_keys)`` after uniqueness heal.
 
-    Collision repair must run before INSERT. Incremental autosave used to
-    re-heal the whole roster every collect and then merge ``extra_keys``
-    onto this pass *after* the dirty cap -- that serialized hundreds of
-    bodies while ``chars=`` still showed 2-3 writes (skip-save). Heal once
-    per boot (and again on force-full verify); ``_ensure_save_cnum`` still
-    stamps newcomers on the bodies that actually write.
+    ``snapshot_seen`` is always a fresh empty set -- CNUMs written in
+    *this* collect pass only. ``game._persist_taken_cnums`` is the
+    allocate-only pool (live roster + leftover sidecar tags). Returning
+    that pool as seen_cnums reminted every login PC on every dirty save
+    because their own lasting tag was already "seen" (bug report 1846).
     """
     from engine.char_cnum import collect_taken_cnums
     from engine.char_identity import heal_unique_character_cnums
@@ -4565,11 +4724,20 @@ def _begin_persist_cnum_set(game):
             game._persist_taken_cnums = None
     cached = getattr(game, "_persist_taken_cnums", None)
     if already and not extra_keys and isinstance(cached, set):
-        return cached, extra_keys
+        return set(), extra_keys
     taken = collect_taken_cnums(iter_characters(game))
+    # Orphan sidecar shards still occupy a CNUM (homestead crates survive
+    # character DELETE). Treat those tags as taken so an NPC remint does
+    # not land on leftover crates. Login PCs keep their own tag even when
+    # it appears in this pool.
+    conn = getattr(game, "db", None) if game is not None else None
+    if conn is not None:
+        from engine.char_identity import _taken_cnums_from_heavy_blobs
+
+        taken.update(_taken_cnums_from_heavy_blobs(conn))
     if game is not None:
         game._persist_taken_cnums = taken
-    return taken, extra_keys
+    return set(), extra_keys
 
 
 def _persist_merge_cnum_extra_dirty(
@@ -4599,9 +4767,20 @@ def _persist_merge_cnum_extra_dirty(
 
 
 def _ensure_save_cnum(obj, game, seen_cnums):
-    """Validated CNUM on ``obj`` for the SQLite column (mutates if missing)."""
-    from engine.char_cnum import allocate_cnum, validate_cnum
-    from engine.char_identity import character_given_name
+    """Validated CNUM on ``obj`` for the SQLite column (mutates if missing).
+
+    Login bodies keep their lasting tag. ``seen_cnums`` is this collect
+    pass only -- a second NPC still wearing a PC's tag yields and takes
+    the next free number. Never remint a passworded / account PC (bug
+    report 1846). Leftover sidecar tags live in ``_persist_taken_cnums``
+    so NPC allocate skips them; they must not count as a snapshot clash
+    against the player who still owns that number.
+    """
+    from engine.char_cnum import allocate_cnum, next_cnum, parse_cnum, validate_cnum
+    from engine.char_identity import (
+        character_given_name,
+        is_passworded_roster_body,
+    )
 
     raw = getattr(obj, "cnum", None)
     current = None
@@ -4611,29 +4790,148 @@ def _ensure_save_cnum(obj, game, seen_cnums):
         except ValueError:
             current = None
     if current:
+        clash = seen_cnums is not None and current in seen_cnums
+        if clash and is_passworded_roster_body(obj):
+            # Player tag wins. The earlier writer in this snapshot was
+            # the duplicate (Echo, civic, index ghost). Keep the PC.
+            print(
+                f"[cnum] persist keep login {getattr(obj, 'key', None)!r} "
+                f"{current} (snapshot clash; other body must yield)",
+                flush=True,
+            )
+            obj.cnum = current
+            return current
+        if clash:
+            parsed = parse_cnum(current)
+            prefix = parsed[0] if parsed else "XX"
+            taken = set(seen_cnums)
+            cached = getattr(game, "_persist_taken_cnums", None)
+            if isinstance(cached, set):
+                taken.update(cached)
+            new = next_cnum(prefix, taken)
+            obj.cnum = new
+            seen_cnums.add(new)
+            if isinstance(cached, set):
+                cached.add(new)
+            print(
+                f"[cnum] persist remint {getattr(obj, 'key', None)!r} "
+                f"{current} -> {new} (snapshot clash; NPC yields)",
+                flush=True,
+            )
+            try:
+                from engine.id_reserve import note_character_cnum
+
+                note_character_cnum(obj)
+            except Exception:
+                pass
+            return new
         obj.cnum = current
         if seen_cnums is not None:
             seen_cnums.add(current)
         cached = getattr(game, "_persist_taken_cnums", None)
         if isinstance(cached, set):
             cached.add(current)
+        try:
+            from engine.id_reserve import note_character_cnum
+
+            note_character_cnum(obj)
+        except Exception:
+            pass
         return current
-    taken = seen_cnums if seen_cnums is not None else set()
+    taken = set(seen_cnums) if seen_cnums is not None else set()
+    cached = getattr(game, "_persist_taken_cnums", None)
+    if isinstance(cached, set):
+        taken.update(cached)
     new = allocate_cnum(character_given_name(obj), taken=taken)
     obj.cnum = new
     taken.add(new)
-    cached = getattr(game, "_persist_taken_cnums", None)
+    if seen_cnums is not None:
+        seen_cnums.add(new)
     if isinstance(cached, set):
         cached.add(new)
+    try:
+        from engine.id_reserve import note_character_cnum
+
+        note_character_cnum(obj)
+    except Exception:
+        pass
     return new
 
 
-def _character_save_rows(game, obj, seen_names, seen_cnums=None):
+# Yield inside one character blob so a megachar cannot pin collect (E1).
+_PERSIST_CHAR_ITEM_SLICE = 32
+
+
+def _character_save_rows(game, obj, seen_names, seen_cnums=None, **kwargs):
     """Build INSERT rows for one persistable Character (or None to skip)."""
+    gen = _character_save_rows_gen(
+        game, obj, seen_names, seen_cnums, **kwargs,
+    )
+    try:
+        while True:
+            next(gen)
+    except StopIteration as stop:
+        return stop.value
+
+
+async def _character_save_rows_async(
+    game, obj, seen_names, seen_cnums=None, *,
+    wall_start=None, wall_budget_ms=0, skip_heavy_on_wall=True,
+):
+    """Same as ``_character_save_rows`` but yields between blob/sidecar slices.
+
+    One Daniel-class ``known_faces`` / life_log dump used to ignore the
+    1.5s collect wall because the wall check sat *between* characters.
+    """
+    import asyncio
+
+    def wall_hit():
+        if not skip_heavy_on_wall:
+            return False
+        if wall_start is None or wall_budget_ms <= 0:
+            return False
+        return _persist_save_over_wall_budget(wall_start, wall_budget_ms)
+
+    gen = _character_save_rows_gen(
+        game, obj, seen_names, seen_cnums, wall_check=wall_hit,
+    )
+    while True:
+        try:
+            next(gen)
+        except StopIteration as stop:
+            return stop.value
+        await asyncio.sleep(0)
+
+
+def _character_save_rows_gen(
+    game, obj, seen_names, seen_cnums=None, *, wall_check=None,
+):
+    """Generator: yield between blob / dumps / sidecars / item slices."""
     # Reseat runs inside skip-save; read location only after that so a
     # None/stale room that just got parked is the key we write.
     if _should_skip_character_save(obj, game, seen_names):
         return None
+    frozen = None
+    try:
+        from engine.viewport_live import frozen_persist_payload
+
+        frozen = frozen_persist_payload(obj)
+    except Exception:
+        frozen = None
+    if frozen is not None:
+        char_row, item_rows = frozen
+        save_name = getattr(obj, "key", None) or ""
+        seen_names.add(save_name)
+        build_stats = {
+            "blob_ms": 0.0,
+            "dumps_ms": 0.0,
+            "items_ms": 0.0,
+            "blob_bytes": len(char_row[3]) if char_row and len(char_row) > 3 else 0,
+            "total_ms": 0.0,
+            "heavy_sidecar_rows": [],
+            "viewport_frozen": True,
+        }
+        return char_row, item_rows, build_stats
     room = getattr(obj, "location", None)
     if room is None:
         return None
@@ -4680,6 +4978,7 @@ def _character_save_rows(game, obj, seen_names, seen_cnums=None):
     t_blob = time.perf_counter()
     blob_dict = character_to_blob(obj, include_heavy=False)
     blob_build_ms = (time.perf_counter() - t_blob) * 1000.0
+    yield "blob"
     heavy_sidecar_rows = []
     try:
         prev_heavy = getattr(game, "_persist_heavy_shard_hashes", None) or {}
@@ -4689,7 +4988,9 @@ def _character_save_rows(game, obj, seen_names, seen_cnums=None):
             obj,
             cnum,
             prev_shard_hashes=prev_heavy.get(name_key),
+            wall_check=wall_check,
         )
+        yield "sidecars"
         if _shard_hashes and name_key:
             merged_heavy = dict(prev_heavy)
             merged_heavy[name_key] = _shard_hashes
@@ -4702,9 +5003,19 @@ def _character_save_rows(game, obj, seen_names, seen_cnums=None):
             f"heavy sidecar collect skipped key={getattr(obj, 'key', '?')}",
             exc=exc,
         )
+        # Copyover warmup/seal must not silently drop crates / journals.
+        if (
+            getattr(game, "_persist_copyover_save", False)
+            or getattr(game, "_persist_copyover_warmup", False)
+            or getattr(game, "_persist_heavy_sidecar_required", False)
+        ):
+            game._persist_heavy_sidecar_failed = True
+            raise
+    yield "pre_dumps"
     t_dumps = time.perf_counter()
     blob = json.dumps(blob_dict)
     dumps_ms = (time.perf_counter() - t_dumps) * 1000.0
+    yield "dumps"
     save_room = room
     if getattr(obj, "djinn_captive", False):
         real = getattr(obj, "djinn_real_room", None)
@@ -4726,16 +5037,18 @@ def _character_save_rows(game, obj, seen_names, seen_cnums=None):
     )
     t_items = time.perf_counter()
     item_rows = []
-    for item in obj.inventory:
+    for n_item, item in enumerate(obj.inventory):
         item_rows.append((
             _persist_item_field(item, "key"),
             _persist_item_field(
                 item, "description", fallback=_persist_item_field(item, "key"),
             ),
             "character", obj.key,
-            _item_container_blob(item),
+            _item_container_blob(item, holder=obj),
             cnum,
         ))
+        if n_item and n_item % _PERSIST_CHAR_ITEM_SLICE == 0:
+            yield "items"
     for item in list(getattr(obj, "gear_bag", None) or []):
         item_rows.append((
             _persist_item_field(item, "key"),
@@ -4743,7 +5056,7 @@ def _character_save_rows(game, obj, seen_names, seen_cnums=None):
                 item, "description", fallback=_persist_item_field(item, "key"),
             ),
             "gear", obj.key,
-            _item_container_blob(item),
+            _item_container_blob(item, holder=obj),
             cnum,
         ))
     items_ms = (time.perf_counter() - t_items) * 1000.0
@@ -5143,6 +5456,44 @@ def command_marks_character_dirty(verb, args=""):
     return True
 
 
+def _checkpoint_heavy_sidecars(conn, character, collected_rows):
+    """Sidecar payloads for the player save tank (RAM collect + leftover disk)."""
+    out = {}
+    for _cnum, shard, payload in collected_rows or ():
+        if not shard:
+            continue
+        if isinstance(payload, dict):
+            out[str(shard)] = payload
+            continue
+        try:
+            parsed = json.loads(payload) if payload else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, dict):
+            out[str(shard)] = parsed
+    cnum = getattr(character, "cnum", None)
+    if conn is None or not cnum:
+        return out
+    try:
+        rows = conn.execute(
+            "SELECT shard, payload FROM character_heavy_blobs WHERE cnum=?",
+            (str(cnum),),
+        ).fetchall()
+    except sqlite3.Error:
+        return out
+    for shard, payload in rows:
+        key = str(shard)
+        if key in out:
+            continue
+        try:
+            parsed = json.loads(payload) if payload else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, dict) and parsed:
+            out[key] = parsed
+    return out
+
+
 def persist_save_character(
     conn, game, character, *, player_checkpoint=False, flush_built_sites=True,
 ):
@@ -5215,6 +5566,9 @@ def persist_save_character(
             root = getattr(game, "report_dir", None) or psb._repo_root()
             psb.archive_player_checkpoint(
                 char_row, item_rows, root=root, built_sites=built_sites,
+                heavy_sidecars=_checkpoint_heavy_sidecars(
+                    conn, character, heavy_sidecar_rows,
+                ),
             )
         except Exception as exc:
             print(
@@ -5434,6 +5788,7 @@ def _collect_character_save_pass(
     changed_chars = []
     new_char_hashes = {}
     skipped_login_names = []
+    skipped_persistable_names = []
     heavy_sidecar_rows = []
     seen_cnums, extra_keys = _begin_persist_cnum_set(game)
     dirty_chars, _extra_deferred = _persist_merge_cnum_extra_dirty(
@@ -5459,11 +5814,15 @@ def _collect_character_save_pass(
             continue
         payload = _character_save_rows(game, obj, seen_names, seen_cnums)
         if payload is None:
-            _keep_skipped_login_body_alive(
-                obj, name, alive_names, new_char_hashes, prev_char_hashes,
+            _note_skipped_persistable_body(
+                obj,
+                name,
+                alive_names,
+                new_char_hashes,
+                prev_char_hashes,
+                skipped_login_names,
+                skipped_persistable_names,
             )
-            if _login_body_must_save(obj) and name:
-                skipped_login_names.append(name)
             continue
         char_row, owned_items, build_stats = payload
         name = char_row[0]
@@ -5481,6 +5840,9 @@ def _collect_character_save_pass(
     skipped_login_names = [
         n for n in skipped_login_names if n not in written_names
     ]
+    skipped_persistable_names = [
+        n for n in skipped_persistable_names if n not in written_names
+    ]
     removed_chars = []
     if not force_full and prev_char_hashes:
         removed_chars = sorted(set(prev_char_hashes.keys()) - alive_names)
@@ -5488,7 +5850,7 @@ def _collect_character_save_pass(
         game._persist_login_storage_keys = None
     return (
         char_rows, item_rows, changed_chars, removed_chars, new_char_hashes,
-        skipped_login_names, heavy_sidecar_rows,
+        skipped_login_names, skipped_persistable_names, heavy_sidecar_rows,
     )
 
 
@@ -5751,6 +6113,80 @@ def _persist_bump_echo_generation(game):
     ) + 1
 
 
+def persist_world_skip_parks_meta(world_stats):
+    """True when ``save_async`` must not run homestead/meta or pending-retry.
+
+    Wall-budget skips already parked (2026-09-18 PR 4640). Empty and
+    short ``force_full`` refuses also set ``skipped=True`` but without
+    ``wall_budget``, so ``save_async`` used to fall through to a 2s
+    homestead walk and then set ``_save_pending_after_current`` (Gabriel
+    gist 77009b2e). Any discarded world snapshot parks the same way:
+    keep ``_persist_force_full`` armed; wait for the next scheduled
+    autosave. Copyover/shutdown still uses their abort paths, not this.
+    """
+    return bool((world_stats or {}).get("skipped"))
+
+
+def park_save_async_after_world_skip(game, meta_stats):
+    """Stamp skip tags onto ``meta_stats`` when world collect discarded.
+
+    Returns True when ``save_async`` should return without inline meta
+    and without setting ``_save_pending_after_current``.
+    """
+    world_stats = getattr(game, "_last_world_save_stats", None) or {}
+    if not persist_world_skip_parks_meta(world_stats):
+        return False
+    meta_stats = meta_stats if meta_stats is not None else {}
+    meta_stats["world_skip"] = True
+    if world_stats.get("wall_budget"):
+        meta_stats["world_wall_budget_skip"] = True
+    if world_stats.get("empty_force_full"):
+        meta_stats["world_empty_force_full_skip"] = True
+    if world_stats.get("short_force_full"):
+        meta_stats["world_short_force_full_skip"] = True
+    if game is not None:
+        game._last_meta_save_stats = meta_stats
+    return True
+
+
+def _persist_finish_wall_budget_skip(game, meta, collect_ms):
+    """Park a wall-budget collect skip without an immediate retry.
+
+    Restores deferred dirty and stamps ``_last_world_save_stats``. Does
+    **not** set ``_save_pending_after_current`` -- that kick used to
+    bypass the 180s autosave gate, re-arm ``force_full``, and peg the
+    asyncio loop until Mudlet clients dropped (Pierre / Alcidies,
+    2026-09-18). ``_persist_force_full`` stays armed when collect re-armed
+    it; the next scheduled autosave continues the pass.
+    """
+    _persist_restore_deferred_dirty(
+        game,
+        set((meta or {}).get("deferred_chars") or ()),
+        set((meta or {}).get("deferred_rooms") or ()),
+    )
+    if game is None:
+        return
+    game._last_world_save_stats = {
+        "skipped": True,
+        "wall_budget": True,
+        "collect_ms": round(float(collect_ms or 0.0), 2),
+        "apply_ms": 0.0,
+        "force_full": bool((meta or {}).get("force_full")),
+        "n_char_rows": 0,
+        "n_item_rows": 0,
+        "wall_budget_hit": True,
+    }
+    from engine import log_util
+
+    log_util.ops(
+        "persistence",
+        "wall-budget skip force_full="
+        f"{bool((meta or {}).get('force_full'))} "
+        f"collect_ms={round(float(collect_ms or 0.0), 2)} "
+        "pending_retry=False",
+    )
+
+
 def _persist_restore_deferred_dirty(game, deferred_chars, deferred_rooms):
     """Re-queue dirty keys that this save did not rewrite."""
     if game is None:
@@ -5784,7 +6220,7 @@ def _collect_world_save_snapshot(game):
     seen_names = set()
     (
         char_rows, item_rows, changed_chars, removed_chars, new_char_hashes,
-        skipped_login, heavy_sidecar_rows,
+        skipped_login, skipped_persistable, heavy_sidecar_rows,
     ) = _collect_character_save_pass(
         game, seen_names, prev_char or {}, force_full_chars, dirty_chars,
     )
@@ -5811,6 +6247,7 @@ def _collect_world_save_snapshot(game):
         "n_dirty_chars_this_pass": len(dirty_chars) if not force_full_chars else -1,
         "n_dirty_rooms_this_pass": len(dirty_rooms) if not force_full_floor else -1,
         "skipped_login_names": list(skipped_login),
+        "skipped_persistable_names": list(skipped_persistable),
         "heavy_sidecar_rows": heavy_sidecar_rows,
     }
     return char_rows, item_rows, meta
@@ -5850,6 +6287,7 @@ async def _collect_world_save_snapshot_async(
     changed_chars = []
     new_char_hashes = {}
     skipped_login_names = []
+    skipped_persistable_names = []
     n = 0
     seen_cnums, extra_keys = _begin_persist_cnum_set(game)
     dirty_chars, deferred_chars = _persist_merge_cnum_extra_dirty(
@@ -5917,14 +6355,28 @@ async def _collect_world_save_snapshot_async(
             alive_names.add(name)
             continue
         t_char = time.perf_counter()
-        payload = _character_save_rows(game, obj, seen_names, seen_cnums)
+        copyover = bool(
+            getattr(game, "_persist_copyover_save", False)
+            or getattr(game, "_persist_copyover_warmup", False)
+            or getattr(game, "_persist_heavy_sidecar_required", False)
+        )
+        payload = await _character_save_rows_async(
+            game, obj, seen_names, seen_cnums,
+            wall_start=char_collect_wall_start,
+            wall_budget_ms=wall_budget_ms,
+            skip_heavy_on_wall=not force_full_chars and not copyover,
+        )
         outer_ms = (time.perf_counter() - t_char) * 1000.0
         if payload is None:
-            _keep_skipped_login_body_alive(
-                obj, name, alive_names, new_char_hashes, prev_char,
+            _note_skipped_persistable_body(
+                obj,
+                name,
+                alive_names,
+                new_char_hashes,
+                prev_char,
+                skipped_login_names,
+                skipped_persistable_names,
             )
-            if _login_body_must_save(obj) and name:
-                skipped_login_names.append(name)
             continue
         char_row, owned_items, build_stats = payload
         name = char_row[0]
@@ -6056,6 +6508,9 @@ async def _collect_world_save_snapshot_async(
     skipped_login_names = [
         n for n in skipped_login_names if n not in written_names
     ]
+    skipped_persistable_names = [
+        n for n in skipped_persistable_names if n not in written_names
+    ]
     meta = {
         "force_full": force_full_chars,
         "force_full_chars_only": force_full_chars and not force_full_floor,
@@ -6080,6 +6535,7 @@ async def _collect_world_save_snapshot_async(
         "n_dirty_chars_this_pass": len(dirty_chars) if not force_full_chars else -1,
         "n_dirty_rooms_this_pass": len(dirty_rooms) if not force_full_floor else -1,
         "skipped_login_names": list(skipped_login_names),
+        "skipped_persistable_names": list(skipped_persistable_names),
         # Lag P12 breadcrumbs -- see _PERSIST_SLOW_CHAR_LOG_MS above.
         "slow_chars": slow_chars[:_PERSIST_SLOW_CHAR_LOG_CAP],
         "slow_char_detail": slow_char_detail[:_PERSIST_SLOW_CHAR_LOG_CAP],
@@ -6137,9 +6593,184 @@ def _delete_owned_items_for_character(conn, name, holder_cnum=None):
 
 def _skipped_login_keep_names(meta):
     """Deduped storage keys of login PCs collect could not snapshot."""
+    return _dedupe_name_list((meta or {}).get("skipped_login_names"))
+
+
+def _skipped_keep_names(meta):
+    """Login + catalog/pet skip-saves that must survive force_full DELETE.
+
+    Copyover abort still uses ``_skipped_login_keep_names`` only -- one
+    skip-saved Thor must not hold the Veil rewrite. Force-full DELETE
+    still keeps that SQLite row.
+    """
+    return _dedupe_name_list(
+        list((meta or {}).get("skipped_login_names") or ())
+        + list((meta or {}).get("skipped_persistable_names") or ())
+    )
+
+
+def _copyover_keep_uncollected_sqlite_names(conn, char_rows, meta):
+    """Keep SQLite character rows the RAM snapshot never collected.
+
+    Live 2026-09-20: copyover of ``fb15ca09`` aborted 3/3 with
+    ``short_force_full`` because RAM collect was hundreds of bodies and
+    the ``characters`` table was ~2000. Copyover already collects with
+    ``wall_budget_ms=0``; bodies that were never in this process still
+    must survive ``DELETE FROM characters``. Add those names to the keep
+    list so refuse does not abort the Veil rewrite.
+    """
+    if conn is None or not (meta or {}).get("force_full"):
+        return
+    snap = set()
+    for row in char_rows or ():
+        if not row:
+            continue
+        name = str(row[0] or "").strip()
+        if name:
+            snap.add(name)
+    try:
+        live_names = [
+            str(r[0] or "").strip()
+            for r in conn.execute("SELECT name FROM characters").fetchall()
+            if r and str(r[0] or "").strip()
+        ]
+    except sqlite3.Error:
+        return
+    extra = [n for n in live_names if n not in snap]
+    if not extra:
+        return
+    prev = list((meta or {}).get("skipped_persistable_names") or ())
+    meta["skipped_persistable_names"] = _dedupe_name_list(prev + extra)
+    print(
+        "[persistence] copyover keep "
+        f"{len(extra)} sqlite-only character row(s)",
+        flush=True,
+    )
+
+
+_SQLITE_IN_CHUNK = 400
+
+
+def _snapshot_room_holder_keys(item_rows):
+    """Room keys the snapshot would INSERT as floor loot."""
+    keys = []
+    seen = set()
+    for row in item_rows or ():
+        if not row or len(row) < 4:
+            continue
+        if row[2] != "room":
+            continue
+        holder = str(row[3] or "").strip()
+        if not holder or holder in seen:
+            continue
+        seen.add(holder)
+        keys.append(holder)
+    return keys
+
+
+def _copyover_keep_uncollected_room_items(conn, item_rows, meta):
+    """Keep SQLite floor loot whose rooms this process never collected.
+
+    Live 2026-09-20: 2035 character rows and 2830 room-item rows. Character
+    keep-list alone still trips ``_refuse_short_room_item_wipe`` (floor 80%
+    of 2830). Copyover DELETE used to wipe every room row; a scoped replace
+    keeps homestead interiors this process never loaded.
+    """
+    if conn is None or not (meta or {}).get("force_full"):
+        return
+    if (meta or {}).get("force_full_chars_only"):
+        return
+    rooms = _snapshot_room_holder_keys(item_rows)
+    meta["copyover_replace_room_keys"] = rooms
+    snap = set(rooms)
+    try:
+        live_keys = [
+            str(r[0] or "").strip()
+            for r in conn.execute(
+                "SELECT holder_key FROM items WHERE holder_type='room'"
+            ).fetchall()
+            if r and str(r[0] or "").strip()
+        ]
+    except sqlite3.Error:
+        return
+    extra = sum(1 for key in live_keys if key not in snap)
+    if extra:
+        print(
+            "[persistence] copyover keep "
+            f"{extra} sqlite-only room-item row(s)",
+            flush=True,
+        )
+
+
+def _copyover_keep_uncollected_sidecars(conn, meta):
+    """Credit sqlite property_stash rows copyover will not delete.
+
+    Force-full prune never drops ``property_stash`` (bug report 1776).
+    After P6k char/room keep, Veil still aborted as ``short_force_full``
+    when RAM collected fewer homestead-crate shards than SQLite held.
+    Mark the snapshot so refuse counts those leftover rows instead of
+    cancelling the rewrite.
+    """
+    if conn is None or not (meta or {}).get("force_full"):
+        return
+    meta["copyover_keep_sqlite_sidecars"] = True
+
+
+
+def _keep_sqlite_only_rows_for_force_full(conn, char_rows, item_rows, meta):
+    """Keep sqlite-only bodies on every force_full apply, not only copyover.
+
+    Live 2026-09-20: P6k credited extras during Veil collect so refuse
+    would not abort. The first autosave after Veil (cold hashes,
+    ``_persist_copyover_save`` already false) still ran
+    ``DELETE FROM characters`` then INSERT RAM and dropped skip-saved
+    PCs (Daniel, Ayla, and the rest of the afternoon roster).
+    """
+    if conn is None or not (meta or {}).get("force_full"):
+        return
+    _copyover_keep_uncollected_sqlite_names(conn, char_rows, meta)
+    _copyover_keep_uncollected_room_items(conn, item_rows, meta)
+    _copyover_keep_uncollected_sidecars(conn, meta)
+
+
+def _exec_delete_in(conn, sql_prefix, values, *, chunk=_SQLITE_IN_CHUNK):
+    """DELETE ... IN (?) in chunks so SQLite's variable cap cannot abort."""
+    cleaned = [v for v in (values or ()) if str(v or "").strip()]
+    size = max(1, int(chunk or _SQLITE_IN_CHUNK))
+    for i in range(0, len(cleaned), size):
+        batch = cleaned[i : i + size]
+        qmarks = ",".join("?" * len(batch))
+        conn.execute(f"{sql_prefix} ({qmarks})", batch)
+
+
+def _load_temp_keep_names(conn, names):
+    """Load keep names into a TEMP table so NOT IN can exceed SQLite's ? cap.
+
+    Live extras are ~1800 sqlite-only bodies. A single
+    ``DELETE ... NOT IN (?,?,...)`` with that many placeholders can raise
+    ``too many SQL variables`` and abort the Veil apply after refuse
+    already passed. TEMP table + subquery does not hit that cap.
+    """
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS _copyover_keep_names "
+        "(name TEXT PRIMARY KEY)"
+    )
+    conn.execute("DELETE FROM _copyover_keep_names")
+    cleaned = _dedupe_name_list(names)
+    size = max(1, int(_SQLITE_IN_CHUNK))
+    for i in range(0, len(cleaned), size):
+        batch = [(n,) for n in cleaned[i : i + size]]
+        conn.executemany(
+            "INSERT OR IGNORE INTO _copyover_keep_names(name) VALUES (?)",
+            batch,
+        )
+
+
+def _dedupe_name_list(raw_names):
+    """Preserve order, drop blanks and duplicates."""
     names = []
     seen = set()
-    for raw in (meta or {}).get("skipped_login_names") or ():
+    for raw in raw_names or ():
         name = str(raw or "").strip()
         if not name or name in seen:
             continue
@@ -6148,70 +6779,179 @@ def _skipped_login_keep_names(meta):
     return names
 
 
-def _upsert_heavy_sidecar_rows(conn, rows):
-    """INSERT OR REPLACE sidecar shards; skip empty collects (do not wipe)."""
+def _shard_payload_dict(payload):
+    """JSON-decode a sidecar cell to a dict (empty on junk)."""
+    if isinstance(payload, dict):
+        return payload
+    if not isinstance(payload, str) or not payload.strip():
+        return {}
+    try:
+        parsed = json.loads(payload)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _read_heavy_shard_payload(conn, cnum, shard):
+    """Parsed sidecar dict for one cnum/shard, or None when missing."""
+    try:
+        row = conn.execute(
+            "SELECT payload FROM character_heavy_blobs "
+            "WHERE cnum=? AND shard=?",
+            (str(cnum), str(shard)),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    parsed = _shard_payload_dict(row[0])
+    return parsed
+
+
+def _property_stash_dict_empty(parsed):
+    """True when a property_stash dict holds no piles (hooks or local heuristic)."""
     from engine import hooks
 
-    for cnum, shard, payload in rows or ():
+    if not parsed:
+        return True
+    if hooks.property_stash_payload_empty(parsed):
+        return True
+    return not any(parsed.values())
+
+
+def _life_log_dict_empty(parsed):
+    """True when a life_log dict holds no events or pages."""
+    from engine import hooks
+
+    if not parsed:
+        return True
+    if hooks.life_log_payload_empty(parsed):
+        return True
+    events = parsed.get("life_log_events")
+    if isinstance(events, list) and events:
+        return False
+    for key in ("life_log_diary", "life_log_daily"):
+        val = parsed.get(key)
+        if isinstance(val, dict) and val:
+            return False
+    return True
+
+
+def _upsert_heavy_sidecar_rows(conn, rows):
+    """INSERT OR REPLACE sidecar shards; never let empty piles clobber full ones."""
+    from engine import hooks
+
+    # Last write wins per (cnum, shard). Two bodies that still shared a
+    # CNUM during collect used to emit duplicate keys; collapsing here
+    # keeps the apply loop from depending on SQLite REPLACE order.
+    collapsed = []
+    seen = {}
+    for row in rows or ():
+        if not row or len(row) < 3:
+            continue
+        key = (str(row[0]), str(row[1]))
+        if key in seen:
+            collapsed[seen[key]] = row
+        else:
+            seen[key] = len(collapsed)
+            collapsed.append(row)
+    for cnum, shard, payload in collapsed:
+        write_payload = payload
         if str(shard) == "property_stash":
-            parsed_new = hooks.parse_heavy_shard_payload(payload)
-            if parsed_new is not None and hooks.property_stash_payload_empty(parsed_new):
-                try:
-                    row = conn.execute(
-                        "SELECT payload FROM character_heavy_blobs "
-                        "WHERE cnum=? AND shard=?",
-                        (str(cnum), str(shard)),
-                    ).fetchone()
-                except sqlite3.Error:
-                    row = None
-                if row:
-                    parsed_old = hooks.parse_heavy_shard_payload(row[0])
-                    if parsed_old is not None and not hooks.property_stash_payload_empty(
-                        parsed_old,
-                    ):
-                        continue
+            parsed_new = _shard_payload_dict(payload)
+            parsed_old = _read_heavy_shard_payload(conn, cnum, shard)
+            if _property_stash_dict_empty(parsed_new):
+                if parsed_old is not None and not _property_stash_dict_empty(
+                    parsed_old,
+                ):
+                    continue
+            if parsed_old or parsed_new:
+                merged = hooks.merge_property_stash_payloads(
+                    parsed_old or {}, parsed_new or {},
+                )
+                write_payload = json.dumps(
+                    merged, separators=(",", ":"), ensure_ascii=False,
+                )
+        elif str(shard) == "life_log":
+            parsed_new = _shard_payload_dict(payload)
+            if _life_log_dict_empty(parsed_new):
+                parsed_old = _read_heavy_shard_payload(conn, cnum, shard)
+                if parsed_old is not None and not _life_log_dict_empty(
+                    parsed_old,
+                ):
+                    continue
         conn.execute(
             "INSERT OR REPLACE INTO character_heavy_blobs "
             "(cnum, shard, payload) VALUES (?,?,?)",
-            (str(cnum), str(shard), payload),
+            (str(cnum), str(shard), write_payload),
         )
 
 
 def _prune_orphan_heavy_blobs(conn):
-    """Drop sidecar rows whose character cnum is gone."""
+    """Drop leftover mapper/crew sidecars whose character cnum is gone.
+
+    Never delete ``property_stash`` or ``life_log`` this way. Force-full
+    ``DELETE FROM characters`` then prune used to erase every homestead
+    crate and Echo journal (bug report 1776) when collect omitted those
+    shards. Orphan belonging rows are cheap; player belongings are not.
+    """
     conn.execute(
         "DELETE FROM character_heavy_blobs WHERE cnum NOT IN "
-        "(SELECT cnum FROM characters WHERE cnum IS NOT NULL AND cnum != '')"
+        "(SELECT cnum FROM characters WHERE cnum IS NOT NULL AND cnum != '') "
+        "AND shard NOT IN ('property_stash', 'life_log')"
     )
 
 
-def _force_full_delete_tables(conn, *, chars_only, keep_login_names):
+def _force_full_delete_tables(
+    conn, *, chars_only, keep_login_names, replace_room_keys=None,
+):
     """Wipe characters/items for a force-full apply, keeping skip-saved PCs.
 
     Copyover ``DELETE FROM characters`` then INSERT only collected rows used
     to erase a skip-saved login body (bug report 1509 -- Ayla). Keep those
     names (and their held items) when collect could not snapshot them.
+    Copyover also scopes the room-item DELETE to rooms the snapshot
+    collected so homestead interiors this process never loaded survive.
     """
     keep = [n for n in (keep_login_names or ()) if str(n).strip()]
+
+    def _wipe_room_items():
+        if replace_room_keys is not None:
+            _exec_delete_in(
+                conn,
+                "DELETE FROM items WHERE holder_type='room' "
+                "AND holder_key IN",
+                replace_room_keys,
+            )
+            return
+        conn.execute("DELETE FROM items WHERE holder_type = 'room'")
+
     if keep:
-        qmarks = ",".join("?" * len(keep))
+        _load_temp_keep_names(conn, keep)
         conn.execute(
-            f"DELETE FROM characters WHERE name NOT IN ({qmarks})",
-            keep,
+            "DELETE FROM characters WHERE name NOT IN "
+            "(SELECT name FROM _copyover_keep_names)"
         )
         item_owned = (
-            f"DELETE FROM items WHERE holder_type IN ('character', 'gear') "
-            f"AND holder_key NOT IN ({qmarks})"
+            "DELETE FROM items WHERE holder_type IN ('character', 'gear') "
+            "AND holder_key NOT IN (SELECT name FROM _copyover_keep_names)"
         )
         if chars_only:
-            conn.execute(item_owned, keep)
+            conn.execute(item_owned)
         else:
-            conn.execute("DELETE FROM items WHERE holder_type = 'room'")
-            conn.execute(item_owned, keep)
-        _prune_orphan_heavy_blobs(conn)
+            _wipe_room_items()
+            conn.execute(item_owned)
+        # Do not prune belonging sidecars here. Characters just deleted are
+        # about to be re-inserted; prune-before-insert wiped homestead
+        # crates and Echo journals (bug report 1776).
         return
     conn.execute("DELETE FROM characters")
     if chars_only:
+        conn.execute(
+            "DELETE FROM items WHERE holder_type IN ('character', 'gear')",
+        )
+    elif replace_room_keys is not None:
+        _wipe_room_items()
         conn.execute(
             "DELETE FROM items WHERE holder_type IN ('character', 'gear')",
         )
@@ -6236,15 +6976,15 @@ def _refuse_short_force_full_wipe(conn, char_rows, meta):
     """True when force_full would replace a large SQLite roster with a short snapshot.
 
     Empty-wipe refuse does not catch a non-empty partial snapshot (108 of
-    1475). ``skipped_login_names`` count toward the snapshot so a keep-list
-    copyover is not treated as a wipe.
+    1475). Skip-saved login *and* catalog bodies count toward the snapshot
+    so a keep-list copyover is not treated as a wipe.
     """
     if not (meta or {}).get("force_full"):
         return False
     if conn is None:
         return False
     snap_n = len(char_rows or ())
-    keep_n = len(_skipped_login_keep_names(meta) or ())
+    keep_n = len(_skipped_keep_names(meta) or ())
     effective = snap_n + keep_n
     try:
         live_n = int(
@@ -6265,11 +7005,271 @@ def _refuse_short_force_full_wipe(conn, char_rows, meta):
     return True
 
 
-def _refuse_unsafe_force_full_wipe(conn, char_rows, meta):
-    """Empty or short force_full snapshot -- do not DELETE the live roster."""
+def _unsafe_force_full_wipe_reason(conn, char_rows, meta, item_rows=None):
+    """Which force_full wipe guard fired, or None when apply is safe."""
     if _refuse_empty_force_full_wipe(char_rows, meta):
-        return True
-    return _refuse_short_force_full_wipe(conn, char_rows, meta)
+        return "empty_force_full"
+    if _refuse_short_force_full_wipe(conn, char_rows, meta):
+        return "short_force_full"
+    if _refuse_short_sidecar_wipe(conn, meta):
+        return "short_sidecar"
+    if _refuse_short_room_item_wipe(conn, item_rows, meta):
+        return "short_room_items"
+    return None
+
+
+def _refuse_unsafe_force_full_wipe(conn, char_rows, meta, item_rows=None):
+    """Empty or short force_full snapshot -- do not DELETE live roster or homes."""
+    return _unsafe_force_full_wipe_reason(
+        conn, char_rows, meta, item_rows=item_rows,
+    ) is not None
+
+
+def _stamp_refused_force_full_skip(game, *, char_rows, meta, collect_ms, reason):
+    """Record why a force_full apply was parked (autosave or copyover seal)."""
+    if game is None:
+        return
+    game._last_world_save_stats = {
+        "skipped": True,
+        "empty_force_full": reason == "empty_force_full",
+        "short_force_full": reason == "short_force_full",
+        "short_sidecar": reason == "short_sidecar",
+        "short_room_items": reason == "short_room_items",
+        "collect_ms": round(collect_ms, 2),
+        "apply_ms": 0.0,
+        "force_full": bool((meta or {}).get("force_full")),
+        "n_char_rows": len(char_rows or ()),
+        "n_item_rows": 0,
+        "skipped_login_names": list((meta or {}).get("skipped_login_names") or ()),
+    }
+
+
+def _count_snapshot_property_stash(meta):
+    """How many non-empty property_stash shards this snapshot would upsert."""
+    from engine import hooks
+
+    n = 0
+    for _cnum, shard, payload in (meta or {}).get("heavy_sidecar_rows") or ():
+        if str(shard) != "property_stash":
+            continue
+        parsed = hooks.parse_heavy_shard_payload(payload)
+        if parsed is not None and not hooks.property_stash_payload_empty(parsed):
+            n += 1
+    return n
+
+
+def _refuse_short_sidecar_wipe(conn, meta):
+    """True when force_full would replace many stash sidecars with almost none."""
+    if not (meta or {}).get("force_full"):
+        return False
+    if conn is None:
+        return False
+    try:
+        live_n = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM character_heavy_blobs "
+                "WHERE shard='property_stash'"
+            ).fetchone()[0] or 0
+        )
+    except sqlite3.Error:
+        return False
+    # Tiny / already-wiped DBs stay writable so a blend+save can refill.
+    if live_n < 20:
+        return False
+    snap_n = _count_snapshot_property_stash(meta)
+    keep_n = 0
+    if (meta or {}).get("copyover_keep_sqlite_sidecars"):
+        # Apply upserts/merges snapshot shards and never DELETEs
+        # property_stash. SQLite-only crate rows survive; credit them
+        # (and empty snapshot payloads omitted from snap_n) so a short
+        # RAM collect cannot abort Veil as short_force_full.
+        snap_cnums = {
+            str(cnum)
+            for cnum, shard, _payload in (meta or {}).get("heavy_sidecar_rows") or ()
+            if str(shard) == "property_stash" and str(cnum)
+        }
+        try:
+            live_cnums = [
+                str(r[0] or "")
+                for r in conn.execute(
+                    "SELECT cnum FROM character_heavy_blobs "
+                    "WHERE shard='property_stash'"
+                ).fetchall()
+                if r
+            ]
+        except sqlite3.Error:
+            live_cnums = []
+        keep_n = sum(1 for cnum in live_cnums if cnum and cnum not in snap_cnums)
+        keep_n += max(0, live_n - snap_n - keep_n)
+    floor = max(1, int(live_n * _FORCE_FULL_SHORT_FRACTION))
+    if (snap_n + keep_n) >= floor:
+        return False
+    print(
+        "[persistence] refuse short property_stash sidecar wipe "
+        f"(snapshot {snap_n + keep_n} vs live {live_n}, floor {floor})",
+        flush=True,
+    )
+    return True
+
+
+def _count_room_items_in_rows(item_rows):
+    """Count floor-loot tuples in a snapshot (holder_type is column 2)."""
+    n = 0
+    for row in item_rows or ():
+        if len(row) > 2 and row[2] == "room":
+            n += 1
+    return n
+
+
+def _refuse_short_room_item_wipe(conn, item_rows, meta):
+    """True when force_full would DELETE homestead/room loot then insert far fewer rows."""
+    if not (meta or {}).get("force_full"):
+        return False
+    if (meta or {}).get("force_full_chars_only"):
+        return False
+    if conn is None:
+        return False
+    # Live 2026-09-21: keep logged 1847 sqlite-only room items, then refuse
+    # printed snapshot 4473 (keep_n=0) and cancelled Veil. Stamp replace
+    # from the snapshot here so leftover rooms are credited even when the
+    # keep helper's meta did not stick, and so apply still scopes DELETE.
+    if meta.get("copyover_replace_room_keys") is None:
+        _copyover_keep_uncollected_room_items(conn, item_rows, meta)
+    try:
+        live_n = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM items WHERE holder_type='room'"
+            ).fetchone()[0] or 0
+        )
+    except sqlite3.Error:
+        return False
+    if live_n < _FORCE_FULL_SHORT_MIN_LIVE:
+        return False
+    snap_n = _count_room_items_in_rows(item_rows)
+    keep_n = 0
+    replace = meta.get("copyover_replace_room_keys")
+    if replace is not None:
+        snap_rooms = {str(k).strip() for k in replace if str(k).strip()}
+        try:
+            live_keys = [
+                str(r[0] or "").strip()
+                for r in conn.execute(
+                    "SELECT holder_key FROM items WHERE holder_type='room'"
+                ).fetchall()
+                if r
+            ]
+        except sqlite3.Error:
+            live_keys = []
+        keep_n = sum(1 for key in live_keys if key and key not in snap_rooms)
+    floor = max(1, int(live_n * _FORCE_FULL_SHORT_FRACTION))
+    if (snap_n + keep_n) >= floor:
+        return False
+    print(
+        "[persistence] refuse short room-item wipe "
+        f"(snapshot {snap_n}+keep {keep_n}={snap_n + keep_n} vs live {live_n}, "
+        f"floor {floor}, snap_rooms {len(replace or ())})",
+        flush=True,
+    )
+    return True
+
+
+def _removed_chars_not_vaulted(conn, removed):
+    """Names in *removed* that are not hard-folded into ``character_vault``.
+
+    Vaulted bodies must still be deleted from ``characters`` (the vault
+    row is the pfile). Counting them as a wipe would block legitimate
+    ``gm fold`` / dormant-cast boot folds.
+    """
+    out = []
+    for name in removed or ():
+        try:
+            if vault_has(conn, name):
+                continue
+        except sqlite3.Error:
+            pass
+        out.append(name)
+    return out
+
+
+def _refuse_mass_removed_chars(conn, meta):
+    """True when incremental DELETE would drop a large fraction of live rows.
+
+    ``removed_chars = prev_hashes - alive_names``. If RAM lost most of the
+    roster, that list is the same wipe as a short force_full (21:29 -> 23:23
+    mechanism B). Vaulted names are not counted -- fold is supposed to
+    drop the live row. Tiny test DBs stay under the floor.
+    """
+    if conn is None:
+        return False
+    if (meta or {}).get("force_full"):
+        return False
+    live_missing = _removed_chars_not_vaulted(
+        conn, _dedupe_name_list((meta or {}).get("removed_chars")),
+    )
+    if not live_missing:
+        return False
+    try:
+        live_n = int(
+            conn.execute("SELECT COUNT(*) FROM characters").fetchone()[0] or 0
+        )
+    except sqlite3.Error:
+        return False
+    if live_n < _FORCE_FULL_SHORT_MIN_LIVE:
+        return False
+    cap = max(1, live_n - int(live_n * _FORCE_FULL_SHORT_FRACTION))
+    if len(live_missing) < cap:
+        return False
+    print(
+        "[persistence] refuse mass removed_chars "
+        f"({len(live_missing)} unvaulted vs live {live_n}, cap {cap})",
+        flush=True,
+    )
+    return True
+
+
+def _meta_without_mass_removed_chars(conn, meta):
+    """Keep vaulted despawns; drop unvaulted mass-deletes when the guard fires."""
+    meta = meta or {}
+    removed = _dedupe_name_list(meta.get("removed_chars"))
+    if not removed or not _refuse_mass_removed_chars(conn, meta):
+        return meta
+    live_missing = set(_removed_chars_not_vaulted(conn, removed))
+    kept_vaulted = [name for name in removed if name not in live_missing]
+    out = dict(meta)
+    out["removed_chars"] = kept_vaulted
+    out["refused_mass_removed_chars"] = sorted(live_missing)
+    return out
+
+
+
+def _remint_earlier_snapshot_row(healed, name, taken, assigned):
+    """Give an already-healed snapshot row a new CNUM; player keeps the tag."""
+    from engine.char_cnum import next_cnum, parse_cnum
+    from engine.char_identity import rewrite_stats_blob_cnum
+
+    out = []
+    for row in healed:
+        rname, desc, room, stats, cnum = row
+        if rname != name:
+            out.append(row)
+            continue
+        parsed_cnum = parse_cnum(cnum) if cnum else None
+        prefix = parsed_cnum[0] if parsed_cnum else "XX"
+        if cnum:
+            taken.add(str(cnum))
+        new = next_cnum(prefix, taken)
+        stats = rewrite_stats_blob_cnum(stats, new)
+        if cnum and assigned.get(str(cnum)) == name:
+            del assigned[str(cnum)]
+        assigned[str(new)] = name
+        taken.add(str(new))
+        print(
+            f"[cnum] snapshot remint earlier {name!r} {cnum} -> {new} "
+            f"(login PC keeps the tag)",
+            flush=True,
+        )
+        out.append((rname, desc, room, stats, new))
+    return out
 
 
 def _heal_char_rows_cnum_clashes(conn, char_rows):
@@ -6281,7 +7281,23 @@ def _heal_char_rows_cnum_clashes(conn, char_rows):
         rewrite_stats_blob_cnum,
     )
 
+    from engine.char_cnum import next_cnum, parse_cnum, validate_cnum
+    from engine.char_identity import _taken_cnums_from_heavy_blobs
+
+    taken = set()
+    for row in conn.execute(
+        "SELECT cnum FROM characters WHERE cnum IS NOT NULL AND cnum != ''"
+    ):
+        raw = row[0]
+        if isinstance(raw, str) and raw.strip():
+            try:
+                taken.add(validate_cnum(raw))
+            except ValueError:
+                continue
+    taken.update(_taken_cnums_from_heavy_blobs(conn))
+
     healed = []
+    assigned = {}
     for row in char_rows:
         name, desc, room, stats = row[0], row[1], row[2], row[3]
         cnum = row[4] if len(row) > 4 else None
@@ -6293,16 +7309,54 @@ def _heal_char_rows_cnum_clashes(conn, char_rows):
                 loaded = {}
             if isinstance(loaded, dict):
                 parsed = loaded
-        new_cnum, _notes = remint_cnum_clash_for_restore(
-            conn,
-            keep_name=name,
-            keep_cnum=cnum,
-            keep_stats=parsed,
-        )
+        wanted = None
+        if isinstance(cnum, str) and cnum.strip():
+            try:
+                wanted = validate_cnum(cnum)
+            except ValueError:
+                wanted = None
+        # Login bodies should be first. If a later login PC still
+        # wears a tag an earlier NPC already claimed, the player keeps
+        # it and we remint the earlier row (bug report 1846). NPCs yield.
+        if wanted and wanted in assigned:
+            from engine.char_identity import stats_blob_is_login_pfile
+
+            later_is_pc = stats_blob_is_login_pfile(parsed)
+            if later_is_pc:
+                earlier_name = assigned[wanted]
+                print(
+                    f"[cnum] snapshot keep login {name!r} {wanted}; "
+                    f"remint earlier {earlier_name!r}",
+                    flush=True,
+                )
+                healed = _remint_earlier_snapshot_row(
+                    healed, earlier_name, taken, assigned,
+                )
+                new_cnum = wanted
+            else:
+                parsed_cnum = parse_cnum(wanted)
+                prefix = parsed_cnum[0] if parsed_cnum else "XX"
+                taken.add(wanted)
+                new_cnum = next_cnum(prefix, taken)
+                print(
+                    f"[cnum] snapshot remint {name!r} {wanted} -> {new_cnum} "
+                    f"(earlier row {assigned[wanted]!r} keeps the tag)",
+                    flush=True,
+                )
+        else:
+            new_cnum, _notes = remint_cnum_clash_for_restore(
+                conn,
+                keep_name=name,
+                keep_cnum=cnum,
+                keep_stats=parsed,
+            )
         if new_cnum:
             if new_cnum != cnum:
                 stats = rewrite_stats_blob_cnum(stats, new_cnum)
             cnum = new_cnum
+        if cnum:
+            assigned[str(cnum)] = name
+            taken.add(str(cnum))
         healed.append((name, desc, room, stats, cnum))
     return healed
 
@@ -6350,6 +7404,8 @@ def _abort_copyover_skipped_save(game):
         detail = (
             stats.get("empty_force_full") and "empty_force_full"
             or stats.get("short_force_full") and "short_force_full"
+            or stats.get("short_sidecar") and "short_sidecar"
+            or stats.get("short_room_items") and "short_room_items"
             or "skipped"
         )
         raise RuntimeError(
@@ -6370,6 +7426,7 @@ def _apply_world_save_snapshot(conn, char_rows, item_rows, meta=None):
     """
     _ensure_persist_schema(conn)
     meta = meta or {"force_full": True}
+    _keep_sqlite_only_rows_for_force_full(conn, char_rows, item_rows, meta)
     force_full = bool(meta.get("force_full"))
     if force_full and meta.get("force_full_chunked_apply"):
         # CPU followon 2026-09: scheduled chars-only verify commits each
@@ -6382,8 +7439,12 @@ def _apply_world_save_snapshot(conn, char_rows, item_rows, meta=None):
         meta = dict(meta)
         meta["force_full"] = False
         force_full = False
-    if force_full and _refuse_unsafe_force_full_wipe(conn, char_rows, meta):
+    if force_full and _refuse_unsafe_force_full_wipe(
+        conn, char_rows, meta, item_rows=item_rows,
+    ):
         return
+    if not force_full:
+        meta = _meta_without_mass_removed_chars(conn, meta)
     last_err = None
     for attempt in range(2):
         try:
@@ -6392,7 +7453,8 @@ def _apply_world_save_snapshot(conn, char_rows, item_rows, meta=None):
                     _force_full_delete_tables(
                         conn,
                         chars_only=bool(meta.get("force_full_chars_only")),
-                        keep_login_names=_skipped_login_keep_names(meta),
+                        keep_login_names=_skipped_keep_names(meta),
+                        replace_room_keys=meta.get("copyover_replace_room_keys"),
                     )
                 else:
                     char_by_name = {row[0]: row for row in (char_rows or ())}
@@ -6432,6 +7494,12 @@ def _apply_world_save_snapshot(conn, char_rows, item_rows, meta=None):
                 )
                 if force_full:
                     _prune_orphan_heavy_blobs(conn)
+                try:
+                    from engine.id_reserve import save_to_conn
+
+                    save_to_conn(conn)
+                except Exception:
+                    pass
             return
         except sqlite3.OperationalError as err:
             last_err = err
@@ -6447,6 +7515,7 @@ def _apply_world_save_snapshot(conn, char_rows, item_rows, meta=None):
 async def _apply_force_full_snapshot_async(
     conn, char_rows, item_rows, *, yield_every, chars_only=False,
     keep_login_names=None, heavy_sidecar_rows=None,
+    replace_room_keys=None,
 ):
     """Cooperative full-verify apply for ``save_world_async`` only.
 
@@ -6478,7 +7547,10 @@ async def _apply_force_full_snapshot_async(
             conn,
             chars_only=chars_only,
             keep_login_names=keep_login_names,
+            replace_room_keys=replace_room_keys,
         )
+        if char_rows:
+            char_rows = _heal_char_rows_cnum_clashes(conn, char_rows)
 
         async def _apply_rows(rows, insert_sql):
             for i in range(0, len(rows), ye):
@@ -6492,6 +7564,12 @@ async def _apply_force_full_snapshot_async(
         await _apply_rows(item_rows, _ITEM_INSERT_SQL)
         _upsert_heavy_sidecar_rows(conn, heavy_sidecar_rows)
         _prune_orphan_heavy_blobs(conn)
+        try:
+            from engine.id_reserve import save_to_conn
+
+            save_to_conn(conn)
+        except Exception:
+            pass
         conn.commit()
     except Exception:
         conn.rollback()
@@ -6524,6 +7602,7 @@ async def _apply_world_save_snapshot_async(
 
     _ensure_persist_schema(conn)
     meta = meta or {"force_full": True}
+    _keep_sqlite_only_rows_for_force_full(conn, char_rows, item_rows, meta)
     force_full = bool(meta.get("force_full"))
     if force_full and meta.get("force_full_chunked_apply"):
         # CPU followon 2026-09: a scheduled chars-only verify applies each
@@ -6540,17 +7619,21 @@ async def _apply_world_save_snapshot_async(
         persist_save_yield_every() if yield_every is None else int(yield_every)
     )
     if force_full:
-        if _refuse_unsafe_force_full_wipe(conn, char_rows, meta):
+        if _refuse_unsafe_force_full_wipe(
+            conn, char_rows, meta, item_rows=item_rows,
+        ):
             return
         await _apply_force_full_snapshot_async(
             conn, char_rows, item_rows, yield_every=yield_every,
             chars_only=bool(meta.get("force_full_chars_only")),
-            keep_login_names=_skipped_login_keep_names(meta),
+            keep_login_names=_skipped_keep_names(meta),
             heavy_sidecar_rows=meta.get("heavy_sidecar_rows"),
+            replace_room_keys=meta.get("copyover_replace_room_keys"),
         )
         return
 
     # Batch DELETE+INSERT per changed character / floor room.
+    meta = _meta_without_mass_removed_chars(conn, meta)
     char_by_name = {row[0]: row for row in char_rows}
     # Items: character/gear vs room floor.
     items_by_holder = {}
@@ -6568,6 +7651,15 @@ async def _apply_world_save_snapshot_async(
     n = 0
     pending_commit = False
 
+    def _commit_apply():
+        try:
+            from engine.id_reserve import save_to_conn
+
+            save_to_conn(conn)
+        except Exception:
+            pass
+        conn.commit()
+
     try:
         for name in meta.get("removed_chars", ()):
             holder_cnum = _persist_cnum_for_storage_name(conn, name)
@@ -6581,7 +7673,7 @@ async def _apply_world_save_snapshot_async(
             pending_commit = True
             n += 1
             if n % commit_batch == 0:
-                conn.commit()
+                _commit_apply()
                 pending_commit = False
             if yield_every and n % yield_every == 0:
                 await asyncio.sleep(0)
@@ -6602,7 +7694,7 @@ async def _apply_world_save_snapshot_async(
             pending_commit = True
             n += 1
             if n % commit_batch == 0:
-                conn.commit()
+                _commit_apply()
                 pending_commit = False
             if yield_every and n % yield_every == 0:
                 await asyncio.sleep(0)
@@ -6619,30 +7711,25 @@ async def _apply_world_save_snapshot_async(
             pending_commit = True
             n += 1
             if n % commit_batch == 0:
-                conn.commit()
+                _commit_apply()
                 pending_commit = False
             if yield_every and n % yield_every == 0:
                 await asyncio.sleep(0)
 
-        for cnum, shard, payload in meta.get("heavy_sidecar_rows") or ():
-            conn.execute(
-                "INSERT OR REPLACE INTO character_heavy_blobs "
-                "(cnum, shard, payload) VALUES (?,?,?)",
-                (str(cnum), str(shard), payload),
-            )
+        sidecar_rows = list(meta.get("heavy_sidecar_rows") or ())
+        if sidecar_rows:
+            _upsert_heavy_sidecar_rows(conn, sidecar_rows)
             pending_commit = True
-            n += 1
+            n += len(sidecar_rows)
             if n % commit_batch == 0:
-                conn.commit()
+                _commit_apply()
                 pending_commit = False
-            if yield_every and n % yield_every == 0:
-                await asyncio.sleep(0)
     finally:
         # Always flush whatever completed, even on an exception mid-batch --
         # never leave more than one row group uncommitted (same worst-case
         # loss window as the old per-character commit).
         if pending_commit:
-            conn.commit()
+            _commit_apply()
 
 
 async def save_world_async(
@@ -6676,58 +7763,29 @@ async def save_world_async(
     collect_ms = (time.perf_counter() - t_collect) * 1000.0
     meta["ack_epoch"] = ack_epoch
     if meta.get("skipped_wall_budget"):
-        _persist_restore_deferred_dirty(
-            game,
-            set(meta.get("deferred_chars") or ()),
-            set(meta.get("deferred_rooms") or ()),
-        )
-        game._save_pending_after_current = True
-        game._last_world_save_stats = {
-            "skipped": True,
-            "wall_budget": True,
-            "collect_ms": round(collect_ms, 2),
-            "apply_ms": 0.0,
-            "force_full": bool(meta.get("force_full")),
-            "n_char_rows": 0,
-            "n_item_rows": 0,
-        }
+        _persist_finish_wall_budget_skip(game, meta, collect_ms)
         return
     if not char_rows and not item_rows and not meta.get("changed_chars"):
         if meta.get("wall_budget_hit"):
-            _persist_restore_deferred_dirty(
-                game,
-                set(meta.get("deferred_chars") or ()),
-                set(meta.get("deferred_rooms") or ()),
-            )
-            game._save_pending_after_current = True
-            game._last_world_save_stats = {
-                "skipped": True,
-                "wall_budget": True,
-                "collect_ms": round(collect_ms, 2),
-                "apply_ms": 0.0,
-                "force_full": bool(meta.get("force_full")),
-                "n_char_rows": 0,
-                "n_item_rows": 0,
-            }
+            _persist_finish_wall_budget_skip(game, meta, collect_ms)
             return
-    if _refuse_unsafe_force_full_wipe(conn, char_rows, meta):
+    _keep_sqlite_only_rows_for_force_full(conn, char_rows, item_rows, meta)
+    reason = _unsafe_force_full_wipe_reason(
+        conn, char_rows, meta, item_rows=item_rows,
+    )
+    if reason:
         _persist_restore_deferred_dirty(
             game,
             set(meta.get("deferred_chars") or ()),
             set(meta.get("deferred_rooms") or ()),
         )
-        empty = not char_rows
-        game._last_world_save_stats = {
-            "skipped": True,
-            "empty_force_full": empty,
-            "short_force_full": (not empty),
-            "collect_ms": round(collect_ms, 2),
-            "apply_ms": 0.0,
-            "force_full": bool(meta.get("force_full")),
-            "n_char_rows": len(char_rows or ()),
-            "n_item_rows": 0,
-            "skipped_login_names": list(meta.get("skipped_login_names") or ()),
-        }
+        _stamp_refused_force_full_skip(
+            game,
+            char_rows=char_rows,
+            meta=meta,
+            collect_ms=collect_ms,
+            reason=reason,
+        )
         return
     # Let queued player commands run before SQLite work.
     await asyncio.sleep(0)
@@ -6786,6 +7844,7 @@ def _persist_provisional_world_stats(
         "force_full_chars_only": bool(meta.get("force_full_chars_only")),
         "n_char_rows": len(char_rows),
         "n_item_rows": len(item_rows),
+        "n_sidecar_rows": len(meta.get("heavy_sidecar_rows") or ()),
         "n_changed_chars": len(meta.get("changed_chars") or ()),
         "n_changed_rooms": len(meta.get("changed_floor_rooms") or ()),
         "n_deferred_chars": len(deferred_chars),
@@ -6843,6 +7902,7 @@ def _persist_ack_world_save(
         "force_full_chars_only": bool(meta.get("force_full_chars_only")),
         "n_char_rows": len(char_rows),
         "n_item_rows": len(item_rows),
+        "n_sidecar_rows": len(meta.get("heavy_sidecar_rows") or ()),
         "n_changed_chars": len(meta.get("changed_chars") or ()),
         "n_changed_rooms": len(meta.get("changed_floor_rooms") or ()),
         "n_deferred_chars": len(deferred_chars),
@@ -6892,6 +7952,13 @@ def save_world_before_process_exit(conn, game, *, reason="shutdown"):
     """
     if conn is None or game is None:
         return
+    try:
+        _reload_item_inum_module()
+    except Exception as exc:
+        print(
+            f"[persistence] item_inum reload skipped: {exc!r}",
+            flush=True,
+        )
     if persist_background_writer_enabled():
         from engine.persistence_writer import shutdown_persistence_writer
         shutdown_persistence_writer(timeout=persist_writer_drain_timeout_s())
@@ -7002,19 +8069,18 @@ def save_world(conn, game):
     char_rows, item_rows, meta = _collect_world_save_snapshot(game)
     collect_ms = (time.perf_counter() - t_collect) * 1000.0
     _abort_copyover_incomplete_snapshot(game, char_rows, meta)
-    if _refuse_unsafe_force_full_wipe(conn, char_rows, meta):
-        empty = not char_rows
-        game._last_world_save_stats = {
-            "skipped": True,
-            "empty_force_full": empty,
-            "short_force_full": (not empty),
-            "collect_ms": round(collect_ms, 2),
-            "apply_ms": 0.0,
-            "force_full": True,
-            "n_char_rows": len(char_rows or ()),
-            "n_item_rows": 0,
-            "skipped_login_names": list(meta.get("skipped_login_names") or ()),
-        }
+    _keep_sqlite_only_rows_for_force_full(conn, char_rows, item_rows, meta)
+    reason = _unsafe_force_full_wipe_reason(
+        conn, char_rows, meta, item_rows=item_rows,
+    )
+    if reason:
+        _stamp_refused_force_full_skip(
+            game,
+            char_rows=char_rows,
+            meta=meta,
+            collect_ms=collect_ms,
+            reason=reason,
+        )
         return
     t_apply = time.perf_counter()
     _apply_world_save_snapshot(conn, char_rows, item_rows, meta)
@@ -7036,6 +8102,7 @@ def save_world(conn, game):
         "force_full_chars_only": bool(meta.get("force_full_chars_only")),
         "n_char_rows": len(char_rows),
         "n_item_rows": len(item_rows),
+        "n_sidecar_rows": len(meta.get("heavy_sidecar_rows") or ()),
         "n_changed_chars": len(meta.get("changed_chars") or ()),
         "n_changed_rooms": len(meta.get("changed_floor_rooms") or ()),
         "n_deferred_chars": len(deferred_chars),
@@ -7218,6 +8285,17 @@ def load_world(conn, game):
     unique = heal_unique_character_cnums(game)
     for char in unique.get("changed") or ():
         mark_character_dirty(game, char, force=True)
+    try:
+        from engine.id_reserve import flush_to_conn, note_character_cnum, note_room_vnum
+
+        for char in list(getattr(game, "characters", None) or []):
+            note_character_cnum(char, persist=False)
+        rooms = getattr(game, "rooms", None) or {}
+        for room in rooms.values() if isinstance(rooms, dict) else ():
+            note_room_vnum(room, persist=False)
+        flush_to_conn(conn)
+    except Exception:
+        pass
 
     # Hoisted out of the item loop below (fast copyover boot plan 8):
     # every one of these ``from ... import ...`` statements used to run
@@ -7617,6 +8695,18 @@ def load_world(conn, game):
             f"reallocated={reallocated}",
             flush=True,
         )
+    try:
+        from engine.id_reserve import flush_to_conn, note_item_inum
+        from engine.item_inum import walk_item_tree
+
+        for char in list(getattr(game, "characters", None) or []):
+            for attr in ("inventory", "gear_bag", "home_stash"):
+                for obj in getattr(char, attr, None) or ():
+                    for node in walk_item_tree(obj):
+                        note_item_inum(node, holder=char, persist=False)
+        flush_to_conn(conn)
+    except Exception:
+        pass
     # One dirty per holder/room, not per copy -- first boot otherwise
     # queues the same Echo thousands of times and stalls autosave.
     dirty_owners = set()

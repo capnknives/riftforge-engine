@@ -8,7 +8,7 @@
   <link rel="manifest" href="manifest.json">
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="icon-192.png">
-  <link rel="stylesheet" href="style.css?v=2026-09-05c">
+  <link rel="stylesheet" href="style.css?v=2026-09-18-blankinit">
 </head>
 <body>
   <a class="skip" href="#cmd">Skip to command</a>
@@ -25,6 +25,7 @@
       &middot; <button type="button" id="show-display-prefs" class="hint">display</button>
       &middot; <button type="button" id="save-log" class="hint">save log</button>
       &middot; <span id="client-build" class="build-stamp"></span>
+      <button type="button" id="client-error-badge" class="hint" hidden aria-live="polite" aria-atomic="true">client problem</button>
     </p>
     <p id="status" role="status" aria-live="polite">Connecting…</p>
   </header>
@@ -264,11 +265,21 @@
           <option value="contrast">High contrast</option>
         </select>
       </label>
+      <div id="diag-block">
+        <h3 id="diag-title">Connection report</h3>
+        <p class="fine" id="diag-note">
+          Kept in this browser until you reload. Filing <code>bug</code> from
+          this tab attaches the report. Copy still lets you paste it yourself.
+        </p>
+        <pre id="diag-text" tabindex="0" aria-labelledby="diag-title"></pre>
+        <button type="button" id="diag-copy">Copy for a bug report</button>
+        <span id="diag-copied" role="status" aria-live="polite"></span>
+      </div>
       <button type="button" id="display-close">Close</button>
     </div>
   </div>
 
   <script src="discord-invite.js"></script>
-  <script src="app.js?v=2026-09-07-pathwalk"></script>
+  <script src="app.js?v=2026-09-19-bugdiag"></script>
 </body>
 </html>

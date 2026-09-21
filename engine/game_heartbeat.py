@@ -22,6 +22,13 @@ Env (all optional):
   Watcher only needs mtime; fsync-per-handler on Windows Docker
   bind-mounts was extra filesync storm. `tick_loop` still stamps
   pre_tick / post_tick once per heartbeat.
+
+Scoped hang hold (``.hang_check_hold`` beside the stamp): copyover
+persist, terminating save, and reload boot stitch arm this file so a
+long cooperative SQLite pass does not trip the 120s hang kill or the
+gateway IPC stale watchdog exit. Hold is not ``GAME_HANG_CHECK=0`` --
+when the hold file is absent, stale stamps and stale IPC frames still
+kill/exit.
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ import time
 # autosave can block the single asyncio thread for many seconds.
 DEFAULT_HANG_TIMEOUT = 120.0
 DEFAULT_BOOT_GRACE = 300.0
+HANG_HOLD_STAMP_NAME = ".hang_check_hold"
 
 
 def _repo_root():
@@ -78,6 +86,42 @@ def heartbeat_path():
     if override:
         return override
     return os.path.join(_repo_root(), ".game_heartbeat")
+
+
+def hang_check_hold_path(root=None):
+    """Path of the scoped hang-hold flag (same root as the heartbeat)."""
+    if root:
+        return os.path.join(root, HANG_HOLD_STAMP_NAME)
+    stamp = heartbeat_path()
+    return os.path.join(os.path.dirname(stamp), HANG_HOLD_STAMP_NAME)
+
+
+def hang_check_hold_enabled(root=None):
+    """True while copyover persist / boot stitch holds the hang killer."""
+    try:
+        return os.path.isfile(hang_check_hold_path(root))
+    except OSError:
+        return False
+
+
+def set_hang_check_hold(enabled, *, root=None):
+    """Arm or disarm scoped hang hold (best-effort; never raises)."""
+    path = hang_check_hold_path(root)
+    if enabled:
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(f"{time.time():.3f} hold\n")
+                handle.flush()
+        except OSError:
+            pass
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def heartbeat_fsync_enabled():
@@ -126,7 +170,11 @@ def heartbeat_mtime():
 
 
 def clear_heartbeat():
-    """Remove a leftover stamp (watcher calls this on each spawn)."""
+    """Remove a leftover stamp (watcher calls this on each spawn).
+
+    Also drops ``.hang_check_hold``. A SIGKILL mid-seal used to leave the
+    hold file on disk, which would disable hang kill for the next child.
+    """
     path = heartbeat_path()
     try:
         os.remove(path)
@@ -136,6 +184,7 @@ def clear_heartbeat():
         os.remove(path + ".tmp")
     except OSError:
         pass
+    set_hang_check_hold(False)
 
 
 def should_kill_for_hang(*, spawn_wall, now_wall=None):
@@ -154,6 +203,8 @@ def should_kill_for_hang(*, spawn_wall, now_wall=None):
     """
     if not hang_check_enabled():
         return False, "disabled"
+    if hang_check_hold_enabled():
+        return False, "hang_hold"
     from engine import crash_recovery
 
     if crash_recovery.planned_restart_pending():

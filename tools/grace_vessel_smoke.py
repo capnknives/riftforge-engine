@@ -44,9 +44,10 @@ def test_grace_math():
     new_val, delta = add_grace_amount(10.0, -25.0)
     _assert(new_val == 0.0 and delta == -10.0, (new_val, delta))
 
-    _assert(grace_drip_amount(on_home_plane=True, on_consecrated=False) == 0.20, "home drip")
+    _assert(grace_drip_amount(on_home_plane=True, on_earth=False) == 0.20, "home drip")
+    _assert(grace_drip_amount(on_home_plane=False, on_earth=True) == 0.05, "earth drip")
     _assert(grace_drip_amount(on_home_plane=False, on_consecrated=True) == 0.05, "consecrated drip")
-    _assert(grace_drip_amount(on_home_plane=False, on_consecrated=False) == 0.0, "secular drip")
+    _assert(grace_drip_amount(on_home_plane=False, on_earth=False, on_consecrated=False) == 0.0, "other-plane drip")
 
 
 def test_vessel_chassis():

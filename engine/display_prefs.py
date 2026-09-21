@@ -72,7 +72,7 @@ TRAFFIC_MODES = frozenset({
 _SEGMENT_TOKENS = frozenset({
     "Hp", "En", "St", "Mn", "Fu", "Mo", "Tg", "Ex", "Gr", "Nd",
     "Fm", "Vs", "Af", "In", "Fv", "Hs",
-    "Cc", "Ch", "Rm", "Mu", "Qi",
+    "Cc", "Ch", "Rm", "Mu", "Qi", "Pn",
 })
 
 # Templates treated as "still on factory default" for Origin migration.
@@ -239,9 +239,27 @@ def ensure_display_defaults(character):
     if not hasattr(character, "combat_prose"):
         # Word-only combat overlay (numbers/diag/tags all off).
         character.combat_prose = False
+    if not hasattr(character, "combat_terse"):
+        # Sighted short pair voice. Default off: the sighted default is the
+        # 4-beat cinematic pair (voice matrix, 2026-09-20).
+        character.combat_terse = False
+    if not hasattr(character, "combat_long"):
+        # Preserved render_attack paragraph voice (combatlong). Default off.
+        character.combat_long = False
+    if not hasattr(character, "combat_view_rev"):
+        character.combat_view_rev = 0
+    # One-shot: old saves defaulted combatterse off. Flip sighted play to
+    # the short line unless they already opted into combatprose cinematic.
+    if int(getattr(character, "combat_view_rev", 0) or 0) < 1:
+        if not getattr(character, "combat_prose", False):
+            character.combat_terse = True
+        character.combat_view_rev = 1
     if not hasattr(character, "show_combat_hints"):
         # Tutorial nudges on engage/KO/score/connect reads; config combathints off.
         character.show_combat_hints = True
+    if not hasattr(character, "show_combat_pulse_n"):
+        # Opt-in: show YOUR personal pulse gap only (Q30); never opponents.
+        character.show_combat_pulse_n = False
     if not hasattr(character, "compact_floor_items"):
         # config items compact on|off -- one paragraph for floor loot on look.
         character.compact_floor_items = False
@@ -1012,11 +1030,14 @@ def _prompt_vitals(character, game=None):
     Optional resources (fuel / mana) only appear when the vitals builder
     stamped them -- humans never get a phantom fuel field.
     """
-    try:
-        from engine import hooks
-        character = hooks.perception_character(character, game)
-    except Exception:
-        pass
+    from engine import hooks
+
+    round_vitals = getattr(character, "_combat_round_vitals_cache", None)
+    if not isinstance(round_vitals, dict):
+        try:
+            character = hooks.perception_character(character, game)
+        except Exception:
+            pass
     show_raw = bool(getattr(character, "combat_numbers", False))
     hp = 100
     max_hp = 100
@@ -1045,11 +1066,12 @@ def _prompt_vitals(character, game=None):
     has_spirit = False
     spirit_str = ""
     spirit_label = "spirit"
-    try:
-        from engine import hooks
-        vitals = hooks.gmcp_char_vitals(character) or {}
-    except Exception:
-        vitals = {}
+    vitals = round_vitals if isinstance(round_vitals, dict) else None
+    if not isinstance(vitals, dict):
+        try:
+            vitals = hooks.gmcp_char_vitals(character) or {}
+        except Exception:
+            vitals = {}
     if vitals:
         hp, max_hp = _prompt_meter_pair(
             vitals,
@@ -1185,8 +1207,16 @@ def _prompt_vitals(character, game=None):
         "name": name,
         "exits": format_exit_abbrevs(character, game),
         "group": format_group_names(character),
-        "target_band": hooks.prompt_target_band(character, game),
-        "need_band": hooks.prompt_need_band(character, game),
+        "target_band": (
+            getattr(character, "_combat_round_target_band_cached", "")
+            if getattr(character, "_combat_round_target_band_ready", False)
+            else hooks.prompt_target_band(character, game)
+        ),
+        "need_band": (
+            getattr(character, "_combat_round_need_band_cached", "")
+            if getattr(character, "_combat_round_need_band_ready", False)
+            else hooks.prompt_need_band(character, game)
+        ),
     }
     bands.update(hooks.prompt_supplemental_bands(character, game))
     return bands
@@ -1324,6 +1354,11 @@ def _expand_segment(code, v):
             "<dark_grey> ",
             f"<gold>[{v['spirit']}{noun}]",
         )
+    if code == "Pn":
+        band = (v.get("pulse_band") or "").strip()
+        if not band:
+            return ""
+        return _seg("<dark_grey> ", f"<silver>[{band}]")
     return ""
 
 
@@ -1364,6 +1399,7 @@ def format_prompt(character, game=None):
       %Rm  [70remembrance] Ghost Remembrance (Path Ghost only)
       %Mu  [12mut]        Mutant mutation charges (omits when not Mutant)
       %Qi  [80spirit]     Human Spirit / Qi / Xian Qi (omits when not Human)
+      %Pn  [gap 3hb]      your pulse gap while fighting (config combatpulse on)
       %Hs  [clinic]        hospitalized at Town Clinic (omits when ambulatory)
       %Ex  [n,e,s,w]
       %Gr  [Sam, Dean] (colocated groupmates only; omits when solo/apart)

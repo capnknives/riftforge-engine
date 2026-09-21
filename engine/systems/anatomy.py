@@ -127,6 +127,35 @@ TARGETS = {
     for tid, (region, line, noun, rider) in _TARGET_SPECS.items()
 }
 
+# Generic body-region words used as prose flavor that name no single
+# TARGETS id -- "chest" or "torso" reads fine against any of solar_plexus/
+# liver/ribs/sternum/kidney/abdomen/heart/gut, so authors reach for the
+# generic word instead of picking one. Registered here (not duplicated in
+# combat_prose.py's or combat_lexicon.py's foreign-anatomy marker lists) so
+# combat_prose._action_conflicts_location can compare regions instead of
+# missing these words entirely -- the render-time filter otherwise only
+# recognizes literal TARGETS nouns (docs/plans/combat_prose_coherence_plan.md
+# Phase 2.2; boxing.json's hardcoded "chest" was the case that found this).
+GENERIC_REGION_NOUNS = {
+    "head": "head",
+    "face": "head",
+    "chest": "torso",
+    "torso": "torso",
+    "leg": "legs",
+    "legs": "legs",
+    "shins": "legs",
+    "knees": "legs",
+    "hips": "legs",
+    "thighs": "legs",
+    "calf": "legs",
+    "calves": "legs",
+}
+
+
+def region_for_generic_noun(word):
+    """Region for a generic (non-fine-target) body word, or None."""
+    return GENERIC_REGION_NOUNS.get((word or "").strip().lower())
+
 
 # --- Auto-target weighting ---------------------------------------------------
 # Base line distribution for an ordinary swing: body strikes are the bread

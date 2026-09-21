@@ -116,7 +116,11 @@ def persist_inum_text(item) -> str | None:
 
 
 def note_inum(inum) -> str | None:
-    """Add a validated INUM to the process taken set. Returns the tag."""
+    """Add a validated INUM to the process taken set. Returns the tag.
+
+    Process-taken is live uniqueness (including ephemeral loot this boot).
+    Lasting reserve is a separate table -- call ``note_item_inum``.
+    """
     if inum is None or str(inum).strip() == "":
         return None
     try:
@@ -139,11 +143,24 @@ def _scan_free_inum(pref: str, used, start: int) -> tuple[str, int]:
     """First free ``PREFIX#####`` at or after ``start``; also return its n.
 
     ``used`` must support ``in`` against normalized (uppercase) tags.
+    Lasting reserved INUMs (player/relic gear) are merged in so a wiped
+    colt does not reuse AD00002 on a new clerk's coffee.
     """
+    pool = _normalized_pool(used)
+    reserved = None
+    try:
+        from engine.id_reserve import KIND_INUM, reserved_pool
+
+        reserved = reserved_pool(KIND_INUM)
+    except Exception:
+        reserved = None
     for n in range(max(1, start), _MAX_SEQ + 1):
         candidate = format_inum(pref, n)
-        if candidate not in used:
-            return candidate, n
+        if candidate in pool:
+            continue
+        if reserved and candidate in reserved:
+            continue
+        return candidate, n
     raise ValueError(
         f"no free INUM left under prefix {pref!r} (1..{_MAX_SEQ} exhausted)"
     )
@@ -201,10 +218,11 @@ def allocate_inum(name: str, *, taken: set[str]) -> str:
     return next_inum(prefix, taken)
 
 
-def ensure_item_inum(item, *, taken: set[str] | None = None) -> str:
+def ensure_item_inum(item, *, taken: set[str] | None = None, holder=None) -> str:
     """Stamp a unique INUM on ``item`` if missing; return the tag.
 
     ``taken`` defaults to the process-lifetime set. Mutates ``item.inum``.
+    Lasting holders (PCs / relics) also persist-reserve the tag.
     """
     pool = _PROCESS_TAKEN if taken is None else taken
     existing = persist_inum_text(item)
@@ -212,23 +230,28 @@ def ensure_item_inum(item, *, taken: set[str] | None = None) -> str:
         item.inum = existing
         pool.add(existing)
         _PROCESS_TAKEN.add(existing)
-        return existing
-    if taken is None:
-        # Default (spawn / persist dual-write) path: ride the process
-        # cursor so a world with tens of thousands of copies under one
-        # prefix does not rescan the whole range per new item.
+    elif taken is None:
         code = _next_inum_cursored(
             inum_prefix(item_display_name(item)), pool, _PROCESS_CURSOR,
         )
+        item.inum = code
+        pool.add(code)
+        _PROCESS_TAKEN.add(code)
     else:
         code = allocate_inum(item_display_name(item), taken=pool)
-    item.inum = code
-    pool.add(code)
-    _PROCESS_TAKEN.add(code)
-    return code
+        item.inum = code
+        pool.add(code)
+        _PROCESS_TAKEN.add(code)
+    try:
+        from engine.id_reserve import note_item_inum
+
+        note_item_inum(item, holder=holder)
+    except Exception:
+        pass
+    return item.inum
 
 
-def apply_saved_inum(item, raw) -> str | None:
+def apply_saved_inum(item, raw, *, holder=None) -> str | None:
     """Restore a blob INUM onto ``item`` (invalid tags become missing)."""
     if item is None:
         return None
@@ -241,6 +264,12 @@ def apply_saved_inum(item, raw) -> str | None:
         return None
     item.inum = code
     note_inum(code)
+    try:
+        from engine.id_reserve import note_item_inum
+
+        note_item_inum(item, holder=holder)
+    except Exception:
+        pass
     return code
 
 

@@ -86,7 +86,7 @@ def money_to_cents(value):
                 text = text[: len(text) - len(suffix)].strip()
                 lower = text.lower()
                 break
-        # ``wallet pull 1 dollar`` / ``5 bucks`` -- first token is the amount.
+        # ``get 1 dollar from wallet`` / ``5 bucks`` -- first token is the amount.
         if " " in text:
             head = text.split(None, 1)[0]
             if head.replace(".", "", 1).isdigit():
@@ -649,13 +649,15 @@ def transfer_wallet_to_loose(character, dollars=0, cents=0, *, reason=None, tick
     migrate_wallet_fields(character)
     pocket = _pocket_wallet_item(character)
     if pocket is None:
-        return False, "You need a pocket wallet for that."
+        from engine.systems.wallet_container import NO_WALLET
+
+        return False, NO_WALLET
     if cents != 0:
         need = int(dollars or 0) * 100 + int(cents)
     else:
         need = money_to_cents(dollars)
     if need <= 0:
-        return False, "Pull how much? (a positive amount)"
+        return False, "Take how much? Try get 20 from wallet."
     from engine.systems import wallet_container as wallet_mod
     wallet_c = wallet_mod.wallet_total_cents(pocket)
     if wallet_c < need:
@@ -685,7 +687,199 @@ def transfer_wallet_to_loose(character, dollars=0, cents=0, *, reason=None, tick
             tick=tick,
         )
     pulled = format_money(need // 100, need % 100)
-    return True, f"You pull {pulled} out of your wallet."
+    return True, f"You take {pulled} from your wallet."
+
+
+# Words that mean "dollars" in get/put wallet syntax -- not item names.
+_CASH_NOUNS = frozenset({
+    "money", "cash", "bills", "bill", "dollars", "dollar", "bucks", "buck",
+})
+
+# parse_cash_move_query sentinel: move every loose / wallet dollar.
+CASH_MOVE_ALL = "all"
+
+
+def _is_amount_token(tok):
+    """True when ``tok`` is $12, 12, or 12.50 -- not 'mug' or 'id'."""
+    text = (tok or "").strip().lstrip("$")
+    if not text:
+        return False
+    return text.replace(".", "", 1).isdigit()
+
+
+def _is_wallet_container_query(query):
+    """True when the container word is a pocket wallet (not jeans, backpack)."""
+    q = (query or "").strip().lower()
+    for prefix in ("my ", "the ", "your ", "a ", "an "):
+        if q.startswith(prefix):
+            q = q[len(prefix):].strip()
+    if not q:
+        return False
+    if q in ("wallet", "leather wallet", "pocket wallet", "pocketwallet"):
+        return True
+    # Ordinals like 2.wallet, or "leather wallet" already handled.
+    if q.endswith(".wallet"):
+        return True
+    return q.endswith(" wallet")
+
+
+def parse_cash_move_query(text, *, allow_bare_all=False):
+    """Parse a get/put fragment as cash, or None if it is an item name.
+
+    Returns ``CASH_MOVE_ALL`` ("all"), a positive int (cents), or None.
+    ``put 20 mug in wallet`` must stay an item put -- only money words
+    after a number count as cash (20 dollars, 5 bucks, $20).
+    """
+    raw = (text or "").strip().lower()
+    if not raw:
+        return None
+    tokens = raw.replace(",", "").split()
+    if not tokens:
+        return None
+    if tokens[0] in ("all", "*", "everything"):
+        rest = tokens[1:]
+        if not rest:
+            return CASH_MOVE_ALL if allow_bare_all else None
+        if len(rest) == 1 and rest[0] in _CASH_NOUNS:
+            return CASH_MOVE_ALL
+        return None
+    if len(tokens) == 1:
+        if tokens[0] in _CASH_NOUNS:
+            return CASH_MOVE_ALL
+        if not _is_amount_token(tokens[0]):
+            return None
+        cents = money_to_cents(tokens[0])
+        return cents if cents > 0 else None
+    # "20 dollars" / "$5 cash" -- last word must be a money noun.
+    if _is_amount_token(tokens[0]) and tokens[-1] in _CASH_NOUNS:
+        cents = money_to_cents(raw)
+        return cents if cents > 0 else None
+    return None
+
+
+def split_wallet_container_args(args):
+    """Split ``20 from wallet`` / ``20 wallet`` into (left, wallet_query).
+
+    Returns ``(None, None)`` when the container is not a wallet. Bare
+    ``wallet`` (no left side) is not a cash/paper move -- that is pick-up.
+    """
+    raw = (args or "").strip()
+    if not raw:
+        return None, None
+    lower = raw.lower()
+    for sep in (" from ", " in ", " into "):
+        if sep not in lower:
+            continue
+        left, _, right = lower.partition(sep)
+        if _is_wallet_container_query(right):
+            return left.strip(), right.strip()
+    parts = lower.rsplit(None, 1)
+    if len(parts) == 2 and _is_wallet_container_query(parts[1]):
+        return parts[0], parts[1]
+    return None, None
+
+
+def transfer_loose_to_wallet(character, dollars=0, cents=0, *, reason=None, tick=None):
+    """Move loose inventory bills into a worn pocket wallet.
+
+    Returns ``(ok, message)``. Inverse of ``transfer_wallet_to_loose``.
+    """
+    migrate_wallet_fields(character)
+    pocket = _pocket_wallet_item(character)
+    if pocket is None:
+        from engine.systems.wallet_container import NO_WALLET
+
+        return False, NO_WALLET
+    if cents != 0:
+        need = int(dollars or 0) * 100 + int(cents)
+    else:
+        need = money_to_cents(dollars)
+    if need <= 0:
+        return False, "Put how much? Try put 20 in wallet."
+    loose_d, loose_c = inventory_loose_cash_parts(character)
+    loose_total = loose_d * 100 + loose_c
+    if loose_total <= 0:
+        return False, "You aren't holding any loose bills."
+    if loose_total < need:
+        return False, (
+            f"You only have {format_inventory_loose_cash(character)} loose."
+        )
+    from engine.systems import wallet_container as wallet_mod
+
+    wallet_c = wallet_mod.wallet_total_cents(pocket)
+    new_loose = loose_total - need
+    ld, lc = divmod(new_loose, 100)
+    character.dollars = ld
+    character.cents = lc
+    new_wallet = wallet_c + need
+    wd, wc = divmod(new_wallet, 100)
+    wallet_mod.set_wallet_cash(pocket, wd, wc)
+    if reason:
+        record_wallet_ledger(
+            character,
+            delta_wallet_cents=need,
+            reason=reason,
+            tick=tick,
+        )
+    moved = format_money(need // 100, need % 100)
+    return True, f"You put {moved} in your wallet."
+
+
+def try_wallet_cash_verb(character, args, *, direction, tick=None):
+    """Handle get/put cash vs a wallet, or return None if this is not cash.
+
+    ``direction`` is ``get`` (wallet -> loose bills) or ``put`` (loose ->
+    wallet). Callers pass the args after the verb: ``20 from wallet``.
+    """
+    left, _right = split_wallet_container_args(args)
+    if left is None:
+        return None
+    parsed = parse_cash_move_query(left, allow_bare_all=True)
+    if parsed is None:
+        return None
+    migrate_wallet_fields(character)
+    pocket = _pocket_wallet_item(character)
+    if pocket is None:
+        from engine.systems.wallet_container import NO_WALLET
+
+        return False, NO_WALLET
+    from engine.systems import wallet_container as wallet_mod
+
+    if parsed == CASH_MOVE_ALL:
+        if direction == "get":
+            amount = wallet_mod.wallet_total_cents(pocket)
+            if amount <= 0:
+                return False, "There's no cash in your wallet."
+            return transfer_wallet_to_loose(
+                character,
+                cents=amount,
+                reason="Took from wallet",
+                tick=tick,
+            )
+        loose_d, loose_c = inventory_loose_cash_parts(character)
+        amount = loose_d * 100 + loose_c
+        if amount <= 0:
+            return False, "You aren't holding any loose bills."
+        return transfer_loose_to_wallet(
+            character,
+            cents=amount,
+            reason="Put in wallet",
+            tick=tick,
+        )
+    amount = int(parsed)
+    if direction == "get":
+        return transfer_wallet_to_loose(
+            character,
+            cents=amount,
+            reason="Took from wallet",
+            tick=tick,
+        )
+    return transfer_loose_to_wallet(
+        character,
+        cents=amount,
+        reason="Put in wallet",
+        tick=tick,
+    )
 
 
 def credit_bank(character, dollars=0, cents=0, *, reason=None, tick=None):

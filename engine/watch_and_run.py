@@ -356,6 +356,11 @@ def reload_auto_deploy():
     importlib.reload(changelog_ledger)
     importlib.reload(discord_patch_notes)
     importlib.reload(deploy_pr_ticket_map)
+    # Hang hold (``.hang_check_hold``) lives in this module. A weeks-old
+    # watcher process would keep the pre-hold ``should_kill_for_hang``
+    # until reload — SIGKILL during Veil persist. Reload with the other
+    # deploy modules so live does not need compose recreate.
+    importlib.reload(game_heartbeat)
     # Watcher is not the game child — bootstrap never re-registers map
     # heal after this hooks reload. Late-bind so the next reset --hard
     # actually merges content/map_backups into zone/map JSON.
@@ -518,6 +523,19 @@ def _file_is_watched(rel):
         norm.startswith("content/") or norm.startswith("supers/content/")
     ):
         return True
+    return False
+
+
+def deploy_commit_needs_copyover(paths):
+    """True when any path in a deploy commit would trigger SIGUSR1 copyover.
+
+    Auto-deploy uses this for docs / ops / ``[docs]`` tips: overlay those
+    files with ``git checkout`` and advance ``origin_main`` without the 30s
+    catch-up Veil or a full ``reset --hard`` protect-restore mtime storm.
+    """
+    for raw in paths or ():
+        if _file_is_watched(_rel_posix(raw)):
+            return True
     return False
 
 
@@ -1430,6 +1448,9 @@ def main():
                 settle_deadline = None
                 continue
 
+        # Reload even when auto-deploy is off (that path skips the
+        # deploy-module reload above). Cheap: hang check is a small file.
+        importlib.reload(game_heartbeat)
         kill_hang, hang_reason = game_heartbeat.should_kill_for_hang(
             spawn_wall=game_spawn_wall,
         )

@@ -25,9 +25,10 @@ from commands import dispatch
 
 
 # How many recent command lines (plus any traceback they raised) to keep on
-# each Session for bug/suggest reports. Tunable placeholder -- same spirit as
-# training.py's constants block.
-RECENT_HISTORY_SIZE = 10
+# each Session for bug/suggest reports. 20 covers a look-around after the
+# incident without dumping the whole session (the old 10-line ring often
+# held only look/say by the time someone typed bug).
+RECENT_HISTORY_SIZE = 20
 
 # Some web/telnet clients (notably darkwiz.org/play multi-window) prepend
 # session routing tags like "P1" / "P4" onto every outbound line. Without
@@ -338,6 +339,10 @@ class Session:
         self.playcast_gm_tools = False
         # Staff cast occupy: False = player/cast look+who; True = GM chrome.
         self.gm_eyes_staff_view = False
+        # Hide Account(GM) on who while this Session plays a body.
+        self.gm_incognito = False
+        # Body this client last left with gm on / landed with gm off <name>.
+        self.gm_play_body_key = ""
         self.alive = True         # flips to False on quit/disconnect; ends the loop
         # Coalesce duplicate blank lines (see Session.send).
         self._last_output_empty = False
@@ -912,17 +917,18 @@ class Session:
                 # copyover (bug report 1219). Only GMCP needs a fresh push
                 # (reset_gmcp() wiped it on gateway reconnect).
                 gmcp.resume_gmcp_after_gateway_reattach(self)
-                from engine.copyover import MSG_AFTER
+                from engine.copyover import MSG_AFTER, session_skips_login_pack
                 from engine import char_identity as identity_mod
                 self.send(MSG_AFTER)
                 # Skip reprinting the login MOTD board on gateway reattach.
                 self._copyover_resume = True
                 self._notify_gateway_bound(char.key)
                 hooks.after_session_attach(char, self.game)
-                notice = identity_mod.legacy_surname_login_notice(char)
-                if notice:
-                    from engine import display_prefs as dp_mod
-                    self.send(dp_mod.format_tagged_text(char, notice))
+                if not session_skips_login_pack(char, self.game, session=self):
+                    notice = identity_mod.legacy_surname_login_notice(char)
+                    if notice:
+                        from engine import display_prefs as dp_mod
+                        self.send(dp_mod.format_tagged_text(char, notice))
                 await self._wait_veil_world_ready()
                 await self.play()
                 return
@@ -1719,6 +1725,14 @@ class Session:
             self.report_capture = None
             self.help_edit = None
             self.staff_account = None
+            # Stale occupy / gm off stamps must not ride the next roster pick
+            # on the same TCP session (bug report 1764).
+            self.playcast_gm_tools = False
+            self.gm_play_body_key = ""
+            self.gm_eyes_staff_view = False
+            self.gm_incognito = False
+            self.cast_grant_account = None
+            self.cast_grant_return_key = None
             self.reset_gmcp()
             self._soft_relogin = True
             self.alive = True

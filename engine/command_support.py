@@ -335,6 +335,21 @@ def _can_see_hellhound(viewer, hound):
     return bool(hooks.can_see_hellhound(viewer, hound))
 
 
+def _look_skip_room_occupant(viewer, occupant, room, game):
+    """True when ``occupant`` must not appear in room look Souls lists.
+
+    Riding Mantles inside a host, ridden living husks, and game hooks
+    (co-located own husk while the Mantle is also in the room) all skip
+    here so Gabriel does not double-list as Gabriel + husk:Gabriel.
+    """
+    if getattr(occupant, "vessel_host_key", None):
+        return True
+    if getattr(occupant, "husk_ridden", False):
+        return True
+    from engine import hooks
+    return bool(hooks.look_room_skip_occupant(viewer, occupant, room, game))
+
+
 def _is_presence_hidden(viewer, other):
     """True when ``other`` should be omitted from viewer's look / targeting.
 
@@ -461,6 +476,8 @@ def _can_target_for_combat(viewer, other):
     from engine import hooks
     if hooks.is_untargetable_helper(other):
         return False
+    if hooks.combat_target_refusal(viewer, other):
+        return False
     if not _is_presence_hidden(viewer, other):
         return True
     if not _is_attacking_viewer(viewer, other):
@@ -506,7 +523,8 @@ def strip_ephemeral_storage_prefix(name):
     """Peel internal storage prefixes (nested too).
 
     Storage keys like ``gmspirit:Wits``, ``husk:Castiel``, ``twin:Gary``,
-    or ``gym_dummy:TM00001`` must never reach players as a display name.
+    ``threshold_clone:<room>:<face>``, or ``gym_dummy:TM00001`` must never
+    reach players as a display name.
     Also cleans a mistaken ``assumed_face`` that still carries the prefix.
     Returns ``?`` only when the input is empty after stripping.
     """
@@ -528,6 +546,11 @@ def strip_ephemeral_storage_prefix(name):
             if not text:
                 return "?"
             continue
+        if low.startswith("threshold_clone:"):
+            # Pocket mentor / Desk clerk: ``threshold_clone:<room>:<face>``.
+            # The face after the last colon is the only public name.
+            face = text.rsplit(":", 1)[-1].strip()
+            return face or "?"
         if low.startswith("gym_dummy:"):
             # Room suffix is an internal VNUM -- never expose it.
             return "a training dummy"
@@ -1029,6 +1052,7 @@ def _display_name_base(obj, viewer=None):
             from engine.hooks import presence_face_for
             face = presence_face_for(viewer, obj)
             if face:
+                face = strip_ephemeral_storage_prefix(face)
                 if _staff_form_label(obj):
                     return f"{face}(GM)"
                 if obj.acts_as_echo():
@@ -2101,11 +2125,15 @@ def resolve_fight_target(
     Returns ``(target, error_message)``; on success the error is ``None``.
     """
     raw = (query or "").strip()
+    from engine import hooks
     pool = _combat_target_candidates(actor, candidates)
     if raw:
         target = _find_character(raw, pool, self_character=actor)
         if target is None:
             return None, missing_msg
+        refusal = hooks.combat_target_refusal(actor, target)
+        if refusal:
+            return None, refusal
         if not _can_target_for_combat(actor, target):
             return None, missing_msg
         return target, None
@@ -2119,6 +2147,11 @@ def resolve_fight_target(
             actor.target = None
         gone = _public_label(target)
         return None, f"{gone} is no longer here."
+    refusal = hooks.combat_target_refusal(actor, target)
+    if refusal:
+        if clear_stale_target:
+            actor.target = None
+        return None, refusal
     if not _can_target_for_combat(actor, target):
         if clear_stale_target:
             actor.target = None
@@ -2219,13 +2252,13 @@ def verb_target_token(actor, target, game=None):
 
 
 def _collect_character_matches(query, characters, self_character=None):
-    """All Characters whose key / given / face / kind aliases contain ``query``.
+    """All Characters whose key / given / face / kind aliases match ``query``.
 
     Kind/race aliases (``arachne``, ``vampire``, …) come from the
     ``extra_target_match_needles`` hook when the game registers one --
     bare engine stays name-only.
     """
-    from engine.char_identity import identity_match_needles
+    from engine.char_identity import identity_match_needles, identity_query_matches
 
     needle = (query or "").strip().lower()
     if not needle:
@@ -2250,20 +2283,18 @@ def _collect_character_matches(query, characters, self_character=None):
                 )
             true_key = (getattr(char, "key", None) or "").lower()
             if mask and true_key and true_key not in str(mask).lower():
-                if needle in str(mask).lower():
+                if identity_query_matches(needle, (str(mask).lower(),)):
                     matched = True
                 if matched and char not in hits:
                     hits.append(char)
                 continue
-        for label in identity_match_needles(char):
-            if needle in label:
-                matched = True
-                break
+        if identity_query_matches(needle, identity_match_needles(char)):
+            matched = True
         if not matched and self_character is not None:
             try:
                 from engine.hooks import presence_face_for
                 rel = presence_face_for(self_character, char)
-                if rel and needle in rel.lower():
+                if rel and identity_query_matches(needle, (rel.lower(),)):
                     matched = True
             except Exception:
                 _log_hook_error(
@@ -2275,10 +2306,11 @@ def _collect_character_matches(query, characters, self_character=None):
         if not matched:
             try:
                 from engine.hooks import extra_target_match_needles
-                for label in extra_target_match_needles(self_character, char):
-                    if needle in label:
-                        matched = True
-                        break
+                if identity_query_matches(
+                    needle,
+                    extra_target_match_needles(self_character, char),
+                ):
+                    matched = True
             except Exception:
                 _log_hook_error(
                     "extra_target_match_needles (find)",

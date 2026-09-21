@@ -70,6 +70,23 @@ JOURNAL_KEEP = 80
 JOURNAL_SHOW = 12
 
 
+def session_skips_login_pack(character=None, game=None, session=None):
+    """True on copyover / gateway reattach: skip the fresh-login pack.
+
+    MOTD already skipped this path. Surname nag, makecar, Phone Tree,
+    and journal-gated look must skip too -- every connected session,
+    not just staff occupy.
+    """
+    sess = session
+    if sess is None and character is not None:
+        sess = getattr(character, "session", None)
+    if sess is not None and getattr(sess, "_copyover_resume", False):
+        return True
+    if game is not None and getattr(game, "_gateway_copyover_reattach", False):
+        return True
+    return False
+
+
 def _stamp_root(root=None):
     """Repo cwd, or ``RIFTFORGE_COPYOVER_STAMP_DIR`` for smokes."""
     if root:
@@ -200,6 +217,14 @@ def consume_skip_deferred_boot(*, root=None):
 def skip_deferred_boot_pending(*, root=None):
     """True when a planned copyover asked the next boot to skip deferred."""
     return os.path.isfile(_skip_deferred_path(root))
+
+
+def clear_skip_deferred_boot(*, root=None):
+    """Disarm the stamp when the rewrite aborts after it was written."""
+    try:
+        os.remove(_skip_deferred_path(root))
+    except OSError:
+        pass
 
 
 def clear_copyover_ready(*, root=None):
@@ -505,6 +530,14 @@ def _cancel_rewrite(game, reason, detail=""):
     from engine import crash_recovery
 
     crash_recovery.clear_planned_restart()
+    # Same reasoning for the persist stamps. An execv / gateway-bind failure
+    # aborts *after* the seal already wrote both, and this process keeps
+    # mutating the world -- a leftover stamp would let a later crash-respawn
+    # skip deferred heals against a snapshot that is no longer current.
+    from engine import copyover_persist as copyover_persist_mod
+
+    clear_skip_deferred_boot()
+    copyover_persist_mod.clear_persist_complete()
     _restore_persistence_writer_after_abort(game)
 
 
@@ -747,6 +780,12 @@ def reload_world_save_modules():
     identity module -- reload(persistence) then ImportError's after the
     Veil rewrite announce (live 2026-09-10, reason ``save``).
 
+    Item INUM stamping is the same trap one file later: overlay can land
+    ``ensure_item_inum(..., holder=)`` in persistence while this process
+    still holds a pre-holder ``engine.item_inum``. Copyover save then
+    TypeError's, the rewrite cancels, and autosave keeps failing
+    (live 2026-09-17, reason ``save`` / ``holder``).
+
     Homestead collect/apply live in the game package. ``game_select``
     reloads that module after persistence so a new ``owner_cnum``
     INSERT cannot pair with an old wipe-rewrite that NULLs the column.
@@ -756,6 +795,12 @@ def reload_world_save_modules():
     on disk while this process still holds a stale facade missing new
     ``save_*`` re-exports — copyover save then AttributeError's (e.g.
     ``save_ground_item_decay_tuning``).
+
+    Persist blob can land a new ``spawn_hubs`` classifier
+    (``is_ephemeral_path_demon_npc``) while this process still holds the
+    pre-overlay hub module. ``reregister_blob_codec`` reloads spawn_hubs
+    before persist_blob so copyover save does not AttributeError
+    (live 2026-09-19, reason ``save``).
     """
     import importlib
 
@@ -786,10 +831,35 @@ def reload_world_save_modules():
     from engine import char_identity as ci
 
     importlib.reload(ci)
+    # INUM helper next: persistence save-path imports bind to the
+    # in-memory module. Reload from disk before persistence so
+    # ``ensure_item_inum(..., holder=)`` matches the on-disk signature.
+    from engine import item_inum as item_inum_mod
+
+    importlib.reload(item_inum_mod)
+    try:
+        from engine import id_reserve as id_reserve_mod
+
+        importlib.reload(id_reserve_mod)
+    except Exception:
+        pass
     ep = importlib.reload(ep)
     import persistence as persistence_facade
 
     importlib.reload(persistence_facade)
+    # The seal's aux flush (meta / sites / parking) lives here, and it runs
+    # *after* this reload. Without refreshing it, an overlay that ships a
+    # fix to the flush would not take effect until the rewrite after the
+    # one that deployed it -- the same one-behind trap as persistence.
+    from engine import copyover_persist as copyover_persist_mod
+
+    importlib.reload(copyover_persist_mod)
+    # Persist stamp after MAP BACKUP ALL lives on map_heal. Reloading persist
+    # without this module left live 2026-09-19 AttributeError stamp_heal_fingerprint
+    # (disk had the function; the still-running interpreter did not).
+    from engine import map_heal as map_heal_mod
+
+    importlib.reload(map_heal_mod)
     # reload(hooks) clears bootstrap callbacks; re-register the active game's
     # persist_blob codec before copyover save (empty blobs wiped live, #2096).
     try:
@@ -811,15 +881,19 @@ async def _perform(game):
         save, then exit so watch_and_run can respawn the game; reattach
         sends MSG_AFTER. Do not execv (no inheritable client fds here).
     """
-    print("[copyover] reload requested -- freezing connections briefly", flush=True)
-
-    from engine import crash_recovery
-    crash_recovery.mark_planned_restart()
+    print(
+        "[copyover] reload requested -- Veil pause then one complete persist",
+        flush=True,
+    )
 
     from engine import persistence
+    from engine import copyover_persist as copyover_persist_mod
 
     await persistence.wait_collect_idle_async(game)
     await persistence.wait_writer_idle_async()
+
+    from engine import crash_recovery
+    crash_recovery.mark_planned_restart()
 
     from engine.gateway_client import gateway_enabled
 
@@ -903,35 +977,11 @@ async def _perform(game):
             flush=True,
         )
     try:
-        # SQLite busy/locked during a laggy rewrite used to cancel the
-        # Veil after one try. Retry a couple of times before aborting.
         _heal_occupy_sessions_before_copyover_persist(game)
-        last_save_exc = None
-        for attempt in range(3):
-            try:
-                game.save(copyover=True)
-                last_save_exc = None
-                break
-            except Exception as save_exc:
-                last_save_exc = save_exc
-                msg = str(save_exc).lower()
-                busy = "busy" in msg or "locked" in msg
-                if not busy or attempt >= 2:
-                    raise
-                print(
-                    f"[copyover] save busy (attempt {attempt + 1}/3) -- retrying: "
-                    f"{save_exc!r}",
-                    flush=True,
-                )
-                await asyncio.sleep(0.4 * (attempt + 1))
-        if last_save_exc is not None:
-            raise last_save_exc
-        stats = getattr(game, "_last_world_save_stats", None) or {}
-        if stats.get("skipped") or stats.get("writer_pending"):
-            raise RuntimeError(
-                "copyover save did not apply world snapshot "
-                f"(stats={stats!r})"
-            )
+        seal_stats = await copyover_persist_mod.run_warmup_async(game)
+        # Use the seal return, not a later getattr -- aux skip can
+        # clobber game._last_world_save_stats with chars=0.
+        copyover_persist_mod.mark_persist_complete(stats=seal_stats)
     except Exception as exc:
         import traceback
 
@@ -1194,10 +1244,11 @@ async def resume(game):
         # notify, GMCP Char vitals/status). Without this, copyover resumes
         # skip mail/GMCP that login would have pushed. Also restores
         # `gm on` when the body has gm_staff_form.
+        # Flag FIRST so occupy heal / pit resume / deferred nags see
+        # copyover (gateway reattach already set this before attach).
+        session._copyover_resume = True
         hooks.after_session_attach(char, game)
         session.send(MSG_AFTER)
-        # Skip reprinting the login MOTD board on copyover resume.
-        session._copyover_resume = True
         asyncio.create_task(_resume_client(session))
 
     # If a bug-fix deploy was in flight, announce it is live and mark resolved.
