@@ -1208,11 +1208,62 @@ def game_meta_codec_registered():
     return _game_meta_saver is not None
 
 
+# (function, accepted-names-or-None) memo for ``character_to_blob``. ``None``
+# means the codec takes ``**kwargs`` and receives every keyword unchanged.
+_blob_to_kwarg_cache = (None, None)
+
+
+def _blob_to_accepted_kwargs(fn):
+    """Return the keyword names *fn* accepts, or None when it takes ``**kwargs``.
+
+    Inspected once per registered function (memoised by identity) because
+    ``character_to_blob`` runs for every character on every save.
+    """
+    global _blob_to_kwarg_cache
+    cached_fn, cached = _blob_to_kwarg_cache
+    if cached_fn is fn:
+        return cached
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        # Uninspectable (some builtins/C callables): assume it takes nothing
+        # extra -- dropping an optional hint is safe, a TypeError is not.
+        accepted = frozenset()
+    else:
+        if any(p.kind is p.VAR_KEYWORD for p in params):
+            accepted = None
+        else:
+            accepted = frozenset(
+                p.name for p in params
+                if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+            )
+    _blob_to_kwarg_cache = (fn, accepted)
+    return accepted
+
+
 def character_to_blob(character, **kwargs):
-    """Serialize game fields for the characters.stats JSON column."""
-    if _blob_to is not None:
-        return _blob_to(character, **kwargs)
-    return {}
+    """Serialize game fields for the characters.stats JSON column.
+
+    The engine passes optional hints such as ``include_heavy=False`` (see
+    ``engine.persistence._character_save_rows_gen``). They are *hints*: a
+    game whose codec predates a keyword (basegame / classic ship the plain
+    ``character_to_blob(character)``) must not be able to break every save
+    with a ``TypeError``, so keywords the registered function cannot accept
+    are dropped here. A codec that does accept a keyword -- by name or via
+    ``**kwargs`` -- receives it exactly as the engine passed it. We probe
+    the signature (like ``save_game_meta`` does) instead of catching
+    ``TypeError``, so a real TypeError raised *inside* a codec still
+    surfaces rather than being retried or hidden.
+    """
+    if _blob_to is None:
+        return {}
+    if kwargs:
+        accepted = _blob_to_accepted_kwargs(_blob_to)
+        if accepted is not None:
+            kwargs = {k: v for k, v in kwargs.items() if k in accepted}
+    return _blob_to(character, **kwargs)
 
 
 def apply_character_blob(character, data):

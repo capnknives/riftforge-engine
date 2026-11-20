@@ -168,6 +168,70 @@ def main():
         placed.append(char)
     assert len(placed) == len(PATH_ORDER)
 
+    # NOTE: runs right after chargen on purpose. Later steps (buy lantern)
+    # leave a None Item in a shopper's inventory (separate known issue:
+    # basegame.items.make_world_item rejects the shop's key/description ref),
+    # which would abort save_world for reasons unrelated to this check.
+    # ---- Regression: a real character save must succeed and round-trip. ----
+    # engine.persistence passes ``include_heavy=False`` to the blob codec;
+    # basegame's plain ``character_to_blob(character)`` used to raise
+    # TypeError, so no basegame character was ever written. save_world
+    # swallows per-character failures (it only logs), so assert on the row.
+    import json
+    from engine import char_index, persistence
+    from world import Character
+
+    saver = Character("SaveProbe")
+    saver.account = "saveprobe_acct"  # account-linked = must-save login body
+    saver.is_npc = False
+    saver.bg_path = PATH_ORDER[-1]
+    saver.move_to(game.start_room)
+    char_index.register_character(game, saver)
+    # A body never saved before is only written once it is dirty (incremental
+    # save); force=True queues it regardless of the Echo coalescing rule.
+    persistence.mark_character_dirty(game, saver, force=True)
+    persistence.save_world(game.db, game)
+    row = game.db.execute(
+        "SELECT room_key, stats FROM characters WHERE name = ?",
+        (saver.key,),
+    ).fetchone()
+    assert row is not None, (
+        "basegame character save wrote no row (blob hook rejected a keyword?)"
+    )
+    assert row[0] == game.start_room.key, row[0]
+    saved_blob = json.loads(row[1])
+    assert saved_blob.get("bg_path") == PATH_ORDER[-1], saved_blob.get("bg_path")
+    # Load side: apply the saved blob onto a fresh body.
+    reloaded = Character("SaveProbeReloaded")
+    hooks.apply_character_blob(reloaded, saved_blob)
+    assert reloaded.bg_path == PATH_ORDER[-1], reloaded.bg_path
+    # The hook wrapper must also keep forwarding a keyword a codec accepts.
+    seen = {}
+
+    def _kw_codec(character, include_heavy=True):
+        seen["include_heavy"] = include_heavy
+        return {}
+
+    def _plain_codec(character):
+        return {"plain": True}
+
+    def _var_codec(character, **kw):
+        seen["var"] = dict(kw)
+        return {}
+
+    real_to, real_from = hooks._blob_to, hooks._blob_from
+    try:
+        hooks.set_blob_codec(_kw_codec, real_from)
+        hooks.character_to_blob(saver, include_heavy=False)
+        assert seen["include_heavy"] is False
+        hooks.set_blob_codec(_var_codec, real_from)
+        hooks.character_to_blob(saver, include_heavy=False)
+        assert seen["var"] == {"include_heavy": False}
+        hooks.set_blob_codec(_plain_codec, real_from)
+        assert hooks.character_to_blob(saver, include_heavy=False) == {"plain": True}
+    finally:
+        hooks.set_blob_codec(real_to, real_from)
+
     walker = placed[0]
     _FakeSession([]).attach(walker)
     dispatch = hooks.get_dispatch()
