@@ -14,3 +14,5 @@ player_social.log
 typos.log
 content/map_archives/
 content/map_backups/
+.map_heal_fingerprint.json
+player_reports.log

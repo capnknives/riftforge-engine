@@ -22,3 +22,5 @@ jobs:
         run: python tools/basegame_smoke.py
       - name: Classic smoke
         run: python tools/classic_smoke.py
+      - name: Viewport harness smoke
+        run: python tools/viewport_harness_smoke.py
