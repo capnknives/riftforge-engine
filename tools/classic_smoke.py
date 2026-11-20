@@ -164,6 +164,35 @@ def main():
     assert spells_module.spell_ids_for_class("mage") == ["bolt"]
     assert set(spells_module.spell_ids_for_class("cleric")) == {"heal", "smite"}
 
+    # ---- Regression: a real character save must succeed and round-trip. ----
+    # engine.persistence passes ``include_heavy=False`` to the blob codec;
+    # classic's plain ``character_to_blob(character)`` used to raise
+    # TypeError, so no classic character was ever written. save_world
+    # swallows per-character failures (it only logs), so assert on the row.
+    import json
+    from engine import char_index, persistence
+
+    saver = placed[1]
+    saver.account = "saveprobe_acct"  # account-linked = must-save login body
+    saver.is_npc = False
+    char_index.register_character(game, saver)
+    # A body never saved before is only written once it is dirty (incremental
+    # save); force=True queues it regardless of the Echo coalescing rule.
+    persistence.mark_character_dirty(game, saver, force=True)
+    persistence.save_world(game.db, game)
+    row = game.db.execute(
+        "SELECT stats FROM characters WHERE name = ?", (saver.key,),
+    ).fetchone()
+    assert row is not None, (
+        "classic character save wrote no row (blob hook rejected a keyword?)"
+    )
+    saved_blob = json.loads(row[0])
+    assert saved_blob.get("classic_class") == saver.classic_class
+    reloaded = Character("SaveProbeReloaded")
+    reloaded.classic_class = "war"
+    hooks.apply_character_blob(reloaded, saved_blob)
+    assert reloaded.classic_class == saver.classic_class, reloaded.classic_class
+
     print("classic_smoke_ok")
 
 
