@@ -47,6 +47,15 @@ PUBLIC_PATHS = (
     "tools/demo_weather_smoke.py",
     "tools/packaging_smoke.py",
     "tools/export_public_engine.py",
+    # Agent play harness: the engine half (engine/viewport*.py) already
+    # ships under "engine". These are the local-only tools that drive it.
+    # The remote-host layer (tools/viewport_ops.py) and the private MCP
+    # server stay in the game monorepo.
+    "tools/viewport_sidecar.py",
+    "tools/viewport_client.py",
+    "tools/viewport_mcp.py",
+    "tools/viewport_harness_smoke.py",
+    "docs/VIEWPORT_HARNESS.md",
     "docs/ENGINE_CONSUMER.md",
     "docs/GAME_MODE_SCHEMA_CHECKLIST.md",
     "docs/templates/kind_catalog_classic_classes_file.example.json",
@@ -122,6 +131,16 @@ telnet localhost 4000
 RIFTFORGE_GAME=classic python server.py
 telnet localhost 4000
 ```
+
+**Let an AI agent play it** (no telnet — output plus the handler `file:line`):
+
+```bash
+python tools/viewport_sidecar.py &
+python tools/viewport_client.py open
+python tools/viewport_client.py send look
+```
+
+See [Agent play harness](#agent-play-harness-viewport) below.
 
 Scaffold a new game mode (kind profiles + content dirs):
 
@@ -263,6 +282,27 @@ Schema-first second consumer — OSR STR–CHA, War/Cleric/Mage/Rogue, d20 comba
 
 Boot: `RIFTFORGE_GAME=classic python server.py` (never auto-selected; default remains `basegame` for `python -m engine`).
 
+## Agent play harness (viewport)
+
+Riftforge ships a way for an AI coding agent to **play the game and debug
+it**. The viewport is a loopback JSON door into a running `Game()`: the
+agent types commands as a real player `Session` and gets back the game's
+output *and the Python handler `file:line` that produced it*.
+
+```
+handler: engine.verbs.basic.cmd_look  engine/verbs/basic.py:374
+> look
+Notbigville - Main Street - Plaza                          [ City ]
+```
+
+- `engine/viewport.py` — the harness (real `Session`, in-process queues, structured event feed).
+- `tools/viewport_sidecar.py` — isolated `Game()` on a temp database; never a real save.
+- `tools/viewport_mcp.py` — MCP stdio server with one `viewport` tool, for Cursor / Claude Code / any MCP client.
+- `engine/viewport_live.py` — safeties for a server with real players (snapshot + restore, refused verbs).
+
+Loopback only, standard library only. Setup, the MCP config snippet, and
+the wire protocol: [`docs/VIEWPORT_HARNESS.md`](docs/VIEWPORT_HARNESS.md).
+
 ## Layout
 
 | Path | Role |
@@ -274,7 +314,9 @@ Boot: `RIFTFORGE_GAME=classic python server.py` (never auto-selected; default re
 | `classic/` | OSR fantasy demo (Millbrook + wilds) |
 | `engine/content/sheet_profile.json` | Score-sheet field catalog (games extend via hooks) |
 | `content/maps/demo.json` | Minimal map for lean engine boot (`RIFTFORGE_GAME=none`) |
+| `tools/viewport_*.py` | Agent play harness tools (sidecar, client, MCP server, smoke) |
 | `docs/ENGINE_CONSUMER.md` | How a game registers on the engine |
+| `docs/VIEWPORT_HARNESS.md` | Agent play harness guide |
 | `docs/RELEASING_RIFTFORGE.md` / `docs/UPGRADING_RIFTFORGE.md` | Cut / consume a release |
 
 ## Smoke tests
@@ -283,9 +325,10 @@ Boot: `RIFTFORGE_GAME=classic python server.py` (never auto-selected; default re
 python tools/engine_smoke.py      # lean engine — no game package on disk
 python tools/basegame_smoke.py    # basegame reference game
 python tools/classic_smoke.py     # classic OSR demo
+python tools/viewport_harness_smoke.py   # agent play harness, end to end
 ```
 
-CI runs all three on every push.
+CI runs all four on every push.
 
 ## Building your own game
 
@@ -298,6 +341,7 @@ CI runs all three on every push.
 ## Docs
 
 - **Consumer guide:** [`docs/ENGINE_CONSUMER.md`](docs/ENGINE_CONSUMER.md)
+- **Agent play harness:** [`docs/VIEWPORT_HARNESS.md`](docs/VIEWPORT_HARNESS.md)
 - **Two-repo split / purity roadmap:** [`docs/plans/two_repo_purity.md`](docs/plans/two_repo_purity.md)
 - **Release / upgrade:** [`docs/RELEASING_RIFTFORGE.md`](docs/RELEASING_RIFTFORGE.md), [`docs/UPGRADING_RIFTFORGE.md`](docs/UPGRADING_RIFTFORGE.md)
 
@@ -351,6 +395,8 @@ jobs:
         run: python tools/basegame_smoke.py
       - name: Classic smoke
         run: python tools/classic_smoke.py
+      - name: Viewport harness smoke
+        run: python tools/viewport_harness_smoke.py
 """
 
 
@@ -421,6 +467,8 @@ def export(dest: str) -> None:
             ".save_health.json\nbug_reports.log\nsuggestions.log\n"
             "help_proposals.log\nplayer_queries.log\nplayer_social.log\n"
             "typos.log\ncontent/map_archives/\ncontent/map_backups/\n"
+            # Written beside the repo by any Game() boot (smokes, sidecar).
+            ".map_heal_fingerprint.json\nplayer_reports.log\n"
         )
 
     # Public tree must not ship a supers package or AI instruction files.

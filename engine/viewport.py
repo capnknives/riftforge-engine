@@ -171,6 +171,22 @@ def player_mode_blocks(line: str) -> bool:
     return verb == "gm"
 
 
+def _known_staff_lines(lines) -> tuple[str, ...]:
+    """Drop reset lines whose verb this game never registered.
+
+    ``op=reset`` types ``gm on`` (plus wipe lines off live). SUPERS has
+    the ``gm`` hub. basegame / classic / the lean engine do not, and the
+    reset feed opened with "Unknown command: 'gm'" three times. Keep
+    every line when the command table cannot be read -- a game that does
+    have ``gm`` must never lose its staff setup to an import hiccup.
+    """
+    try:
+        from commands import COMMANDS
+    except Exception:
+        return tuple(lines)
+    return tuple(line for line in lines if _first_verb(line) in COMMANDS)
+
+
 class ViewportWriter:
     """asyncio StreamWriter subset used by Session._write / drain / close."""
 
@@ -842,7 +858,7 @@ class ViewportHub:
         staff_lines = (
             viewport_live_mod.LIVE_RESET_STAFF_LINES if live else RESET_STAFF_LINES
         )
-        for line in staff_lines:
+        for line in _known_staff_lines(staff_lines):
             last = await self.send_line(line, timeout=20.0)
             if str(line).strip().lower() == "gm on":
                 self._live_gm_on = True
