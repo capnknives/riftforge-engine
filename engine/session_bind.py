@@ -1,6 +1,6 @@
 """Resolve gateway / copyover reattach keys for live sessions.
 
-Staff occupying immersion cast (Gabriel, Dean, …) must reattach to that
+Staff occupying immersion cast (assigned cast bodies) must reattach to that
 body after a Veil rewrite, not the ranked PC anchor on the parked spirit.
 """
 

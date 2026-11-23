@@ -463,7 +463,7 @@ class Game:
         self.death_beacons = {}
         # Lebanon civic housing construction (supers/town_construction.py).
         self.town_construction = {"zones": {}}
-        # Chuck Author mantle-resume (meta JSON; idle until load/restore).
+        # Author mantle-resume (meta JSON; idle until load/restore).
         self.author_mantle_event = {}
         self.amara_pressure_state = {}
         self.chuck_heaven_claim = {}

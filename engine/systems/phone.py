@@ -981,7 +981,7 @@ def retire_number(game, number, *, free_after_ticks: int):
     A live handset may still carry the stamp (corpse loot); ``number_is_live``
     treats a retired number as disconnected until it is reclaimed or a
     player ``claim_number``s it. Essential / immersion faces should not
-    call this -- they keep the number across Chuck remake (Slice 6).
+    call this -- they keep the number across an Author remake (Slice 6).
     """
     if game is None:
         return

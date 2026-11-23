@@ -8,7 +8,7 @@ from engine import channel_history
 
 OOC_HISTORY_MAX = channel_history.OOC_HISTORY_MAX
 
-# Normal player/staff OOC vs immersion Chuck Author nudges (bug/suggest).
+# Normal player/staff OOC vs immersion Author-cast nudges (bug/suggest).
 OOC_KIND_NORMAL = "normal"
 OOC_KIND_AUTHOR_NUDGE = "author_nudge"
 
@@ -38,7 +38,7 @@ def speaker_face_for_character(character, game, viewer=None):
     storage key, Echo body login name, or a redundant ``(Account)`` seeaccounts
     suffix (``CapnKnives(GM)(CapnKnives)``).
 
-    Immersion catalog cast (Chuck, Dean, …) always OOC as the character
+    Immersion catalog cast (named story NPCs) always OOC as the character
     legal name — never the owning staff account from ``config oocname
     account``, including ``gm force <cast> ooc`` and Author nudges.
     Staff ``gm on`` spirit form still reads ``Accountname(GM)`` via
@@ -188,7 +188,7 @@ def broadcast_ooc(
     When no session receives the line but *speaker_session* is set, deliver
     to that session anyway (``cmd_ooc`` parity).
 
-    *kind* ``author_nudge`` uses gold + ``[AUTHOR]`` (Chuck bug/suggest lines).
+    *kind* ``author_nudge`` uses gold + ``[AUTHOR]`` (Author-cast bug/suggest lines).
 
     *skip_discord_mirror* avoids re-posting lines that already arrived from
     Discord (prevents webhook echo loops).

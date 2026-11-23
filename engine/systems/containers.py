@@ -863,7 +863,7 @@ def _item_stack_merge_eligible(item):
     if getattr(item, "loot", None) or getattr(item, "loot_payloads", None):
         if not is_stackable_reward_box(item):
             return False
-    # Unique quest keys (Rowena tower keys, …) must not fold by name.
+    # Unique quest keys (portal tower keys, …) must not fold by name.
     if getattr(item, "nostack", False):
         return False
     if getattr(item, "portal_tower_key", False):
@@ -1259,7 +1259,7 @@ def try_merge_carried_stack(character, item, *, dest=None):
         dest = placement_destination(character, item)
     # Open-inventory slot math applies only to surface ``hands`` routing.
     # Gear and loot bags merge against their own contents — otherwise every
-    # reagent/ammo pickup spawns a new row (Dean's kit bag bloat).
+    # reagent/ammo pickup spawns a new row (cast kit bag bloat).
     if dest not in ("gear", "loot", "profession") and open_inventory_would_add_stack(
         character, item,
     ):

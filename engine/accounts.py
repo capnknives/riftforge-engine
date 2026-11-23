@@ -131,7 +131,7 @@ class Account:
         self.chargen_draft_key = ""
         # Account names blocked on OOC + player public channels (not IC say/tell).
         self.ooc_blocked_accounts = []
-        # Catalog bodies on loan for RPC tenure (Gabriel, Dean, …).
+        # Catalog bodies on loan for RPC tenure (assigned cast bodies).
         # Never ``character_keys`` / ``.account`` -- see Assigned Characters menu.
         self.assigned_characters = []
         # Wall-clock UNIX time when this account was minted. 0.0 on
@@ -1969,7 +1969,7 @@ def list_immersion_cast(game):
 def list_essential_fixture_cast(game):
     """Idle ``npc_until_assigned`` essential cast (desk fixtures, …).
 
-    Staff login no longer paints this onto the Cast band (Dean / Sergei
+    Staff login no longer paints this onto the Cast band (cast roster
     clutter). ``staff_login`` fixtures (Ash) still come from
     ``list_immersion_cast``. Crash-gate can type Ash via the name backdoor.
     """
@@ -2098,7 +2098,7 @@ def list_assigned_characters(game, account):
         if not getattr(char, "immersion", False):
             continue
         # Idle fixtures stay is_npc until ridden -- still list them so
-        # assigned Dean/Gabriel rows appear on the login play list.
+        # assigned cast rows appear on the login play list.
         found.append(char)
     return found
 
@@ -2299,7 +2299,7 @@ def account_login_choices(game, account):
     """Build account-login pick list: assigned + owned PCs, then cast if staff.
 
     Assigned catalog bodies sit at the top of the Characters band (not a
-    dump of Dean / Chuck). Staff Cast band is ``staff_login`` fixtures
+    dump of every cast body). Staff Cast band is ``staff_login`` fixtures
     only (Ash). Vaulted assigned keys are omitted here --
     ``account_login.build_account_menu`` adds them.
     """

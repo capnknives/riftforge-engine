@@ -251,7 +251,7 @@ def describe_ticket_countdown_verb(bug_ids=None, suggestion_ids=None):
 KIND_FIX = "fix"
 KIND_CATCHUP = "catchup"
 
-# Player-facing catch-up Veil lines (Supernatural gothic — clear arc, same
+# Player-facing catch-up Veil lines (gothic house voice — clear arc, same
 # family as copyover MSG_BEFORE / Fix reseal countdowns).
 CATCHUP_COUNTDOWN_OPEN = (
     "*** The Veil thins — the world will rewrite in {total} seconds. "

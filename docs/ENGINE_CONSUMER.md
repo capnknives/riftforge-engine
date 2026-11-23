@@ -73,7 +73,7 @@ Call these **before** constructing `Character`s or loading a save:
 | Evil Strikes Back world-meter defaults | `set_ensure_game_defaults(fn)` | no-op | `supers.balance.ensure_game_defaults` |
 | Recompute max HP | `set_recompute_hp(fn)` | no-op | `supers.bootstrap._recompute_hp` |
 | Legacy strongbox upgrade | `set_upgrade_legacy_container(fn)` | no-op, reports "not upgraded" | `supers.world_ext.upgrade_legacy_strongbox` |
-| Homeless floor-item sink | `set_orphan_item_room(fn)` | `game.start_room` | `supers.magic.orphan_item_room_for_game` (Beneath Lucifer's Cage) |
+| Homeless floor-item sink | `set_orphan_item_room(fn)` | `game.start_room` | `supers.magic.orphan_item_room_for_game` (the game's vault room) |
 | Map seed-item builder | `set_make_world_item(fn)` | plain flavor `Item` from `item_data` alone | `supers.items.make_world_item` |
 | Atlas map center | `set_map_center_room(fn)` | `None` | `supers.bootstrap._map_center_room` (America cell from `macro_pos`) |
 | Special directional move | `set_try_directional_move(fn)` | False (classic exits) | `supers.overland.try_overland_move` |
@@ -474,7 +474,7 @@ Execution waves 0–6 + click-to-walk: [`plans/folklore_2d_mmo_peel.md`](plans/f
 
 | Topic | Engine owns | Games own |
 |-------|-------------|-----------|
-| **Cadence** | `cadence_kernel.plan_tick` / `apply_plan` + needs meters + `npc_do` observable verbs | Job title enums, Winchester pursuit, full `cadence.py` lifestyle driver |
+| **Cadence** | `cadence_kernel.plan_tick` / `apply_plan` + needs meters + `npc_do` observable verbs | Job title enums, cast pursuit overlays, full `cadence.py` lifestyle driver |
 | **Hunter on the road** | `overland`, `paced_travel`, `needs`, `job_catalog` lookup | Hunt boards, show mission types, prose |
 | **Origins** | `origin_registry.register_origin` (mechanism only) | Folklore origin modules under `basegame/` when unparked — ids such as `hunter`, `vampire`, `werewolf`, `ghost`, `witch`, `celestial_vessel` are reserved for basegame catalogs, not engine defaults |
 | **Occult** | `occult_marks` stamps + `set_temporary_devils_trap` / `set_temporary_salt_line` / `set_occult_mark_blocks` | Demon/salt policy, reagent items, player verbs |

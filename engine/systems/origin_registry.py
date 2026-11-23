@@ -47,8 +47,8 @@ from __future__ import annotations
 _ORIGINS: dict[str, dict] = {}
 
 # Reserved folklore origin ids (charter layer table). Empty until a game
-# imports a module that calls register_origin. Do not put Winchester
-# chargen copy or live Origin trees here.
+# imports a module that calls register_origin. Do not put the private
+# game's chargen copy or live Origin trees here.
 FOLKLORE_ORIGIN_IDS = frozenset({
     "hunter",
     "vampire",

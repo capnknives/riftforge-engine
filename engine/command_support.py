@@ -427,7 +427,7 @@ def _is_presence_hidden(viewer, other):
         if not hooks.can_perceive_trickster_laylow(viewer, other):
             return True
     # Magi soul-carry hitchhike -- the passenger is inside the host's
-    # blood (Dean/Benny). Host and staff still see them; everyone else
+    # blood. Host and staff still see them; everyone else
     # treats the body as gone from the room.
     carrier = getattr(other, "soul_carrier_key", "") or ""
     if carrier:
@@ -522,7 +522,7 @@ def _presence_hears(actor):
 def strip_ephemeral_storage_prefix(name):
     """Peel internal storage prefixes (nested too).
 
-    Storage keys like ``gmspirit:Wits``, ``husk:Castiel``, ``twin:Gary``,
+    Storage keys like ``gmspirit:Wits``, ``husk:Avery``, ``twin:Gary``,
     ``threshold_clone:<room>:<face>``, or ``gym_dummy:TM00001`` must never
     reach players as a display name.
     Also cleans a mistaken ``assumed_face`` that still carries the prefix.
@@ -593,7 +593,7 @@ def _presence_face(obj):
     """Public face for score / prompt / leave-arrive (no echo tags).
 
     Prefers ``assumed_face`` / ``husk_display_name`` over storage keys
-    like ``gmspirit:Wits``, ``husk:Castiel``, or ``twin:Gary`` so players
+    like ``gmspirit:Wits``, ``husk:Avery``, or ``twin:Gary`` so players
     never see those internal prefixes in room traffic or sheets. When no
     face overlay is
     set, uses legal given (+ visible surname). Always strips ephemeral
@@ -651,7 +651,7 @@ def _presence_face(obj):
 def _public_label(obj):
     """Player/staff-facing label -- never ``gmspirit:`` / ``husk:`` keys.
 
-    Characters use ``_display_name`` (``Wits(GM)``, ``Jimmy Novak (echo)``,
+    Characters use ``_display_name`` (``Wits(GM)``, ``Avery Hale (echo)``,
     …). Items keep their floor key. Bare strings (relationship keys, etc.)
     get ephemeral prefixes stripped. Internal storage keys stay in code /
     persistence only -- always call this (or ``_display_name`` for Characters)
@@ -693,7 +693,7 @@ def _simple_english_plural(noun):
     lowercase word only so stacks do not become ``cookieses``. Invariant
     plurals (``sweatpants``, ``sneakers``, ``jeans``, ``shoes``) stay
     unchanged when already ending in ``s``. Proper-noun heads such as
-    ``Men of Letters …`` skip the container rule. Good enough for
+    ``Order of …`` skip the container rule. Good enough for
     catalog keys; not a full inflection library (stdlib-only).
     """
     word = (noun or "").strip()
@@ -893,7 +893,7 @@ def _display_name(obj, viewer=None):
     Living husks show their mortal name (never ``husk:Mantle``).
 
     Follow/beckon party mates (engine.group) append ``(Group)`` when the
-    viewer shares their follow tree -- e.g. Dean sees ``Sam(Group)``.
+    viewer shares their follow tree -- e.g. Avery sees ``Blake(Group)``.
 
     When a staff viewer has Account pref ``gm_see_accounts`` on and is in
     GM form, append ``(AccountName)`` -- never shown to ordinary players
@@ -1444,7 +1444,7 @@ def _pull_followers_to(leader, origin, dest, game, *, direction="in"):
 
     Pulls online players **and** Echo / idlemode companions (`acts_as_echo`)
     still standing in the leader's ORIGIN room -- Cadence hunt partners
-    (e.g. Echo Sam trailing Dean) must walk and board together. Ordinary
+    (e.g. an Echo partner trailing the leader) must walk and board together. Ordinary
     spirits still never pull (genuine discorporate linger). A Mantle whose
     ``vessel_host_key`` is the leader (possession rider, not a generic
     spirit follower) does pull so ``enter homestead`` does not leave them
@@ -1491,7 +1491,7 @@ def _pull_followers_to(leader, origin, dest, game, *, direction="in"):
         except Exception:
             _log_hook_error("husk follow peel", getattr(follower, "key", None))
         # Live followers peel off when survival meters spike -- do not drag
-        # Sam past bunk/gym while Dean walks (bug report 464).
+        # a follower past bunk/gym while the leader walks (bug report 464).
         if getattr(follower, "session", None) is not None:
             peel_msg = follow_survival_peel_message(follower, leader)
             if peel_msg:
@@ -1971,7 +1971,7 @@ def _viewport_staff_body_pref(game, query):
     """Prefer the Ash viewport play body over world ``Ash`` name collisions.
 
     Crashgate viewport opens as staff account Ash. ``gm force Ash`` /
-    ``summon Ash`` / ``gm stats Ash`` must hit the staff-login Roadhouse
+    ``summon Ash`` / ``gm stats Ash`` must hit the staff-login
     fixture, not a player Angel named Ash Riley (bug report 1213).
     """
     raw = (query or "").strip()

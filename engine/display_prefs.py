@@ -917,7 +917,7 @@ def format_group_names(character):
     Used by raw ``%g`` and the optional ``%Gr`` segment. Excludes self.
     Only groupmates sharing the leader's room or vehicle appear -- apart
     mates stay on ``group`` / room (Group) tags but not the prompt (live
-    bug #256: stale [Sam, Dean] while walking solo after a crash).
+    bug #256: stale [Avery, Blake] while walking solo after a crash).
     """
     try:
         from engine import group as group_mod
@@ -1402,7 +1402,7 @@ def format_prompt(character, game=None):
       %Pn  [gap 3hb]      your pulse gap while fighting (config combatpulse on)
       %Hs  [clinic]        hospitalized at Town Clinic (omits when ambulatory)
       %Ex  [n,e,s,w]
-      %Gr  [Sam, Dean] (colocated groupmates only; omits when solo/apart)
+      %Gr  [Avery, Blake] (colocated groupmates only; omits when solo/apart)
 
     Color tags (``<dark_red>``, ``<teal>``, …) expand via ``style.render``
     after tokens. Empty / disabled prompt returns \"\".

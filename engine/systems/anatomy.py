@@ -12,7 +12,7 @@ Adds a *where* axis to a swing without inventing a new taxonomy per game:
 
 Real human anatomy and universal combat vocabulary, not any one game's
 lore -- passes the promotion test (docs/plans/riftforge_core_expansion.md
-"another fantasy MUD could use it without Supernatural names"). Peeled
+"another fantasy MUD could use it without the private game's names"). Peeled
 from ``supers/anatomy.py`` under that charter's Phase 5b; that module's
 own SUPERS-specific bridges (which armor slot / tattoo body-part overlaps
 a region -- ``items.py``/``tattoo.py`` concepts this module has no
@@ -105,7 +105,7 @@ _TARGET_SPECS = {
 }
 
 # Within-line auto-pick weights: arms/hands targets are rarer than torso
-# vitals so Dean does not auto-spam forearm every swing. Called shots bypass
+# vitals so a fighter does not auto-spam forearm every swing. Called shots bypass
 # this table entirely (resolve_called_shot wins in choose_target).
 _TARGET_AUTO_WEIGHTS = {
     # High -- head/neck vitals dominate; brow/eye/mouth/nape are seasoning.

@@ -1,6 +1,6 @@
 """cadence_town.py -- idempotent Notbigville townsfolk for basegame Cadence demo.
 
-Seeds folklore mortals (no Winchester / Castiel names) with hunger/thirst
+Seeds folklore mortals (invented names only, no licensed characters) with hunger/thirst
 meters so ``plan_tick`` can walk them to resource rooms. They appear on
 ``Room.Occupants`` as ``kind=npc`` because ``is_npc=True`` and they carry
 no ``password_hash``.

@@ -26,8 +26,8 @@ ROW_LABELS = {
 
 # Game ticks a party may stay follow-bonded in different rooms before
 # auto-disband. Cadence followers may step to catch up during this window
-# (instant disband thrashed Dean/Sam on one-tick lag + blocked reunite).
-# 100 ticks = 5 real minutes at the 3s heartbeat (live bug #67: Dean/Sam
+# (instant disband thrashed cast partners on one-tick lag + blocked reunite).
+# 100 ticks = 5 real minutes at the 3s heartbeat (live bug #67: two partners
 # stayed grouped-but-apart well past the old 3-minute grace window).
 GROUP_APART_DISBAND_TICKS = 100
 
@@ -180,10 +180,10 @@ def format_group_sheet(character, game=None):
 
     Shape::
 
-        Dean  100/100hp - Front Row (you)
-        Sam   85/100hp - Back Row
+        Avery 100/100hp - Front Row (you)
+        Blake 85/100hp - Back Row
 
-        Group wants: food — Sam is hungry.
+        Group wants: food — Blake is hungry.
           Lead them to food (diner / buy / eat).
 
     Labels stay plain text -- never meaning-by-color alone. Rows are
@@ -792,7 +792,7 @@ def live_move_blocked_message(character):
     ``cadence_may_step``. Returns None when movement is allowed.
 
     A follow bond to a GM, idle Echo, NPC, or other non-live leader
-    does not trap a live climber (Ash viewport snoop + force Castiel
+    does not trap a live climber (Ash viewport snoop + force a cast body
     ``up`` while following Ash). Two live players still glue: only the
     live leader walks.
     """

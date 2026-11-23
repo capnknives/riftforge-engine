@@ -601,7 +601,7 @@ def push_char_name(character):
     session = getattr(character, "session", None)
     if session is None or not client_supports(session, "Char.Name"):
         return
-    # Public face (Wits(GM) / Jimmy Novak) -- never gmspirit: / husk: keys.
+    # Public face (Wits(GM) / a husk's public name) -- never gmspirit: / husk: keys.
     from engine.command_support import _display_name
     name = _display_name(character) if character is not None else ""
     session.send_gmcp("Char.Name", {"name": name, "fullname": name})

@@ -548,7 +548,7 @@ class ViewportHub:
                 name = getattr(char, "key", "?")
                 return (
                     f"live viewport refuses occupy/set/force on playerfile "
-                    f"{name!r}. Use immersion Cast (Dean, Buffy, …) or "
+                    f"{name!r}. Use an immersion Cast body or "
                     "staff-login Ash."
                 )
         if viewport_live_mod.live_line_is_yellow(line):
@@ -665,7 +665,7 @@ class ViewportHub:
     def resolve_body(self, name: str):
         """Find the playable / immersion body (Ash by default).
 
-        Bare ``Ash`` must occupy the staff-login Roadhouse fixture, not a
+        Bare ``Ash`` must occupy the staff-login fixture, not a
         player Angel named Ash Riley (bug report 1213).
         """
         raw = (name or DEFAULT_CHARACTER).strip() or DEFAULT_CHARACTER
@@ -827,7 +827,7 @@ class ViewportHub:
         """Place Ash in a known lobby, clear authored quests, staff setup.
 
         ``gm on`` first, then seat the **spirit** in the Sheriff lobby and
-        ``look``. Moving the mortal before form used to report Roadhouse
+        ``look``. Moving the mortal before form used to report the staff-login room
         from the opening auto-look while Cadence walked the Echo (bug
         report 1213). Trust the room after this last look.
         """

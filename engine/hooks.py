@@ -529,7 +529,7 @@ def set_orphan_item_room(fn):
     """Register fn(game) -> Room for homeless floor items on load.
 
     Pass None to restore the start-room fallback. SUPERS points this at
-    the vault under Lucifer's Cage so Central Plaza stays clear.
+    the game's vault room so Central Plaza stays clear.
     """
     global _orphan_item_room
     _orphan_item_room = fn
