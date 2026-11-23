@@ -138,7 +138,7 @@ _TERRAIN_BLURBS = {
     ),
 }
 
-# Water / lake / off-CONUS void block Impala travel (v1 road fantasy).
+# Water / lake / off-CONUS void block car travel (v1 road fantasy).
 _VEHICLE_BLOCKED = frozenset({"ocean", "lake", "void", "water"})
 
 # area_type / map_layer strings that count as paved or settled road for
@@ -502,7 +502,7 @@ class OverlandAtlas:
         has_layers = bool(grid.get("terrain_rows") or grid.get("road_rows"))
         if has_layers:
             # Expand compact glyph rows so .terrain.get still sees highways
-            # (Impala off-road vs asphalt uses map_layer on this dict).
+            # (car off-road vs asphalt uses map_layer on this dict).
             for y in range(self.height):
                 for x in range(self.width):
                     override = expand_grid_cell(grid, x, y)
@@ -872,7 +872,7 @@ def _landmark_display_name(landmark):
 def nearby_landmark_bearing_lines(atlas, macro, micro):
     """Plain-text compass lines for settlements near this foot cell.
 
-    Example: ``North: the Men of Letters bunker.`` / ``South: Lebanon,
+    Example: ``North: the old bunker.`` / ``South: Lebanon,
     Kansas.`` Used by virtual look (sighted + screenreader) so players
     always see which way town / bunker / city hubs lie -- not color alone.
     """
@@ -1439,7 +1439,7 @@ def _overland_auto_look(character, game, *, after_move=False):
 
 
 def _vehicle_can_enter(atlas, mx, my):
-    """True when the Impala may roll onto this macro cell."""
+    """True when a car may roll onto this macro cell."""
     area = atlas.terrain_at(mx, my)
     return area not in _VEHICLE_BLOCKED
 

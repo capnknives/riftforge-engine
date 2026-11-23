@@ -499,8 +499,8 @@ Echoes
 Conference and collect
   phone conference <alias|number> (or phone add …) while connected adds a third party — three characters max. Hang up while they are still ringing and you stay on the original call. Collect charges are covered above.
 
-Wirecraft and Charlie
-  Secret wirecraft ranks up on contested protect, track, and BUG. Protect replies may name your band (Civilian through Ghost) when you outbox Charlie's stamp — never a raw XP number on score. Track and BUG stay terse (legal ping or heat), not a band ladder readout. Charlie Bradbury (alive AU) stamps Operator-quality shields at the Lebanon Town Library afternoons (phone protect drop) and the Men of Letters bunker nights. Ash stamps at the Roadhouse rig when he is in the back room. Ghost-tier operators outbox named stamps. phone protect stamps your handset; phone protect handle <alias> sets a secret handle from Desk-rank Hacker Path or Operator wire — the alias never prints on score. phone protect drop leaves a handset in the library slot without entering the bunker (evils welcome). phone track <number> is legal for sheriff/PI/detective desks (fee) or illegal heat otherwise. phone bug <smartphone> feeds live call audio to you while logged in — flip phones and pagers refuse the tap.
+Wirecraft and operators
+  Secret wirecraft ranks up on contested protect, track, and BUG. Protect replies may name your band (Civilian through Ghost) when you outbox an operator's stamp — never a raw XP number on score. Track and BUG stay terse (legal ping or heat), not a band ladder readout. A town operator stamps Operator-quality shields at the town library afternoons (phone protect drop) and at a hunter bunker nights. A second operator stamps from a back-room rig at the bar when on shift. Ghost-tier operators outbox named stamps. phone protect stamps your handset; phone protect handle <alias> sets a secret handle from Desk-rank Hacker Path or Operator wire — the alias never prints on score. phone protect drop leaves a handset in the library slot without entering the bunker (evils welcome). phone track <number> is legal for sheriff/PI/detective desks (fee) or illegal heat otherwise. phone bug <smartphone> feeds live call audio to you while logged in — flip phones and pagers refuse the tap.
 
 Pager / ham / dashcam
   page <alias|number> <short> — pager SKU only; works in cell blackout. The other person must be carrying a pager and logged in — an offline Echo without a pager does not get a fake Page sent. ham say <short> — handheld ham rig, heard in this room only (no phone number, ignores blackout). dashcam replay — ring buffer on the dashcam item; it records as the vehicle rolls (carry it in the cabin). vehicle dashcam replay from inside the cabin.
@@ -627,7 +627,7 @@ When you leave a home (sellhome, claim a new house, or homestead), old house roo
 
 When Deal hellhounds hunt you (help deal), pour goofer here (and salt here) to buy time -- the pack chews the line, it does not last forever. Occultists and Demons with pierce sight may also leash a contained hound briefly (help hellhound). Killing a hound still needs an angel blade, demon-killing knife, or The Colt, plus sight (glasses, or being an Angel / Demon / God).
 
-Cadence / your Echo (Hunter, Slayer, or Occultist) re-chalks listed rooms when salt, iron, or the devil's trap goes missing -- they restock kit first when short. Hunters (and Bobby at Singer House) also exorcise
+Cadence / your Echo (Hunter, Slayer, or Occultist) re-chalks listed rooms when salt, iron, or the devil's trap goes missing -- they restock kit first when short. Hunters (and the salvage-yard mentor) also exorcise
 Demon hosts held in a devil's trap in the same room or next door.
 Occultist circle is a timed trap, not a permanent chalk mark.
 
@@ -785,21 +785,21 @@ Who arrives here
   Wilderness and nest hostiles that die on Earth leave a corpse; the soul wakes as living flesh on the Ashen Marches -- Leviathan prey until an escape clock returns them to the living world.
 
 Getting home
-  Your nest, crypt, pack den, haunt, or parlor is your HOME -- not where you automatically wake after a normal kill. After Waystation check-in you return to where you died (body_room). Homes matter for chargen spawn, Chuck rewrite while protected, phantomstep, larder, and Ghost haunt bind (haunt moves your home when you claim a new room).
+  Your nest, crypt, pack den, haunt, or parlor is your HOME -- not where you automatically wake after a normal kill. After Waystation check-in you return to where you died (body_room). Homes matter for chargen spawn, Author rewrite while protected, phantomstep, larder, and Ghost haunt bind (haunt moves your home when you claim a new room).
   Mortals and ensouled vampires: after a short linger near your body, a Reaper claims and ferries you (help reaper), then you wait roughly ten real minutes for check-out.
   Monster-frequency souls (Vampire nest, Shifter, Arachne, Leviathan, …): no Reaper queue and no Earth linger -- you wake as flesh on the ash at once. Logging off does not dodge that usher. Your corpse stays on Earth. Leviathans hunt this prison.
   Porter at the Waystation restores you (Lumen does Heaven; Sift does Hell). Bound souls cannot leave this plane -- move, gate, teleport, realmhome, and ridereaper stay sealed until release:
     paydebt in the Ledger Room (dollars) once you are among the living again
     Leviathans never use the Ledger or Fog-Reaper -- only Master+ breach
     at the Bone Gate with the seal key
-  Winchester brothers (Sam/Dean): the desk clocks the soul on Heaven/Hell arrival, then holds check-out for a deal window (help relationships).
+  Bonded hunter siblings: the desk clocks the soul on Heaven/Hell arrival, then holds check-out for a deal window (help relationships).
 
 Living bodies stranded here (flesh, not a death-spirit, not bound):
   Porter approaches and offers passage home -- type acceptpassage
   (see help passage). Homesickness climbs on the wrong plane; Echoes
   Cadence-seek Porter and auto-return. There is no walk path from the Ashen Marches to Earth.
 
-Newbie protection on Purgatory: a confirmed lethal finish is Chuck-rewritten to your origin home (help protection) -- not spirit check-in.
+Newbie protection on Purgatory: a confirmed lethal finish is Author-rewritten to your origin home (help protection) -- not spirit check-in.
   After protection ends, monster-frequency souls who die here route to The Empty instead of the Waystation desk (help empty).
   NPC Leviathans who suffer true death here melt into ooze and may leave a Leviathan Blossom on the ash (help blossom).
 

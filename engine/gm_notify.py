@@ -10,7 +10,7 @@ Never the only signal -- every line keeps a plain ``[GM]`` prefix so
 
 Opt-out: Character.gm_notify False (GM verb ``gm staffnotify off``). Idle
 immersion fixtures never listen (they are not in ``game.sessions``).
-Staff occupying a powered cast (playcast / Cast menu / ``gm off Dean``)
+Staff occupying a powered cast (playcast / Cast menu / ``gm off <cast>``)
 still receive pings -- ``_is_staff_gm`` stays False so who / threat
 scaling remain in-character.
 Command-error pings (live player ``Something went wrong``) honor a second

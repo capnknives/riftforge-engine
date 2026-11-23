@@ -235,7 +235,7 @@ def legal_public_name(char, *, force_surname=False) -> str:
 
     Respects ``surname_visible`` unless ``force_surname`` (GM tooling).
     When visible and ``public_name_order`` is surname-first, formats
-    ``Surname, Given`` (Bond / Crowley desk style).
+    ``Surname, Given`` (desk-roster style, e.g. ``Hartwell, Mara``).
 
     Civic ``title`` (Sheriff, Deputy, Agent, Doctor, …) replaces the
     given name in ordinary prose so players see ``Sheriff Calder`` while
@@ -333,7 +333,7 @@ def humanize_storage_key(raw_key) -> str:
 
     Inserts spaces at lower→Upper boundaries so mashed legacy keys like
     ``ZackMarkson`` read as ``Zack Markson``. Does not invent surnames for
-    single-token keys (``Crowley`` stays ``Crowley``). Ephemeral prefixes
+    single-token keys (``Hartwell`` stays ``Hartwell``). Ephemeral prefixes
     are stripped first. Prefer ``legal_public_name`` / ``reporter_display_name``
     when a live body is available.
     """
@@ -354,7 +354,7 @@ def split_mashed_key_identity(raw_key):
 
     Only when there is exactly one lower→Upper boundary (``ZackMarkson`` →
     Zack + Markson). Multi-hump keys (``MaryAnneSmith``) and single-token
-    keys (``Crowley``, ``McDonald``) return None so we do not invent a
+    keys (``Hartwell``, ``McDonald``) return None so we do not invent a
     wrong surname. Trailing numeric suffixes from ``allocate_storage_key``
     are stripped first (``ZackMarkson2`` → Zack + Markson).
     """
@@ -564,7 +564,7 @@ def parse_target_ordinal(query: str):
     raw = (query or "").strip()
     if not raw:
         return None, ""
-    # Dot form: 2.carl / 2.Carl Winchester
+    # Dot form: 2.carl / 2.Carl Hartwell
     m = _DOT_ORDINAL_RE.match(raw)
     if m:
         try:
@@ -1320,7 +1320,7 @@ def retarget_orphan_stash_sidecars(game, conn=None, *, backup_db_path=None):
     the character row is inserted under a reminted CNUM (live 2026-09-20:
     Ayla AL00002 crates vs AL00038 body). ``stash`` then looks empty.
     The one-shot ``STASH_SIDECAR_CNUM_REATTACH_V1`` already stamped, and
-    it skipped tags still held by an NPC (Donna Robbins on DN00001).
+    it skipped tags still held by an NPC (a cast NPC on DN00001).
 
     This walk is idempotent: passworded bodies that already hold their
     sidecar are a no-op. Does not remint the PC back onto the old tag.

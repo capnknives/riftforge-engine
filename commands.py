@@ -205,7 +205,7 @@ COMMANDS = {**ENGINE_COMMANDS, **GAME_COMMANDS}
 def _verb_disabled_for_actor(game, verb, actor):
     """True when staff disabled this verb for the actor.
 
-    Catalog immersion cast (Dean, Chuck, …) always bypass the global
+    Catalog immersion cast (named story NPCs) always bypass the global
     ``dothepit`` disable so pit autopilot stays available on cast logins.
     """
     from engine import command_disable as _cmd_disable

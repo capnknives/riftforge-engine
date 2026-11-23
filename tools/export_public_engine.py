@@ -156,7 +156,7 @@ See [`docs/GAME_MODE_SCHEMA_CHECKLIST.md`](docs/GAME_MODE_SCHEMA_CHECKLIST.md).
 - **Folklore kernels** — fishing catch math, lockpick attempts, occult room stamps (`devils_trap`, `salt_line`, `iron_ward`, `holy_water_ward` on `room.engine`), Cadence seek/wander (`cadence_kernel`), grace meter + vessel chassis, Purgatory corporeal-prison plane policy, pocket-grid demesne chassis. Show names stay out of `engine/`.
 - **Room.Occupants + click-to-walk** — GMCP who-is-here tokens and interior-map path walking (layout graph). In-room `local_x`/`local_y` stay parked.
 - **`origin_registry.FOLKLORE_ORIGIN_IDS`** — reserved hunter / vampire / werewolf / ghost / witch / celestial_vessel ids for a later game catalog pass. Alien remains the shipped sideline demo origin.
-- **Known debt** — public `basegame/help_topics.py` still pastes some Winchester / Lebanon / Men of Letters lines. Folklore Mortals & Monsters catalogs are **planned**, not this tag.
+- **Known debt** — public `basegame/help_topics.py` was copied from the private game's help and still describes some of its systems (Heaven/Hell desks, Purgatory, hunter kit); TV-show character and place names have been removed from it. A few engine function names and save/meta keys (e.g. `winchester_*`, `chuck_heaven_claim`, zone id `men-of-letters`) keep legacy names until a save migration. Folklore Mortals & Monsters catalogs are **planned**, not this tag.
 
 ## What's new in v0.7.0
 

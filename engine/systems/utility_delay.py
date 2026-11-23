@@ -145,7 +145,7 @@ def ensure_defaults(character):
 
 
 def _base_key(verb_key):
-    """Family key for scoped gates (e.g. ``grill:Dean`` -> ``grill``)."""
+    """Family key for scoped gates (e.g. ``grill:Avery`` -> ``grill``)."""
     return str(verb_key or "").split(":", 1)[0]
 
 

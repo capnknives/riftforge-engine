@@ -391,7 +391,7 @@ MAP_LAYER_COLOR = {
     "mountains": "\x1b[90m",       # dark grey rock
     "lake": "\x1b[94m",            # bright blue
     "forest": "\x1b[32m",
-    "highway": "\x1b[33m",         # yellow asphalt / Impala road
+    "highway": "\x1b[33m",         # yellow asphalt / car road
     "mountain_highway": "\x1b[33m",  # yellow pass through Rockies
     "trail": "\x1b[33m",           # dim tan wagon ruts (not interstate gold)
     "city": "\x1b[97m",            # bright white hub letter

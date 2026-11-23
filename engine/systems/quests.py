@@ -504,7 +504,7 @@ def _npc_matches_giver(npc, giver_name, *, quest_data=None, game=None):
     Civic office tokens (``sheriff``, ``coroner``, a jobs.json id, …)
     match whoever currently holds that title in the quest's town --
     leftover names on a retired body do not. Named givers still use
-    substring / identity match (Bobby / Bobby Singer).
+    substring / identity match (``Avery`` / ``Avery Hale``).
     """
     if npc is None or not giver_name:
         return False
@@ -1683,7 +1683,7 @@ def _match_when(character, when, event, payload, *, quest_id=None, game=None):
     if kind == "call_npc" and event == "call_npc":
         # Fires when a phone call connects to that NPC -- lets a step
         # complete for a giver who is a real drive away without forcing
-        # the trip (docs/plans/men_of_letters_path.md "call Bobby" beat).
+        # the trip (the private game's "call the mentor" quest beat).
         return _payload_npc_matches(
             when.get("npc"),
             payload,
@@ -1820,9 +1820,9 @@ def notify(character, event, **payload):
 def allows_talk(character, npc):
     """True when ``talk`` may bypass the peaceful-NPC gate for this pair.
 
-    Immersion mentors (Dean, Sam, …) are player-shaped Echoes
+    Immersion mentors (named cast) are player-shaped Echoes
     (``is_npc`` / ``peaceful`` false) but authored openers still need
-    ``talk Dean`` / ``talk Sam``. Allow when an active quest has
+    ``talk <mentor>``. Allow when an active quest has
     ``npc_lines`` for their key, or they are listed in that quest's
     pin map / giver. Offer-room lines also count so a giver can be
     talked to before takequest.
@@ -1963,7 +1963,7 @@ def npc_talk_line(character, npc):
             return lines["active"]
     # Offer line -- talking directly to the giver ignores offer_rooms so a
     # player does not have to blind-walk every one of their errand rooms to
-    # learn something is available (Wave 1: Garth's cases sit at the pawn
+    # learn something is available (Wave 1: one giver's cases sit at the pawn
     # counter, vault, street, and park). Prefer the offer whose own room
     # matches where you are standing (correct flavor); otherwise fall back
     # to the first one (stable id order) so talk always surfaces *something*.
@@ -2043,7 +2043,7 @@ def show_hint(character):
             else:
                 _send(character, "(No extra hint for this step.)")
         # Optional recovery line for travel-heavy opener steps (lodging,
-        # finding Bobby, haunt intro that used to send people road-tripping).
+        # finding a mentor, haunt intro that used to send people road-tripping).
         stuck = (step or {}).get("stuck_hint")
         if stuck:
             if sr:

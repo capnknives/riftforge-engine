@@ -2403,7 +2403,7 @@ BADGE_COLORS = {
     "hunter": "absinthe_green",
     "occultist": "dark_purple",
     "slayer": "dark_red",
-    # Supernatural Lineages -------------------------------------------------
+    # Monster lineages ------------------------------------------------------
     "vampire": "dark_red",
     "shifter": "teal",
     "leviathan": "dark_cyan",

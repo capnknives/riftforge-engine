@@ -640,7 +640,7 @@ def _resolve_frontierland_saved_room_key(game, room_key, character=None):
 
     Virtual 1861 cells live in ``game.frontierland_rooms``, not
     ``game.rooms``. Without an atlas-aware lookup, copyover reload falls
-    back to ``home_room_key`` (often the Men of Letters bunker).
+    back to ``home_room_key`` (often the starter hub).
 
     Generic ``Wilderness (mx,my)/ux,uy`` titles are shared with Prime
     Earth. Only materialize the sealed-age twin when the save belongs
@@ -2552,7 +2552,7 @@ def save_death_beacons(conn, game):
 
 
 def load_author_mantle_event(conn):
-    """Load Chuck Author mantle-resume event dict from meta (default {}).
+    """Load the Author mantle-resume event dict from meta (default {}).
 
     Missing / malformed key → empty dict so ``ensure_event`` can fill
     idle defaults. Engine-pure: no SUPERS imports.
@@ -2561,10 +2561,10 @@ def load_author_mantle_event(conn):
 
 
 def save_author_mantle_event(conn, game):
-    """Persist game.author_mantle_event so copyover keeps Chuck's event.
+    """Persist game.author_mantle_event so copyover keeps the Author's event.
 
     Phase / until_tick / foe_key / stat_backup / auto_bout survive the
-    process swap; SUPERS ``restore_after_boot`` re-reveals Chuck and
+    process swap; SUPERS ``restore_after_boot`` re-reveals the Author cast and
     respawns a missing Unmade shade quietly.
     """
     _save_meta_dict(conn, "author_mantle_event", game, "author_mantle_event")
@@ -3172,7 +3172,7 @@ def save_cadence_scale(conn, game):
 
 
 def load_winchester_failsafe(conn):
-    """Load Winchester Earth-job failsafe toggle from meta (default {})."""
+    """Load the cast Earth-job failsafe toggle from meta (default {})."""
     return _load_meta_dict(conn, "winchester_failsafe")
 
 
@@ -3182,7 +3182,7 @@ def save_winchester_failsafe(conn, game):
 
 
 def load_winchester_pursuit(conn):
-    """Load Winchester evil-monster pursuit state from meta (default {})."""
+    """Load the cast evil-monster pursuit state from meta (default {})."""
     return _load_meta_dict(conn, "winchester_pursuit")
 
 
@@ -3192,7 +3192,7 @@ def save_winchester_pursuit(conn, game):
 
 
 def load_winchester_road(conn):
-    """Load Winchester board-tour circuit toggle from meta (default {})."""
+    """Load the cast board-tour circuit toggle from meta (default {})."""
     return _load_meta_dict(conn, "winchester_road")
 
 
@@ -4020,7 +4020,7 @@ def _item_container_blob(item, holder=None):
         "custom_look_in_lines": getattr(item, "custom_look_in_lines", None),
         # Abandoned floor loot grace (Cadence scavengers); absent = legacy pile.
         "floor_dropped_tick": getattr(item, "floor_dropped_tick", None),
-        # Beneath Lucifer's Cage TTL; absent = stamp on next vault decay tick.
+        # Vault-room TTL; absent = stamp on next vault decay tick.
         "vault_decay_at_tick": getattr(item, "vault_decay_at_tick", None),
         # Physical phone line id (supers/phone.py); absent = not a phone.
         "phone_number": getattr(item, "phone_number", None),
@@ -4031,7 +4031,7 @@ def _item_container_blob(item, holder=None):
         "is_spirit_mirror": bool(getattr(item, "is_spirit_mirror", False)),
         "spirit_mirror_source_key": getattr(item, "spirit_mirror_source_key", None),
         "is_god_twin_visual": bool(getattr(item, "is_god_twin_visual", False)),
-        # Rowena tower keys -- flags must survive Echo logout or a leftover
+        # Witch-tower portal keys -- flags must survive Echo logout or a leftover
         # flavor stack eats the next drop (no portal_tower_key on merge).
         "nostack": bool(getattr(item, "nostack", False)),
         "portal_tower_key": bool(getattr(item, "portal_tower_key", False)),
@@ -4243,7 +4243,7 @@ def _item_container_dict(item):
 
 
 def _restore_portal_key_fields(item, state):
-    """Apply saved Rowena tower-key flags (absent on older flavor stacks)."""
+    """Apply saved portal tower-key flags (absent on older flavor stacks)."""
     if not isinstance(state, dict) or item is None:
         return
     if state.get("nostack"):
@@ -8853,7 +8853,7 @@ def resolve_pending_body_link(game, char, body_room_key, body_key):
     everything already placed, so this can run immediately there instead
     of a second pass). Living vessel husks are Characters (not floor Item
     corpses) -- resolve them via ``find_character`` so a vessel-free
-    Angel/Demon is not force-unspirited while their Jimmy-style husk keeps
+    Angel/Demon is not force-unspirited while their vacated-vessel husk keeps
     walking (dual-corporeal bug). If no body can be found at all
     (corrupted save / missing room / vaulted husk never restored), the
     safe fallback is still to un-spirit rather than leave them stuck with
@@ -8911,7 +8911,7 @@ def resolve_pending_body_link(game, char, body_room_key, body_key):
         char.spirit_untethered_ticks = 0
         # Drop vessel_free so boot heal / Cadence do not treat this
         # Mantle as a vessel spirit with a missing husk (hybrid state
-        # that used to leave Castiel corporeal + Jimmy vacant).
+        # that used to leave the angel corporeal + its vessel vacant).
         if hasattr(char, "vessel_free"):
             char.vessel_free = False
         # Re-derive HP after un-spiriting a character whose body was

@@ -8,7 +8,7 @@ beside the save DB (``game.report_dir``).
 
 Games register catalog loaders and optional validators via ``engine.hooks``
 (see ``register_vehicle_catalog``, ``set_vehicle_park_spot_extra_gate``, …).
-SUPERS layers Impala/Cadence/atlas cruise on top; this module deliberately
+SUPERS layers its catalog cars/Cadence/atlas cruise on top; this module deliberately
 stays free of ``import supers``.
 
 ``drive_step`` moves a parked vehicle one hop through the room graph via
@@ -858,8 +858,8 @@ def save_parking_state(game, *, force=True):
 def _catalog_interior_title(spec):
     """Player-facing cabin name -- never the interior_description first sentence.
 
-    Catalog Impala cabins used to stamp the sensory blurb as ROOM NAME
-    (bug report 1277). Prefer the authored interior_key (Inside the Impala).
+    Catalog car cabins used to stamp the sensory blurb as ROOM NAME
+    (bug report 1277). Prefer the authored interior_key (``Inside the <car>``).
     """
     if not isinstance(spec, dict):
         return "Inside a vehicle"

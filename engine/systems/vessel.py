@@ -2,7 +2,7 @@
 
 Pure field defaults and room-visible identity helpers for Mantles that
 ride or possess mortal hosts. Show-specific verbs (discorporate, smite,
-exorcise, Jimmy warehouse prose) stay in ``supers.vessel``; this module
+exorcise, vessel-origin prose) stay in ``supers.vessel``; this module
 only owns the shared chassis:
 
   * ``ensure_vessel_defaults`` — idempotent field stamp

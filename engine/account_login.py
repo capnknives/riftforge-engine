@@ -104,7 +104,7 @@ def _parse_menu_choice(pick, tagged):
         for i, (_section, entry) in enumerate(tagged, start=1):
             if entry is LINK_EXISTING_MARKER:
                 return i
-    # Staff (and assigned-cast) menus: type Ash / Dean instead of hunting
+    # Staff (and assigned-cast) menus: type Ash / a cast name instead of hunting
     # a shifting roster number. Exact key, given name, or vault face only.
     exact = []
     for i, (_section, entry) in enumerate(tagged, start=1):
