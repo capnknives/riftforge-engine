@@ -343,7 +343,7 @@
       "slot": "attributes_extras",
       "source": "hook:supers_path_primary",
       "panes": ["default", "combat", "full"],
-      "filter_prefixes": ["  Hunter edge:", "  Occultist edge:", "  Slayer edge:", "  Men of Letters edge:", "  Alchemist edge:"]
+      "filter_prefixes": ["  Hunter edge:", "  Occultist edge:", "  Slayer edge:", "  Alchemist edge:"]
     },
     {
       "id": "supers_edges",

@@ -42,6 +42,16 @@ _CONTRIBUTORS: list[tuple[int, str, object]] = []
 # still the preferred long-term home (audit warns on auto-only fields).
 _DYNAMIC_FIELDS: list[dict] = []
 
+# Extra ``filter_prefixes`` a game adds to an existing catalog row, keyed by
+# field id. The engine catalog keeps only prefixes that are not one game's
+# proper nouns; a game appends its own (a Path name, say) at boot with
+# ``register_filter_prefixes``. ``filter_prefixes_for_pane`` emits them
+# right after that row's catalog prefixes, so the effective list for the
+# game is the catalog list plus its additions. Matchers use the list as a
+# set (``str.startswith(tuple)``), so position does not change what a
+# pane keeps.
+_EXTRA_FILTER_PREFIXES: dict[str, list[str]] = {}
+
 # Slots the engine default assembler owns. Custom game layouts (SUPERS
 # two-column identity/vitals) skip these on overflow so primaries/HP do
 # not double-print.
@@ -170,6 +180,25 @@ def register_auto_field(
     })
 
 
+def register_filter_prefixes(
+    field_id: str, prefixes: list[str] | tuple[str, ...],
+) -> None:
+    """Add game-owned ``filter_prefixes`` to catalog row ``field_id``.
+
+    Use this when the catalog row exists but some of its line prefixes
+    name one game's content (e.g. a Path label) and so do not belong in
+    the public engine JSON. Idempotent: a prefix already registered for
+    the row is not added twice (boot registers on package import and again
+    in ``register_all_hooks``). Order of first registration is kept.
+    """
+    fid = str(field_id)
+    bucket = _EXTRA_FILTER_PREFIXES.setdefault(fid, [])
+    for raw in prefixes or ():
+        text = str(raw)
+        if text and text not in bucket:
+            bucket.append(text)
+
+
 def clear_registrations_for_tests():
     """Reset hook tables (smoke tests that flip game packages mid-run)."""
     global _PROFILE
@@ -177,6 +206,7 @@ def clear_registrations_for_tests():
     _FIELD_HOOKS.clear()
     _CONTRIBUTORS.clear()
     _DYNAMIC_FIELDS.clear()
+    _EXTRA_FILTER_PREFIXES.clear()
 
 
 def _pane_meta(ctx: SheetContext) -> dict:
@@ -286,6 +316,8 @@ def filter_prefixes_for_pane(pane: str) -> list[str]:
         if not _field_applies(field_row, pane):
             continue
         _add(field_row.get("filter_prefixes"))
+        # Game additions for this row (``register_filter_prefixes``).
+        _add(_EXTRA_FILTER_PREFIXES.get(str(field_row.get("id") or "")))
     for dyn in _DYNAMIC_FIELDS:
         panes = dyn.get("panes")
         if panes and pane not in panes:
